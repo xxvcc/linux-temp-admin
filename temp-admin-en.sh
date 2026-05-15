@@ -25,7 +25,7 @@ err() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "Please run as rootsudo bash $SCRIPT_NAME"
+    err "Please run as root: sudo bash $SCRIPT_NAME"
     exit 1
   fi
 }
@@ -221,7 +221,7 @@ ensure_dependencies() {
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
-    err "Still missing after install${still_missing[*]}。请手动处理后重试。"
+    err "Still missing after install: ${still_missing[*]}. Please fix manually and retry."
     return 1
   fi
 
@@ -440,7 +440,7 @@ create_user_if_needed() {
   local user="$1"
   local shell_path="$2"
   if user_exists "$user"; then
-    err "User already exists$user"
+    err "User already exists: $user"
     exit 1
   fi
   if command_exists useradd; then
@@ -514,7 +514,7 @@ write_ssh_key() {
   local home_dir
   home_dir=$(getent passwd "$user" | cut -d: -f6)
   if [[ -z "$home_dir" || ! -d "$home_dir" ]]; then
-    err "User home directory not found$user"
+    err "User home directory not found: $user"
     exit 1
   fi
   install -d -m 700 -o "$user" -g "$user" "$home_dir/.ssh"
@@ -601,7 +601,7 @@ invite() {
       --no-install-deps) deps_mode="never"; shift ;;
       --auto-revoke) auto_revoke="yes"; shift ;;
       --no-auto-revoke) auto_revoke="no"; shift ;;
-      *) err "Unknown option$1"; usage; exit 1 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
 
@@ -705,7 +705,7 @@ EOF
   fi
   registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
 
-  success "Temporary account created and registered$user"
+  success "Temporary account created and registered: $user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
 }
 
@@ -716,7 +716,7 @@ revoke_user() {
     case "$1" in
       --user) user="$2"; shift 2 ;;
       --yes|-y) assume_yes="true"; shift ;;
-      *) err "Unknown option$1"; usage; exit 1 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
   if [[ -z "$user" ]]; then
@@ -734,7 +734,7 @@ ${YELLOW}Will force logout and delete user %s and its home directory.${NC}
 " "$user"
     read -r -p "Type full username $user to confirm deletion: " confirm_user
     if [[ "$confirm_user" != "$user" ]]; then
-      warn "确认不匹配，Cancelled."
+      warn "Confirmation mismatch; cancelled."
       exit 0
     fi
   fi
@@ -747,7 +747,7 @@ ${YELLOW}Will force logout and delete user %s and its home directory.${NC}
     userdel -r "$user"
   fi
   registry_remove_user "$user"
-  success "User revoked and deleted$user"
+  success "User revoked and deleted: $user"
 }
 
 status_user() {
@@ -755,7 +755,7 @@ status_user() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) user="$2"; shift 2 ;;
-      *) err "Unknown option$1"; usage; exit 1 ;;
+      *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
   if [[ -n "$user" ]]; then
@@ -840,7 +840,7 @@ main() {
     cleanup-expired) shift; cleanup_expired "$@" ;;
     help|-h|--help) usage ;;
     version|--version) echo "$VERSION" ;;
-    *) err "Unknown command$cmd"; usage; exit 1 ;;
+    *) err "Unknown command: $cmd"; usage; exit 1 ;;
   esac
 }
 
