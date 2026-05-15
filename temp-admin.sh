@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.5.2"
+VERSION="0.5.3"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -155,9 +155,7 @@ ensure_dependencies() {
   command_exists chage || missing+=("chage")
 
   if [[ "$need_sudo" == "true" ]]; then
-    if ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then
-      missing+=("sudo")
-    fi
+    command_exists sudo || missing+=("sudo")
   fi
 
   if [[ ${#missing[@]} -eq 0 ]]; then
@@ -218,7 +216,7 @@ ensure_dependencies() {
   if ! command_exists useradd && ! command_exists adduser; then still_missing+=("useradd/adduser"); fi
   command_exists chpasswd || still_missing+=("chpasswd")
   command_exists usermod || still_missing+=("usermod")
-  if [[ "$need_sudo" == "true" ]] && ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then still_missing+=("sudo"); fi
+  if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
     err "安装后仍缺少：${still_missing[*]}。请手动处理后重试。"
@@ -241,7 +239,11 @@ random_password() {
   if command_exists openssl; then
     openssl rand -base64 24 | tr -d '\n'
   else
-    tr -dc 'A-Za-z0-9_@%+=:,.^-' </dev/urandom | head -c 32
+    local pass=""
+    while [[ ${#pass} -lt 32 ]]; do
+      pass+=$(head -c 64 /dev/urandom | tr -dc 'A-Za-z0-9_@%+=:,.^-' || true)
+    done
+    printf '%s' "${pass:0:32}"
   fi
 }
 
@@ -282,11 +284,10 @@ registry_remove_user() {
   local user="$1"
   [[ -f "$REGISTRY_FILE" ]] || return 0
   local tmp
-  tmp=$(mktemp)
+  tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
   awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
-  cat "$tmp" > "$REGISTRY_FILE"
-  chmod 600 "$REGISTRY_FILE"
-  rm -f "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$REGISTRY_FILE"
 }
 
 registry_unit_for_user() {
@@ -422,10 +423,13 @@ get_public_ip() {
 
 expire_date_from_hours() {
   local hours="$1"
-  if date -u -d "+${hours} hours" +%F >/dev/null 2>&1; then
-    date -u -d "+${hours} hours" +%F
+  # chage -E 是按“日期”过期。这里用 ceil(hours/24) 天，避免短有效期
+  # 因目标日期仍是“今天”而被立即过期。
+  local days=$(( (hours + 23) / 24 ))
+  (( days < 1 )) && days=1
+  if date -u -d "+${days} days" +%F >/dev/null 2>&1; then
+    date -u -d "+${days} days" +%F
   else
-    # BusyBox/macOS fallback：账号过期日期不精确支持时用明天
     date -u +%F
   fi
 }
@@ -630,6 +634,10 @@ invite() {
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)
   fi
+    if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+    err "SSH 端口不合法：$port"
+    exit 1
+  fi
 
   if [[ "$grant_sudo" == "ask" ]]; then
     read -r -p "是否授予 sudo 管理员权限？[y/N]: " ans
@@ -797,8 +805,6 @@ cleanup_expired() {
     warn "找不到 chage，无法检查过期时间。"
     return 0
   fi
-  local today
-  today=$(date -u +%F)
   getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}' | while read -r user; do
     [[ -z "$user" ]] && continue
     printf '\n--- %s ---\n' "$user"
