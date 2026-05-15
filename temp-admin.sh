@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.1.0"
+VERSION="0.2.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -49,6 +49,8 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   --no-sudo              不授予 sudo/wheel 权限
   --nopasswd-sudo        写入免密 sudoers（高风险，不推荐）
   --yes                  跳过 YES 二次确认
+  --install-deps         缺少依赖时自动安装，不再交互询问
+  --no-install-deps      缺少依赖时不安装，直接报错
 
 示例：
   bash $SCRIPT_NAME invite
@@ -70,6 +72,156 @@ confirm_yes() {
 }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+pkg_manager() {
+  if command_exists apt-get; then echo "apt";
+  elif command_exists dnf; then echo "dnf";
+  elif command_exists yum; then echo "yum";
+  elif command_exists apk; then echo "apk";
+  elif command_exists pacman; then echo "pacman";
+  else echo ""; fi
+}
+
+install_packages() {
+  local pm="$1"; shift
+  local packages=("$@")
+  case "$pm" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+      ;;
+    dnf) dnf install -y "${packages[@]}" ;;
+    yum) yum install -y "${packages[@]}" ;;
+    apk) apk add --no-cache "${packages[@]}" ;;
+    pacman) pacman -Sy --noconfirm "${packages[@]}" ;;
+    *) err "不支持的包管理器：$pm"; return 1 ;;
+  esac
+}
+
+package_candidates_for_tool() {
+  local tool="$1" pm="$2"
+  case "$tool" in
+    ssh-keygen)
+      case "$pm" in
+        apt) echo "openssh-client" ;;
+        dnf|yum) echo "openssh-clients" ;;
+        apk) echo "openssh-keygen" ;;
+        pacman) echo "openssh" ;;
+      esac
+      ;;
+    useradd|chpasswd|usermod|chage)
+      case "$pm" in
+        apt) echo "passwd" ;;
+        dnf|yum) echo "shadow-utils" ;;
+        apk) echo "shadow" ;;
+        pacman) echo "shadow" ;;
+      esac
+      ;;
+    adduser)
+      case "$pm" in
+        apt) echo "adduser" ;;
+        dnf|yum) echo "shadow-utils" ;;
+        apk) echo "shadow" ;;
+        pacman) echo "shadow" ;;
+      esac
+      ;;
+    sudo) echo "sudo" ;;
+    curl) echo "curl" ;;
+  esac
+}
+
+unique_words() {
+  tr ' ' '
+' | awk 'NF && !seen[$0]++' | tr '
+' ' ' | sed 's/[[:space:]]*$//'
+}
+
+ensure_dependencies() {
+  local mode="${1:-ask}" need_sudo="${2:-false}"
+  local missing=()
+
+  command_exists bash || missing+=("bash")
+  command_exists ssh-keygen || missing+=("ssh-keygen")
+  if ! command_exists useradd && ! command_exists adduser; then
+    missing+=("useradd/adduser")
+  fi
+  command_exists chpasswd || missing+=("chpasswd")
+  command_exists usermod || missing+=("usermod")
+  command_exists chage || missing+=("chage")
+
+  if [[ "$need_sudo" == "true" ]]; then
+    if ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then
+      missing+=("sudo")
+    fi
+  fi
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  warn "检测到缺少依赖：${missing[*]}"
+
+  local pm
+  pm=$(pkg_manager)
+  if [[ -z "$pm" ]]; then
+    err "未找到支持的包管理器（apt/dnf/yum/apk/pacman）。请手动安装缺失依赖后重试。"
+    return 1
+  fi
+
+  local install="false"
+  case "$mode" in
+    auto) install="true" ;;
+    never)
+      err "依赖缺失且已指定不自动安装。"
+      return 1
+      ;;
+    ask|*)
+      read -r -p "是否使用 $pm 自动安装缺失依赖？[Y/n]: " ans
+      if [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]; then install="true"; fi
+      ;;
+  esac
+
+  if [[ "$install" != "true" ]]; then
+    err "已取消安装依赖。请手动安装后重试。"
+    return 1
+  fi
+
+  local pkgs=""
+  local item tool candidates
+  for item in "${missing[@]}"; do
+    if [[ "$item" == "useradd/adduser" ]]; then
+      tool="useradd"
+    else
+      tool="$item"
+    fi
+    candidates=$(package_candidates_for_tool "$tool" "$pm" || true)
+    [[ -n "$candidates" ]] && pkgs+=" $candidates"
+  done
+  pkgs=$(printf '%s' "$pkgs" | unique_words)
+  if [[ -z "$pkgs" ]]; then
+    err "无法映射缺失依赖到安装包：${missing[*]}"
+    return 1
+  fi
+
+  info "安装依赖包：$pkgs"
+  # shellcheck disable=SC2086
+  install_packages "$pm" $pkgs
+
+  local still_missing=()
+  command_exists bash || still_missing+=("bash")
+  command_exists ssh-keygen || still_missing+=("ssh-keygen")
+  if ! command_exists useradd && ! command_exists adduser; then still_missing+=("useradd/adduser"); fi
+  command_exists chpasswd || still_missing+=("chpasswd")
+  command_exists usermod || still_missing+=("usermod")
+  if [[ "$need_sudo" == "true" ]] && ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then still_missing+=("sudo"); fi
+
+  if [[ ${#still_missing[@]} -gt 0 ]]; then
+    err "安装后仍缺少：${still_missing[*]}。请手动处理后重试。"
+    return 1
+  fi
+
+  success "依赖检查通过。"
+}
 
 random_hex() {
   local bytes="${1:-3}"
@@ -292,7 +444,7 @@ EOF
 invite() {
   need_root
   local prefix="$DEFAULT_PREFIX" user="" host="" port="" hours="$DEFAULT_EXPIRE_HOURS"
-  local grant_sudo="ask" nopasswd="false" assume_yes="false"
+  local grant_sudo="ask" nopasswd="false" assume_yes="false" deps_mode="ask"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -305,6 +457,8 @@ invite() {
       --no-sudo) grant_sudo="no"; shift ;;
       --nopasswd-sudo) nopasswd="true"; grant_sudo="yes"; shift ;;
       --yes|-y) assume_yes="true"; shift ;;
+      --install-deps) deps_mode="auto"; shift ;;
+      --no-install-deps) deps_mode="never"; shift ;;
       *) err "未知参数：$1"; usage; exit 1 ;;
     esac
   done
@@ -342,6 +496,12 @@ invite() {
     if [[ "$ans2" =~ ^[Yy]$ ]]; then nopasswd="true"; fi
   fi
 
+  if [[ "$grant_sudo" == "yes" ]]; then
+    ensure_dependencies "$deps_mode" true
+  else
+    ensure_dependencies "$deps_mode" false
+  fi
+
   cat <<EOF
 
 即将创建一次性临时账号：
@@ -363,11 +523,6 @@ EOF
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
   trap 'rm -rf "$tmpdir"' RETURN
-
-  if ! command_exists ssh-keygen; then
-    err "找不到 ssh-keygen，请先安装 openssh-client/openssh。"
-    exit 1
-  fi
 
   password=$(random_password)
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null

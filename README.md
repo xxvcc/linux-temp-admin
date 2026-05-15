@@ -27,20 +27,42 @@
 - 宝塔常见 Linux 环境
 - CentOS / Rocky Linux / AlmaLinux（使用 `wheel` 组）
 
-需要系统已有：
+脚本会在创建邀请前检测这些依赖：
 
 - `bash`
 - `ssh-keygen`
 - `useradd` 或 `adduser`
 - `chpasswd`
 - `usermod`
+- `chage`（用于账号过期，推荐）
+- `sudo`（仅当你选择授予 sudo 权限时检测）
+
+如果缺少依赖，脚本会询问是否自动安装。支持的包管理器：
+
+- `apt-get`
+- `dnf`
+- `yum`
+- `apk`
+- `pacman`
+
+也可以直接自动安装：
+
+```bash
+sudo bash temp-admin.sh invite --sudo --install-deps
+```
+
+或者禁止自动安装，缺依赖就退出：
+
+```bash
+sudo bash temp-admin.sh invite --sudo --no-install-deps
+```
 
 ## 安装 / 下载
 
 推荐：
 
 ```bash
-wget https://raw.githubusercontent.com/longlannet/linux-temp-admin/main/temp-admin.sh
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
 chmod +x temp-admin.sh
 sudo bash temp-admin.sh
 ```
@@ -48,7 +70,7 @@ sudo bash temp-admin.sh
 或者：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/longlannet/linux-temp-admin/main/temp-admin.sh
+curl -fsSLO https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
 chmod +x temp-admin.sh
 sudo bash temp-admin.sh
 ```
@@ -195,6 +217,7 @@ bash temp-admin.sh status --user xxvcc-a1b2c3
 - 不把私钥、sudo 密码写入日志。
 - 默认用户名前缀 `xxvcc`。
 - 默认有效期 24 小时。
+- 创建前检测依赖；缺少依赖时可交互安装。
 - 高风险操作要求输入 `YES` 确认。
 - 不自动修改 `sshd_config`。
 - 不自动改防火墙。
