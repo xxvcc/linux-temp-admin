@@ -117,14 +117,14 @@ sudo bash temp-admin.sh invite --prefix xxvcc --hours 24 --no-sudo
 sudo bash temp-admin.sh invite --host 152.53.171.151 --port 22 --sudo
 ```
 
-## 输出邀请包示例
+## 输出邀请包示例（已脱敏）
 
-脚本会输出类似：
+下面只是格式示例，**不可用于登录**。真实私钥和 sudo 密码只会在脚本运行时随机生成，并在终端里显示一次。
 
 ```text
 ====== 一次性临时管理员连接信息 ======
 
-Host: 152.53.171.151
+Host: 203.0.113.10
 Port: 22
 User: xxvcc-a1b2c3
 Expires: 2026-05-17 01:00:00 CST
@@ -132,24 +132,28 @@ Sudo: yes
 Passwordless sudo: no
 
 SSH 登录命令：
-ssh -i ./xxvcc-a1b2c3.key -p 22 xxvcc-a1b2c3@152.53.171.151
+ssh -i ./xxvcc-a1b2c3.key -p 22 xxvcc-a1b2c3@203.0.113.10
 
 保存私钥命令：
 cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
-...
+[REDACTED: 这里是真实运行时生成的一次性私钥]
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
 
 Sudo 密码：
-随机密码
+[REDACTED: 这里是真实运行时生成的一次性 sudo 密码]
 
 撤销命令：
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 ```
 
-把这一整段通过可信私聊发给协作者即可。
+安全提醒：
+
+- README 里的示例是脱敏占位内容，不能登录任何服务器。
+- 真实邀请包只能通过可信私聊发送给协作者。
+- 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 
 ## 撤销临时用户
 
