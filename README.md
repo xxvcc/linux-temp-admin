@@ -153,6 +153,36 @@ sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 
 ## 撤销临时用户
 
+脚本创建用户时会登记到：
+
+```text
+/var/lib/linux-temp-admin/users.tsv
+```
+
+登记内容只包括：用户名、创建时间、过期时间、是否 sudo、Host、端口、公钥指纹。  
+不会记录私钥，也不会记录 sudo 密码。
+
+交互式删除时可以从列表选择：
+
+```bash
+sudo bash temp-admin.sh revoke
+```
+
+示例交互：
+
+```text
+已登记的临时用户：
+ 1) xxvcc-a1b2c3
+ 2) xxvcc-d4e5f6
+也可以直接输入用户名。
+请选择要删除的编号/用户名: 1
+
+将强制下线并删除用户 xxvcc-a1b2c3 及其家目录。
+请输入完整用户名 xxvcc-a1b2c3 以确认删除:
+```
+
+也可以直接指定用户名：
+
 ```bash
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 ```
@@ -212,6 +242,7 @@ bash temp-admin.sh status --user xxvcc-a1b2c3
 ## 设计原则
 
 - 每次随机生成新的 SSH 密钥对。
+- 创建时登记临时用户名，删除时可编号选择。
 - 服务器只保存公钥，不保存私钥。
 - 私钥只在创建成功后输出一次。
 - 不把私钥、sudo 密码写入日志。

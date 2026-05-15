@@ -2,11 +2,13 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.2.0"
+VERSION="0.3.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
 MANAGED_TAG="linux-temp-admin"
+REGISTRY_DIR="/var/lib/linux-temp-admin"
+REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -255,6 +257,87 @@ sudo_group() {
 }
 
 user_exists() { id "$1" >/dev/null 2>&1; }
+
+registry_init() {
+  mkdir -p "$REGISTRY_DIR"
+  chmod 700 "$REGISTRY_DIR"
+  touch "$REGISTRY_FILE"
+  chmod 600 "$REGISTRY_FILE"
+}
+
+registry_record_user() {
+  local user="$1" expires="$2" sudo_enabled="$3" nopasswd="$4" host="$5" port="$6" fingerprint="$7"
+  registry_init
+  registry_remove_user "$user" 2>/dev/null || true
+  local created
+  created=$(date '+%F %T %Z')
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$user" "$created" "$expires" "$sudo_enabled" "$nopasswd" "$host" "$port" "$fingerprint" >> "$REGISTRY_FILE"
+}
+
+registry_remove_user() {
+  local user="$1"
+  [[ -f "$REGISTRY_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -F '	' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
+  cat "$tmp" > "$REGISTRY_FILE"
+  rm -f "$tmp"
+}
+
+registry_has_users() {
+  [[ -s "$REGISTRY_FILE" ]]
+}
+
+registry_list_users() {
+  if ! registry_has_users; then
+    warn "暂无脚本登记的临时用户。"
+    return 1
+  fi
+  local i=0 user created expires sudo_enabled nopasswd host port fingerprint state
+  while IFS=$'	' read -r user created expires sudo_enabled nopasswd host port fingerprint; do
+    [[ -z "${user:-}" ]] && continue
+    i=$((i + 1))
+    if user_exists "$user"; then state="active"; else state="missing"; fi
+    printf '%2d) %-20s status=%-7s sudo=%-3s nopasswd=%-3s expires=%s host=%s port=%s key=%s
+'       "$i" "$user" "$state" "${sudo_enabled:-?}" "${nopasswd:-?}" "${expires:-?}" "${host:-?}" "${port:-?}" "${fingerprint:-?}"
+  done < "$REGISTRY_FILE"
+}
+
+registry_select_user() {
+  local users=()
+  if [[ -s "$REGISTRY_FILE" ]]; then
+    while IFS=$'	' read -r user _rest; do
+      [[ -z "${user:-}" ]] && continue
+      user_exists "$user" && users+=("$user")
+    done < "$REGISTRY_FILE"
+  fi
+
+  if [[ ${#users[@]} -eq 0 ]]; then
+    warn "没有找到仍存在的已登记临时用户。"
+    read -r -p "请输入要撤销/删除的用户名: " user
+    printf '%s
+' "$user"
+    return 0
+  fi
+
+  echo "已登记的临时用户：" >&2
+  local idx
+  for idx in "${!users[@]}"; do
+    printf '%2d) %s
+' "$((idx + 1))" "${users[$idx]}" >&2
+  done
+  echo "也可以直接输入用户名。" >&2
+  local choice
+  read -r -p "请选择要删除的编号/用户名: " choice
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#users[@]} )); then
+    printf '%s
+' "${users[$((choice - 1))]}"
+  else
+    printf '%s
+' "$choice"
+  fi
+}
 
 get_ssh_port() {
   local port=""
@@ -518,7 +601,7 @@ EOF
     exit 0
   }
 
-  local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text
+  local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text fingerprint
   tmpdir=$(mktemp -d)
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
@@ -543,8 +626,10 @@ EOF
 
   expires=$(expire_datetime_local "$hours")
   revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
+  fingerprint=$(ssh-keygen -lf "$pubfile" 2>/dev/null | awk '{print $2}' || true)
+  registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}"
 
-  success "临时账号已创建：$user"
+  success "临时账号已创建并登记：$user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd"
 }
 
@@ -559,16 +644,22 @@ revoke_user() {
     esac
   done
   if [[ -z "$user" ]]; then
-    read -r -p "请输入要撤销/删除的用户名: " user
+    user=$(registry_select_user)
   fi
   if ! user_exists "$user"; then
     err "用户不存在：$user"
     exit 1
   fi
-  confirm_yes "将强制下线并删除用户 $user 及其家目录。" "$assume_yes" || {
-    warn "已取消。"
-    exit 0
-  }
+  if [[ "$assume_yes" != "true" ]]; then
+    printf "
+${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
+" "$user"
+    read -r -p "请输入完整用户名 $user 以确认删除: " confirm_user
+    if [[ "$confirm_user" != "$user" ]]; then
+      warn "确认不匹配，已取消。"
+      exit 0
+    fi
+  fi
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user"
   if command_exists deluser; then
@@ -576,6 +667,7 @@ revoke_user() {
   else
     userdel -r "$user"
   fi
+  registry_remove_user "$user"
   success "已撤销并删除用户：$user"
 }
 
