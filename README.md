@@ -59,6 +59,8 @@ sudo bash temp-admin.sh invite --sudo
 - **默认 24 小时有效期**。
 - **默认尝试自动删除用户**：使用 `systemd-run` 创建一次性定时任务。
 - **删除用户时删除家目录和 SSH key**。
+- **防误删保护**：默认只允许删除登记用户或默认前缀用户；删除其他用户必须显式加 `--force`。
+- **创建失败自动回滚**：创建过程中出错时，会尽量删除已创建的临时用户。
 - **本地登记临时用户**，删除时可编号选择。
 - **依赖自动检测**，缺失时可交互安装。
 - **独立中英文脚本**：`temp-admin.sh` 为中文默认脚本，`temp-admin-en.sh` 为英文脚本。
@@ -244,10 +246,17 @@ sudo bash temp-admin.sh revoke
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 ```
 
+默认情况下，`revoke` 只允许删除脚本登记过的用户，或匹配默认前缀 `xxvcc-*` 的用户。若确实要删除其他用户，需要显式加 `--force`：
+
+```bash
+sudo bash temp-admin.sh revoke --user USER --force
+```
+
 查看账号过期和自动删除 timer：
 
 ```bash
-sudo bash temp-admin.sh cleanup-expired
+sudo bash temp-admin.sh expiry-status
+# 兼容旧命令：sudo bash temp-admin.sh cleanup-expired
 ```
 
 ## 关于“过期”和“自动删除”
@@ -287,6 +296,8 @@ systemctl list-timers --all | grep linux-temp-admin
 - 默认非免密 sudo 模式下，邀请包里的账号/Sudo 密码也是 Linux 账号密码；如果 SSH 密码登录开启，它也可能用于 SSH 密码登录。
 - README 示例均为脱敏内容，不能登录任何服务器。
 - 删除用户时会删除家目录和 SSH key。
+- 默认防误删：`revoke` 只删除登记用户或默认前缀用户，其他用户需要 `--force`。
+- 创建过程中如果出错，脚本会尽量回滚并删除刚创建的临时用户。
 - sudo 权限基本等同 root，请只给可信对象。
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 - 用完请立即执行 `revoke`，不要只依赖过期兜底。

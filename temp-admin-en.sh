@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin-en.sh"
-VERSION="0.5.3"
+VERSION="0.5.4"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -40,6 +40,7 @@ Usage
   bash $SCRIPT_NAME revoke --user USER      Revoke/delete temp user
   bash $SCRIPT_NAME status [--user USER]    Show status
   bash $SCRIPT_NAME cleanup-expired         Show expiry/auto-revoke status
+  bash $SCRIPT_NAME expiry-status           Show expiry/auto-revoke status
   bash $SCRIPT_NAME help                    Show help
 
 Options
@@ -56,6 +57,7 @@ Options
   --no-install-deps      Never install dependencies
   --auto-revoke          Auto-delete user on expiry, default
   --no-auto-revoke       Disable auto-delete, keep account expiry only
+  --force                Allow revoke of users not registered/not matching default prefix (dangerous)
 
 Examples
   bash $SCRIPT_NAME invite
@@ -263,6 +265,26 @@ sudo_group() {
 
 user_exists() { id "$1" >/dev/null 2>&1; }
 
+sanitize_registry_field() {
+  local value="${1:-}"
+  value=${value//$'\t'/ }
+  value=${value//$'\r'/ }
+  value=${value//$'\n'/ }
+  printf '%s' "$value"
+}
+
+registry_contains_user() {
+  local target="$1"
+  [[ -f "$REGISTRY_FILE" ]] || return 1
+  awk -F '\t' -v u="$target" '$1 == u {found=1; exit} END {exit found ? 0 : 1}' "$REGISTRY_FILE"
+}
+
+is_managed_user() {
+  local target="$1"
+  registry_contains_user "$target" && return 0
+  [[ "$target" == ${DEFAULT_PREFIX}-* ]]
+}
+
 registry_init() {
   mkdir -p "$REGISTRY_DIR"
   chmod 700 "$REGISTRY_DIR"
@@ -272,6 +294,15 @@ registry_init() {
 
 registry_record_user() {
   local user="$1" expires="$2" sudo_enabled="$3" nopasswd="$4" host="$5" port="$6" fingerprint="$7" auto_revoke="$8" auto_unit="$9"
+  user=$(sanitize_registry_field "$user")
+  expires=$(sanitize_registry_field "$expires")
+  sudo_enabled=$(sanitize_registry_field "$sudo_enabled")
+  nopasswd=$(sanitize_registry_field "$nopasswd")
+  host=$(sanitize_registry_field "$host")
+  port=$(sanitize_registry_field "$port")
+  fingerprint=$(sanitize_registry_field "$fingerprint")
+  auto_revoke=$(sanitize_registry_field "$auto_revoke")
+  auto_unit=$(sanitize_registry_field "$auto_unit")
   registry_init
   registry_remove_user "$user" 2>/dev/null || true
   local created
@@ -527,6 +558,24 @@ write_ssh_key() {
   chmod 600 "$home_dir/.ssh/authorized_keys"
 }
 
+
+rollback_created_user() {
+  local user="$1"
+  [[ -n "${user:-}" ]] || return 0
+  warn "Error during creation; rolling back temporary user: $user"
+  cancel_auto_revoke "$user" || true
+  pkill -KILL -u "$user" 2>/dev/null || true
+  remove_sudoers_file "$user" || true
+  if user_exists "$user"; then
+    if command_exists deluser; then
+      deluser --remove-home "$user" >/dev/null 2>&1 || userdel -r "$user" >/dev/null 2>&1 || true
+    else
+      userdel -r "$user" >/dev/null 2>&1 || true
+    fi
+  fi
+  registry_remove_user "$user" || true
+}
+
 print_invite() {
   local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9" auto_revoke="${10}" auto_unit="${11}"
   cat <<EOF
@@ -675,15 +724,27 @@ EOF
   }
 
   local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text fingerprint auto_text auto_unit
+  local created_user="" invite_completed="false"
   tmpdir=$(mktemp -d)
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
+  cleanup_invite_error() {
+    local code=$?
+    trap - ERR
+    if [[ "$invite_completed" != "true" && -n "$created_user" ]]; then
+      rollback_created_user "$created_user"
+    fi
+    rm -rf "$tmpdir"
+    exit "$code"
+  }
+  trap cleanup_invite_error ERR
   trap 'rm -rf "$tmpdir"' RETURN
 
   password=$(random_password)
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
 
   create_user_if_needed "$user" "$DEFAULT_SHELL"
+  created_user="$user"
   set_user_password "$user" "$password"
   write_ssh_key "$user" "$pubfile"
   set_user_expiry "$user" "$hours"
@@ -713,22 +774,33 @@ EOF
   fi
   registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
 
+  invite_completed="true"
+  trap - ERR
   success "Temporary account created and registered: $user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
 }
 
 revoke_user() {
   need_root
-  local user="" assume_yes="false"
+  local user="" assume_yes="false" force="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) user="$2"; shift 2 ;;
       --yes|-y) assume_yes="true"; shift ;;
+      --force) force="true"; shift ;;
       *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
   done
   if [[ -z "$user" ]]; then
     user=$(registry_select_user)
+  fi
+  if ! valid_username "$user"; then
+    err "Invalid username; refusing deletion: $user"
+    exit 1
+  fi
+  if [[ "$force" != "true" ]] && ! is_managed_user "$user"; then
+    err "Refusing to delete a user not registered/not matching default prefix: $user. Use --force if you are sure."
+    exit 1
   fi
   if ! user_exists "$user"; then
     warn "User does not exist; cleaning registry and auto-delete task if present."
@@ -843,7 +915,7 @@ main() {
     invite|create) shift; invite "$@" ;;
     revoke|delete-user|remove) shift; revoke_user "$@" ;;
     status) shift; status_user "$@" ;;
-    cleanup-expired) shift; cleanup_expired "$@" ;;
+    cleanup-expired|expiry-status) shift; cleanup_expired "$@" ;;
     help|-h|--help) usage ;;
     version|--version) echo "$VERSION" ;;
     *) err "Unknown command: $cmd"; usage; exit 1 ;;

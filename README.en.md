@@ -59,6 +59,8 @@ This script standardizes the workflow: create, print invite bundle, register, in
 - **Default validity is 24 hours**.
 - **Auto-delete on expiry by default** using `systemd-run` transient timers.
 - **Deletes the home directory and SSH key when revoked**.
+- **Deletion guard**: by default, `revoke` only deletes registered users or users matching the default prefix; other users require explicit `--force`.
+- **Rollback on failed creation**: if creation fails mid-way, the script tries to remove the temporary user it just created.
 - **Keeps a local registry of temporary users** so you can select by number when revoking.
 - **Detects missing dependencies** and can install them interactively.
 - **Separate Chinese and English scripts**: `temp-admin.sh` is the default Chinese script, and `temp-admin-en.sh` is the English script.
@@ -241,13 +243,20 @@ sudo bash temp-admin.sh revoke
 Delete a specific user:
 
 ```bash
-sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
+sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3
+```
+
+By default, `revoke` only deletes users registered by the script or users matching the default `xxvcc-*` prefix. To delete another user, explicitly pass `--force`:
+
+```bash
+sudo bash temp-admin-en.sh revoke --user USER --force
 ```
 
 Show account expiry and auto-delete timers:
 
 ```bash
-sudo bash temp-admin.sh cleanup-expired
+sudo bash temp-admin-en.sh expiry-status
+# Backward-compatible alias: sudo bash temp-admin-en.sh cleanup-expired
 ```
 
 ## Expiry vs auto-delete
@@ -287,6 +296,8 @@ systemctl list-timers --all | grep linux-temp-admin
 - In the default non-passwordless-sudo mode, the account/sudo password is also the Linux account password; if SSH password login is enabled, it may also allow SSH password login.
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key.
+- Deletion guard: `revoke` only deletes registered/default-prefix users unless `--force` is explicitly used.
+- If account creation fails mid-way, the script tries to roll back and remove the just-created temporary user.
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.
