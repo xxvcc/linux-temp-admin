@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.6.1"
+VERSION="0.7.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -10,6 +10,7 @@ MANAGED_TAG="linux-temp-admin"
 REGISTRY_DIR="/var/lib/linux-temp-admin"
 REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
 INSTALL_PATH="/usr/local/sbin/linux-temp-admin"
+SYSTEMD_DIR="/etc/systemd/system"
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -367,6 +368,16 @@ auto_revoke_unit_name() {
   printf '%s-revoke-%s' "$MANAGED_TAG" "$user"
 }
 
+auto_revoke_service_path() {
+  local unit="$1"
+  printf '%s/%s.service' "$SYSTEMD_DIR" "$unit"
+}
+
+auto_revoke_timer_path() {
+  local unit="$1"
+  printf '%s/%s.timer' "$SYSTEMD_DIR" "$unit"
+}
+
 install_self_for_revoke() {
   local src="${BASH_SOURCE[0]}"
   if [[ ! -f "$src" ]]; then
@@ -378,21 +389,58 @@ install_self_for_revoke() {
 
 schedule_auto_revoke() {
   local user="$1" hours="$2"
-  if ! command_exists systemd-run; then
-    warn "找不到 systemd-run，无法创建自动删除任务；仅设置账号过期。"
+  if ! command_exists systemctl; then
+    warn "找不到 systemctl，无法创建持久自动删除任务；仅设置账号过期。"
     return 1
   fi
   if ! install_self_for_revoke; then
-    warn "安装 $INSTALL_PATH 失败，无法创建自动删除任务；仅设置账号过期。"
+    warn "安装 $INSTALL_PATH 失败，无法创建持久自动删除任务；仅设置账号过期。"
     return 1
   fi
-  local unit
+  local unit service_path timer_path on_calendar
   unit=$(auto_revoke_unit_name "$user")
-  systemd-run \
-    --unit="$unit" \
-    --description="linux-temp-admin auto revoke $user" \
-    --on-active="${hours}h" \
-    "$INSTALL_PATH" revoke --user "$user" --yes >/dev/null 2>&1
+  service_path=$(auto_revoke_service_path "$unit")
+  timer_path=$(auto_revoke_timer_path "$unit")
+  if ! on_calendar=$(date -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
+    warn "当前系统 date 不支持 -d，无法计算持久自动删除时间；仅设置账号过期。"
+    return 1
+  fi
+
+  cat > "$service_path" <<EOF_SERVICE
+[Unit]
+Description=linux-temp-admin auto revoke $user
+Documentation=https://github.com/xxvcc/linux-temp-admin
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH revoke --user $user --yes
+EOF_SERVICE
+
+  cat > "$timer_path" <<EOF_TIMER
+[Unit]
+Description=linux-temp-admin auto revoke timer for $user
+Documentation=https://github.com/xxvcc/linux-temp-admin
+
+[Timer]
+OnCalendar=$on_calendar
+Persistent=true
+AccuracySec=1min
+Unit=$unit.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+  chmod 644 "$service_path" "$timer_path"
+  if command_exists systemd-analyze; then
+    systemd-analyze verify "$service_path" "$timer_path" >/dev/null || {
+      rm -f "$service_path" "$timer_path"
+      warn "systemd unit 校验失败，无法创建持久自动删除任务；仅设置账号过期。"
+      return 1
+    }
+  fi
+  systemctl daemon-reload
+  systemctl enable --now "$unit.timer" >/dev/null
   printf '%s\n' "$unit"
 }
 
@@ -401,10 +449,13 @@ cancel_auto_revoke() {
   [[ -n "$unit" ]] || unit=$(registry_unit_for_user "$user" 2>/dev/null || true)
   [[ -n "$unit" ]] || unit=$(auto_revoke_unit_name "$user")
   if command_exists systemctl; then
-    # Stop only the timer. Do not stop ${unit}.service here: auto-revoke runs inside
-    # that transient service, and stopping it could kill the cleanup in progress.
-    systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
+    # 只停止 timer，不主动 stop service；自动删除本身可能正在 service 内运行。
+    systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
     systemctl reset-failed "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
+  fi
+  rm -f "$(auto_revoke_timer_path "$unit")" "$(auto_revoke_service_path "$unit")" 2>/dev/null || true
+  if command_exists systemctl; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 }
 

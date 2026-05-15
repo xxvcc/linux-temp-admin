@@ -57,7 +57,7 @@ sudo bash temp-admin.sh invite --sudo
 - **默认用户名前缀 `xxvcc`**，生成如 `xxvcc-a1b2c3`。
 - **可选 NOPASSWD sudo / wheel 权限**。
 - **默认 24 小时有效期**。
-- **默认尝试自动删除用户**：使用 `systemd-run` 创建一次性定时任务。
+- **默认尝试自动删除用户**：写入持久 systemd `.service/.timer`。
 - **Key-only 登录**：账号密码默认锁定，不输出账号/Sudo 密码。
 - **删除用户时删除家目录和 SSH key**。
 - **防误删保护**：默认只允许删除登记用户或默认前缀用户；删除其他用户必须显式加 `--force`。
@@ -82,7 +82,7 @@ sudo bash temp-admin.sh invite --sudo
   ↓
 登记到 /var/lib/linux-temp-admin/users.tsv
   ↓
-默认用 systemd-run 安排到期自动 revoke
+默认写入持久 systemd timer 安排到期自动 revoke
   ↓
 输出一次性邀请包
 ```
@@ -259,14 +259,14 @@ sudo bash temp-admin.sh expiry-status
 默认有效期是 24 小时。脚本会尽量同时做两件事：
 
 1. 通过 `chage -E` 设置 Linux 账号过期日期；
-2. 通过 `systemd-run --on-active=<hours>h` 创建一次性自动删除任务。
+2. 写入 `/etc/systemd/system/linux-temp-admin-revoke-USER.service` 和 `.timer`，使用 `OnCalendar` + `Persistent=true` 创建持久自动删除任务。
 
 需要注意：
 
 - `chage -E` 通常按日期过期，不是精确到分钟的定时删除。
 - 过期通常会阻止后续登录，但不会删除用户和家目录。
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
-- 如果系统没有 `systemd-run`，脚本会降级为只设置账号过期，并提示手动删除。
+- 如果系统没有 `systemctl` 或无法计算删除时间，脚本会降级为只设置账号过期，并提示手动删除。
 
 ## 安装后写入的内容
 
@@ -275,11 +275,13 @@ sudo bash temp-admin.sh expiry-status
 ```text
 /usr/local/sbin/linux-temp-admin
 /var/lib/linux-temp-admin/users.tsv
+/etc/systemd/system/linux-temp-admin-revoke-USER.service
+/etc/systemd/system/linux-temp-admin-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER       # 仅在启用免密 sudo 时
 /home/USER/.ssh/authorized_keys
 ```
 
-自动删除任务由 systemd transient unit 管理，可查看：
+自动删除任务由持久 systemd timer 管理，可查看：
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin

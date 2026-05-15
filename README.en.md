@@ -57,7 +57,7 @@ This script standardizes the workflow: create, print invite bundle, register, in
 - **Default username prefix is `xxvcc`**, e.g. `xxvcc-a1b2c3`.
 - **Optional NOPASSWD sudo / wheel access**.
 - **Default validity is 24 hours**.
-- **Auto-delete on expiry by default** using `systemd-run` transient timers.
+- **Auto-delete on expiry by default** using persistent systemd `.service/.timer` units.
 - **Key-only login**: account password is locked by default, and no account/sudo password is printed.
 - **Deletes the home directory and SSH key when revoked**.
 - **Deletion guard**: by default, `revoke` only deletes registered users or users matching the default prefix; other users require explicit `--force`.
@@ -82,7 +82,7 @@ Optionally add the user to sudo/wheel
   ↓
 Register it in /var/lib/linux-temp-admin/users.tsv
   ↓
-Schedule auto-revoke with systemd-run by default
+Schedule auto-revoke with a persistent systemd timer by default
   ↓
 Print a one-time invite bundle
 ```
@@ -259,14 +259,14 @@ sudo bash temp-admin-en.sh expiry-status
 Default validity is 24 hours. The script tries to do two things:
 
 1. set account expiry with `chage -E`;
-2. create a one-shot auto-delete task with `systemd-run --on-active=<hours>h`.
+2. write `/etc/systemd/system/linux-temp-admin-revoke-USER.service` and `.timer`, using `OnCalendar` + `Persistent=true` for persistent auto-delete.
 
 Important details:
 
 - `chage -E` is usually date-based, not minute-precise.
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
-- If `systemd-run` is unavailable, the script falls back to account expiry only and asks you to revoke manually.
+- If `systemctl` is unavailable or the revoke time cannot be calculated, the script falls back to account expiry only and asks you to revoke manually.
 
 ## Files written
 
@@ -275,11 +275,13 @@ The script may write:
 ```text
 /usr/local/sbin/linux-temp-admin
 /var/lib/linux-temp-admin/users.tsv
+/etc/systemd/system/linux-temp-admin-revoke-USER.service
+/etc/systemd/system/linux-temp-admin-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER       # only when passwordless sudo is enabled
 /home/USER/.ssh/authorized_keys
 ```
 
-Auto-delete is managed by systemd transient units. Inspect them with:
+Auto-delete is managed by persistent systemd timers. Inspect them with:
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
