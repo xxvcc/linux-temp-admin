@@ -87,7 +87,7 @@ sudo bash temp-admin.sh invite --sudo
 脚本 **不会**：
 
 - 保存私钥；
-- 把 sudo 密码写入日志；
+- 把账号/Sudo 密码写入日志；
 - 修改 SSH 服务配置；
 - 修改防火墙；
 - 打开任何入站端口。
@@ -154,7 +154,9 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 
 ### 3. 把邀请包私聊发给协作者
 
-脚本会输出 SSH 登录命令、一次性私钥、sudo 密码和撤销命令。只通过可信私聊发送，不要发到群里或公开页面。
+脚本会输出 SSH 登录命令、一次性私钥、账号/Sudo 密码和撤销命令。只通过可信私聊发送，不要发到群里或公开页面。
+
+注意：默认非免密 sudo 模式下，这个密码是 Linux 账号密码，同时也用于 sudo。如果服务器开启了 SSH 密码登录，它理论上也可用于 SSH 密码登录。生产服务器建议禁用 SSH 密码登录，或只把邀请包发给完全可信对象。
 
 英文版使用：
 
@@ -190,7 +192,7 @@ sudo bash temp-admin.sh invite --no-sudo
 
 ## 输出邀请包示例（已脱敏）
 
-下面只是格式示例，**不可用于登录**。真实私钥和 sudo 密码只会在脚本运行时随机生成，并在终端里显示一次。
+下面只是格式示例，**不可用于登录**。真实私钥和账号/Sudo 密码只会在脚本运行时随机生成，并在终端里显示一次。
 
 ```text
 ====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
@@ -215,7 +217,7 @@ cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
 
-Sudo password / Sudo 密码：
+账号/Sudo 密码：
 [REDACTED: one-time sudo password generated at runtime]
 
 Revoke command / 撤销命令：
@@ -282,6 +284,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## 安全说明
 
 - 私钥只在创建时显示一次，服务器不保存私钥。
+- 默认非免密 sudo 模式下，邀请包里的账号/Sudo 密码也是 Linux 账号密码；如果 SSH 密码登录开启，它也可能用于 SSH 密码登录。
 - README 示例均为脱敏内容，不能登录任何服务器。
 - 删除用户时会删除家目录和 SSH key。
 - sudo 权限基本等同 root，请只给可信对象。

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.5.1"
+VERSION="0.5.2"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -285,6 +285,7 @@ registry_remove_user() {
   tmp=$(mktemp)
   awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
   cat "$tmp" > "$REGISTRY_FILE"
+  chmod 600 "$REGISTRY_FILE"
   rm -f "$tmp"
 }
 
@@ -383,7 +384,9 @@ cancel_auto_revoke() {
   [[ -n "$unit" ]] || unit=$(registry_unit_for_user "$user" 2>/dev/null || true)
   [[ -n "$unit" ]] || unit=$(auto_revoke_unit_name "$user")
   if command_exists systemctl; then
-    systemctl stop "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
+    # Stop only the timer. Do not stop ${unit}.service here: auto-revoke runs inside
+    # that transient service, and stopping it could kill the cleanup in progress.
+    systemctl stop "${unit}.timer" >/dev/null 2>&1 || true
     systemctl reset-failed "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
   fi
 }
@@ -550,7 +553,7 @@ chmod 600 ${user}.key
 EOF
   if [[ "$sudo_enabled" == "yes" && "$nopasswd" != "yes" ]]; then
     cat <<EOF
-Sudo 密码:
+账号/Sudo 密码:
 $password
 
 EOF
@@ -777,7 +780,7 @@ status_user() {
     fi
     return
   fi
-  info "Registered temporary users / 脚本登记的临时用户："
+  info "脚本登记的临时用户："
   registry_list_users || true
   printf '\n'
   info "系统中匹配前缀 $DEFAULT_PREFIX- 的用户："

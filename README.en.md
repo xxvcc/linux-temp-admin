@@ -87,7 +87,7 @@ Print a one-time invite bundle
 The script does **not**:
 
 - store private keys;
-- log sudo passwords;
+- log account/sudo passwords;
 - modify SSH daemon configuration;
 - modify firewall rules;
 - open inbound ports.
@@ -154,7 +154,9 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 
 ### 3. Send the invite bundle privately
 
-The script prints an SSH login command, one-time private key, sudo password, and revoke command. Send it only via a trusted private chat. Never paste it into groups or public pages.
+The script prints an SSH login command, one-time private key, account/sudo password, and revoke command. Send it only via a trusted private chat. Never paste it into groups or public pages.
+
+Note: in the default non-passwordless-sudo mode, this password is the Linux account password and is also used for sudo. If SSH password authentication is enabled on the server, it may also allow SSH password login. Production servers should disable SSH password login, or share invite bundles only with fully trusted parties.
 
 Use the Chinese script with:
 
@@ -190,7 +192,7 @@ sudo bash temp-admin.sh invite --no-sudo
 
 ## Redacted invite output example
 
-This is only a format example and **cannot be used to log in**. Real private keys and sudo passwords are generated at runtime and shown once in the terminal.
+This is only a format example and **cannot be used to log in**. Real private keys and account/sudo passwords are generated at runtime and shown once in the terminal.
 
 ```text
 ====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
@@ -215,8 +217,8 @@ cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
 
-Sudo password / Sudo 密码：
-[REDACTED: one-time sudo password generated at runtime]
+Account/Sudo password:
+[REDACTED: one-time account/sudo password generated at runtime]
 
 Revoke command / 撤销命令：
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
@@ -282,6 +284,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## Security notes
 
 - The private key is shown only once and is not stored on the server.
+- In the default non-passwordless-sudo mode, the account/sudo password is also the Linux account password; if SSH password login is enabled, it may also allow SSH password login.
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key.
 - sudo access is effectively root access; grant it only to trusted parties.
