@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.6.0"
+VERSION="0.6.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -505,11 +505,11 @@ add_sudo() {
     warn "未找到 sudo 或 wheel 组，跳过 sudo 授权。"
     return 1
   fi
-  usermod -aG "$group" "$user"
   if [[ ! -d /etc/sudoers.d ]]; then
     warn "/etc/sudoers.d 不存在，无法配置 NOPASSWD sudo。"
     return 1
   fi
+  usermod -aG "$group" "$user"
   local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
   printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$file"
   chmod 440 "$file"
@@ -725,9 +725,8 @@ EOF
 
   sudo_text="no"
   if [[ "$grant_sudo" == "yes" ]]; then
-    if add_sudo "$user"; then
-      sudo_text="yes"
-    fi
+    add_sudo "$user"
+    sudo_text="yes"
   fi
 
   expires=$(expire_datetime_local "$hours")
