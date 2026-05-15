@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.3.0"
+VERSION="0.3.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -38,7 +38,7 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME invite          创建一次性临时管理员邀请
   bash $SCRIPT_NAME revoke --user USER
   bash $SCRIPT_NAME status [--user USER]
-  bash $SCRIPT_NAME cleanup-expired
+  bash $SCRIPT_NAME cleanup-expired          查看账号过期状态（不自动删除）
   bash $SCRIPT_NAME help
 
 常用参数：
@@ -699,7 +699,7 @@ status_user() {
 
 cleanup_expired() {
   need_root
-  warn "cleanup-expired 当前仅显示过期候选，不自动删除，避免误删。"
+  warn "这里只查看账号过期状态，不自动删除用户，避免误删。"
   if ! command_exists chage; then
     warn "找不到 chage，无法检查过期时间。"
     return 0
@@ -711,7 +711,7 @@ cleanup_expired() {
     printf '\n--- %s ---\n' "$user"
     chage -l "$user" | sed -n '1,8p'
   done
-  info "如需删除，请执行：bash $SCRIPT_NAME revoke --user USER"
+  info "说明：账号过期只会阻止后续登录，不等于自动删除。彻底删除请执行：bash $SCRIPT_NAME revoke --user USER"
 }
 
 menu() {
@@ -724,7 +724,7 @@ ${BOLD}Linux Temporary Admin Manager${NC} v$VERSION
 1) 创建一次性临时管理员邀请
 2) 撤销/删除临时用户
 3) 查看用户状态
-4) 查看过期候选
+4) 查看账号过期状态
 5) 退出
 EOF
     read -r -p "请选择 [1-5]: " choice

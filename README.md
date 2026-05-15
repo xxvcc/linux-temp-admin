@@ -87,7 +87,7 @@ sudo bash temp-admin.sh
 1) 创建一次性临时管理员邀请
 2) 撤销/删除临时用户
 3) 查看用户状态
-4) 查看过期候选
+4) 查看账号过期状态
 5) 退出
 ```
 
@@ -212,13 +212,15 @@ bash temp-admin.sh status --user xxvcc-a1b2c3
 bash temp-admin.sh status
 ```
 
-## 查看过期候选
+## 查看账号过期状态
 
 ```bash
 sudo bash temp-admin.sh cleanup-expired
 ```
 
-第一版为了避免误删，只显示候选，不自动删除。确认后手动执行：
+说明：脚本创建账号时会用 `chage -E` 设置账号过期日期。账号过期后通常不能继续登录，但用户和家目录不会自动删除。
+
+这个命令只查看过期状态，不自动删除，避免误删。确认后手动执行：
 
 ```bash
 sudo bash temp-admin.sh revoke --user USER
@@ -241,6 +243,21 @@ sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 
 # 查看用户状态
 bash temp-admin.sh status --user xxvcc-a1b2c3
+```
+
+## 关于“过期”
+
+默认有效期是 24 小时。脚本会尽量通过 `chage -E` 设置 Linux 账号过期日期。
+
+需要注意：
+
+- `chage -E` 通常是按“日期”过期，不是精确到分钟/小时的定时删除。
+- 过期表示账号后续通常不能登录。
+- 过期不等于删除，用户记录和家目录仍然存在。
+- 真正清理请使用：
+
+```bash
+sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 ```
 
 ## 设计原则
