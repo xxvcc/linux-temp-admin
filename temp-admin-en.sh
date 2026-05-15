@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin-en.sh"
-VERSION="0.5.4"
+VERSION="0.6.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -49,9 +49,8 @@ Options
   --host HOST            Host shown in invite
   --port PORT            SSH port, auto-detected or 22
   --hours HOURS          Valid hours, default: $DEFAULT_EXPIRE_HOURS
-  --sudo                 Grant sudo/wheel
+  --sudo                 Grant NOPASSWD sudo/wheel
   --no-sudo              Do not grant sudo/wheel
-  --nopasswd-sudo        Passwordless sudo, high risk
   --yes                  Skip confirmation
   --install-deps         Auto-install missing dependencies
   --no-install-deps      Never install dependencies
@@ -116,7 +115,7 @@ package_candidates_for_tool() {
         pacman) echo "openssh" ;;
       esac
       ;;
-    useradd|chpasswd|usermod|chage)
+    useradd|usermod|chage)
       case "$pm" in
         apt) echo "passwd" ;;
         dnf|yum) echo "shadow-utils" ;;
@@ -152,7 +151,6 @@ ensure_dependencies() {
   if ! command_exists useradd && ! command_exists adduser; then
     missing+=("useradd/adduser")
   fi
-  command_exists chpasswd || missing+=("chpasswd")
   command_exists usermod || missing+=("usermod")
   command_exists chage || missing+=("chage")
 
@@ -216,7 +214,6 @@ ensure_dependencies() {
   command_exists bash || still_missing+=("bash")
   command_exists ssh-keygen || still_missing+=("ssh-keygen")
   if ! command_exists useradd && ! command_exists adduser; then still_missing+=("useradd/adduser"); fi
-  command_exists chpasswd || still_missing+=("chpasswd")
   command_exists usermod || still_missing+=("usermod")
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
@@ -234,18 +231,6 @@ random_hex() {
     openssl rand -hex "$bytes"
   else
     head -c "$bytes" /dev/urandom | od -An -tx1 | tr -d ' \n'
-  fi
-}
-
-random_password() {
-  if command_exists openssl; then
-    openssl rand -base64 24 | tr -d '\n'
-  else
-    local pass=""
-    while [[ ${#pass} -lt 32 ]]; do
-      pass+=$(head -c 64 /dev/urandom | tr -dc 'A-Za-z0-9_@%+=:,.^-' || true)
-    done
-    printf '%s' "${pass:0:32}"
   fi
 }
 
@@ -336,8 +321,8 @@ registry_list_users() {
     warn "No registered temporary users."
     return 1
   fi
-  local i=0 user created expires sudo_enabled nopasswd host port fingerprint auto_revoke auto_unit state
-  while IFS=$'\t' read -r user created expires sudo_enabled nopasswd host port fingerprint auto_revoke auto_unit; do
+  local i=0 user created expires sudo_enabled legacy_nopasswd host port fingerprint auto_revoke auto_unit state
+  while IFS=$'\t' read -r user created expires sudo_enabled legacy_nopasswd host port fingerprint auto_revoke auto_unit; do
     [[ -z "${user:-}" ]] && continue
     i=$((i + 1))
     if user_exists "$user"; then state="active"; else state="missing"; fi
@@ -488,14 +473,13 @@ create_user_if_needed() {
   fi
 }
 
-set_user_password() {
+lock_user_password() {
   local user="$1"
-  local pass="$2"
-  if command_exists chpasswd; then
-    printf '%s:%s\n' "$user" "$pass" | chpasswd
-  else
-    warn "chpasswd not found; password not set; sudo password elevation may not work."
+  if usermod -L "$user" >/dev/null 2>&1; then
+    return 0
   fi
+  warn "Failed to lock account password; please check manually: $user"
+  return 1
 }
 
 set_user_expiry() {
@@ -512,7 +496,6 @@ set_user_expiry() {
 
 add_sudo() {
   local user="$1"
-  local nopasswd="$2"
   local group
   group=$(sudo_group)
   if [[ -z "$group" ]]; then
@@ -520,21 +503,19 @@ add_sudo() {
     return 1
   fi
   usermod -aG "$group" "$user"
-  if [[ "$nopasswd" == "true" ]]; then
-    if [[ ! -d /etc/sudoers.d ]]; then
-      warn "/etc/sudoers.d does not exist; cannot configure passwordless sudo."
-      return 0
-    fi
-    local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
-    printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$file"
-    chmod 440 "$file"
-    if command_exists visudo; then
-      visudo -cf "$file" >/dev/null || {
-        rm -f "$file"
-        err "sudoers validation failed; removed $file"
-        exit 1
-      }
-    fi
+  if [[ ! -d /etc/sudoers.d ]]; then
+    warn "/etc/sudoers.d does not exist; cannot configure NOPASSWD sudo."
+    return 1
+  fi
+  local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
+  printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" > "$file"
+  chmod 440 "$file"
+  if command_exists visudo; then
+    visudo -cf "$file" >/dev/null || {
+      rm -f "$file"
+      err "sudoers validation failed; removed $file"
+      exit 1
+    }
   fi
 }
 
@@ -577,7 +558,7 @@ rollback_created_user() {
 }
 
 print_invite() {
-  local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9" auto_revoke="${10}" auto_unit="${11}"
+  local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" private_key_file="$6" revoke_cmd="$7" auto_revoke="$8" auto_unit="$9"
   cat <<EOF
 
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -587,7 +568,8 @@ Port: $port
 User: $user
 Expires: $expires
 Sudo: $sudo_enabled
-Passwordless sudo: $nopasswd
+Login: SSH key only
+Password login: locked
 Auto revoke: $auto_revoke
 Auto revoke unit: $auto_unit
 
@@ -601,22 +583,16 @@ EOF_KEY
 chmod 600 ${user}.key
 
 EOF
-  if [[ "$sudo_enabled" == "yes" && "$nopasswd" != "yes" ]]; then
-    cat <<EOF
-Account/Sudo password:
-$password
-
-EOF
-  elif [[ "$sudo_enabled" == "yes" && "$nopasswd" == "yes" ]]; then
+  if [[ "$sudo_enabled" == "yes" ]]; then
     cat <<EOF
 Sudo note:
-Passwordless sudo is enabled. This is highly privileged; revoke it immediately after use.
+NOPASSWD sudo is enabled. This account can log in only with the SSH key; account password is locked.
 
 EOF
   else
     cat <<EOF
 Sudo note:
-sudo was not granted; this is a normal user.
+sudo was not granted; this is a normal user. Account password is locked.
 
 EOF
   fi
@@ -625,10 +601,11 @@ Revoke command:
 $revoke_cmd
 
 Security notes:
-- The private key and sudo password above are shown only once.
+- The private key is shown only once and is not stored on the server.
+- Account password is locked; no account/sudo password is printed.
 - Send only via trusted private chat; never post in groups or public pages.
 - Run the revoke command immediately after use.
-- The server stores only the public key, not the private key.
+- The server stores only the public key; deleting the user invalidates this key immediately.
 
 ----- END LINUX TEMP ADMIN INVITE -----
 EOF
@@ -637,7 +614,7 @@ EOF
 invite() {
   need_root
   local prefix="$DEFAULT_PREFIX" user="" host="" port="" hours="$DEFAULT_EXPIRE_HOURS"
-  local grant_sudo="ask" nopasswd="false" assume_yes="false" deps_mode="ask" auto_revoke="ask"
+  local grant_sudo="ask" assume_yes="false" deps_mode="ask" auto_revoke="ask"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -648,7 +625,7 @@ invite() {
       --hours) hours="$2"; shift 2 ;;
       --sudo) grant_sudo="yes"; shift ;;
       --no-sudo) grant_sudo="no"; shift ;;
-      --nopasswd-sudo) nopasswd="true"; grant_sudo="yes"; shift ;;
+      --nopasswd-sudo) warn "--nopasswd-sudo is deprecated: --sudo now uses NOPASSWD sudo by default."; grant_sudo="yes"; shift ;;
       --yes|-y) assume_yes="true"; shift ;;
       --install-deps) deps_mode="auto"; shift ;;
       --no-install-deps) deps_mode="never"; shift ;;
@@ -690,10 +667,6 @@ invite() {
     if [[ "$ans" =~ ^[Yy]$ ]]; then grant_sudo="yes"; else grant_sudo="no"; fi
   fi
 
-  if [[ "$grant_sudo" == "yes" && "$nopasswd" != "true" ]]; then
-    read -r -p "Enable passwordless sudo? High risk, not recommended.[y/N]: " ans2
-    if [[ "$ans2" =~ ^[Yy]$ ]]; then nopasswd="true"; fi
-  fi
 
   if [[ "$auto_revoke" == "ask" ]]; then
     read -r -p "Auto-delete this user on expiry?[Y/n]: " ans3
@@ -714,7 +687,6 @@ About to create one-time temporary account
 - SSH port$port
 - Valid for$hours hours
 - sudo$grant_sudo
-- passwordless sudo$nopasswd
 - auto-delete on expiry$auto_revoke
 
 EOF
@@ -723,7 +695,7 @@ EOF
     exit 0
   }
 
-  local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text fingerprint auto_text auto_unit
+  local tmpdir keyfile pubfile expires revoke_cmd sudo_text fingerprint auto_text auto_unit
   local created_user="" invite_completed="false"
   tmpdir=$(mktemp -d)
   keyfile="$tmpdir/${user}.key"
@@ -740,21 +712,18 @@ EOF
   trap cleanup_invite_error ERR
   trap 'rm -rf "$tmpdir"' RETURN
 
-  password=$(random_password)
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
 
   create_user_if_needed "$user" "$DEFAULT_SHELL"
   created_user="$user"
-  set_user_password "$user" "$password"
+  lock_user_password "$user"
   write_ssh_key "$user" "$pubfile"
   set_user_expiry "$user" "$hours"
 
   sudo_text="no"
-  nopasswd_text="no"
   if [[ "$grant_sudo" == "yes" ]]; then
-    if add_sudo "$user" "$nopasswd"; then
+    if add_sudo "$user"; then
       sudo_text="yes"
-      [[ "$nopasswd" == "true" ]] && nopasswd_text="yes"
     fi
   fi
 
@@ -772,12 +741,12 @@ EOF
       revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
     fi
   fi
-  registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
+  registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
 
   invite_completed="true"
   trap - ERR
   success "Temporary account created and registered: $user"
-  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
+  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
 }
 
 revoke_user() {

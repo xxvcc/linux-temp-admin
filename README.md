@@ -7,7 +7,7 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> 一次性 Linux 临时管理员邀请脚本：随机生成 SSH 密钥、创建临时用户、可选授予 sudo，并默认安排到期自动删除。
+> 一次性 Linux 临时管理员邀请脚本：随机生成 SSH 密钥、创建临时用户、可选授予 NOPASSWD sudo，并默认安排到期自动删除。
 
 **linux-temp-admin** 适合临时给可信协作者、运维人员或自动化助手开一个 SSH 管理入口。它会输出一份可私聊转发的邀请包；服务器端只保存公钥，不保存私钥。
 
@@ -55,9 +55,10 @@ sudo bash temp-admin.sh invite --sudo
 
 - **每次随机生成 SSH 密钥对**。
 - **默认用户名前缀 `xxvcc`**，生成如 `xxvcc-a1b2c3`。
-- **可选 sudo / wheel 权限**。
+- **可选 NOPASSWD sudo / wheel 权限**。
 - **默认 24 小时有效期**。
 - **默认尝试自动删除用户**：使用 `systemd-run` 创建一次性定时任务。
+- **Key-only 登录**：账号密码默认锁定，不输出账号/Sudo 密码。
 - **删除用户时删除家目录和 SSH key**。
 - **防误删保护**：默认只允许删除登记用户或默认前缀用户；删除其他用户必须显式加 `--force`。
 - **创建失败自动回滚**：创建过程中出错时，会尽量删除已创建的临时用户。
@@ -89,7 +90,7 @@ sudo bash temp-admin.sh invite --sudo
 脚本 **不会**：
 
 - 保存私钥；
-- 把账号/Sudo 密码写入日志；
+- 生成、输出、写入或记录账号/Sudo 密码；
 - 修改 SSH 服务配置；
 - 修改防火墙；
 - 打开任何入站端口。
@@ -114,7 +115,6 @@ sudo bash temp-admin.sh invite --sudo
 - `bash`
 - `ssh-keygen`
 - `useradd` 或 `adduser`
-- `chpasswd`
 - `usermod`
 - `chage`
 - `sudo`（仅在选择授予 sudo 权限时需要）
@@ -156,9 +156,7 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 
 ### 3. 把邀请包私聊发给协作者
 
-脚本会输出 SSH 登录命令、一次性私钥、账号/Sudo 密码和撤销命令。只通过可信私聊发送，不要发到群里或公开页面。
-
-注意：默认非免密 sudo 模式下，这个密码是 Linux 账号密码，同时也用于 sudo。如果服务器开启了 SSH 密码登录，它理论上也可用于 SSH 密码登录。生产服务器建议禁用 SSH 密码登录，或只把邀请包发给完全可信对象。
+脚本会输出 SSH 登录命令、一次性私钥和撤销命令。账号密码默认锁定，不会输出账号/Sudo 密码。只通过可信私聊发送，不要发到群里或公开页面。
 
 英文版使用：
 
@@ -194,7 +192,7 @@ sudo bash temp-admin.sh invite --no-sudo
 
 ## 输出邀请包示例（已脱敏）
 
-下面只是格式示例，**不可用于登录**。真实私钥和账号/Sudo 密码只会在脚本运行时随机生成，并在终端里显示一次。
+下面只是格式示例，**不可用于登录**。真实私钥只会在脚本运行时随机生成，并在终端里显示一次。账号密码默认锁定，不会输出账号/Sudo 密码。
 
 ```text
 ====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
@@ -204,7 +202,7 @@ Port: 22
 User: xxvcc-a1b2c3
 Expires: 2026-05-17 01:00:00 CST
 Sudo: yes
-Passwordless sudo: no
+Password login: locked
 Auto revoke: yes
 Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3
 
@@ -214,13 +212,10 @@ ssh -i ./xxvcc-a1b2c3.key -p 22 xxvcc-a1b2c3@203.0.113.10
 Save private key command / 保存私钥命令：
 cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
-[REDACTED: one-time private key generated at runtime]
+[REDACTED: 运行时生成的一次性私钥]
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
-
-账号/Sudo 密码：
-[REDACTED: one-time sudo password generated at runtime]
 
 Revoke command / 撤销命令：
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
@@ -293,7 +288,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## 安全说明
 
 - 私钥只在创建时显示一次，服务器不保存私钥。
-- 默认非免密 sudo 模式下，邀请包里的账号/Sudo 密码也是 Linux 账号密码；如果 SSH 密码登录开启，它也可能用于 SSH 密码登录。
+- 账号密码默认锁定，不输出账号/Sudo 密码。
 - README 示例均为脱敏内容，不能登录任何服务器。
 - 删除用户时会删除家目录和 SSH key。
 - 默认防误删：`revoke` 只删除登记用户或默认前缀用户，其他用户需要 `--force`。

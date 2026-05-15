@@ -7,7 +7,7 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> A one-time Linux temporary admin invite script: generate a fresh SSH key, create a temporary user, optionally grant sudo, and auto-delete the user on expiry by default.
+> A one-time Linux temporary admin invite script: generate a fresh SSH key, create a temporary user, optionally grant NOPASSWD sudo, and auto-delete the user on expiry by default.
 
 **linux-temp-admin** is useful when you need to temporarily grant SSH access to a trusted collaborator, operator, or automation assistant. It prints a private invite bundle that you can send through a trusted private chat. The server stores only the public key, never the private key.
 
@@ -55,9 +55,10 @@ This script standardizes the workflow: create, print invite bundle, register, in
 
 - **Generates a fresh SSH key pair every time**.
 - **Default username prefix is `xxvcc`**, e.g. `xxvcc-a1b2c3`.
-- **Optional sudo / wheel access**.
+- **Optional NOPASSWD sudo / wheel access**.
 - **Default validity is 24 hours**.
 - **Auto-delete on expiry by default** using `systemd-run` transient timers.
+- **Key-only login**: account password is locked by default, and no account/sudo password is printed.
 - **Deletes the home directory and SSH key when revoked**.
 - **Deletion guard**: by default, `revoke` only deletes registered users or users matching the default prefix; other users require explicit `--force`.
 - **Rollback on failed creation**: if creation fails mid-way, the script tries to remove the temporary user it just created.
@@ -89,7 +90,7 @@ Print a one-time invite bundle
 The script does **not**:
 
 - store private keys;
-- log account/sudo passwords;
+- generate, print, write, or log account/sudo passwords;
 - modify SSH daemon configuration;
 - modify firewall rules;
 - open inbound ports.
@@ -114,7 +115,6 @@ The script checks for:
 - `bash`
 - `ssh-keygen`
 - `useradd` or `adduser`
-- `chpasswd`
 - `usermod`
 - `chage`
 - `sudo` when sudo access is requested
@@ -156,9 +156,7 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 
 ### 3. Send the invite bundle privately
 
-The script prints an SSH login command, one-time private key, account/sudo password, and revoke command. Send it only via a trusted private chat. Never paste it into groups or public pages.
-
-Note: in the default non-passwordless-sudo mode, this password is the Linux account password and is also used for sudo. If SSH password authentication is enabled on the server, it may also allow SSH password login. Production servers should disable SSH password login, or share invite bundles only with fully trusted parties.
+The script prints an SSH login command, one-time private key, and revoke command. Account password is locked by default, and no account/sudo password is printed. Send it only via a trusted private chat. Never paste it into groups or public pages.
 
 Use the Chinese script with:
 
@@ -194,7 +192,7 @@ sudo bash temp-admin.sh invite --no-sudo
 
 ## Redacted invite output example
 
-This is only a format example and **cannot be used to log in**. Real private keys and account/sudo passwords are generated at runtime and shown once in the terminal.
+This is only a format example and **cannot be used to log in**. Real private keys are generated at runtime and shown once in the terminal. Account password is locked by default, and no account/sudo password is printed.
 
 ```text
 ====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
@@ -204,7 +202,7 @@ Port: 22
 User: xxvcc-a1b2c3
 Expires: 2026-05-17 01:00:00 CST
 Sudo: yes
-Passwordless sudo: no
+Password login: locked
 Auto revoke: yes
 Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3
 
@@ -218,9 +216,6 @@ cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
-
-Account/Sudo password:
-[REDACTED: one-time account/sudo password generated at runtime]
 
 Revoke command / 撤销命令：
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
@@ -293,7 +288,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## Security notes
 
 - The private key is shown only once and is not stored on the server.
-- In the default non-passwordless-sudo mode, the account/sudo password is also the Linux account password; if SSH password login is enabled, it may also allow SSH password login.
+- Account password is locked by default, and no account/sudo password is printed.
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key.
 - Deletion guard: `revoke` only deletes registered/default-prefix users unless `--force` is explicitly used.
