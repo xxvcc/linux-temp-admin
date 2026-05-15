@@ -87,7 +87,7 @@ sudo bash temp-admin.sh
 1) 创建一次性临时管理员邀请
 2) 撤销/删除临时用户
 3) 查看用户状态
-4) 查看账号过期状态
+4) 查看账号过期/自动删除状态
 5) 退出
 ```
 
@@ -212,15 +212,19 @@ bash temp-admin.sh status --user xxvcc-a1b2c3
 bash temp-admin.sh status
 ```
 
-## 查看账号过期状态
+## 查看账号过期 / 自动删除状态
 
 ```bash
 sudo bash temp-admin.sh cleanup-expired
 ```
 
-说明：脚本创建账号时会用 `chage -E` 设置账号过期日期。账号过期后通常不能继续登录，但用户和家目录不会自动删除。
+说明：脚本创建账号时会用 `chage -E` 设置账号过期日期，同时默认尝试使用 `systemd-run` 创建一次性自动删除任务。
 
-这个命令只查看过期状态，不自动删除，避免误删。确认后手动执行：
+- 账号过期：通常阻止后续登录，但不会删除用户和家目录。
+- 自动删除：到期后调用 `revoke`，会删除用户、家目录、SSH key、sudoers 文件和登记记录。
+- 如果系统没有 `systemd-run`，脚本会降级为只设置账号过期，并提示你手动删除。
+
+这个命令只查看状态，不主动删除，避免误删。确认后也可以手动执行：
 
 ```bash
 sudo bash temp-admin.sh revoke --user USER
@@ -245,16 +249,20 @@ sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 bash temp-admin.sh status --user xxvcc-a1b2c3
 ```
 
-## 关于“过期”
+## 关于“过期”和“自动删除”
 
-默认有效期是 24 小时。脚本会尽量通过 `chage -E` 设置 Linux 账号过期日期。
+默认有效期是 24 小时。脚本会尽量同时做两件事：
+
+1. 通过 `chage -E` 设置 Linux 账号过期日期；
+2. 通过 `systemd-run --on-active=<hours>h` 创建一次性自动删除任务。
 
 需要注意：
 
 - `chage -E` 通常是按“日期”过期，不是精确到分钟/小时的定时删除。
 - 过期表示账号后续通常不能登录。
 - 过期不等于删除，用户记录和家目录仍然存在。
-- 真正清理请使用：
+- 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key 和 sudoers 文件。
+- 如果自动删除任务创建失败，请手动清理：
 
 ```bash
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
@@ -269,6 +277,8 @@ sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3
 - 不把私钥、sudo 密码写入日志。
 - 默认用户名前缀 `xxvcc`。
 - 默认有效期 24 小时。
+- 默认尝试创建自动删除任务；没有 systemd-run 时降级为账号过期。
+- 删除用户时默认删除家目录和 SSH key。
 - 创建前检测依赖；缺少依赖时可交互安装。
 - 高风险操作要求输入 `YES` 确认。
 - 不自动修改 `sshd_config`。

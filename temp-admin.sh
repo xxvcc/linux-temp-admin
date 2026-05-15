@@ -2,13 +2,14 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.3.1"
+VERSION="0.4.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
 MANAGED_TAG="linux-temp-admin"
 REGISTRY_DIR="/var/lib/linux-temp-admin"
 REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
+INSTALL_PATH="/usr/local/sbin/linux-temp-admin"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,7 +39,7 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME invite          创建一次性临时管理员邀请
   bash $SCRIPT_NAME revoke --user USER
   bash $SCRIPT_NAME status [--user USER]
-  bash $SCRIPT_NAME cleanup-expired          查看账号过期状态（不自动删除）
+  bash $SCRIPT_NAME cleanup-expired          查看账号过期/自动删除状态
   bash $SCRIPT_NAME help
 
 常用参数：
@@ -53,6 +54,8 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   --yes                  跳过 YES 二次确认
   --install-deps         缺少依赖时自动安装，不再交互询问
   --no-install-deps      缺少依赖时不安装，直接报错
+  --auto-revoke          到期后自动删除用户（默认）
+  --no-auto-revoke       不设置自动删除任务，仅设置账号过期
 
 示例：
   bash $SCRIPT_NAME invite
@@ -266,13 +269,13 @@ registry_init() {
 }
 
 registry_record_user() {
-  local user="$1" expires="$2" sudo_enabled="$3" nopasswd="$4" host="$5" port="$6" fingerprint="$7"
+  local user="$1" expires="$2" sudo_enabled="$3" nopasswd="$4" host="$5" port="$6" fingerprint="$7" auto_revoke="$8" auto_unit="$9"
   registry_init
   registry_remove_user "$user" 2>/dev/null || true
   local created
   created=$(date '+%F %T %Z')
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$user" "$created" "$expires" "$sudo_enabled" "$nopasswd" "$host" "$port" "$fingerprint" >> "$REGISTRY_FILE"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$user" "$created" "$expires" "$sudo_enabled" "$nopasswd" "$host" "$port" "$fingerprint" "$auto_revoke" "$auto_unit" >> "$REGISTRY_FILE"
 }
 
 registry_remove_user() {
@@ -280,9 +283,15 @@ registry_remove_user() {
   [[ -f "$REGISTRY_FILE" ]] || return 0
   local tmp
   tmp=$(mktemp)
-  awk -F '	' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
+  awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
   cat "$tmp" > "$REGISTRY_FILE"
   rm -f "$tmp"
+}
+
+registry_unit_for_user() {
+  local target="$1"
+  [[ -f "$REGISTRY_FILE" ]] || return 1
+  awk -F '\t' -v u="$target" '$1 == u {print $10; exit}' "$REGISTRY_FILE"
 }
 
 registry_has_users() {
@@ -294,20 +303,20 @@ registry_list_users() {
     warn "暂无脚本登记的临时用户。"
     return 1
   fi
-  local i=0 user created expires sudo_enabled nopasswd host port fingerprint state
-  while IFS=$'	' read -r user created expires sudo_enabled nopasswd host port fingerprint; do
+  local i=0 user created expires sudo_enabled nopasswd host port fingerprint auto_revoke auto_unit state
+  while IFS=$'\t' read -r user created expires sudo_enabled nopasswd host port fingerprint auto_revoke auto_unit; do
     [[ -z "${user:-}" ]] && continue
     i=$((i + 1))
     if user_exists "$user"; then state="active"; else state="missing"; fi
-    printf '%2d) %-20s status=%-7s sudo=%-3s nopasswd=%-3s expires=%s host=%s port=%s key=%s
-'       "$i" "$user" "$state" "${sudo_enabled:-?}" "${nopasswd:-?}" "${expires:-?}" "${host:-?}" "${port:-?}" "${fingerprint:-?}"
+    printf '%2d) %-20s status=%-7s sudo=%-3s auto=%-3s expires=%s host=%s port=%s key=%s unit=%s\n' \
+      "$i" "$user" "$state" "${sudo_enabled:-?}" "${auto_revoke:-no}" "${expires:-?}" "${host:-?}" "${port:-?}" "${fingerprint:-?}" "${auto_unit:-}"
   done < "$REGISTRY_FILE"
 }
 
 registry_select_user() {
   local users=()
   if [[ -s "$REGISTRY_FILE" ]]; then
-    while IFS=$'	' read -r user _rest; do
+    while IFS=$'\t' read -r user _rest; do
       [[ -z "${user:-}" ]] && continue
       user_exists "$user" && users+=("$user")
     done < "$REGISTRY_FILE"
@@ -316,26 +325,72 @@ registry_select_user() {
   if [[ ${#users[@]} -eq 0 ]]; then
     warn "没有找到仍存在的已登记临时用户。"
     read -r -p "请输入要撤销/删除的用户名: " user
-    printf '%s
-' "$user"
+    printf '%s\n' "$user"
     return 0
   fi
 
   echo "已登记的临时用户：" >&2
   local idx
   for idx in "${!users[@]}"; do
-    printf '%2d) %s
-' "$((idx + 1))" "${users[$idx]}" >&2
+    printf '%2d) %s\n' "$((idx + 1))" "${users[$idx]}" >&2
   done
   echo "也可以直接输入用户名。" >&2
   local choice
   read -r -p "请选择要删除的编号/用户名: " choice
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#users[@]} )); then
-    printf '%s
-' "${users[$((choice - 1))]}"
+    printf '%s\n' "${users[$((choice - 1))]}"
   else
-    printf '%s
-' "$choice"
+    printf '%s\n' "$choice"
+  fi
+}
+
+auto_revoke_unit_name() {
+  local user="$1"
+  printf '%s-revoke-%s' "$MANAGED_TAG" "$user"
+}
+
+install_self_for_revoke() {
+  local src="${BASH_SOURCE[0]}"
+  if [[ ! -f "$src" ]]; then
+    warn "无法定位当前脚本文件，不能安装稳定撤销命令。"
+    return 1
+  fi
+  install -m 700 -o root -g root "$src" "$INSTALL_PATH"
+}
+
+schedule_auto_revoke() {
+  local user="$1" hours="$2"
+  if ! command_exists systemd-run; then
+    warn "找不到 systemd-run，无法创建自动删除任务；仅设置账号过期。"
+    return 1
+  fi
+  if ! install_self_for_revoke; then
+    warn "安装 $INSTALL_PATH 失败，无法创建自动删除任务；仅设置账号过期。"
+    return 1
+  fi
+  local unit
+  unit=$(auto_revoke_unit_name "$user")
+  systemd-run \
+    --unit="$unit" \
+    --description="linux-temp-admin auto revoke $user" \
+    --on-active="${hours}h" \
+    "$INSTALL_PATH" revoke --user "$user" --yes >/dev/null
+  printf '%s\n' "$unit"
+}
+
+cancel_auto_revoke() {
+  local user="$1" unit="${2:-}"
+  [[ -n "$unit" ]] || unit=$(registry_unit_for_user "$user" 2>/dev/null || true)
+  [[ -n "$unit" ]] || unit=$(auto_revoke_unit_name "$user")
+  if command_exists systemctl; then
+    systemctl stop "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
+  fi
+}
+
+show_auto_revoke_timers() {
+  if command_exists systemctl; then
+    systemctl list-timers --all --no-pager 2>/dev/null | grep "$MANAGED_TAG-revoke-" || true
   fi
 }
 
@@ -469,7 +524,7 @@ write_ssh_key() {
 }
 
 print_invite() {
-  local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9"
+  local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9" auto_revoke="${10}" auto_unit="${11}"
   cat <<EOF
 
 ${BOLD}====== 一次性临时管理员连接信息 ======${NC}
@@ -480,6 +535,8 @@ User: $user
 Expires: $expires
 Sudo: $sudo_enabled
 Passwordless sudo: $nopasswd
+Auto revoke: $auto_revoke
+Auto revoke unit: $auto_unit
 
 SSH 登录命令：
 ssh -i ./${user}.key -p $port ${user}@${host}
@@ -527,7 +584,7 @@ EOF
 invite() {
   need_root
   local prefix="$DEFAULT_PREFIX" user="" host="" port="" hours="$DEFAULT_EXPIRE_HOURS"
-  local grant_sudo="ask" nopasswd="false" assume_yes="false" deps_mode="ask"
+  local grant_sudo="ask" nopasswd="false" assume_yes="false" deps_mode="ask" auto_revoke="ask"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -542,6 +599,8 @@ invite() {
       --yes|-y) assume_yes="true"; shift ;;
       --install-deps) deps_mode="auto"; shift ;;
       --no-install-deps) deps_mode="never"; shift ;;
+      --auto-revoke) auto_revoke="yes"; shift ;;
+      --no-auto-revoke) auto_revoke="no"; shift ;;
       *) err "未知参数：$1"; usage; exit 1 ;;
     esac
   done
@@ -579,6 +638,11 @@ invite() {
     if [[ "$ans2" =~ ^[Yy]$ ]]; then nopasswd="true"; fi
   fi
 
+  if [[ "$auto_revoke" == "ask" ]]; then
+    read -r -p "是否到期后自动删除该用户？[Y/n]: " ans3
+    if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then auto_revoke="yes"; else auto_revoke="no"; fi
+  fi
+
   if [[ "$grant_sudo" == "yes" ]]; then
     ensure_dependencies "$deps_mode" true
   else
@@ -594,6 +658,7 @@ invite() {
 - 有效期：$hours 小时
 - sudo 权限：$grant_sudo
 - 免密 sudo：$nopasswd
+- 到期自动删除：$auto_revoke
 
 EOF
   confirm_yes "sudo/SSH 账号属于高权限入口。确认创建请输入 YES。" "$assume_yes" || {
@@ -601,7 +666,7 @@ EOF
     exit 0
   }
 
-  local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text fingerprint
+  local tmpdir keyfile pubfile password expires revoke_cmd sudo_text nopasswd_text fingerprint auto_text auto_unit
   tmpdir=$(mktemp -d)
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
@@ -625,12 +690,23 @@ EOF
   fi
 
   expires=$(expire_datetime_local "$hours")
-  revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
+  revoke_cmd="sudo $INSTALL_PATH revoke --user $user"
   fingerprint=$(ssh-keygen -lf "$pubfile" 2>/dev/null | awk '{print $2}' || true)
-  registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}"
+  auto_text="no"
+  auto_unit=""
+  if [[ "$auto_revoke" == "yes" ]]; then
+    if auto_unit=$(schedule_auto_revoke "$user" "$hours"); then
+      auto_text="yes"
+      revoke_cmd="sudo $INSTALL_PATH revoke --user $user"
+    else
+      auto_text="no"
+      revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
+    fi
+  fi
+  registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
 
   success "临时账号已创建并登记：$user"
-  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd"
+  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
 }
 
 revoke_user() {
@@ -647,8 +723,10 @@ revoke_user() {
     user=$(registry_select_user)
   fi
   if ! user_exists "$user"; then
-    err "用户不存在：$user"
-    exit 1
+    warn "用户不存在：$user。将清理登记记录和自动删除任务（如果存在）。"
+    cancel_auto_revoke "$user"
+    registry_remove_user "$user"
+    exit 0
   fi
   if [[ "$assume_yes" != "true" ]]; then
     printf "
@@ -660,6 +738,7 @@ ${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
       exit 0
     fi
   fi
+  cancel_auto_revoke "$user"
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user"
   if command_exists deluser; then
@@ -687,19 +766,30 @@ status_user() {
       home_dir=$(getent passwd "$user" | cut -d: -f6)
       [[ -d "$home_dir/.ssh" ]] && ls -la "$home_dir/.ssh"
       if command_exists chage; then chage -l "$user" || true; fi
+      local unit
+      unit=$(registry_unit_for_user "$user" 2>/dev/null || true)
+      if [[ -n "$unit" ]] && command_exists systemctl; then
+        systemctl list-timers --all --no-pager 2>/dev/null | grep "$unit" || true
+      fi
     else
       err "用户不存在：$user"
       exit 1
     fi
     return
   fi
-  info "匹配前缀 $DEFAULT_PREFIX- 的用户："
+  info "脚本登记的临时用户："
+  registry_list_users || true
+  printf '\n'
+  info "系统中匹配前缀 $DEFAULT_PREFIX- 的用户："
   getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1 "\t" $6 "\t" $7}' || true
+  printf '\n'
+  info "自动删除 timer："
+  show_auto_revoke_timers || true
 }
 
 cleanup_expired() {
   need_root
-  warn "这里只查看账号过期状态，不自动删除用户，避免误删。"
+  warn "这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。"
   if ! command_exists chage; then
     warn "找不到 chage，无法检查过期时间。"
     return 0
@@ -711,7 +801,8 @@ cleanup_expired() {
     printf '\n--- %s ---\n' "$user"
     chage -l "$user" | sed -n '1,8p'
   done
-  info "说明：账号过期只会阻止后续登录，不等于自动删除。彻底删除请执行：bash $SCRIPT_NAME revoke --user USER"
+  info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
+  show_auto_revoke_timers || true
 }
 
 menu() {
@@ -724,7 +815,7 @@ ${BOLD}Linux Temporary Admin Manager${NC} v$VERSION
 1) 创建一次性临时管理员邀请
 2) 撤销/删除临时用户
 3) 查看用户状态
-4) 查看账号过期状态
+4) 查看账号过期/自动删除状态
 5) 退出
 EOF
     read -r -p "请选择 [1-5]: " choice
