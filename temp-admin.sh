@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.5.0"
+VERSION="0.5.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -11,12 +11,12 @@ REGISTRY_DIR="/var/lib/linux-temp-admin"
 REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
 INSTALL_PATH="/usr/local/sbin/linux-temp-admin"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
 
 info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
 success() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
@@ -374,7 +374,7 @@ schedule_auto_revoke() {
     --unit="$unit" \
     --description="linux-temp-admin auto revoke $user" \
     --on-active="${hours}h" \
-    "$INSTALL_PATH" revoke --user "$user" --yes >/dev/null
+    "$INSTALL_PATH" revoke --user "$user" --yes >/dev/null 2>&1
   printf '%s\n' "$unit"
 }
 
@@ -527,7 +527,7 @@ print_invite() {
   local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9" auto_revoke="${10}" auto_unit="${11}"
   cat <<EOF
 
-${BOLD}====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======${NC}
+----- BEGIN LINUX TEMP ADMIN INVITE -----
 
 Host: $host
 Port: $port
@@ -538,10 +538,10 @@ Passwordless sudo: $nopasswd
 Auto revoke: $auto_revoke
 Auto revoke unit: $auto_unit
 
-SSH login command / SSH 登录命令：
+SSH login command / SSH 登录命令:
 ssh -i ./${user}.key -p $port ${user}@${host}
 
-Save private key command / 保存私钥命令：
+Save private key command / 保存私钥命令:
 cat > ${user}.key <<'EOF_KEY'
 $(cat "$private_key_file")
 EOF_KEY
@@ -550,34 +550,40 @@ chmod 600 ${user}.key
 EOF
   if [[ "$sudo_enabled" == "yes" && "$nopasswd" != "yes" ]]; then
     cat <<EOF
-Sudo password / Sudo 密码：
+Sudo password / Sudo 密码:
 $password
 
 EOF
   elif [[ "$sudo_enabled" == "yes" && "$nopasswd" == "yes" ]]; then
     cat <<EOF
-Sudo note / Sudo 提示：
-Passwordless sudo is enabled. This is highly privileged; revoke it immediately after use. / 已开启免密 sudo。此权限很高，用完请立即撤销。
+Sudo note / Sudo 提示:
+Passwordless sudo is enabled. This is highly privileged; revoke it immediately after use.
+已开启免密 sudo。此权限很高，用完请立即撤销。
 
 EOF
   else
     cat <<EOF
-Sudo note / Sudo 提示：
-sudo was not granted; this is a normal user. / 未授予 sudo 权限，此账号是普通用户。
+Sudo note / Sudo 提示:
+sudo was not granted; this is a normal user.
+未授予 sudo 权限，此账号是普通用户。
 
 EOF
   fi
   cat <<EOF
-Revoke command / 撤销命令：
+Revoke command / 撤销命令:
 $revoke_cmd
 
-${BOLD}Security notes / 安全提醒：${NC}
-- The private key and sudo password above are shown only once. / 上面的私钥和 sudo 密码只显示这一次。
-- Send only via trusted private chat; never post in groups or public pages. / 只通过可信私聊发送，不要发群里或公开页面。
-- Run the revoke command immediately after use. / 用完请立即执行撤销命令。
-- The server stores only the public key, not the private key. / 服务器上只保存公钥，不保存私钥。
+Security notes / 安全提醒:
+- The private key and sudo password above are shown only once.
+  上面的私钥和 sudo 密码只显示这一次。
+- Send only via trusted private chat; never post in groups or public pages.
+  只通过可信私聊发送，不要发群里或公开页面。
+- Run the revoke command immediately after use.
+  用完请立即执行撤销命令。
+- The server stores only the public key, not the private key.
+  服务器上只保存公钥，不保存私钥。
 
-${BOLD}======================================${NC}
+----- END LINUX TEMP ADMIN INVITE -----
 EOF
 }
 
