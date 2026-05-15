@@ -18,6 +18,14 @@
 Download first, then run, so you can inspect the script:
 
 ```bash
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
+chmod +x temp-admin-en.sh
+sudo bash temp-admin-en.sh
+```
+
+Chinese script / 中文脚本:
+
+```bash
 wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
 chmod +x temp-admin.sh
 sudo bash temp-admin.sh
@@ -53,7 +61,7 @@ This script standardizes the workflow: create, print invite bundle, register, in
 - **Deletes the home directory and SSH key when revoked**.
 - **Keeps a local registry of temporary users** so you can select by number when revoking.
 - **Detects missing dependencies** and can install them interactively.
-- **Bilingual Chinese/English prompts**.
+- **Separate Chinese and English scripts**: `temp-admin.sh` is the default Chinese script, and `temp-admin-en.sh` is the English script.
 - **Does not modify sshd_config, firewall rules, or open ports**.
 
 ## How it works
@@ -147,6 +155,12 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 ### 3. Send the invite bundle privately
 
 The script prints an SSH login command, one-time private key, sudo password, and revoke command. Send it only via a trusted private chat. Never paste it into groups or public pages.
+
+Use the Chinese script with:
+
+```bash
+sudo bash temp-admin.sh invite --sudo
+```
 
 ## Non-interactive examples
 
@@ -277,7 +291,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## Validation
 
 ```bash
-bash -n temp-admin.sh
+bash -n temp-admin.sh temp-admin-en.sh
 ```
 
 If ShellCheck is installed:

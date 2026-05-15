@@ -23,6 +23,14 @@ chmod +x temp-admin.sh
 sudo bash temp-admin.sh
 ```
 
+英文脚本 / English script:
+
+```bash
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
+chmod +x temp-admin-en.sh
+sudo bash temp-admin-en.sh
+```
+
 直接创建带 sudo 的一次性邀请：
 
 ```bash
@@ -53,7 +61,7 @@ sudo bash temp-admin.sh invite --sudo
 - **删除用户时删除家目录和 SSH key**。
 - **本地登记临时用户**，删除时可编号选择。
 - **依赖自动检测**，缺失时可交互安装。
-- **中英双语交互提示**。
+- **独立中英文脚本**：`temp-admin.sh` 为中文默认脚本，`temp-admin-en.sh` 为英文脚本。
 - **不修改 sshd_config，不改防火墙，不开放端口**。
 
 ## 工作方式
@@ -147,6 +155,12 @@ sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 ### 3. 把邀请包私聊发给协作者
 
 脚本会输出 SSH 登录命令、一次性私钥、sudo 密码和撤销命令。只通过可信私聊发送，不要发到群里或公开页面。
+
+英文版使用：
+
+```bash
+sudo bash temp-admin-en.sh invite --sudo
+```
 
 ## 非交互式示例
 
@@ -277,7 +291,7 @@ systemctl list-timers --all | grep linux-temp-admin
 ## 构建 / 校验
 
 ```bash
-bash -n temp-admin.sh
+bash -n temp-admin.sh temp-admin-en.sh
 ```
 
 如安装了 ShellCheck：
