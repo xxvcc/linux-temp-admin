@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.4.0"
+VERSION="0.5.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 DEFAULT_SHELL="/bin/bash"
@@ -25,39 +25,39 @@ err() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "请使用 root 运行：sudo bash $SCRIPT_NAME"
+    err "Please run as root / 请使用 root 运行：sudo bash $SCRIPT_NAME"
     exit 1
   fi
 }
 
 usage() {
   cat <<EOF
-$SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
+$SCRIPT_NAME v$VERSION - Linux one-time temporary admin invite script / Linux 一次性临时管理员邀请脚本
 
-用法：
-  bash $SCRIPT_NAME                 交互式菜单
-  bash $SCRIPT_NAME invite          创建一次性临时管理员邀请
-  bash $SCRIPT_NAME revoke --user USER
-  bash $SCRIPT_NAME status [--user USER]
-  bash $SCRIPT_NAME cleanup-expired          查看账号过期/自动删除状态
-  bash $SCRIPT_NAME help
+Usage / 用法：
+  bash $SCRIPT_NAME                         Interactive menu / 交互式菜单
+  bash $SCRIPT_NAME invite                  Create one-time admin invite / 创建一次性临时管理员邀请
+  bash $SCRIPT_NAME revoke --user USER      Revoke/delete temp user / 撤销/删除临时用户
+  bash $SCRIPT_NAME status [--user USER]    Show status / 查看状态
+  bash $SCRIPT_NAME cleanup-expired         Show expiry/auto-revoke status / 查看过期/自动删除状态
+  bash $SCRIPT_NAME help                    Show help / 显示帮助
 
-常用参数：
-  --prefix PREFIX        用户名前缀，默认：$DEFAULT_PREFIX，生成如 PREFIX-a1b2c3
-  --user USER            指定用户名
-  --host HOST            输出邀请包中的服务器地址
-  --port PORT            SSH 端口，默认自动探测，失败则 22
-  --hours HOURS          有效期小时数，默认：$DEFAULT_EXPIRE_HOURS
-  --sudo                 授予 sudo/wheel 权限
-  --no-sudo              不授予 sudo/wheel 权限
-  --nopasswd-sudo        写入免密 sudoers（高风险，不推荐）
-  --yes                  跳过 YES 二次确认
-  --install-deps         缺少依赖时自动安装，不再交互询问
-  --no-install-deps      缺少依赖时不安装，直接报错
-  --auto-revoke          到期后自动删除用户（默认）
-  --no-auto-revoke       不设置自动删除任务，仅设置账号过期
+Options / 常用参数：
+  --prefix PREFIX        Username prefix, default: $DEFAULT_PREFIX / 用户名前缀，默认：$DEFAULT_PREFIX
+  --user USER            Specify username / 指定用户名
+  --host HOST            Host shown in invite / 邀请包中显示的服务器地址
+  --port PORT            SSH port, auto-detected or 22 / SSH 端口，自动探测，失败则 22
+  --hours HOURS          Valid hours, default: $DEFAULT_EXPIRE_HOURS / 有效期小时数，默认：$DEFAULT_EXPIRE_HOURS
+  --sudo                 Grant sudo/wheel / 授予 sudo/wheel 权限
+  --no-sudo              Do not grant sudo/wheel / 不授予 sudo/wheel 权限
+  --nopasswd-sudo        Passwordless sudo, high risk / 免密 sudo，高风险
+  --yes                  Skip confirmation / 跳过确认
+  --install-deps         Auto-install missing dependencies / 自动安装缺失依赖
+  --no-install-deps      Never install dependencies / 不安装缺失依赖
+  --auto-revoke          Auto-delete user on expiry, default / 到期自动删除用户，默认
+  --no-auto-revoke       Disable auto-delete, keep account expiry only / 不自动删除，仅设置账号过期
 
-示例：
+Examples / 示例：
   bash $SCRIPT_NAME invite
   bash $SCRIPT_NAME invite --prefix xxvcc --hours 12 --sudo
   bash $SCRIPT_NAME revoke --user xxvcc-a1b2c3
@@ -72,7 +72,7 @@ confirm_yes() {
     return 0
   fi
   printf "\n${YELLOW}%s${NC}\n" "$prompt"
-  read -r -p "请输入 YES 确认继续: " ans
+  read -r -p "Type YES to confirm / 请输入 YES 确认继续: " ans
   [[ "$ans" == "YES" ]]
 }
 
@@ -99,7 +99,7 @@ install_packages() {
     yum) yum install -y "${packages[@]}" ;;
     apk) apk add --no-cache "${packages[@]}" ;;
     pacman) pacman -Sy --noconfirm "${packages[@]}" ;;
-    *) err "不支持的包管理器：$pm"; return 1 ;;
+    *) err "Unsupported package manager / 不支持的包管理器：$pm"; return 1 ;;
   esac
 }
 
@@ -164,12 +164,12 @@ ensure_dependencies() {
     return 0
   fi
 
-  warn "检测到缺少依赖：${missing[*]}"
+  warn "Missing dependencies detected / 检测到缺少依赖：${missing[*]}"
 
   local pm
   pm=$(pkg_manager)
   if [[ -z "$pm" ]]; then
-    err "未找到支持的包管理器（apt/dnf/yum/apk/pacman）。请手动安装缺失依赖后重试。"
+    err "No supported package manager found (apt/dnf/yum/apk/pacman). Please install missing dependencies manually and retry. / 未找到支持的包管理器（apt/dnf/yum/apk/pacman）。请手动安装缺失依赖后重试。"
     return 1
   fi
 
@@ -177,17 +177,17 @@ ensure_dependencies() {
   case "$mode" in
     auto) install="true" ;;
     never)
-      err "依赖缺失且已指定不自动安装。"
+      err "Dependencies are missing and auto-install is disabled. / 依赖缺失且已指定不自动安装。"
       return 1
       ;;
     ask|*)
-      read -r -p "是否使用 $pm 自动安装缺失依赖？[Y/n]: " ans
+      read -r -p "Use $pm to install missing dependencies automatically? / 是否使用 $pm 自动安装缺失依赖？[Y/n]: " ans
       if [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]; then install="true"; fi
       ;;
   esac
 
   if [[ "$install" != "true" ]]; then
-    err "已取消安装依赖。请手动安装后重试。"
+    err "Dependency installation cancelled. Please install manually and retry. / 已取消安装依赖。请手动安装后重试。"
     return 1
   fi
 
@@ -204,11 +204,11 @@ ensure_dependencies() {
   done
   pkgs=$(printf '%s' "$pkgs" | unique_words)
   if [[ -z "$pkgs" ]]; then
-    err "无法映射缺失依赖到安装包：${missing[*]}"
+    err "Could not map missing tools to packages / 无法映射缺失依赖到安装包：${missing[*]}"
     return 1
   fi
 
-  info "安装依赖包：$pkgs"
+  info "Installing dependency packages / 安装依赖包：$pkgs"
   # shellcheck disable=SC2086
   install_packages "$pm" $pkgs
 
@@ -221,11 +221,11 @@ ensure_dependencies() {
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo && [[ ! -d /etc/sudoers.d ]]; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
-    err "安装后仍缺少：${still_missing[*]}。请手动处理后重试。"
+    err "Still missing after install / 安装后仍缺少：${still_missing[*]}。请手动处理后重试。"
     return 1
   fi
 
-  success "依赖检查通过。"
+  success "Dependency check passed. / 依赖检查通过。"
 }
 
 random_hex() {
@@ -300,7 +300,7 @@ registry_has_users() {
 
 registry_list_users() {
   if ! registry_has_users; then
-    warn "暂无脚本登记的临时用户。"
+    warn "No registered temporary users. / 暂无脚本登记的临时用户。"
     return 1
   fi
   local i=0 user created expires sudo_enabled nopasswd host port fingerprint auto_revoke auto_unit state
@@ -323,20 +323,20 @@ registry_select_user() {
   fi
 
   if [[ ${#users[@]} -eq 0 ]]; then
-    warn "没有找到仍存在的已登记临时用户。"
-    read -r -p "请输入要撤销/删除的用户名: " user
+    warn "No existing registered temporary users found. / 没有找到仍存在的已登记临时用户。"
+    read -r -p "Enter username to revoke/delete / 请输入要撤销/删除的用户名: " user
     printf '%s\n' "$user"
     return 0
   fi
 
-  echo "已登记的临时用户：" >&2
+  echo "Registered temporary users / 已登记的临时用户：" >&2
   local idx
   for idx in "${!users[@]}"; do
     printf '%2d) %s\n' "$((idx + 1))" "${users[$idx]}" >&2
   done
-  echo "也可以直接输入用户名。" >&2
+  echo "You can also type a username directly. / 也可以直接输入用户名。" >&2
   local choice
-  read -r -p "请选择要删除的编号/用户名: " choice
+  read -r -p "Select number or username to delete / 请选择要删除的编号/用户名: " choice
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#users[@]} )); then
     printf '%s\n' "${users[$((choice - 1))]}"
   else
@@ -352,7 +352,7 @@ auto_revoke_unit_name() {
 install_self_for_revoke() {
   local src="${BASH_SOURCE[0]}"
   if [[ ! -f "$src" ]]; then
-    warn "无法定位当前脚本文件，不能安装稳定撤销命令。"
+    warn "Cannot locate current script file; cannot install stable revoke command. / 无法定位当前脚本文件，不能安装稳定撤销命令。"
     return 1
   fi
   install -m 700 -o root -g root "$src" "$INSTALL_PATH"
@@ -361,11 +361,11 @@ install_self_for_revoke() {
 schedule_auto_revoke() {
   local user="$1" hours="$2"
   if ! command_exists systemd-run; then
-    warn "找不到 systemd-run，无法创建自动删除任务；仅设置账号过期。"
+    warn "systemd-run not found; auto-delete task cannot be created; account expiry only. / 找不到 systemd-run，无法创建自动删除任务；仅设置账号过期。"
     return 1
   fi
   if ! install_self_for_revoke; then
-    warn "安装 $INSTALL_PATH 失败，无法创建自动删除任务；仅设置账号过期。"
+    warn "Failed to install $INSTALL_PATH; auto-delete task cannot be created; account expiry only. / 安装 $INSTALL_PATH 失败，无法创建自动删除任务；仅设置账号过期。"
     return 1
   fi
   local unit
@@ -422,7 +422,7 @@ expire_date_from_hours() {
   if date -u -d "+${hours} hours" +%F >/dev/null 2>&1; then
     date -u -d "+${hours} hours" +%F
   else
-    # BusyBox/macOS fallback：账号过期日期不精确支持时用明天
+    # BusyBox/macOS fallback：Fallback when precise account expiry date is unsupported / 账号过期日期不精确支持时用明天
     date -u +%F
   fi
 }
@@ -440,7 +440,7 @@ create_user_if_needed() {
   local user="$1"
   local shell_path="$2"
   if user_exists "$user"; then
-    err "用户已存在：$user"
+    err "User already exists / 用户已存在：$user"
     exit 1
   fi
   if command_exists useradd; then
@@ -448,7 +448,7 @@ create_user_if_needed() {
   elif command_exists adduser; then
     adduser -D -s "$shell_path" -g "$MANAGED_TAG temporary admin" "$user"
   else
-    err "找不到 useradd/adduser，无法创建用户"
+    err "useradd/adduser not found; cannot create user. / 找不到 useradd/adduser，无法创建用户"
     exit 1
   fi
 }
@@ -459,7 +459,7 @@ set_user_password() {
   if command_exists chpasswd; then
     printf '%s:%s\n' "$user" "$pass" | chpasswd
   else
-    warn "找不到 chpasswd，未设置用户密码；sudo 可能无法使用密码提权。"
+    warn "chpasswd not found; password not set; sudo password elevation may not work. / 找不到 chpasswd，未设置用户密码；sudo 可能无法使用密码提权。"
   fi
 }
 
@@ -469,9 +469,9 @@ set_user_expiry() {
   local date_only
   date_only=$(expire_date_from_hours "$hours")
   if command_exists chage; then
-    chage -E "$date_only" "$user" || warn "设置账号过期时间失败，请手动检查 chage。"
+    chage -E "$date_only" "$user" || warn "Failed to set account expiry; please check chage manually. / 设置账号过期时间失败，请手动检查 chage。"
   else
-    warn "找不到 chage，未设置系统账号过期时间。"
+    warn "chage not found; account expiry not set. / 找不到 chage，未设置系统账号过期时间。"
   fi
 }
 
@@ -481,13 +481,13 @@ add_sudo() {
   local group
   group=$(sudo_group)
   if [[ -z "$group" ]]; then
-    warn "未找到 sudo 或 wheel 组，跳过 sudo 授权。"
+    warn "sudo/wheel group not found; skipping sudo grant. / 未找到 sudo 或 wheel 组，跳过 sudo 授权。"
     return 1
   fi
   usermod -aG "$group" "$user"
   if [[ "$nopasswd" == "true" ]]; then
     if [[ ! -d /etc/sudoers.d ]]; then
-      warn "/etc/sudoers.d 不存在，无法配置免密 sudo。"
+      warn "/etc/sudoers.d does not exist; cannot configure passwordless sudo. / /etc/sudoers.d 不存在，无法配置免密 sudo。"
       return 0
     fi
     local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
@@ -496,7 +496,7 @@ add_sudo() {
     if command_exists visudo; then
       visudo -cf "$file" >/dev/null || {
         rm -f "$file"
-        err "sudoers 校验失败，已删除 $file"
+        err "sudoers validation failed; removed $file / sudoers 校验失败，已删除 $file"
         exit 1
       }
     fi
@@ -514,7 +514,7 @@ write_ssh_key() {
   local home_dir
   home_dir=$(getent passwd "$user" | cut -d: -f6)
   if [[ -z "$home_dir" || ! -d "$home_dir" ]]; then
-    err "找不到用户家目录：$user"
+    err "User home directory not found / 找不到用户家目录：$user"
     exit 1
   fi
   install -d -m 700 -o "$user" -g "$user" "$home_dir/.ssh"
@@ -527,7 +527,7 @@ print_invite() {
   local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" nopasswd="$6" password="$7" private_key_file="$8" revoke_cmd="$9" auto_revoke="${10}" auto_unit="${11}"
   cat <<EOF
 
-${BOLD}====== 一次性临时管理员连接信息 ======${NC}
+${BOLD}====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======${NC}
 
 Host: $host
 Port: $port
@@ -538,10 +538,10 @@ Passwordless sudo: $nopasswd
 Auto revoke: $auto_revoke
 Auto revoke unit: $auto_unit
 
-SSH 登录命令：
+SSH login command / SSH 登录命令：
 ssh -i ./${user}.key -p $port ${user}@${host}
 
-保存私钥命令：
+Save private key command / 保存私钥命令：
 cat > ${user}.key <<'EOF_KEY'
 $(cat "$private_key_file")
 EOF_KEY
@@ -550,32 +550,32 @@ chmod 600 ${user}.key
 EOF
   if [[ "$sudo_enabled" == "yes" && "$nopasswd" != "yes" ]]; then
     cat <<EOF
-Sudo 密码：
+Sudo password / Sudo 密码：
 $password
 
 EOF
   elif [[ "$sudo_enabled" == "yes" && "$nopasswd" == "yes" ]]; then
     cat <<EOF
-Sudo 提示：
-已开启免密 sudo。此权限很高，用完请立即撤销。
+Sudo note / Sudo 提示：
+Passwordless sudo is enabled. This is highly privileged; revoke it immediately after use. / 已开启免密 sudo。此权限很高，用完请立即撤销。
 
 EOF
   else
     cat <<EOF
-Sudo 提示：
-未授予 sudo 权限，此账号是普通用户。
+Sudo note / Sudo 提示：
+sudo was not granted; this is a normal user. / 未授予 sudo 权限，此账号是普通用户。
 
 EOF
   fi
   cat <<EOF
-撤销命令：
+Revoke command / 撤销命令：
 $revoke_cmd
 
-${BOLD}安全提醒：${NC}
-- 上面的私钥和 sudo 密码只显示这一次。
-- 只通过可信私聊发送，不要发群里或公开页面。
-- 用完请立即执行撤销命令。
-- 服务器上只保存公钥，不保存私钥。
+${BOLD}Security notes / 安全提醒：${NC}
+- The private key and sudo password above are shown only once. / 上面的私钥和 sudo 密码只显示这一次。
+- Send only via trusted private chat; never post in groups or public pages. / 只通过可信私聊发送，不要发群里或公开页面。
+- Run the revoke command immediately after use. / 用完请立即执行撤销命令。
+- The server stores only the public key, not the private key. / 服务器上只保存公钥，不保存私钥。
 
 ${BOLD}======================================${NC}
 EOF
@@ -601,12 +601,12 @@ invite() {
       --no-install-deps) deps_mode="never"; shift ;;
       --auto-revoke) auto_revoke="yes"; shift ;;
       --no-auto-revoke) auto_revoke="no"; shift ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "Unknown option / 未知参数：$1"; usage; exit 1 ;;
     esac
   done
 
   if [[ ! "$hours" =~ ^[0-9]+$ || "$hours" -lt 1 ]]; then
-    err "--hours 必须是大于 0 的整数"
+    err "--hours must be an integer greater than 0 / --hours 必须是大于 0 的整数"
     exit 1
   fi
 
@@ -614,7 +614,7 @@ invite() {
     user="${prefix}-$(random_hex 3)"
   fi
   if ! valid_username "$user"; then
-    err "用户名不合法：$user。只能使用小写字母、数字、下划线、连字符，且以字母/下划线开头。"
+    err "Invalid username / 用户名不合法：$user。只能使用小写字母、数字、下划线、连字符，且以字母/下划线开头。"
     exit 1
   fi
 
@@ -622,24 +622,24 @@ invite() {
     host=$(get_public_ip)
   fi
   if [[ -z "$host" ]]; then
-    read -r -p "请输入服务器公网 IP/域名: " host
+    read -r -p "Enter server public IP/domain / 请输入服务器公网 IP/域名: " host
   fi
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)
   fi
 
   if [[ "$grant_sudo" == "ask" ]]; then
-    read -r -p "是否授予 sudo 管理员权限？[y/N]: " ans
+    read -r -p "Grant sudo admin privileges? / 是否授予 sudo 管理员权限？[y/N]: " ans
     if [[ "$ans" =~ ^[Yy]$ ]]; then grant_sudo="yes"; else grant_sudo="no"; fi
   fi
 
   if [[ "$grant_sudo" == "yes" && "$nopasswd" != "true" ]]; then
-    read -r -p "是否开启免密 sudo？高风险，不推荐。[y/N]: " ans2
+    read -r -p "Enable passwordless sudo? High risk, not recommended. / 是否开启免密 sudo？高风险，不推荐。[y/N]: " ans2
     if [[ "$ans2" =~ ^[Yy]$ ]]; then nopasswd="true"; fi
   fi
 
   if [[ "$auto_revoke" == "ask" ]]; then
-    read -r -p "是否到期后自动删除该用户？[Y/n]: " ans3
+    read -r -p "Auto-delete this user on expiry? / 是否到期后自动删除该用户？[Y/n]: " ans3
     if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then auto_revoke="yes"; else auto_revoke="no"; fi
   fi
 
@@ -651,18 +651,18 @@ invite() {
 
   cat <<EOF
 
-即将创建一次性临时账号：
-- 用户名：$user
+About to create one-time temporary account / 即将创建一次性临时账号：
+- User / 用户名：$user
 - Host：$host
-- SSH 端口：$port
-- 有效期：$hours 小时
-- sudo 权限：$grant_sudo
-- 免密 sudo：$nopasswd
-- 到期自动删除：$auto_revoke
+- SSH port / SSH 端口：$port
+- Valid for / 有效期：$hours hours / 小时
+- sudo / sudo 权限：$grant_sudo
+- passwordless sudo / 免密 sudo：$nopasswd
+- auto-delete on expiry / 到期自动删除：$auto_revoke
 
 EOF
-  confirm_yes "sudo/SSH 账号属于高权限入口。确认创建请输入 YES。" "$assume_yes" || {
-    warn "已取消。"
+  confirm_yes "sudo/SSH accounts are high-privilege access. Type YES to confirm. / sudo/SSH 账号属于高权限入口。确认创建请输入 YES。" "$assume_yes" || {
+    warn "Cancelled. / 已取消。"
     exit 0
   }
 
@@ -705,7 +705,7 @@ EOF
   fi
   registry_record_user "$user" "$expires" "$sudo_text" "$nopasswd_text" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
 
-  success "临时账号已创建并登记：$user"
+  success "Temporary account created and registered / 临时账号已创建并登记：$user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$nopasswd_text" "$password" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
 }
 
@@ -716,25 +716,25 @@ revoke_user() {
     case "$1" in
       --user) user="$2"; shift 2 ;;
       --yes|-y) assume_yes="true"; shift ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "Unknown option / 未知参数：$1"; usage; exit 1 ;;
     esac
   done
   if [[ -z "$user" ]]; then
     user=$(registry_select_user)
   fi
   if ! user_exists "$user"; then
-    warn "用户不存在：$user。将清理登记记录和自动删除任务（如果存在）。"
+    warn "User does not exist; cleaning registry and auto-delete task if present. / 用户不存在：$user。将清理登记记录和自动删除任务（如果存在）。"
     cancel_auto_revoke "$user"
     registry_remove_user "$user"
     exit 0
   fi
   if [[ "$assume_yes" != "true" ]]; then
     printf "
-${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
+${YELLOW}Will force logout and delete user %s and its home directory. / 将强制下线并删除用户 %s 及其家目录。${NC}
 " "$user"
-    read -r -p "请输入完整用户名 $user 以确认删除: " confirm_user
+    read -r -p "Type full username $user to confirm deletion / 请输入完整用户名 $user 以确认删除: " confirm_user
     if [[ "$confirm_user" != "$user" ]]; then
-      warn "确认不匹配，已取消。"
+      warn "确认不匹配，Cancelled. / 已取消。"
       exit 0
     fi
   fi
@@ -747,7 +747,7 @@ ${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
     userdel -r "$user"
   fi
   registry_remove_user "$user"
-  success "已撤销并删除用户：$user"
+  success "User revoked and deleted / 已撤销并删除用户：$user"
 }
 
 status_user() {
@@ -755,7 +755,7 @@ status_user() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) user="$2"; shift 2 ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "Unknown option / 未知参数：$1"; usage; exit 1 ;;
     esac
   done
   if [[ -n "$user" ]]; then
@@ -777,21 +777,21 @@ status_user() {
     fi
     return
   fi
-  info "脚本登记的临时用户："
+  info "Registered temporary users / 脚本登记的临时用户："
   registry_list_users || true
   printf '\n'
-  info "系统中匹配前缀 $DEFAULT_PREFIX- 的用户："
+  info "System users matching prefix $DEFAULT_PREFIX- / 系统中匹配前缀 $DEFAULT_PREFIX- 的用户："
   getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1 "\t" $6 "\t" $7}' || true
   printf '\n'
-  info "自动删除 timer："
+  info "Auto-delete timers / 自动删除 timer："
   show_auto_revoke_timers || true
 }
 
 cleanup_expired() {
   need_root
-  warn "这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。"
+  warn "This only shows account expiry and auto-delete status; it does not delete users. / 这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。"
   if ! command_exists chage; then
-    warn "找不到 chage，无法检查过期时间。"
+    warn "chage not found; cannot inspect expiry. / 找不到 chage，无法检查过期时间。"
     return 0
   fi
   local today
@@ -801,7 +801,7 @@ cleanup_expired() {
     printf '\n--- %s ---\n' "$user"
     chage -l "$user" | sed -n '1,8p'
   done
-  info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
+  info "Note: account expiry only blocks later login; auto-delete calls revoke to delete user, home, and SSH key. / 说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
   show_auto_revoke_timers || true
 }
 
@@ -810,22 +810,22 @@ menu() {
   while true; do
     cat <<EOF
 
-${BOLD}Linux Temporary Admin Manager${NC} v$VERSION
+${BOLD}Linux Temporary Admin Manager / Linux 临时管理员管理器${NC} v$VERSION
 
-1) 创建一次性临时管理员邀请
-2) 撤销/删除临时用户
-3) 查看用户状态
-4) 查看账号过期/自动删除状态
-5) 退出
+1) Create one-time temp admin invite / 创建一次性临时管理员邀请
+2) Revoke/delete temp user / 撤销/删除临时用户
+3) Show user status / 查看用户状态
+4) Show expiry/auto-delete status / 查看账号过期/自动删除状态
+5) Exit / 退出
 EOF
-    read -r -p "请选择 [1-5]: " choice
+    read -r -p "Select [1-5] / 请选择 [1-5]: " choice
     case "$choice" in
       1) invite ;;
       2) revoke_user ;;
-      3) read -r -p "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " u; if [[ -n "$u" ]]; then status_user --user "$u"; else status_user; fi ;;
+      3) read -r -p "Username (blank lists ${DEFAULT_PREFIX}-*) / 用户名（留空列出 ${DEFAULT_PREFIX}-*）: " u; if [[ -n "$u" ]]; then status_user --user "$u"; else status_user; fi ;;
       4) cleanup_expired ;;
       5) exit 0 ;;
-      *) warn "无效选择" ;;
+      *) warn "Invalid choice / 无效选择" ;;
     esac
   done
 }
@@ -840,7 +840,7 @@ main() {
     cleanup-expired) shift; cleanup_expired "$@" ;;
     help|-h|--help) usage ;;
     version|--version) echo "$VERSION" ;;
-    *) err "未知命令：$cmd"; usage; exit 1 ;;
+    *) err "Unknown command / 未知命令：$cmd"; usage; exit 1 ;;
   esac
 }
 
