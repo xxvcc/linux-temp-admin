@@ -239,6 +239,10 @@ valid_username() {
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{1,30}$ ]]
 }
 
+valid_prefix() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,19}$ && "$1" != *- && "$1" != *_ ]]
+}
+
 sudo_group() {
   if getent group sudo >/dev/null 2>&1; then
     echo "sudo"
@@ -691,6 +695,10 @@ invite() {
 
   if [[ ! "$hours" =~ ^[0-9]+$ || "$hours" -lt 1 ]]; then
     err "--hours 必须是大于 0 的整数"
+    exit 1
+  fi
+  if ! valid_prefix "$prefix"; then
+    err "用户名前缀不合法：$prefix。只能使用小写字母、数字、下划线、连字符，需以字母/下划线开头，不能以 '-' 或 '_' 结尾，最长 20 字符。"
     exit 1
   fi
 

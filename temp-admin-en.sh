@@ -239,6 +239,10 @@ valid_username() {
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{1,30}$ ]]
 }
 
+valid_prefix() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,19}$ && "$1" != *- && "$1" != *_ ]]
+}
+
 sudo_group() {
   if getent group sudo >/dev/null 2>&1; then
     echo "sudo"
@@ -688,6 +692,10 @@ invite() {
 
   if [[ ! "$hours" =~ ^[0-9]+$ || "$hours" -lt 1 ]]; then
     err "--hours must be an integer greater than 0"
+    exit 1
+  fi
+  if ! valid_prefix "$prefix"; then
+    err "Invalid username prefix: $prefix. Use lowercase letters, digits, underscore, and hyphen only; start with a letter/underscore; do not end with '-' or '_'; max 20 chars."
     exit 1
   fi
 

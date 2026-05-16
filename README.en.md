@@ -148,6 +148,12 @@ Set a custom validity period:
 sudo bash temp-admin.sh invite --sudo --hours 12
 ```
 
+Set a custom username prefix (lowercase letters, digits, underscore, and hyphen only; max 20 chars):
+
+```bash
+sudo bash temp-admin.sh invite --prefix ops --sudo
+```
+
 Set the Host and SSH port shown in the invite output:
 
 ```bash
@@ -263,10 +269,11 @@ Default validity is 24 hours. The script tries to do two things:
 
 Important details:
 
-- `chage -E` is usually date-based, not minute-precise.
+- `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer.
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
 - If `systemctl` is unavailable or the revoke time cannot be calculated, the script falls back to account expiry only and asks you to revoke manually.
+- If `--host` is not provided, the script tries to call `https://api.ipify.org` to detect the public IP for invite display only; pass `--host` explicitly if you do not want this external lookup.
 
 ## Files written
 
@@ -298,6 +305,7 @@ systemctl list-timers --all | grep linux-temp-admin
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.
+- Without `--host`, the script queries `api.ipify.org` for the public IP; pass `--host` manually if you want to avoid external requests.
 
 ## Validation
 

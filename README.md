@@ -148,6 +148,12 @@ sudo bash temp-admin.sh invite --sudo
 sudo bash temp-admin.sh invite --sudo --hours 12
 ```
 
+指定用户名前缀（仅允许小写字母、数字、下划线和连字符，最长 20 字符）：
+
+```bash
+sudo bash temp-admin.sh invite --prefix ops --sudo
+```
+
 指定输出里的 Host 和端口：
 
 ```bash
@@ -263,10 +269,11 @@ sudo bash temp-admin.sh expiry-status
 
 需要注意：
 
-- `chage -E` 通常按日期过期，不是精确到分钟的定时删除。
+- `chage -E` 通常按日期过期，不是精确到分钟/小时的定时删除；`--hours` 的精确自动撤销依赖 systemd timer。
 - 过期通常会阻止后续登录，但不会删除用户和家目录。
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
 - 如果系统没有 `systemctl` 或无法计算删除时间，脚本会降级为只设置账号过期，并提示手动删除。
+- 不传 `--host` 时，脚本会尝试访问 `https://api.ipify.org` 获取公网 IP，只用于邀请包显示；不希望外部查询时请显式传入 `--host`。
 
 ## 安装后写入的内容
 
@@ -298,6 +305,7 @@ systemctl list-timers --all | grep linux-temp-admin
 - sudo 权限基本等同 root，请只给可信对象。
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 - 用完请立即执行 `revoke`，不要只依赖过期兜底。
+- 不传 `--host` 会查询 `api.ipify.org` 获取公网 IP；介意外部请求时请手动指定 `--host`。
 
 ## 构建 / 校验
 
