@@ -208,14 +208,15 @@ Port: 22
 User: xxvcc-a1b2c3
 Expires: 2026-05-17 01:00:00 CST
 Sudo: yes
+Login: SSH key only
 Password login: locked
 Auto revoke: yes
 Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3
 
-SSH login command / SSH 登录命令：
+SSH 登录命令:
 ssh -i ./xxvcc-a1b2c3.key -p 22 xxvcc-a1b2c3@203.0.113.10
 
-Save private key command / 保存私钥命令：
+保存私钥命令:
 cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
 [REDACTED: 运行时生成的一次性私钥]
@@ -223,8 +224,20 @@ cat > xxvcc-a1b2c3.key <<'EOF_KEY'
 EOF_KEY
 chmod 600 xxvcc-a1b2c3.key
 
-Revoke command / 撤销命令：
+Sudo 提示:
+已启用 NOPASSWD sudo。此账号只能通过 SSH key 登录；账号密码已锁定。
+
+撤销命令:
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
+
+安全提醒:
+- 私钥只显示这一次，服务器不保存私钥。
+- 账号密码已锁定，不会输出账号/Sudo 密码。
+- 只通过可信私聊发送，不要发群里或公开页面。
+- 用完请立即执行撤销命令。
+- 服务器上只保存公钥，删除用户后这把私钥立即失效。
+
+----- END LINUX TEMP ADMIN INVITE -----
 ```
 
 ## 日常操作
