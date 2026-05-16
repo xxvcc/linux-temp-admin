@@ -273,7 +273,9 @@ sudo bash temp-admin.sh expiry-status
 - 过期通常会阻止后续登录，但不会删除用户和家目录。
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
 - 如果系统没有 `systemctl` 或无法计算删除时间，脚本会降级为只设置账号过期，并提示手动删除。
+- 如果无法设置账号过期日期（缺少 `chage` 或 `chage` 执行失败），脚本会停止创建并回滚刚创建的用户。
 - 不传 `--host` 时，脚本会尝试访问 `https://api.ipify.org` 获取公网 IP，只用于邀请包显示；不希望外部查询时请显式传入 `--host`。
+- `--host` 只接受普通域名、IPv4 或 IPv6 地址；不要带端口，端口请用 `--port` 单独指定。
 
 ## 安装后写入的内容
 
@@ -282,7 +284,7 @@ sudo bash temp-admin.sh expiry-status
 ```text
 /usr/local/sbin/linux-temp-admin
 /var/lib/linux-temp-admin/users.tsv
-/etc/systemd/system/linux-temp-admin-revoke-USER.service
+/etc/systemd/system/linux-temp-admin-revoke-USER.service  # 包含 NoNewPrivileges/PrivateTmp 轻量限制
 /etc/systemd/system/linux-temp-admin-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER       # 仅在启用免密 sudo 时
 /home/USER/.ssh/authorized_keys

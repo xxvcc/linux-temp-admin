@@ -216,6 +216,7 @@ ensure_dependencies() {
   command_exists ssh-keygen || still_missing+=("ssh-keygen")
   if ! command_exists useradd && ! command_exists adduser; then still_missing+=("useradd/adduser"); fi
   command_exists usermod || still_missing+=("usermod")
+  command_exists chage || still_missing+=("chage")
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
@@ -246,8 +247,34 @@ valid_prefix() {
 valid_host() {
   local host="$1"
   [[ ${#host} -ge 1 && ${#host} -le 253 ]] || return 1
+  [[ "$host" != *[[:space:]]* ]] || return 1
   [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
-  [[ "$host" != .* && "$host" != *..* && "$host" != *- && "$host" != -* ]]
+
+  # IPv6 literals contain ':' and are accepted after the shell-metacharacter filter.
+  if [[ "$host" == *:* ]]; then
+    [[ "$host" =~ ^[0-9A-Fa-f:.]+$ && "$host" == *:* && "$host" != *::*::* ]]
+    return
+  fi
+
+  # IPv4 literals: four decimal octets in 0..255.
+  if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    local IFS=. octets octet
+    read -r -a octets <<< "$host"
+    [[ ${#octets[@]} -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+      [[ "$octet" =~ ^[0-9]+$ && "$octet" -le 255 ]] || return 1
+    done
+    return 0
+  fi
+
+  # DNS hostname: labels 1..63 chars, alnum at edges, hyphen allowed inside.
+  [[ "$host" != .* && "$host" != *..* && "$host" != *. ]] || return 1
+  local label IFS=.
+  read -r -a labels <<< "$host"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
 }
 
 sudo_group() {
@@ -424,6 +451,8 @@ Documentation=https://github.com/xxvcc/linux-temp-admin
 
 [Service]
 Type=oneshot
+NoNewPrivileges=yes
+PrivateTmp=yes
 ExecStart=$INSTALL_PATH revoke --user $user --yes
 EOF_SERVICE
 
@@ -553,9 +582,13 @@ set_user_expiry() {
   local date_only
   date_only=$(expire_date_from_hours "$hours")
   if command_exists chage; then
-    chage -E "$date_only" "$user" || warn "设置账号过期时间失败，请手动检查 chage。"
+    chage -E "$date_only" "$user" || {
+      err "设置账号过期时间失败，已停止创建并准备回滚。"
+      return 1
+    }
   else
-    warn "找不到 chage，未设置系统账号过期时间。"
+    err "找不到 chage，无法安全设置账号过期时间。"
+    return 1
   fi
 }
 
@@ -724,7 +757,7 @@ invite() {
     read -r -p "请输入服务器公网 IP/域名: " host
   fi
   if ! valid_host "$host"; then
-    err "Host 不合法：$host。请使用普通域名、IPv4 或 IPv6 地址，不要包含空格、引号或 shell 符号。"
+    err "Host 不合法：$host。请使用普通域名、IPv4 或 IPv6 地址，不要包含端口、空格、引号或 shell 符号。"
     exit 1
   fi
   if [[ -z "$port" ]]; then

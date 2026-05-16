@@ -273,7 +273,9 @@ Important details:
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
 - If `systemctl` is unavailable or the revoke time cannot be calculated, the script falls back to account expiry only and asks you to revoke manually.
+- If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
 - If `--host` is not provided, the script tries to call `https://api.ipify.org` to detect the public IP for invite display only; pass `--host` explicitly if you do not want this external lookup.
+- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately.
 
 ## Files written
 
@@ -282,7 +284,7 @@ The script may write:
 ```text
 /usr/local/sbin/linux-temp-admin
 /var/lib/linux-temp-admin/users.tsv
-/etc/systemd/system/linux-temp-admin-revoke-USER.service
+/etc/systemd/system/linux-temp-admin-revoke-USER.service  # includes lightweight NoNewPrivileges/PrivateTmp hardening
 /etc/systemd/system/linux-temp-admin-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER       # only when passwordless sudo is enabled
 /home/USER/.ssh/authorized_keys
