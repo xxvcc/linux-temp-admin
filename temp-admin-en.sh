@@ -853,6 +853,8 @@ EOF
   trap - ERR
   success "Temporary account created and registered: $user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
+  rm -rf "$tmpdir"
+  trap - RETURN
 }
 
 revoke_user() {

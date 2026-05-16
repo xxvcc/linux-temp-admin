@@ -852,6 +852,8 @@ EOF
   trap - ERR
   success "临时账号已创建并登记：$user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
+  rm -rf "$tmpdir"
+  trap - RETURN
 }
 
 revoke_user() {
