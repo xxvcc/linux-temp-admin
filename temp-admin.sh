@@ -243,6 +243,13 @@ valid_prefix() {
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,19}$ && "$1" != *- && "$1" != *_ ]]
 }
 
+valid_host() {
+  local host="$1"
+  [[ ${#host} -ge 1 && ${#host} -le 253 ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  [[ "$host" != .* && "$host" != *..* && "$host" != *- && "$host" != -* ]]
+}
+
 sudo_group() {
   if getent group sudo >/dev/null 2>&1; then
     echo "sudo"
@@ -715,6 +722,10 @@ invite() {
   fi
   if [[ -z "$host" ]]; then
     read -r -p "请输入服务器公网 IP/域名: " host
+  fi
+  if ! valid_host "$host"; then
+    err "Host 不合法：$host。请使用普通域名、IPv4 或 IPv6 地址，不要包含空格、引号或 shell 符号。"
+    exit 1
   fi
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)

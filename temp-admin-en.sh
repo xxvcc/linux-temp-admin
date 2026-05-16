@@ -101,7 +101,7 @@ install_packages() {
     yum) yum install -y "${packages[@]}" ;;
     apk) apk add --no-cache "${packages[@]}" ;;
     pacman) pacman -Sy --noconfirm "${packages[@]}" ;;
-    *) err "Unsupported package manager$pm"; return 1 ;;
+    *) err "Unsupported package manager: $pm"; return 1 ;;
   esac
 }
 
@@ -163,7 +163,7 @@ ensure_dependencies() {
     return 0
   fi
 
-  warn "Missing dependencies detected${missing[*]}"
+  warn "Missing dependencies detected: ${missing[*]}"
 
   local pm
   pm=$(pkg_manager)
@@ -203,11 +203,11 @@ ensure_dependencies() {
   done
   pkgs=$(printf '%s' "$pkgs" | unique_words)
   if [[ -z "$pkgs" ]]; then
-    err "Could not map missing tools to packages${missing[*]}"
+    err "Could not map missing tools to packages: ${missing[*]}"
     return 1
   fi
 
-  info "Installing dependency packages$pkgs"
+  info "Installing dependency packages: $pkgs"
   # shellcheck disable=SC2086
   install_packages "$pm" $pkgs
 
@@ -241,6 +241,13 @@ valid_username() {
 
 valid_prefix() {
   [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,19}$ && "$1" != *- && "$1" != *_ ]]
+}
+
+valid_host() {
+  local host="$1"
+  [[ ${#host} -ge 1 && ${#host} -le 253 ]] || return 1
+  [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  [[ "$host" != .* && "$host" != *..* && "$host" != *- && "$host" != -* ]]
 }
 
 sudo_group() {
@@ -494,10 +501,14 @@ get_public_ip() {
 
 expire_date_from_hours() {
   local hours="$1"
-  if date -u -d "+${hours} hours" +%F >/dev/null 2>&1; then
-    date -u -d "+${hours} hours" +%F
+  # chage -E is date-based. Use ceil(hours/24) days so short validity
+  # periods do not resolve to "today" and expire immediately.
+  local days=$(( (hours + 23) / 24 ))
+  (( days < 1 )) && days=1
+  if date -u -d "+${days} days" +%F >/dev/null 2>&1; then
+    date -u -d "+${days} days" +%F
   else
-    # BusyBox/macOS fallbackFallback when precise account expiry date is unsupported
+    # BusyBox/macOS fallback when date -d is unsupported.
     date -u +%F
   fi
 }
@@ -713,6 +724,10 @@ invite() {
   if [[ -z "$host" ]]; then
     read -r -p "Enter server public IP/domain: " host
   fi
+  if ! valid_host "$host"; then
+    err "Invalid host: $host. Use a normal domain, IPv4, or IPv6 address without spaces, quotes, or shell metacharacters."
+    exit 1
+  fi
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)
   fi
@@ -741,12 +756,12 @@ invite() {
   cat <<EOF
 
 About to create one-time temporary account
-- User$user
-- Host$host
-- SSH port$port
-- Valid for$hours hours
-- sudo$grant_sudo
-- auto-delete on expiry$auto_revoke
+- User: $user
+- Host: $host
+- SSH port: $port
+- Valid for: $hours hours
+- sudo: $grant_sudo
+- auto-delete on expiry: $auto_revoke
 
 EOF
   confirm_yes "sudo/SSH accounts are high-privilege access. Type YES to confirm." "$assume_yes" || {

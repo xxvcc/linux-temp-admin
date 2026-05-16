@@ -34,7 +34,7 @@ sudo bash temp-admin.sh
 Create a one-time sudo invite directly:
 
 ```bash
-sudo bash temp-admin.sh invite --sudo
+sudo bash temp-admin-en.sh invite --sudo
 ```
 
 ---
@@ -139,25 +139,25 @@ chmod +x temp-admin.sh
 ### 2. Create an invite
 
 ```bash
-sudo bash temp-admin.sh invite --sudo
+sudo bash temp-admin-en.sh invite --sudo
 ```
 
 Set a custom validity period:
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --hours 12
+sudo bash temp-admin-en.sh invite --sudo --hours 12
 ```
 
 Set a custom username prefix (lowercase letters, digits, underscore, and hyphen only; max 20 chars):
 
 ```bash
-sudo bash temp-admin.sh invite --prefix ops --sudo
+sudo bash temp-admin-en.sh invite --prefix ops --sudo
 ```
 
 Set the Host and SSH port shown in the invite output:
 
 ```bash
-sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
+sudo bash temp-admin-en.sh invite --host 203.0.113.10 --port 22 --sudo
 ```
 
 ### 3. Send the invite bundle privately
@@ -175,7 +175,7 @@ sudo bash temp-admin.sh invite --sudo
 Auto-install dependencies and create a sudo invite:
 
 ```bash
-sudo bash temp-admin.sh invite \
+sudo bash temp-admin-en.sh invite \
   --host 203.0.113.10 \
   --port 22 \
   --hours 24 \
@@ -187,13 +187,13 @@ sudo bash temp-admin.sh invite \
 Disable auto-delete and keep only account expiry:
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --no-auto-revoke
+sudo bash temp-admin-en.sh invite --sudo --no-auto-revoke
 ```
 
 Create a normal non-sudo user:
 
 ```bash
-sudo bash temp-admin.sh invite --no-sudo
+sudo bash temp-admin-en.sh invite --no-sudo
 ```
 
 ## Redacted invite output example
@@ -201,7 +201,7 @@ sudo bash temp-admin.sh invite --no-sudo
 This is only a format example and **cannot be used to log in**. Real private keys are generated at runtime and shown once in the terminal. Account password is locked by default, and no account/sudo password is printed.
 
 ```text
-====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
+----- BEGIN LINUX TEMP ADMIN INVITE -----
 
 Host: 203.0.113.10
 Port: 22
@@ -232,13 +232,13 @@ sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
 Show status:
 
 ```bash
-sudo bash temp-admin.sh status
+sudo bash temp-admin-en.sh status
 ```
 
 Select and delete a user from the registry:
 
 ```bash
-sudo bash temp-admin.sh revoke
+sudo bash temp-admin-en.sh revoke
 ```
 
 Delete a specific user:
@@ -301,6 +301,7 @@ systemctl list-timers --all | grep linux-temp-admin
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key.
 - Deletion guard: `revoke` only deletes registered/default-prefix users unless `--force` is explicitly used.
+- If you create users with a custom `--prefix` and the local registry is lost/corrupted, revoking those users also requires explicit `--force`.
 - If account creation fails mid-way, the script tries to roll back and remove the just-created temporary user.
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.

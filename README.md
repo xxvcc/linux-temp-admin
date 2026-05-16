@@ -201,7 +201,7 @@ sudo bash temp-admin.sh invite --no-sudo
 下面只是格式示例，**不可用于登录**。真实私钥只会在脚本运行时随机生成，并在终端里显示一次。账号密码默认锁定，不会输出账号/Sudo 密码。
 
 ```text
-====== One-time Temporary Admin Invite / 一次性临时管理员连接信息 ======
+----- BEGIN LINUX TEMP ADMIN INVITE -----
 
 Host: 203.0.113.10
 Port: 22
@@ -301,6 +301,7 @@ systemctl list-timers --all | grep linux-temp-admin
 - README 示例均为脱敏内容，不能登录任何服务器。
 - 删除用户时会删除家目录和 SSH key。
 - 默认防误删：`revoke` 只删除登记用户或默认前缀用户，其他用户需要 `--force`。
+- 如果使用自定义 `--prefix` 创建用户，但本地登记文件丢失/损坏，撤销时也需要显式加 `--force`。
 - 创建过程中如果出错，脚本会尽量回滚并删除刚创建的临时用户。
 - sudo 权限基本等同 root，请只给可信对象。
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
