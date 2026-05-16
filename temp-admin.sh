@@ -250,10 +250,35 @@ valid_host() {
   [[ "$host" != *[[:space:]]* ]] || return 1
   [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
 
-  # IPv6 literals contain ':' and are accepted after the shell-metacharacter filter.
+  # IPv6 literals
   if [[ "$host" == *:* ]]; then
-    [[ "$host" =~ ^[0-9A-Fa-f:.]+$ && "$host" == *:* && "$host" != *::*::* ]]
-    return
+    [[ "$host" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    # Reject three or more consecutive colons
+    [[ "$host" != *:::* ]] || return 1
+    # At most one :: compression
+    local tmp="$host" count=0
+    while [[ "$tmp" == *::* ]]; do
+      count=$((count + 1))
+      tmp="${tmp/::/:}"
+    done
+    [[ $count -le 1 ]] || return 1
+    # Each group max 4 hex chars; total groups with :: <= 8
+    local IFS=':' groups
+    read -r -a groups <<< "$host"
+    local non_empty=0
+    local group
+    for group in "${groups[@]}"; do
+      [[ ${#group} -le 4 ]] || return 1
+      [[ -z "$group" || "$group" =~ ^[0-9A-Fa-f]+$ ]] || return 1
+      [[ -n "$group" ]] && non_empty=$((non_empty + 1))
+    done
+    # With ::, compressed block counts as at least 1 group
+    if [[ $count -eq 1 ]]; then
+      [[ $((non_empty + 1)) -le 8 ]] || return 1
+    else
+      [[ ${#groups[@]} -eq 8 ]] || return 1
+    fi
+    return 0
   fi
 
   # IPv4 literals: four decimal octets in 0..255.
@@ -763,7 +788,7 @@ invite() {
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)
   fi
-    if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+  if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
     err "SSH 端口不合法：$port"
     exit 1
   fi
@@ -950,10 +975,33 @@ cleanup_expired() {
     warn "找不到 chage，无法检查过期时间。"
     return 0
   fi
-  getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}' | while read -r user; do
+  local users=()
+  if [[ -s "$REGISTRY_FILE" ]]; then
+    while IFS=$'\t' read -r user _rest; do
+      [[ -z "${user:-}" ]] && continue
+      users+=("$user")
+    done < "$REGISTRY_FILE"
+  fi
+  while IFS= read -r user; do
     [[ -z "$user" ]] && continue
+    local found="false"
+    local u
+    for u in "${users[@]}"; do
+      [[ "$u" == "$user" ]] && found="true" && break
+    done
+    [[ "$found" == "false" ]] && users+=("$user")
+  done < <(getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}')
+  if [[ ${#users[@]} -eq 0 ]]; then
+    info "没有登记的临时用户或系统默认前缀用户。"
+    return 0
+  fi
+  for user in "${users[@]}"; do
     printf '\n--- %s ---\n' "$user"
-    chage -l "$user" | sed -n '1,8p'
+    if user_exists "$user"; then
+      chage -l "$user" | sed -n '1,8p' || true
+    else
+      info "用户不存在：$user"
+    fi
   done
   info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
   show_auto_revoke_timers || true
