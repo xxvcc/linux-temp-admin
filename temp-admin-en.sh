@@ -795,14 +795,21 @@ invite() {
   fi
 
   if [[ "$grant_sudo" == "ask" ]]; then
-    read -r -p "Grant sudo admin privileges?[y/N]: " ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then grant_sudo="yes"; else grant_sudo="no"; fi
+    if [[ "$assume_yes" == "true" ]]; then
+      grant_sudo="no"
+    else
+      read -r -p "Grant sudo admin privileges?[y/N]: " ans
+      if [[ "$ans" =~ ^[Yy]$ ]]; then grant_sudo="yes"; else grant_sudo="no"; fi
+    fi
   fi
 
-
   if [[ "$auto_revoke" == "ask" ]]; then
-    read -r -p "Auto-delete this user on expiry?[Y/n]: " ans3
-    if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then auto_revoke="yes"; else auto_revoke="no"; fi
+    if [[ "$assume_yes" == "true" ]]; then
+      auto_revoke="yes"
+    else
+      read -r -p "Auto-delete this user on expiry?[Y/n]: " ans3
+      if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then auto_revoke="yes"; else auto_revoke="no"; fi
+    fi
   fi
 
   if [[ "$grant_sudo" == "yes" ]]; then
