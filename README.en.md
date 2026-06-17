@@ -302,13 +302,14 @@ Default validity is 24 hours. The script tries to do two things:
 
 Important details:
 
-- `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer.
+- `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer or fallback `at` job.
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
-- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job; only if `at` is unavailable too does it fall back to account expiry only and ask you to revoke manually.
+- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job; only if `at` is unavailable too does it fall back to account expiry only and shows a manual-revoke warning in the invite bundle.
 - If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
 - In interactive mode, if `--host` is not provided, the script asks before automatic detection. It first tries local public interface addresses and common cloud metadata endpoints; only if that fails does it try `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`, and it clearly reports success or failure. In `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
-- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately.
+- To troubleshoot public-IP detection failures, temporarily set `LINUX_TEMP_ADMIN_DEBUG_IP=1`; the script prints per-metadata/external-service failure reasons or invalid responses.
+- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately. The invite bundle automatically brackets IPv6 addresses in the SSH command.
 
 ## Files written
 
@@ -324,7 +325,7 @@ fallback job in the at queue                    # only when systemd timer is una
 /home/USER/.ssh/authorized_keys
 ```
 
-Auto-delete is managed by persistent systemd timers first. Inspect timers and fallback `at` jobs with:
+Auto-delete is managed by persistent systemd timers first. The status command also shows `/usr/local/sbin/linux-temp-admin` install version and permissions. Inspect timers and fallback `at` jobs with:
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
@@ -344,6 +345,7 @@ atq
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.
 - In interactive mode, missing `--host` asks before automatic public-IP detection; the script first tries local/cloud metadata, then external public-IP services if needed, and clearly reports success or failure. `--yes` mode requires explicit `--host`.
+- Set `LINUX_TEMP_ADMIN_DEBUG_IP=1` to troubleshoot public-IP detection; diagnostics never print the private key.
 - When stdout is not a TTY, the script refuses to print the one-time private key unless `--allow-non-tty-private-key-output` is passed.
 - `--sudo --yes` requires `--confirm-sudo USER` to avoid accidentally granting sudo non-interactively.
 
@@ -351,13 +353,10 @@ atq
 
 ```bash
 bash -n temp-admin.sh temp-admin-en.sh
+shellcheck -S warning temp-admin.sh temp-admin-en.sh
 ```
 
-If ShellCheck is installed:
-
-```bash
-shellcheck temp-admin.sh
-```
+The repository includes a GitHub Actions workflow that runs Bash syntax checks and ShellCheck on push and pull request.
 
 ## License
 

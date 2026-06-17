@@ -1,0 +1,26 @@
+name: ShellCheck
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: bash -n temp-admin.sh temp-admin-en.sh
+
+      - name: ShellCheck
+        run: shellcheck -S warning temp-admin.sh temp-admin-en.sh

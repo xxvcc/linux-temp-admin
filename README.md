@@ -302,13 +302,14 @@ sudo bash temp-admin.sh expiry-status
 
 需要注意：
 
-- `chage -E` 通常按日期过期，不是精确到分钟/小时的定时删除；`--hours` 的精确自动撤销依赖 systemd timer。
+- `chage -E` 通常按日期过期，不是精确到分钟/小时的定时删除；`--hours` 的精确自动撤销依赖 systemd timer 或备用 `at` 任务。
 - 过期通常会阻止后续登录，但不会删除用户和家目录。
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
-- 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务；如果 `at` 也不可用，才会降级为只设置账号过期，并提示手动删除。
+- 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务；如果 `at` 也不可用，才会降级为只设置账号过期，并在邀请包中提示需要手动撤销。
 - 如果无法设置账号过期日期（缺少 `chage` 或 `chage` 执行失败），脚本会停止创建并回滚刚创建的用户。
 - 交互模式不传 `--host` 时，脚本会先询问是否自动探测；探测会优先尝试本地公网网卡地址和常见云厂商 metadata，失败后才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成功或失败都会给出明确提示；`--yes` 非交互模式不会静默外联，必须显式传入 `--host`。
-- `--host` 只接受普通域名、IPv4 或 IPv6 地址；不要带端口，端口请用 `--port` 单独指定。
+- 如需排查公网 IP 探测失败原因，可临时设置 `LINUX_TEMP_ADMIN_DEBUG_IP=1`，脚本会输出每个 metadata/外部服务的失败原因或无效返回。
+- `--host` 只接受普通域名、IPv4 或 IPv6 地址；不要带端口，端口请用 `--port` 单独指定。邀请包中的 SSH 命令会自动为 IPv6 地址加方括号。
 
 ## 安装后写入的内容
 
@@ -324,7 +325,7 @@ at 任务队列中的备用自动删除任务              # 仅当 systemd time
 /home/USER/.ssh/authorized_keys
 ```
 
-自动删除任务优先由持久 systemd timer 管理，可查看：
+自动删除任务优先由持久 systemd timer 管理；脚本状态页也会显示 `/usr/local/sbin/linux-temp-admin` 的安装版本和权限信息。可手动查看：
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
@@ -344,6 +345,7 @@ atq
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 - 用完请立即执行 `revoke`，不要只依赖过期兜底。
 - 交互模式不传 `--host` 会询问是否自动探测公网 IP；脚本会先尝试本地/云元数据，再按需查询外部公网 IP 服务，并明确提示成功或失败；`--yes` 模式必须手动指定 `--host`。
+- 排查公网 IP 探测问题时可设置 `LINUX_TEMP_ADMIN_DEBUG_IP=1` 查看诊断日志；日志不会输出私钥。
 - stdout 不是 TTY 时默认拒绝输出一次性私钥；只有确认输出通道安全时才使用 `--allow-non-tty-private-key-output`。
 - `--sudo --yes` 必须同时传入 `--confirm-sudo USER`，避免非交互误授予 sudo。
 
@@ -351,13 +353,10 @@ atq
 
 ```bash
 bash -n temp-admin.sh temp-admin-en.sh
+shellcheck -S warning temp-admin.sh temp-admin-en.sh
 ```
 
-如安装了 ShellCheck：
-
-```bash
-shellcheck temp-admin.sh
-```
+仓库已包含 GitHub Actions 工作流，会在 push 和 pull request 时运行 Bash 语法检查与 ShellCheck。
 
 ## 许可证
 

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.8.0"
+VERSION="0.8.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -437,8 +437,8 @@ registry_list_users() {
     warn "暂无脚本登记的临时用户。"
     return 1
   fi
-  local i=0 user created expires sudo_enabled legacy_nopasswd host port fingerprint auto_revoke auto_unit state
-  while IFS=$'\t' read -r user created expires sudo_enabled legacy_nopasswd host port fingerprint auto_revoke auto_unit; do
+  local i=0 user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit state
+  while IFS=$'\t' read -r user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit; do
     [[ -z "${user:-}" ]] && continue
     i=$((i + 1))
     if user_exists "$user"; then state="active"; else state="missing"; fi
@@ -497,6 +497,40 @@ auto_revoke_timer_path() {
   printf '%s/%s.timer' "$SYSTEMD_DIR" "$unit"
 }
 
+shell_quote_arg() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+systemd_quote_arg() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\r'/ }
+  value=${value//$'\n'/ }
+  printf '"%s"' "$value"
+}
+
+show_installed_revoke_status() {
+  if [[ ! -f "$INSTALL_PATH" ]]; then
+    warn "稳定撤销命令未安装：$INSTALL_PATH；创建自动删除任务时会自动安装。"
+    return 0
+  fi
+  local installed_version="unknown" mode_owner=""
+  if command_exists stat; then
+    mode_owner=$(stat -c 'mode=%a owner=%U:%G' "$INSTALL_PATH" 2>/dev/null || true)
+  fi
+  if [[ -x "$INSTALL_PATH" ]]; then
+    installed_version=$("$INSTALL_PATH" version 2>/dev/null || true)
+    [[ -n "$installed_version" ]] || installed_version="unknown"
+  else
+    installed_version="not-executable-by-current-user"
+  fi
+  info "稳定撤销命令：$INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}"
+  if [[ "$installed_version" != "unknown" && "$installed_version" != "not-executable-by-current-user" && "$installed_version" != "$VERSION" ]]; then
+    warn "稳定撤销命令版本与当前脚本不同；下一次创建自动删除任务会重新安装当前脚本。"
+  fi
+}
+
 install_self_for_revoke() {
   local src="${BASH_SOURCE[0]}"
   if [[ ! -f "$src" ]]; then
@@ -516,8 +550,10 @@ schedule_at_revoke() {
     warn "安装 $INSTALL_PATH 失败，无法创建备用自动删除任务；仅设置账号过期。"
     return 1
   fi
-  local output job_id
-  if ! output=$(printf "'%s' revoke --user '%s' --yes\n" "$INSTALL_PATH" "$user" | at now + "$hours" hours 2>&1); then
+  local output job_id install_arg user_arg
+  install_arg=$(shell_quote_arg "$INSTALL_PATH")
+  user_arg=$(shell_quote_arg "$user")
+  if ! output=$(printf "%s revoke --user %s --yes\n" "$install_arg" "$user_arg" | at now + "$hours" hours 2>&1); then
     warn "创建 at 自动删除任务失败：$output"
     return 1
   fi
@@ -541,10 +577,15 @@ schedule_auto_revoke() {
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
-  local unit service_path timer_path timer_schedule on_calendar
+  if ! valid_username "$user"; then
+    warn "自动删除任务用户名不合法，拒绝创建 systemd unit：$user"
+    return 1
+  fi
+  local unit service_path timer_path timer_schedule on_calendar exec_start
   unit=$(auto_revoke_unit_name "$user")
   service_path=$(auto_revoke_service_path "$unit")
   timer_path=$(auto_revoke_timer_path "$unit")
+  exec_start="$(systemd_quote_arg "$INSTALL_PATH") revoke --user $(systemd_quote_arg "$user") --yes"
   if on_calendar=$(date -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
     timer_schedule="OnCalendar=$on_calendar
 Persistent=true"
@@ -563,7 +604,7 @@ Type=oneshot
 NoNewPrivileges=yes
 PrivateTmp=yes
 User=root
-ExecStart=$INSTALL_PATH revoke --user $user --yes
+ExecStart=$exec_start
 EOF_SERVICE
 
   cat > "$timer_path" <<EOF_TIMER
@@ -671,13 +712,44 @@ is_public_ipv4() {
   return 0
 }
 
-get_url_text() {
-  local url="$1"
-  if command_exists curl; then
-    curl -fsS --connect-timeout 1 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]' || true
-  elif command_exists wget; then
-    wget -qO- --timeout=2 "$url" 2>/dev/null | tr -d '[:space:]' || true
+ip_probe_debug() {
+  if [[ -n "${LINUX_TEMP_ADMIN_DEBUG_IP:-${LINUX_TEMP_ADMIN_DEBUG:-}}" ]]; then
+    warn "IP 探测诊断：$*"
   fi
+}
+
+get_url_text() {
+  local url="$1" max_time="${2:-3}" connect_timeout="${3:-1}"
+  local output="" status=0 tmp_err err=""
+  tmp_err=$(mktemp)
+  if command_exists curl; then
+    if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+      status=0
+    else
+      status=$?
+    fi
+  elif command_exists wget; then
+    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+      status=0
+    else
+      status=$?
+    fi
+  else
+    rm -f "$tmp_err"
+    ip_probe_debug "找不到 curl/wget，无法请求 $url"
+    return 1
+  fi
+  err=$(tr '\n' ' ' < "$tmp_err" | sed 's/[[:space:]]*$//')
+  rm -f "$tmp_err"
+  if [[ "$status" -eq 0 && -n "$output" ]]; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    err="empty response"
+  fi
+  ip_probe_debug "$url 失败 exit=$status${err:+ error=$err}"
+  return 1
 }
 
 get_local_public_ip() {
@@ -688,10 +760,12 @@ get_local_public_ip() {
     "http://100.100.100.200/latest/meta-data/eipv4"
   )
   for service in "${metadata_services[@]}"; do
-    ip=$(get_url_text "$service")
-    if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
-      printf '%s\n' "$ip"
-      return 0
+    if ip=$(get_url_text "$service" 2 1); then
+      if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+      ip_probe_debug "$service 返回非公网 IPv4：${ip:0:80}"
     fi
   done
 
@@ -703,11 +777,15 @@ get_local_public_ip() {
       fi
     done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
 
+    ip_probe_debug "本地网卡未发现公网 IPv4，继续检查默认路由源地址。"
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' || true)
     if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
       printf '%s\n' "$ip"
       return 0
     fi
+    [[ -n "$ip" ]] && ip_probe_debug "默认路由源地址不是公网 IPv4：$ip"
+  else
+    ip_probe_debug "找不到 ip 命令，无法检查本地网卡地址。"
   fi
   return 1
 }
@@ -716,14 +794,25 @@ get_public_ip() {
   local ip="" service
   local services=("https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com")
   for service in "${services[@]}"; do
-    ip=$(get_url_text "$service")
-    if [[ -n "$ip" ]] && valid_host "$ip"; then
-      printf '%s\n' "$ip"
-      return 0
+    if ip=$(get_url_text "$service" 5 2); then
+      if [[ -n "$ip" ]] && valid_host "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+      ip_probe_debug "$service 返回无效 Host：${ip:0:80}"
     fi
     ip=""
   done
   return 1
+}
+
+ssh_host_for_command() {
+  local host="$1"
+  if [[ "$host" == *:* ]]; then
+    printf '[%s]' "$host"
+  else
+    printf '%s' "$host"
+  fi
 }
 
 expire_date_from_hours() {
@@ -883,6 +972,8 @@ rollback_created_user() {
 
 print_invite() {
   local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" private_key_file="$6" revoke_cmd="$7" auto_revoke="$8" auto_unit="$9"
+  local ssh_host
+  ssh_host=$(ssh_host_for_command "$host")
   cat <<EOF
 
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -898,7 +989,7 @@ Auto revoke: $auto_revoke
 Auto revoke unit: $auto_unit
 
 SSH 登录命令:
-ssh -i ./${user}.key -p $port ${user}@${host}
+ssh -i ./${user}.key -p $port ${user}@${ssh_host}
 
 保存私钥命令:
 cat > './${user}.key' <<'EOF_KEY'
@@ -917,6 +1008,13 @@ EOF
     cat <<EOF
 Sudo 提示:
 未授予 sudo 权限，此账号是普通用户；账号密码已锁定。
+
+EOF
+  fi
+  if [[ "$auto_revoke" != "yes" ]]; then
+    cat <<EOF
+自动删除提示:
+未创建自动删除任务；账号过期只会阻止后续登录，不会删除用户和家目录。请按需手动执行撤销命令。
 
 EOF
   fi
@@ -973,7 +1071,7 @@ invite() {
 
   if [[ -z "$user" ]]; then
     local attempt
-    for attempt in {1..20}; do
+    for ((attempt = 1; attempt <= 20; attempt++)); do
       user="${prefix}-$(random_hex 5)"
       if ! user_exists "$user"; then
         break
@@ -1115,6 +1213,7 @@ EOF
       auto_text="yes"
       revoke_cmd="sudo $INSTALL_PATH revoke --user $user"
     else
+      warn "自动删除任务创建失败：仅设置账号过期；账号过期不会删除用户和家目录，请按需手动执行撤销命令。"
       auto_text="no"
       revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
     fi
@@ -1219,6 +1318,7 @@ status_user() {
       elif [[ -n "$unit" ]] && command_exists systemctl; then
         systemctl list-timers --all --no-pager 2>/dev/null | grep -F -- "$unit" || true
       fi
+      show_installed_revoke_status
     else
       err "用户不存在：$user"
       exit 1
@@ -1233,6 +1333,8 @@ status_user() {
   printf '\n'
   info "自动删除 timer："
   show_auto_revoke_timers || true
+  printf '\n'
+  show_installed_revoke_status
 }
 
 cleanup_expired() {
@@ -1277,6 +1379,7 @@ cleanup_expired() {
   done
   info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
   show_auto_revoke_timers || true
+  show_installed_revoke_status
 }
 
 menu() {
