@@ -307,7 +307,7 @@ Important details:
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
 - If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job; only if `at` is unavailable too does it fall back to account expiry only and ask you to revoke manually.
 - If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
-- In interactive mode, if `--host` is not provided, the script asks before calling `https://api.ipify.org` to detect the public IP; in `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
+- In interactive mode, if `--host` is not provided, the script asks before automatic detection. It first tries local public interface addresses and common cloud metadata endpoints; only if that fails does it try `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`, and it clearly reports success or failure. In `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
 - `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately.
 
 ## Files written
@@ -343,7 +343,7 @@ atq
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.
-- In interactive mode, missing `--host` asks before querying `api.ipify.org`; `--yes` mode requires explicit `--host`.
+- In interactive mode, missing `--host` asks before automatic public-IP detection; the script first tries local/cloud metadata, then external public-IP services if needed, and clearly reports success or failure. `--yes` mode requires explicit `--host`.
 - When stdout is not a TTY, the script refuses to print the one-time private key unless `--allow-non-tty-private-key-output` is passed.
 - `--sudo --yes` requires `--confirm-sudo USER` to avoid accidentally granting sudo non-interactively.
 

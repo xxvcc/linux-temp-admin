@@ -651,15 +651,79 @@ get_ssh_port() {
   echo "${port:-22}"
 }
 
-get_public_ip() {
-  local ip=""
+is_public_ipv4() {
+  local ip="$1" IFS=. octets
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  read -r -a octets <<< "$ip"
+  [[ ${#octets[@]} -eq 4 ]] || return 1
+  local o
+  for o in "${octets[@]}"; do
+    [[ "$o" =~ ^[0-9]+$ && "$o" -le 255 ]] || return 1
+  done
+  case "${octets[0]}" in
+    0|10|127|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255) return 1 ;;
+  esac
+  [[ "${octets[0]}" -eq 100 && "${octets[1]}" -ge 64 && "${octets[1]}" -le 127 ]] && return 1
+  [[ "${octets[0]}" -eq 169 && "${octets[1]}" -eq 254 ]] && return 1
+  [[ "${octets[0]}" -eq 172 && "${octets[1]}" -ge 16 && "${octets[1]}" -le 31 ]] && return 1
+  [[ "${octets[0]}" -eq 192 && "${octets[1]}" -eq 168 ]] && return 1
+  [[ "${octets[0]}" -eq 198 && ( "${octets[1]}" -eq 18 || "${octets[1]}" -eq 19 ) ]] && return 1
+  return 0
+}
+
+get_url_text() {
+  local url="$1"
   if command_exists curl; then
-    ip=$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
+    curl -fsS --connect-timeout 1 --max-time 2 "$url" 2>/dev/null | tr -d '[:space:]' || true
+  elif command_exists wget; then
+    wget -qO- --timeout=2 "$url" 2>/dev/null | tr -d '[:space:]' || true
   fi
-  if [[ -z "$ip" ]] && command_exists wget; then
-    ip=$(wget -qO- --timeout=3 https://api.ipify.org 2>/dev/null || true)
+}
+
+get_local_public_ip() {
+  local ip="" service
+  local metadata_services=(
+    "http://metadata.tencentyun.com/latest/meta-data/public-ipv4"
+    "http://169.254.169.254/latest/meta-data/public-ipv4"
+    "http://100.100.100.200/latest/meta-data/eipv4"
+  )
+  for service in "${metadata_services[@]}"; do
+    ip=$(get_url_text "$service")
+    if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+
+  if command_exists ip; then
+    while IFS= read -r ip; do
+      if is_public_ipv4 "$ip"; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' || true)
+    if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
   fi
-  echo "$ip"
+  return 1
+}
+
+get_public_ip() {
+  local ip="" service
+  local services=("https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com")
+  for service in "${services[@]}"; do
+    ip=$(get_url_text "$service")
+    if [[ -n "$ip" ]] && valid_host "$ip"; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+    ip=""
+  done
+  return 1
 }
 
 expire_date_from_hours() {
@@ -931,10 +995,17 @@ invite() {
       err "--yes 模式不会自动访问外部服务探测公网 IP，请显式传入 --host。"
       exit 1
     else
-      warn "自动探测公网 IP 会访问外部服务：https://api.ipify.org"
+      warn "自动探测会先尝试本地网卡和云厂商 metadata；失败后才访问外部服务：https://api.ipify.org、https://ifconfig.me/ip、https://icanhazip.com"
       read -r -p "是否自动探测公网 IP？[y/N]: " ans_host
       if [[ "$ans_host" =~ ^[Yy]$ ]]; then
-        host=$(get_public_ip)
+        if host=$(get_local_public_ip); then
+          info "已通过本地/云元数据探测公网 IP：$host"
+        elif host=$(get_public_ip); then
+          info "已通过外部服务探测公网 IP：$host"
+        else
+          warn "自动探测公网 IP 失败，请手动输入服务器公网 IP/域名。"
+          host=""
+        fi
       fi
     fi
   fi

@@ -307,7 +307,7 @@ sudo bash temp-admin.sh expiry-status
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
 - 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务；如果 `at` 也不可用，才会降级为只设置账号过期，并提示手动删除。
 - 如果无法设置账号过期日期（缺少 `chage` 或 `chage` 执行失败），脚本会停止创建并回滚刚创建的用户。
-- 交互模式不传 `--host` 时，脚本会先询问是否访问 `https://api.ipify.org` 获取公网 IP；`--yes` 非交互模式不会静默外联，必须显式传入 `--host`。
+- 交互模式不传 `--host` 时，脚本会先询问是否自动探测；探测会优先尝试本地公网网卡地址和常见云厂商 metadata，失败后才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成功或失败都会给出明确提示；`--yes` 非交互模式不会静默外联，必须显式传入 `--host`。
 - `--host` 只接受普通域名、IPv4 或 IPv6 地址；不要带端口，端口请用 `--port` 单独指定。
 
 ## 安装后写入的内容
@@ -343,7 +343,7 @@ atq
 - sudo 权限基本等同 root，请只给可信对象。
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 - 用完请立即执行 `revoke`，不要只依赖过期兜底。
-- 交互模式不传 `--host` 会询问是否查询 `api.ipify.org` 获取公网 IP；`--yes` 模式必须手动指定 `--host`。
+- 交互模式不传 `--host` 会询问是否自动探测公网 IP；脚本会先尝试本地/云元数据，再按需查询外部公网 IP 服务，并明确提示成功或失败；`--yes` 模式必须手动指定 `--host`。
 - stdout 不是 TTY 时默认拒绝输出一次性私钥；只有确认输出通道安全时才使用 `--allow-non-tty-private-key-output`。
 - `--sudo --yes` 必须同时传入 `--confirm-sudo USER`，避免非交互误授予 sudo。
 
