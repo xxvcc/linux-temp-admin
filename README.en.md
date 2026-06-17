@@ -37,6 +37,18 @@ Create a one-time sudo invite directly:
 sudo bash temp-admin-en.sh invite --sudo
 ```
 
+For non-interactive sudo invites, repeat the full username and explicitly allow private-key output if stdout is not a TTY:
+
+```bash
+sudo bash temp-admin-en.sh invite \
+  --user xxvcc-a1b2c3d4e5 \
+  --host 203.0.113.10 \
+  --sudo \
+  --yes \
+  --confirm-sudo xxvcc-a1b2c3d4e5 \
+  --allow-non-tty-private-key-output
+```
+
 ---
 
 ## Why use it?
@@ -54,16 +66,18 @@ This script standardizes the workflow: create, print invite bundle, register, in
 ## Features
 
 - **Generates a fresh SSH key pair every time**.
-- **Default username prefix is `xxvcc`**, e.g. `xxvcc-a1b2c3`.
+- **Default username prefix is `xxvcc`**, e.g. `xxvcc-a1b2c3d4e5`.
 - **Optional NOPASSWD sudo / wheel access**.
 - **Default validity is 24 hours**.
-- **Auto-delete on expiry by default** using persistent systemd `.service/.timer` units.
+- **Auto-delete on expiry by default** using persistent systemd `.service/.timer` units first, with an `at` fallback when systemd scheduling is unavailable.
 - **Key-only login**: account password is locked by default, and no account/sudo password is printed.
 - **Deletes the home directory and SSH key when revoked**.
-- **Deletion guard**: by default, `revoke` only deletes registered users or users matching the default prefix; other users require explicit `--force`.
+- **Deletion guard**: by default, `revoke` only deletes users registered by the script; unregistered users require explicit `--force`, and non-interactive deletion also requires `--confirm-force USER`.
 - **Rollback on failed creation**: if creation fails mid-way, the script tries to remove the temporary user it just created.
 - **Keeps a local registry of temporary users** so you can select by number when revoking.
-- **Detects missing dependencies** and can install them interactively.
+- **Detects missing dependencies** and can install them interactively; auto-install requires typing `YES` or passing `--install-deps`.
+- **Non-TTY private-key output guard**: refuses to print the private key when stdout is not a terminal unless `--allow-non-tty-private-key-output` is passed.
+- **Non-interactive sudo confirmation**: `--sudo --yes` requires `--confirm-sudo USER`.
 - **Separate Chinese and English scripts**: `temp-admin.sh` is the default Chinese script, and `temp-admin-en.sh` is the English script.
 - **Does not modify sshd_config, firewall rules, or open ports**.
 
@@ -74,7 +88,7 @@ Run script
   ↓
 Generate SSH private key + public key
   ↓
-Create a temporary user, e.g. xxvcc-a1b2c3
+Create a temporary user, e.g. xxvcc-a1b2c3d4e5
   ↓
 Write /home/USER/.ssh/authorized_keys
   ↓
@@ -82,7 +96,7 @@ Optionally add the user to sudo/wheel
   ↓
 Register it in /var/lib/linux-temp-admin/users.tsv
   ↓
-Schedule auto-revoke with a persistent systemd timer by default
+Schedule auto-revoke with a persistent systemd timer by default; use at fallback when systemd scheduling fails
   ↓
 Print a one-time invite bundle
 ```
@@ -117,6 +131,8 @@ The script checks for:
 - `useradd` or `adduser`
 - `usermod`
 - `chage`
+- `flock`
+- `at` / `atq` / `atrm` only for fallback auto-delete when systemd scheduling is unavailable
 - `sudo` when sudo access is requested
 
 It can install missing dependencies with:
@@ -172,16 +188,19 @@ sudo bash temp-admin.sh invite --sudo
 
 ## Non-interactive examples
 
-Auto-install dependencies and create a sudo invite:
+Auto-install dependencies and create a sudo invite. Non-interactive mode must pass `--host`; `--sudo --yes` must repeat the username, and non-TTY stdout must explicitly allow private-key output:
 
 ```bash
 sudo bash temp-admin-en.sh invite \
+  --user xxvcc-a1b2c3d4e5 \
   --host 203.0.113.10 \
   --port 22 \
   --hours 24 \
   --sudo \
   --install-deps \
-  --yes
+  --yes \
+  --confirm-sudo xxvcc-a1b2c3d4e5 \
+  --allow-non-tty-private-key-output
 ```
 
 Disable auto-delete and keep only account expiry:
@@ -205,30 +224,30 @@ This is only a format example and **cannot be used to log in**. Real private key
 
 Host: 203.0.113.10
 Port: 22
-User: xxvcc-a1b2c3
+User: xxvcc-a1b2c3d4e5
 Expires: 2026-05-17 01:00:00 CST
 Sudo: yes
 Login: SSH key only
 Password login: locked
 Auto revoke: yes
-Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3
+Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3d4e5
 
 SSH login command:
-ssh -i ./xxvcc-a1b2c3.key -p 22 xxvcc-a1b2c3@203.0.113.10
+ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
 
 Save private key command:
-cat > xxvcc-a1b2c3.key <<'EOF_KEY'
+cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
 [REDACTED: one-time private key generated at runtime]
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
-chmod 600 xxvcc-a1b2c3.key
+chmod 600 './xxvcc-a1b2c3d4e5.key'
 
 Sudo note:
 NOPASSWD sudo is enabled. This account can log in only with the SSH key; account password is locked.
 
 Revoke command:
-sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3
+sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 
 Security notes:
 - The private key is shown only once and is not stored on the server.
@@ -257,13 +276,14 @@ sudo bash temp-admin-en.sh revoke
 Delete a specific user:
 
 ```bash
-sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3
+sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
-By default, `revoke` only deletes users registered by the script or users matching the default `xxvcc-*` prefix. To delete another user, explicitly pass `--force`:
+By default, `revoke` only deletes users registered by the script. To delete an unregistered user, explicitly pass `--force`; if you also use `--yes` non-interactively, repeat the full username:
 
 ```bash
 sudo bash temp-admin-en.sh revoke --user USER --force
+sudo bash temp-admin-en.sh revoke --user USER --force --yes --confirm-force USER
 ```
 
 Show account expiry and auto-delete timers:
@@ -278,16 +298,16 @@ sudo bash temp-admin-en.sh expiry-status
 Default validity is 24 hours. The script tries to do two things:
 
 1. set account expiry with `chage -E`;
-2. write `/etc/systemd/system/linux-temp-admin-revoke-USER.service` and `.timer`, using `OnCalendar` + `Persistent=true` for persistent auto-delete.
+2. write `/etc/systemd/system/linux-temp-admin-revoke-USER.service` and `.timer`, using `OnCalendar` + `Persistent=true` for persistent auto-delete first; if systemd scheduling is unavailable or fails, try an `at` fallback job.
 
 Important details:
 
 - `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer.
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
-- If `systemctl` is unavailable or the revoke time cannot be calculated, the script falls back to account expiry only and asks you to revoke manually.
+- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job; only if `at` is unavailable too does it fall back to account expiry only and ask you to revoke manually.
 - If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
-- If `--host` is not provided, the script tries to call `https://api.ipify.org` to detect the public IP for invite display only; pass `--host` explicitly if you do not want this external lookup.
+- In interactive mode, if `--host` is not provided, the script asks before calling `https://api.ipify.org` to detect the public IP; in `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
 - `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately.
 
 ## Files written
@@ -299,14 +319,16 @@ The script may write:
 /var/lib/linux-temp-admin/users.tsv
 /etc/systemd/system/linux-temp-admin-revoke-USER.service  # includes lightweight NoNewPrivileges/PrivateTmp hardening
 /etc/systemd/system/linux-temp-admin-revoke-USER.timer
+fallback job in the at queue                    # only when systemd timer is unavailable and at is available
 /etc/sudoers.d/linux-temp-admin-USER       # only when passwordless sudo is enabled
 /home/USER/.ssh/authorized_keys
 ```
 
-Auto-delete is managed by persistent systemd timers. Inspect them with:
+Auto-delete is managed by persistent systemd timers first. Inspect timers and fallback `at` jobs with:
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
+atq
 ```
 
 ## Security notes
@@ -315,13 +337,15 @@ systemctl list-timers --all | grep linux-temp-admin
 - Account password is locked by default, and no account/sudo password is printed.
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key.
-- Deletion guard: `revoke` only deletes registered/default-prefix users unless `--force` is explicitly used.
-- If you create users with a custom `--prefix` and the local registry is lost/corrupted, revoking those users also requires explicit `--force`.
+- Deletion guard: `revoke` only deletes registered users unless `--force` is explicitly used; non-interactive deletion of unregistered users also requires `--confirm-force USER`.
+- If the local registry is lost/corrupted, revoking those users also requires explicit `--force`; non-interactive deletion also requires `--confirm-force USER`.
 - If account creation fails mid-way, the script tries to roll back and remove the just-created temporary user.
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.
-- Without `--host`, the script queries `api.ipify.org` for the public IP; pass `--host` manually if you want to avoid external requests.
+- In interactive mode, missing `--host` asks before querying `api.ipify.org`; `--yes` mode requires explicit `--host`.
+- When stdout is not a TTY, the script refuses to print the one-time private key unless `--allow-non-tty-private-key-output` is passed.
+- `--sudo --yes` requires `--confirm-sudo USER` to avoid accidentally granting sudo non-interactively.
 
 ## Validation
 
