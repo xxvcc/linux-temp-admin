@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
+umask 077
 
 SCRIPT_NAME="temp-admin-en.sh"
 VERSION="0.8.2"
@@ -86,9 +88,9 @@ confirm_yes() {
 
 require_value() {
   local opt="$1"
-  local value="${2-}"
+  local value="${2:-}"
   if [[ -z "$value" || "$value" == --* ]]; then
-    err "Option $opt requires a value."
+    err "Missing value for option $opt."
     usage
     exit 1
   fi
@@ -154,6 +156,7 @@ package_candidates_for_tool() {
       case "$pm" in
         apt|dnf|yum|pacman) echo "util-linux" ;;
         apk) echo "util-linux-misc" ;;
+        *) echo "" ;;
       esac
       ;;
     at) echo "at" ;;
@@ -263,7 +266,7 @@ random_hex() {
 }
 
 valid_username() {
-  [[ "$1" =~ ^[a-z_][a-z0-9_-]{1,30}$ ]]
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}[a-z0-9]$ ]]
 }
 
 valid_prefix() {
@@ -313,7 +316,7 @@ valid_host() {
     read -r -a octets <<< "$host"
     [[ ${#octets[@]} -eq 4 ]] || return 1
     for octet in "${octets[@]}"; do
-      [[ "$octet" =~ ^[0-9]+$ && "$octet" -le 255 ]] || return 1
+      [[ "$octet" =~ ^[0-9]+$ && $((10#$octet)) -le 255 ]] || return 1
     done
     return 0
   fi
@@ -358,6 +361,12 @@ registry_contains_user() {
 registry_init() {
   mkdir -p "$REGISTRY_DIR"
   chmod 700 "$REGISTRY_DIR"
+  # Prevent symlink attacks: remove if target is a symlink
+  for f in "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"; do
+    if [[ -L "$f" ]]; then
+      rm -f "$f"
+    fi
+  done
   touch "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"
   chmod 600 "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"
 }
@@ -372,7 +381,11 @@ registry_lock() {
   fi
   local fd
   exec {fd}>"$REGISTRY_LOCK_FILE"
-  flock "$fd"
+  if ! flock "$fd"; then
+    warn "Failed to acquire registry lock; concurrent-write risk."
+    exec {fd}>&-
+    return 1
+  fi
   printf -v "$__fd_var" '%s' "$fd"
 }
 
@@ -386,6 +399,11 @@ registry_unlock() {
 registry_remove_user_unlocked() {
   local user="$1"
   [[ -f "$REGISTRY_FILE" ]] || return 0
+  # Prevent symlink attack
+  if [[ -L "$REGISTRY_FILE" ]]; then
+    warn "Registry is a symlink; ignoring."
+    return 1
+  fi
   local tmp
   tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
   awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
@@ -407,6 +425,11 @@ registry_record_user() {
   local lock_fd
   registry_lock lock_fd
   registry_remove_user_unlocked "$user" 2>/dev/null || true
+  if [[ -L "$REGISTRY_FILE" ]]; then
+    warn "Registry is a symlink; ignoring append."
+    registry_unlock "$lock_fd"
+    return 1
+  fi
   local created
   created=$(date '+%F %T %Z')
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -483,17 +506,28 @@ auto_revoke_unit_name() {
   if command_exists systemd-escape && escaped=$(systemd-escape -- "$user" 2>/dev/null) && [[ -n "$escaped" ]]; then
     printf '%s-revoke-%s' "$MANAGED_TAG" "$escaped"
   else
-    printf '%s-revoke-%s' "$MANAGED_TAG" "$user"
+    # Fallback: strip unsafe chars to prevent path traversal
+    local safe="${user//[^a-zA-Z0-9_-]/}"
+    [[ -n "$safe" ]] || safe="unknown"
+    printf '%s-revoke-%s' "$MANAGED_TAG" "$safe"
   fi
 }
 
 auto_revoke_service_path() {
   local unit="$1"
+  if [[ "$unit" == *"/"* ]]; then
+    err "systemd unit name contains illegal characters: $unit"
+    return 1
+  fi
   printf '%s/%s.service' "$SYSTEMD_DIR" "$unit"
 }
 
 auto_revoke_timer_path() {
   local unit="$1"
+  if [[ "$unit" == *"/"* ]]; then
+    err "systemd unit name contains illegal characters: $unit"
+    return 1
+  fi
   printf '%s/%s.timer' "$SYSTEMD_DIR" "$unit"
 }
 
@@ -534,7 +568,11 @@ show_installed_revoke_status() {
 install_self_for_revoke() {
   local src="${BASH_SOURCE[0]}"
   if [[ ! -f "$src" ]]; then
-    warn "Cannot locate current script file; cannot install stable revoke command."
+    warn "Cannot locate current script file; unable to install stable revoke command."
+    return 1
+  fi
+  if [[ -L "$INSTALL_PATH" ]]; then
+    warn "$INSTALL_PATH is a symlink; refusing installation to prevent TOCTOU attack."
     return 1
   fi
   install -m 700 -o root -g root "$src" "$INSTALL_PATH"
@@ -542,6 +580,10 @@ install_self_for_revoke() {
 
 schedule_at_revoke() {
   local user="$1" hours="$2"
+  if ! [[ "$hours" =~ ^[0-9]+$ && "$hours" -ge 1 && "$hours" -le "$MAX_EXPIRE_HOURS" ]]; then
+    warn "Invalid hours value, cannot create at auto-revoke task."
+    return 1
+  fi
   if ! command_exists at; then
     warn "at not found; fallback auto-delete task cannot be created; account expiry only."
     return 1
@@ -554,12 +596,14 @@ schedule_at_revoke() {
   install_arg=$(shell_quote_arg "$INSTALL_PATH")
   user_arg=$(shell_quote_arg "$user")
   if ! output=$(printf "%s revoke --user %s --yes\n" "$install_arg" "$user_arg" | at now + "$hours" hours 2>&1); then
-    warn "Failed to create at auto-delete task: $output"
+    warn "Failed to create at auto-revoke job: $output"
     return 1
   fi
+  # Try multiple output formats for compatibility with different at versions
   job_id=$(awk '/^job[[:space:]]+[0-9]+/ {print $2; exit}' <<< "$output")
+  [[ -n "$job_id" && "$job_id" =~ ^[0-9]+$ ]] || job_id=$(awk 'NF && $1 ~ /^[0-9]+$/ {print $1; exit}' <<< "$output")
   if [[ -z "$job_id" || ! "$job_id" =~ ^[0-9]+$ ]]; then
-    warn "Could not parse at auto-delete job id: $output"
+    warn "Unable to parse at job id: $output"
     return 1
   fi
   printf 'at:%s\n' "$job_id"
@@ -583,8 +627,17 @@ schedule_auto_revoke() {
   fi
   local unit service_path timer_path timer_schedule on_calendar exec_start
   unit=$(auto_revoke_unit_name "$user")
-  service_path=$(auto_revoke_service_path "$unit")
-  timer_path=$(auto_revoke_timer_path "$unit")
+  if ! service_path=$(auto_revoke_service_path "$unit") || [[ -z "$service_path" ]]; then
+    warn "Failed to generate systemd service path; falling back to at."
+    schedule_at_revoke "$user" "$hours"
+    return $?
+  fi
+  if ! timer_path=$(auto_revoke_timer_path "$unit") || [[ -z "$timer_path" ]]; then
+    warn "Failed to generate systemd timer path; falling back to at."
+    rm -f "$service_path"
+    schedule_at_revoke "$user" "$hours"
+    return $?
+  fi
   exec_start="$(systemd_quote_arg "$INSTALL_PATH") revoke --user $(systemd_quote_arg "$user") --yes"
   if on_calendar=$(date -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
     timer_schedule="OnCalendar=$on_calendar
@@ -699,7 +752,7 @@ is_public_ipv4() {
   [[ ${#octets[@]} -eq 4 ]] || return 1
   local o
   for o in "${octets[@]}"; do
-    [[ "$o" =~ ^[0-9]+$ && "$o" -le 255 ]] || return 1
+    [[ "$o" =~ ^[0-9]+$ && $((10#$o)) -le 255 ]] || return 1
   done
   case "${octets[0]}" in
     0|10|127|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255) return 1 ;;
@@ -721,15 +774,15 @@ ip_probe_debug() {
 get_url_text() {
   local url="$1" max_time="${2:-3}" connect_timeout="${3:-1}"
   local output="" status=0 tmp_err err=""
-  tmp_err=$(mktemp)
+  tmp_err=$(mktemp -t linux-temp-admin.XXXXXX)
   if command_exists curl; then
-    if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+    if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
     fi
   elif command_exists wget; then
-    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
@@ -874,9 +927,9 @@ create_user_if_needed() {
     exit 1
   fi
   if command_exists useradd; then
-    useradd -m -s "$shell_path" -c "$MANAGED_TAG temporary admin" "$user"
+    useradd -m -s "$shell_path" -c "${MANAGED_TAG} temporary admin" "$user"
   elif command_exists adduser; then
-    adduser -D -s "$shell_path" -g "$MANAGED_TAG temporary admin" "$user"
+    adduser -D -s "$shell_path" -g "${MANAGED_TAG} temporary admin" "$user"
   else
     err "useradd/adduser not found; cannot create user."
     exit 1
@@ -930,8 +983,8 @@ add_sudo() {
   if command_exists visudo; then
     visudo -cf "$file" >/dev/null || {
       rm -f "$file"
-      err "sudoers validation failed; removed $file"
-      exit 1
+      err "sudoers validation failed, removed $file"
+      return 1
     }
   fi
 }
@@ -944,15 +997,25 @@ remove_sudoers_file() {
 write_ssh_key() {
   local user="$1"
   local pubkey_file="$2"
-  local home_dir
-  home_dir=$(getent passwd "$user" | cut -d: -f6)
+  local home_dir uid gid
+  home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
   if [[ -z "$home_dir" || ! -d "$home_dir" ]]; then
-    err "User home directory not found: $user"
-    exit 1
+    err "Home directory not found: $user"
+    return 1
   fi
-  install -d -m 700 -o "$user" -g "$user" "$home_dir/.ssh"
+  uid=$(id -u "$user" 2>/dev/null || true)
+  gid=$(id -g "$user" 2>/dev/null || true)
+  if [[ -z "$uid" || -z "$gid" ]]; then
+    err "Unable to get UID/GID: $user"
+    return 1
+  fi
+  install -d -m 700 -o "$uid" -g "$gid" "$home_dir/.ssh"
+  # Backup existing authorized_keys if present
+  if [[ -f "$home_dir/.ssh/authorized_keys" ]]; then
+    cp -a "$home_dir/.ssh/authorized_keys" "$home_dir/.ssh/authorized_keys.backup.$(date +%s)"
+  fi
   cat "$pubkey_file" > "$home_dir/.ssh/authorized_keys"
-  chown "$user:$user" "$home_dir/.ssh/authorized_keys"
+  chown "$uid:$gid" "$home_dir/.ssh/authorized_keys"
   chmod 600 "$home_dir/.ssh/authorized_keys"
 }
 
@@ -960,15 +1023,18 @@ write_ssh_key() {
 rollback_created_user() {
   local user="$1"
   [[ -n "${user:-}" ]] || return 0
-  warn "Error during creation; rolling back temporary user: $user"
+  warn "Creation failed; rolling back temporary user: $user"
   cancel_auto_revoke "$user" || true
+  # Send SIGTERM first for graceful cleanup, then SIGKILL
+  pkill -TERM -u "$user" 2>/dev/null || true
+  sleep 2
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user" || true
   if user_exists "$user"; then
     if command_exists deluser; then
-      deluser --remove-home "$user" >/dev/null 2>&1 || userdel -r "$user" >/dev/null 2>&1 || warn "Rollback failed to delete user; please inspect manually: $user"
+      deluser --remove-home "$user" >/dev/null 2>&1 || userdel -r "$user" >/dev/null 2>&1 || warn "Rollback failed to remove user; please check manually: $user"
     else
-      userdel -r "$user" >/dev/null 2>&1 || warn "Rollback failed to delete user; please inspect manually: $user"
+      userdel -r "$user" >/dev/null 2>&1 || warn "Rollback failed to remove user; please check manually: $user"
     fi
   fi
   registry_remove_user "$user" || true
@@ -1191,9 +1257,11 @@ EOF
     exit "$code"
   }
   trap cleanup_invite_error ERR
-  trap 'rm -rf "$tmpdir"' RETURN
+  trap 'rm -rf "$tmpdir"' RETURN EXIT
 
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
+  chmod 600 "$keyfile"
+  chmod 644 "$pubfile"
 
   create_user_if_needed "$user" "$login_shell"
   created_user="$user"
@@ -1285,12 +1353,15 @@ ${YELLOW}Will force logout and delete user %s and its home directory.${NC}
     fi
   fi
   cancel_auto_revoke "$user"
+  # Send SIGTERM first for graceful cleanup, then SIGKILL
+  pkill -TERM -u "$user" 2>/dev/null || true
+  sleep 2
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user"
   if command_exists deluser; then
-    deluser --remove-home "$user" || userdel -r "$user"
+    deluser --remove-home "$user" >/dev/null 2>&1 || userdel -r "$user" >/dev/null 2>&1 || warn "Failed to remove user: $user"
   else
-    userdel -r "$user"
+    userdel -r "$user" >/dev/null 2>&1 || warn "Failed to remove user: $user"
   fi
   registry_remove_user "$user"
   success "User revoked and deleted: $user"
@@ -1309,7 +1380,7 @@ status_user() {
       id "$user"
       getent passwd "$user"
       local home_dir
-      home_dir=$(getent passwd "$user" | cut -d: -f6)
+      home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
       if [[ -d "$home_dir/.ssh" ]]; then
         stat -c '.ssh mode=%a owner=%U:%G path=%n' "$home_dir/.ssh" 2>/dev/null || ls -ld "$home_dir/.ssh"
         [[ -f "$home_dir/.ssh/authorized_keys" ]] && stat -c 'authorized_keys mode=%a owner=%U:%G path=%n' "$home_dir/.ssh/authorized_keys" 2>/dev/null || true

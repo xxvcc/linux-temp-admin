@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
+umask 077
 
 SCRIPT_NAME="temp-admin.sh"
 VERSION="0.8.2"
@@ -86,7 +88,7 @@ confirm_yes() {
 
 require_value() {
   local opt="$1"
-  local value="${2-}"
+  local value="${2:-}"
   if [[ -z "$value" || "$value" == --* ]]; then
     err "参数 $opt 缺少值。"
     usage
@@ -154,6 +156,7 @@ package_candidates_for_tool() {
       case "$pm" in
         apt|dnf|yum|pacman) echo "util-linux" ;;
         apk) echo "util-linux-misc" ;;
+        *) echo "" ;;
       esac
       ;;
     at) echo "at" ;;
@@ -263,7 +266,7 @@ random_hex() {
 }
 
 valid_username() {
-  [[ "$1" =~ ^[a-z_][a-z0-9_-]{1,30}$ ]]
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}[a-z0-9]$ ]]
 }
 
 valid_prefix() {
@@ -313,7 +316,7 @@ valid_host() {
     read -r -a octets <<< "$host"
     [[ ${#octets[@]} -eq 4 ]] || return 1
     for octet in "${octets[@]}"; do
-      [[ "$octet" =~ ^[0-9]+$ && "$octet" -le 255 ]] || return 1
+      [[ "$octet" =~ ^[0-9]+$ && $((10#$octet)) -le 255 ]] || return 1
     done
     return 0
   fi
@@ -358,6 +361,12 @@ registry_contains_user() {
 registry_init() {
   mkdir -p "$REGISTRY_DIR"
   chmod 700 "$REGISTRY_DIR"
+  # 防止 symlink 攻击：如果目标是 symlink，先删除
+  for f in "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"; do
+    if [[ -L "$f" ]]; then
+      rm -f "$f"
+    fi
+  done
   touch "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"
   chmod 600 "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"
 }
@@ -372,7 +381,11 @@ registry_lock() {
   fi
   local fd
   exec {fd}>"$REGISTRY_LOCK_FILE"
-  flock "$fd"
+  if ! flock "$fd"; then
+    warn "获取注册表锁失败，操作可能存在并发风险。"
+    exec {fd}>&-
+    return 1
+  fi
   printf -v "$__fd_var" '%s' "$fd"
 }
 
@@ -386,6 +399,11 @@ registry_unlock() {
 registry_remove_user_unlocked() {
   local user="$1"
   [[ -f "$REGISTRY_FILE" ]] || return 0
+  # 防止 symlink 攻击
+  if [[ -L "$REGISTRY_FILE" ]]; then
+    warn "注册表是符号链接，已忽略。"
+    return 1
+  fi
   local tmp
   tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
   awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
@@ -407,6 +425,11 @@ registry_record_user() {
   local lock_fd
   registry_lock lock_fd
   registry_remove_user_unlocked "$user" 2>/dev/null || true
+  if [[ -L "$REGISTRY_FILE" ]]; then
+    warn "注册表是符号链接，已忽略追加。"
+    registry_unlock "$lock_fd"
+    return 1
+  fi
   local created
   created=$(date '+%F %T %Z')
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -483,17 +506,28 @@ auto_revoke_unit_name() {
   if command_exists systemd-escape && escaped=$(systemd-escape -- "$user" 2>/dev/null) && [[ -n "$escaped" ]]; then
     printf '%s-revoke-%s' "$MANAGED_TAG" "$escaped"
   else
-    printf '%s-revoke-%s' "$MANAGED_TAG" "$user"
+    # 回退路径：去除所有非安全字符，防止路径穿越
+    local safe="${user//[^a-zA-Z0-9_-]/}"
+    [[ -n "$safe" ]] || safe="unknown"
+    printf '%s-revoke-%s' "$MANAGED_TAG" "$safe"
   fi
 }
 
 auto_revoke_service_path() {
   local unit="$1"
+  if [[ "$unit" == *"/"* ]]; then
+    err "systemd unit 名称含有非法字符: $unit"
+    return 1
+  fi
   printf '%s/%s.service' "$SYSTEMD_DIR" "$unit"
 }
 
 auto_revoke_timer_path() {
   local unit="$1"
+  if [[ "$unit" == *"/"* ]]; then
+    err "systemd unit 名称含有非法字符: $unit"
+    return 1
+  fi
   printf '%s/%s.timer' "$SYSTEMD_DIR" "$unit"
 }
 
@@ -537,11 +571,19 @@ install_self_for_revoke() {
     warn "无法定位当前脚本文件，不能安装稳定撤销命令。"
     return 1
   fi
+  if [[ -L "$INSTALL_PATH" ]]; then
+    warn "$INSTALL_PATH 是符号链接，拒绝安装以防止 TOCTOU 攻击。"
+    return 1
+  fi
   install -m 700 -o root -g root "$src" "$INSTALL_PATH"
 }
 
 schedule_at_revoke() {
   local user="$1" hours="$2"
+  if ! [[ "$hours" =~ ^[0-9]+$ && "$hours" -ge 1 && "$hours" -le "$MAX_EXPIRE_HOURS" ]]; then
+    warn "无效的小时数，无法创建 at 自动删除任务。"
+    return 1
+  fi
   if ! command_exists at; then
     warn "找不到 at，无法创建备用自动删除任务；仅设置账号过期。"
     return 1
@@ -557,7 +599,9 @@ schedule_at_revoke() {
     warn "创建 at 自动删除任务失败：$output"
     return 1
   fi
+  # 尝试多种格式解析 job id（兼容不同版本的 at 输出）
   job_id=$(awk '/^job[[:space:]]+[0-9]+/ {print $2; exit}' <<< "$output")
+  [[ -n "$job_id" && "$job_id" =~ ^[0-9]+$ ]] || job_id=$(awk 'NF && $1 ~ /^[0-9]+$/ {print $1; exit}' <<< "$output")
   if [[ -z "$job_id" || ! "$job_id" =~ ^[0-9]+$ ]]; then
     warn "无法识别 at 自动删除任务编号：$output"
     return 1
@@ -583,8 +627,17 @@ schedule_auto_revoke() {
   fi
   local unit service_path timer_path timer_schedule on_calendar exec_start
   unit=$(auto_revoke_unit_name "$user")
-  service_path=$(auto_revoke_service_path "$unit")
-  timer_path=$(auto_revoke_timer_path "$unit")
+  if ! service_path=$(auto_revoke_service_path "$unit") || [[ -z "$service_path" ]]; then
+    warn "生成 systemd service 路径失败，将尝试使用 at 创建备用自动删除任务。"
+    schedule_at_revoke "$user" "$hours"
+    return $?
+  fi
+  if ! timer_path=$(auto_revoke_timer_path "$unit") || [[ -z "$timer_path" ]]; then
+    warn "生成 systemd timer 路径失败，将尝试使用 at 创建备用自动删除任务。"
+    rm -f "$service_path"
+    schedule_at_revoke "$user" "$hours"
+    return $?
+  fi
   exec_start="$(systemd_quote_arg "$INSTALL_PATH") revoke --user $(systemd_quote_arg "$user") --yes"
   if on_calendar=$(date -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
     timer_schedule="OnCalendar=$on_calendar
@@ -699,7 +752,7 @@ is_public_ipv4() {
   [[ ${#octets[@]} -eq 4 ]] || return 1
   local o
   for o in "${octets[@]}"; do
-    [[ "$o" =~ ^[0-9]+$ && "$o" -le 255 ]] || return 1
+    [[ "$o" =~ ^[0-9]+$ && $((10#$o)) -le 255 ]] || return 1
   done
   case "${octets[0]}" in
     0|10|127|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255) return 1 ;;
@@ -721,15 +774,15 @@ ip_probe_debug() {
 get_url_text() {
   local url="$1" max_time="${2:-3}" connect_timeout="${3:-1}"
   local output="" status=0 tmp_err err=""
-  tmp_err=$(mktemp)
+  tmp_err=$(mktemp -t linux-temp-admin.XXXXXX)
   if command_exists curl; then
-    if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+    if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
     fi
   elif command_exists wget; then
-    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '[:space:]'); then
+    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
@@ -874,9 +927,9 @@ create_user_if_needed() {
     exit 1
   fi
   if command_exists useradd; then
-    useradd -m -s "$shell_path" -c "$MANAGED_TAG temporary admin" "$user"
+    useradd -m -s "$shell_path" -c "${MANAGED_TAG} temporary admin" "$user"
   elif command_exists adduser; then
-    adduser -D -s "$shell_path" -g "$MANAGED_TAG temporary admin" "$user"
+    adduser -D -s "$shell_path" -g "${MANAGED_TAG} temporary admin" "$user"
   else
     err "找不到 useradd/adduser，无法创建用户"
     exit 1
@@ -931,7 +984,7 @@ add_sudo() {
     visudo -cf "$file" >/dev/null || {
       rm -f "$file"
       err "sudoers 校验失败，已删除 $file"
-      exit 1
+      return 1
     }
   fi
 }
@@ -944,15 +997,25 @@ remove_sudoers_file() {
 write_ssh_key() {
   local user="$1"
   local pubkey_file="$2"
-  local home_dir
-  home_dir=$(getent passwd "$user" | cut -d: -f6)
+  local home_dir uid gid
+  home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
   if [[ -z "$home_dir" || ! -d "$home_dir" ]]; then
     err "找不到用户家目录：$user"
-    exit 1
+    return 1
   fi
-  install -d -m 700 -o "$user" -g "$user" "$home_dir/.ssh"
+  uid=$(id -u "$user" 2>/dev/null || true)
+  gid=$(id -g "$user" 2>/dev/null || true)
+  if [[ -z "$uid" || -z "$gid" ]]; then
+    err "无法获取 UID/GID：$user"
+    return 1
+  fi
+  install -d -m 700 -o "$uid" -g "$gid" "$home_dir/.ssh"
+  # 备份旧的 authorized_keys（如果存在）
+  if [[ -f "$home_dir/.ssh/authorized_keys" ]]; then
+    cp -a "$home_dir/.ssh/authorized_keys" "$home_dir/.ssh/authorized_keys.backup.$(date +%s)"
+  fi
   cat "$pubkey_file" > "$home_dir/.ssh/authorized_keys"
-  chown "$user:$user" "$home_dir/.ssh/authorized_keys"
+  chown "$uid:$gid" "$home_dir/.ssh/authorized_keys"
   chmod 600 "$home_dir/.ssh/authorized_keys"
 }
 
@@ -962,6 +1025,9 @@ rollback_created_user() {
   [[ -n "${user:-}" ]] || return 0
   warn "创建过程中出错，正在回滚临时用户：$user"
   cancel_auto_revoke "$user" || true
+  # 先发 SIGTERM 给用户进程一个清理机会，再 SIGKILL
+  pkill -TERM -u "$user" 2>/dev/null || true
+  sleep 2
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user" || true
   if user_exists "$user"; then
@@ -1191,9 +1257,11 @@ EOF
     exit "$code"
   }
   trap cleanup_invite_error ERR
-  trap 'rm -rf "$tmpdir"' RETURN
+  trap 'rm -rf "$tmpdir"' RETURN EXIT
 
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
+  chmod 600 "$keyfile"
+  chmod 644 "$pubfile"
 
   create_user_if_needed "$user" "$login_shell"
   created_user="$user"
@@ -1285,12 +1353,15 @@ ${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
     fi
   fi
   cancel_auto_revoke "$user"
+  # 先发 SIGTERM 给用户进程一个清理机会，再 SIGKILL
+  pkill -TERM -u "$user" 2>/dev/null || true
+  sleep 2
   pkill -KILL -u "$user" 2>/dev/null || true
   remove_sudoers_file "$user"
   if command_exists deluser; then
-    deluser --remove-home "$user" || userdel -r "$user"
+    deluser --remove-home "$user" >/dev/null 2>&1 || userdel -r "$user" >/dev/null 2>&1 || warn "删除用户失败: $user"
   else
-    userdel -r "$user"
+    userdel -r "$user" >/dev/null 2>&1 || warn "删除用户失败: $user"
   fi
   registry_remove_user "$user"
   success "已撤销并删除用户：$user"
@@ -1309,7 +1380,7 @@ status_user() {
       id "$user"
       getent passwd "$user"
       local home_dir
-      home_dir=$(getent passwd "$user" | cut -d: -f6)
+      home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
       if [[ -d "$home_dir/.ssh" ]]; then
         stat -c '.ssh mode=%a owner=%U:%G path=%n' "$home_dir/.ssh" 2>/dev/null || ls -ld "$home_dir/.ssh"
         [[ -f "$home_dir/.ssh/authorized_keys" ]] && stat -c 'authorized_keys mode=%a owner=%U:%G path=%n' "$home_dir/.ssh/authorized_keys" 2>/dev/null || true
