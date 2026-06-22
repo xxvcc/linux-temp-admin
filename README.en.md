@@ -72,8 +72,9 @@ This script standardizes the workflow: create, print invite bundle, register, in
 - **Auto-delete on expiry by default** using persistent systemd `.service/.timer` units first, with an `at` fallback when systemd scheduling is unavailable.
 - **Key-only login**: account password is locked by default, and no account/sudo password is printed.
 - **Deletes the home directory and SSH key when revoked**.
-- **Deletion guard**: by default, `revoke` only deletes users registered by the script; unregistered users require explicit `--force`, and non-interactive deletion also requires `--confirm-force USER`.
-- **Rollback on failed creation**: if creation fails mid-way, the script tries to remove the temporary user it just created.
+- **Deletion guard**: by default, `revoke` only deletes users registered by the script; unregistered users require explicit `--force`, and non-interactive deletion also requires `--confirm-force USER`; protected/system users are always refused.
+- **Rollback on failed creation**: if creation fails mid-way, the script tries to cancel auto-revoke tasks and remove the temporary user it just created.
+- **Safer writes for critical files**: registry, sudoers, systemd units, installed revoke command, and `authorized_keys` refuse unsafe symlinks/non-regular files and use atomic writes where practical.
 - **Keeps a local registry of temporary users** so you can select by number when revoking.
 - **Detects missing dependencies** and can install them interactively; auto-install requires typing `YES` or passing `--install-deps`.
 - **Non-TTY private-key output guard**: refuses to print the private key when stdout is not a terminal unless `--allow-non-tty-private-key-output` is passed.
@@ -129,6 +130,7 @@ The script checks for:
 - `bash`
 - `ssh-keygen`
 - `useradd` or `adduser`
+- `userdel` or `deluser`
 - `usermod`
 - `chage`
 - `flock`
@@ -337,10 +339,12 @@ atq
 - The private key is shown only once and is not stored on the server.
 - Account password is locked by default, and no account/sudo password is printed.
 - README examples are redacted placeholders and cannot log into any server.
-- Revoking a user deletes its home directory and SSH key.
+- Revoking a user deletes its home directory and SSH key; if the system delete command fails, the script stops and asks you to check manually instead of reporting a false success.
 - Deletion guard: `revoke` only deletes registered users unless `--force` is explicitly used; non-interactive deletion of unregistered users also requires `--confirm-force USER`.
+- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, or low-UID system accounts.
 - If the local registry is lost/corrupted, revoking those users also requires explicit `--force`; non-interactive deletion also requires `--confirm-force USER`.
-- If account creation fails mid-way, the script tries to roll back and remove the just-created temporary user.
+- If account creation fails mid-way, the script tries to cancel auto-revoke tasks, roll back sudoers/registry state, and remove the just-created temporary user.
+- The registry, sudoers, systemd units, `/usr/local/sbin/linux-temp-admin`, and user SSH key files perform basic path-safety checks and refuse to overwrite unsafe symlinks or non-regular files.
 - sudo access is effectively root access; grant it only to trusted parties.
 - Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
 - Revoke immediately after use; do not rely only on expiry.

@@ -72,8 +72,9 @@ sudo bash temp-admin.sh invite \
 - **默认尝试自动删除用户**：优先写入持久 systemd `.service/.timer`，失败时尽量使用 `at` 作为备用任务。
 - **Key-only 登录**：账号密码默认锁定，不输出账号/Sudo 密码。
 - **删除用户时删除家目录和 SSH key**。
-- **防误删保护**：默认只允许删除脚本登记用户；删除未登记用户必须显式加 `--force`，非交互还必须加 `--confirm-force USER`。
-- **创建失败自动回滚**：创建过程中出错时，会尽量删除已创建的临时用户。
+- **防误删保护**：默认只允许删除脚本登记用户；删除未登记用户必须显式加 `--force`，非交互还必须加 `--confirm-force USER`；受保护/系统用户始终拒绝删除。
+- **创建失败自动回滚**：创建过程中出错时，会尽量取消自动撤销任务并删除已创建的临时用户。
+- **关键文件安全写入**：登记表、sudoers、systemd unit、安装后的撤销命令和 `authorized_keys` 会拒绝不安全的符号链接/非普通文件，并尽量使用原子写入。
 - **本地登记临时用户**，删除时可编号选择。
 - **依赖自动检测**，缺失时可交互安装；自动安装需要明确输入 `YES` 或传入 `--install-deps`。
 - **非 TTY 私钥输出保护**：stdout 不是终端时默认拒绝输出私钥，需显式加 `--allow-non-tty-private-key-output`。
@@ -129,6 +130,7 @@ sudo bash temp-admin.sh invite \
 - `bash`
 - `ssh-keygen`
 - `useradd` 或 `adduser`
+- `userdel` 或 `deluser`
 - `usermod`
 - `chage`
 - `flock`
@@ -337,10 +339,12 @@ atq
 - 私钥只在创建时显示一次，服务器不保存私钥。
 - 账号密码默认锁定，不输出账号/Sudo 密码。
 - README 示例均为脱敏内容，不能登录任何服务器。
-- 删除用户时会删除家目录和 SSH key。
+- 删除用户时会删除家目录和 SSH key；如果系统删除命令失败，脚本会停止并提示手动检查，不会假装撤销成功。
 - 默认防误删：`revoke` 只删除登记用户；未登记用户需要 `--force`，非交互删除还需要 `--confirm-force USER`。
+- 即使使用 `--force`，脚本也会拒绝删除 root、常见系统账号、UID 0 或低 UID 系统账号。
 - 如果本地登记文件丢失/损坏，撤销时也需要显式加 `--force`；非交互场景同时需要 `--confirm-force USER`。
-- 创建过程中如果出错，脚本会尽量回滚并删除刚创建的临时用户。
+- 创建过程中如果出错，脚本会尽量取消自动撤销任务、回滚 sudoers/登记记录并删除刚创建的临时用户。
+- 登记表、sudoers、systemd unit、`/usr/local/sbin/linux-temp-admin` 和用户 SSH key 文件会做基础路径安全检查，拒绝覆盖不安全的符号链接或非普通文件。
 - sudo 权限基本等同 root，请只给可信对象。
 - 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
 - 用完请立即执行 `revoke`，不要只依赖过期兜底。
