@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin-en.sh"
-VERSION="0.8.1"
+VERSION="0.8.2"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -817,18 +817,22 @@ ssh_host_for_command() {
 
 expire_date_from_hours() {
   local hours="$1"
-  # chage -E is date-based. Use ceil(hours/24) days so short validity
-  # periods do not resolve to "today" and expire immediately.
+  # chage -E expires on the date at 00:00. If created in the evening
+  # (e.g. 21:00), ceil(hours/24)=1 causes chage to lock the account
+  # at 00:00 the next day -- only 3 hours later, far before the
+  # systemd timer fires. Add one extra day as buffer so the timer
+  # triggers first and chage acts only as a final safeguard.
   local days=$(( (hours + 23) / 24 ))
-  (( days < 1 )) && days=1
+  days=$(( days + 1 ))
+  (( days < 2 )) && days=2
   if date -u -d "+${days} days" +%F >/dev/null 2>&1; then
     date -u -d "+${days} days" +%F
   elif command_exists python3; then
-    python3 - "$days" <<'PYCODE'
+    python3 - "$days" <<'PY'
 import datetime
 import sys
 print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=int(sys.argv[1]))).date().isoformat())
-PYCODE
+PY
   else
     return 1
   fi

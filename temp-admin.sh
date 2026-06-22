@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.8.1"
+VERSION="0.8.2"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -817,10 +817,14 @@ ssh_host_for_command() {
 
 expire_date_from_hours() {
   local hours="$1"
-  # chage -E 是按“日期”过期。这里用 ceil(hours/24) 天，避免短有效期
-  # 因目标日期仍是“今天”而被立即过期。
+  # chage -E 是按"日期"过期，即该日期 00:00 立即失效。
+  # 如果创建时间在晚上（如 21:00），ceil(hours/24)=1 会导致 chage 在
+  # 次日 00:00（只过了 3 小时）就把账号锁死，远早于 systemd timer
+  # 触发的真正到期时间。因此额外加一天缓冲，确保 timer 先触发，
+  # chage 仅作为最终保险。
   local days=$(( (hours + 23) / 24 ))
-  (( days < 1 )) && days=1
+  days=$(( days + 1 ))
+  (( days < 2 )) && days=2
   if date -u -d "+${days} days" +%F >/dev/null 2>&1; then
     date -u -d "+${days} days" +%F
   elif command_exists python3; then
