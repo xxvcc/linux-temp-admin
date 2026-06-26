@@ -281,18 +281,22 @@ sudo bash temp-admin.sh revoke
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
-默认情况下，`revoke` 只允许删除脚本登记过的用户。若确实要删除未登记用户，需要显式加 `--force`；如果还要配合 `--yes` 非交互执行，则必须重复完整用户名：
+默认情况下，`revoke` 只允许删除脚本登记过的用户。若登记记录丢失，可对**本工具创建的账号**（家目录 GECOS 带 `linux-temp-admin` 标记）显式加 `--force` 删除；非交互执行还必须重复完整用户名：
 
 ```bash
 sudo bash temp-admin.sh revoke --user USER --force
 sudo bash temp-admin.sh revoke --user USER --force --yes --confirm-force USER
 ```
 
+出于安全考虑，`--force` **不会删除本工具之外创建的真实账号**——既未登记、GECOS 也无 `linux-temp-admin` 标记的账号始终受保护，即使配合 `--confirm-force` 也会拒绝。这类账号请直接用系统的 `userdel` 处理。
+
 查看账号过期和自动删除 timer：
 
 ```bash
 sudo bash temp-admin.sh expiry-status
 # 兼容旧命令：sudo bash temp-admin.sh cleanup-expired
+# 加 --compact 顺带清理登记表中指向已不存在用户的失效条目（只改登记表，不动任何账号）：
+sudo bash temp-admin.sh expiry-status --compact
 ```
 
 ## 关于“过期”和“自动删除”
@@ -307,7 +311,7 @@ sudo bash temp-admin.sh expiry-status
 - `chage -E` 通常按日期过期，不是精确到分钟/小时的定时删除；`--hours` 的精确自动撤销依赖 systemd timer 或备用 `at` 任务。
 - 过期通常会阻止后续登录，但不会删除用户和家目录。
 - 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
-- 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务；如果 `at` 也不可用，才会降级为只设置账号过期，并在邀请包中提示需要手动撤销。
+- 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务（并尽量启用 `atd` 守护进程）；如果 `at` 不可用或 `atd` 无法启用，才会降级为只设置账号过期，并在邀请包中提示需要手动撤销。
 - 如果无法设置账号过期日期（缺少 `chage` 或 `chage` 执行失败），脚本会停止创建并回滚刚创建的用户。
 - 交互模式不传 `--host` 时，脚本会先询问是否自动探测；探测会优先尝试本地公网网卡地址和常见云厂商 metadata，失败后才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成功或失败都会给出明确提示；`--yes` 非交互模式不会静默外联，必须显式传入 `--host`。
 - 如需排查公网 IP 探测失败原因，可临时设置 `LINUX_TEMP_ADMIN_DEBUG_IP=1`，脚本会输出每个 metadata/外部服务的失败原因或无效返回。
@@ -327,7 +331,11 @@ at 任务队列中的备用自动删除任务              # 仅当 systemd time
 /home/USER/.ssh/authorized_keys
 ```
 
-自动删除任务优先由持久 systemd timer 管理；脚本状态页也会显示 `/usr/local/sbin/linux-temp-admin` 的安装版本和权限信息。可手动查看：
+自动删除任务优先由持久 systemd timer 管理；脚本状态页也会显示 `/usr/local/sbin/linux-temp-admin` 的安装版本和权限信息。
+
+为避免一个被改动或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`（会影响其他在册用户的撤销任务），当已安装版本与当前脚本不同时，脚本会**复用现有命令而不覆盖**并打印提示。确需替换时，运行前设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
+
+可手动查看：
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
@@ -341,7 +349,7 @@ atq
 - README 示例均为脱敏内容，不能登录任何服务器。
 - 删除用户时会删除家目录和 SSH key；如果系统删除命令失败，脚本会停止并提示手动检查，不会假装撤销成功。
 - 默认防误删：`revoke` 只删除登记用户；未登记用户需要 `--force`，非交互删除还需要 `--confirm-force USER`。
-- 即使使用 `--force`，脚本也会拒绝删除 root、常见系统账号、UID 0 或低 UID 系统账号。
+- 即使使用 `--force`，脚本也会拒绝删除 root、常见系统账号、UID 0 或低 UID 系统账号，以及任何**非本工具创建（GECOS 无 `linux-temp-admin` 标记）且未登记**的真实账号；后者请改用系统 `userdel`。
 - 如果本地登记文件丢失/损坏，撤销时也需要显式加 `--force`；非交互场景同时需要 `--confirm-force USER`。
 - 创建过程中如果出错，脚本会尽量取消自动撤销任务、回滚 sudoers/登记记录并删除刚创建的临时用户。
 - 登记表、sudoers、systemd unit、`/usr/local/sbin/linux-temp-admin` 和用户 SSH key 文件会做基础路径安全检查，拒绝覆盖不安全的符号链接或非普通文件。

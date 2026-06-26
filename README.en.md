@@ -281,18 +281,22 @@ Delete a specific user:
 sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
-By default, `revoke` only deletes users registered by the script. To delete an unregistered user, explicitly pass `--force`; if you also use `--yes` non-interactively, repeat the full username:
+By default, `revoke` only deletes users registered by the script. If the registry entry was lost, you can still `--force`-delete an **account this tool created** (its home GECOS carries the `linux-temp-admin` tag); non-interactive runs must also repeat the full username:
 
 ```bash
 sudo bash temp-admin-en.sh revoke --user USER --force
 sudo bash temp-admin-en.sh revoke --user USER --force --yes --confirm-force USER
 ```
 
+For safety, `--force` will **not** delete a real account created outside this tool — an account that is neither registered nor GECOS-tagged stays protected even with `--confirm-force`. Remove such accounts with the system's `userdel` instead.
+
 Show account expiry and auto-delete timers:
 
 ```bash
 sudo bash temp-admin-en.sh expiry-status
 # Backward-compatible alias: sudo bash temp-admin-en.sh cleanup-expired
+# Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched):
+sudo bash temp-admin-en.sh expiry-status --compact
 ```
 
 ## Expiry vs auto-delete
@@ -307,7 +311,7 @@ Important details:
 - `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer or fallback `at` job.
 - Account expiry usually blocks future login but does not delete the user or home directory.
 - Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
-- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job; only if `at` is unavailable too does it fall back to account expiry only and shows a manual-revoke warning in the invite bundle.
+- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job (and attempts to enable the `atd` daemon); only if `at` is unavailable or `atd` cannot be enabled does it fall back to account expiry only and shows a manual-revoke warning in the invite bundle.
 - If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
 - In interactive mode, if `--host` is not provided, the script asks before automatic detection. It first tries local public interface addresses and common cloud metadata endpoints; only if that fails does it try `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`, and it clearly reports success or failure. In `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
 - To troubleshoot public-IP detection failures, temporarily set `LINUX_TEMP_ADMIN_DEBUG_IP=1`; the script prints per-metadata/external-service failure reasons or invalid responses.
@@ -327,7 +331,11 @@ fallback job in the at queue                    # only when systemd timer is una
 /home/USER/.ssh/authorized_keys
 ```
 
-Auto-delete is managed by persistent systemd timers first. The status command also shows `/usr/local/sbin/linux-temp-admin` install version and permissions. Inspect timers and fallback `at` jobs with:
+Auto-delete is managed by persistent systemd timers first. The status command also shows `/usr/local/sbin/linux-temp-admin` install version and permissions.
+
+To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), when the installed version differs from the current script the tool **reuses the existing command instead of overwriting** and prints a notice. To force replacement, set `LINUX_TEMP_ADMIN_REINSTALL=1` before running.
+
+Inspect timers and fallback `at` jobs with:
 
 ```bash
 systemctl list-timers --all | grep linux-temp-admin
@@ -341,7 +349,7 @@ atq
 - README examples are redacted placeholders and cannot log into any server.
 - Revoking a user deletes its home directory and SSH key; if the system delete command fails, the script stops and asks you to check manually instead of reporting a false success.
 - Deletion guard: `revoke` only deletes registered users unless `--force` is explicitly used; non-interactive deletion of unregistered users also requires `--confirm-force USER`.
-- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, or low-UID system accounts.
+- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, low-UID system accounts, and any real account **not created by this tool (no `linux-temp-admin` GECOS tag) and not registered** — use the system's `userdel` for the latter.
 - If the local registry is lost/corrupted, revoking those users also requires explicit `--force`; non-interactive deletion also requires `--confirm-force USER`.
 - If account creation fails mid-way, the script tries to cancel auto-revoke tasks, roll back sudoers/registry state, and remove the just-created temporary user.
 - The registry, sudoers, systemd units, `/usr/local/sbin/linux-temp-admin`, and user SSH key files perform basic path-safety checks and refuse to overwrite unsafe symlinks or non-regular files.

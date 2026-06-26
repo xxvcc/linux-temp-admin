@@ -4,7 +4,7 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="0.8.3"
+VERSION="1.0.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -44,7 +44,7 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME invite                  创建一次性临时管理员邀请
   bash $SCRIPT_NAME revoke --user USER      撤销/删除临时用户
   bash $SCRIPT_NAME status [--user USER]    查看状态
-  bash $SCRIPT_NAME cleanup-expired         查看过期/自动删除状态
+  bash $SCRIPT_NAME cleanup-expired [--compact]  查看过期/自动删除状态（--compact 清理已失效登记）
   bash $SCRIPT_NAME expiry-status           查看过期/自动删除状态
   bash $SCRIPT_NAME help                    显示帮助
 
@@ -160,6 +160,13 @@ package_candidates_for_tool() {
       esac
       ;;
     at) echo "at" ;;
+    date-compute)
+      case "$pm" in
+        apt|dnf|yum|pacman) echo "coreutils" ;;
+        apk) echo "coreutils" ;;
+        *) echo "" ;;
+      esac
+      ;;
   esac
 }
 
@@ -167,6 +174,12 @@ unique_words() {
   tr ' ' '
 ' | awk 'NF && !seen[$0]++' | tr '
 ' ' ' | sed 's/[[:space:]]*$//'
+}
+
+can_compute_future_date() {
+  # 设置账号过期需要能算出未来日期：优先 GNU date，其次 python3。
+  # busybox 的 date 不支持相对格式（如 "+1 day"），需借助 coreutils 或 python3。
+  date -u -d "+1 day" +%F >/dev/null 2>&1 || command_exists python3
 }
 
 ensure_dependencies() {
@@ -184,6 +197,7 @@ ensure_dependencies() {
   fi
   command_exists chage || missing+=("chage")
   command_exists flock || missing+=("flock")
+  can_compute_future_date || missing+=("date-compute")
 
   if [[ "$need_sudo" == "true" ]]; then
     command_exists sudo || missing+=("sudo")
@@ -241,6 +255,7 @@ ensure_dependencies() {
   read -r -a pkgs <<< "$pkgs_text"
   info "安装依赖包：$pkgs_text"
   install_packages "$pm" "${pkgs[@]}"
+  hash -r 2>/dev/null || true
 
   local still_missing=()
   command_exists bash || still_missing+=("bash")
@@ -250,6 +265,7 @@ ensure_dependencies() {
   if ! command_exists userdel && ! command_exists deluser; then still_missing+=("userdel/deluser"); fi
   command_exists chage || still_missing+=("chage")
   command_exists flock || still_missing+=("flock")
+  can_compute_future_date || still_missing+=("date-compute")
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
@@ -283,13 +299,27 @@ valid_host() {
   [[ "$host" != *[[:space:]]* ]] || return 1
   [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
 
-  # IPv6 literals
+  # IPv6 literals (optionally with an embedded IPv4 tail, e.g. ::ffff:1.2.3.4)
   if [[ "$host" == *:* ]]; then
-    [[ "$host" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    local v6="$host"
+    # Split off and validate an embedded IPv4 tail if present, then represent
+    # it as two synthetic hextets so the colon/group checks below still apply.
+    if [[ "$host" == *.* ]]; then
+      local v4tail="${host##*:}" o4 oct
+      [[ "$v4tail" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+      local IFS=.
+      read -r -a o4 <<< "$v4tail"
+      [[ ${#o4[@]} -eq 4 ]] || return 1
+      for oct in "${o4[@]}"; do
+        [[ "$oct" =~ ^(0|[1-9][0-9]{0,2})$ && $((10#$oct)) -le 255 ]] || return 1
+      done
+      v6="${host%:*}:0:0"
+    fi
+    [[ "$v6" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
     # Reject three or more consecutive colons
-    [[ "$host" != *:::* ]] || return 1
+    [[ "$v6" != *:::* ]] || return 1
     # At most one :: compression
-    local tmp="$host" count=0
+    local tmp="$v6" count=0
     while [[ "$tmp" == *::* ]]; do
       count=$((count + 1))
       tmp="${tmp/::/:}"
@@ -297,7 +327,7 @@ valid_host() {
     [[ $count -le 1 ]] || return 1
     # Each group max 4 hex chars; total groups with :: <= 8
     local IFS=':' groups
-    read -r -a groups <<< "$host"
+    read -r -a groups <<< "$v6"
     local non_empty=0
     local group
     for group in "${groups[@]}"; do
@@ -314,13 +344,14 @@ valid_host() {
     return 0
   fi
 
-  # IPv4 literals: four decimal octets in 0..255.
+  # IPv4 literals: four decimal octets in 0..255, no leading zeros (the SSH
+  # resolver would otherwise re-interpret e.g. 010.0.0.5 as octal).
   if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     local IFS=. octets octet
     read -r -a octets <<< "$host"
     [[ ${#octets[@]} -eq 4 ]] || return 1
     for octet in "${octets[@]}"; do
-      [[ "$octet" =~ ^[0-9]+$ && $((10#$octet)) -le 255 ]] || return 1
+      [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ && $((10#$octet)) -le 255 ]] || return 1
     done
     return 0
   fi
@@ -360,8 +391,16 @@ terminate_user_processes() {
   pkill -KILL -u "$uid" 2>/dev/null || true
 }
 
+account_is_managed() {
+  # An account is considered tool-managed if its GECOS carries our tag
+  # (set via useradd -c "${MANAGED_TAG} temporary admin").
+  local user="$1" gecos
+  gecos=$(getent passwd "$user" 2>/dev/null | cut -d: -f5)
+  [[ "$gecos" == *"$MANAGED_TAG"* ]]
+}
+
 is_protected_revoke_target() {
-  local user="$1" _registered="${2:-false}" uid
+  local user="$1" registered="${2:-false}" uid
   case "$user" in
     root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|systemd-*|dbus|sshd|polkitd)
       return 0
@@ -369,7 +408,17 @@ is_protected_revoke_target() {
   esac
   uid=$(id -u -- "$user" 2>/dev/null || true)
   [[ "$uid" == "0" ]] && return 0
+  # System-range UIDs are protected unless this is a registered, managed temp account.
   if [[ "$uid" =~ ^[0-9]+$ && "$uid" -lt 1000 ]]; then
+    if [[ "$registered" == "true" ]] && account_is_managed "$user"; then
+      return 1
+    fi
+    return 0
+  fi
+  # Real UID>=1000 accounts this tool did NOT create are protected: neither
+  # registered nor GECOS-tagged means it is almost certainly a real human/service
+  # account, so refuse to delete it even with --force.
+  if [[ "$registered" != "true" ]] && ! account_is_managed "$user"; then
     return 0
   fi
   return 1
@@ -467,7 +516,11 @@ registry_remove_user_unlocked() {
   registry_plain_file_exists "$REGISTRY_FILE" || return 0
   local tmp
   tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
-  awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"
+  if ! awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    warn "重写注册表失败（awk 退出非零，可能磁盘已满），已取消写入以避免截断注册表。"
+    return 1
+  fi
   chown root:root "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   if [[ -L "$REGISTRY_FILE" || ! -f "$REGISTRY_FILE" ]]; then
@@ -537,7 +590,7 @@ registry_list_users() {
     return 1
   fi
   local i=0 user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit state
-  while IFS=$'\t' read -r user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit; do
+  while IFS=$'\t' read -r user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit _overflow; do
     [[ -z "${user:-}" ]] && continue
     i=$((i + 1))
     if user_exists "$user"; then state="active"; else state="missing"; fi
@@ -646,20 +699,38 @@ show_installed_revoke_status() {
 }
 
 install_self_for_revoke() {
-  local src="${BASH_SOURCE[0]}" install_dir tmp
-  if [[ ! -f "$src" || -L "$src" ]]; then
-    warn "无法安全定位当前脚本文件，不能安装稳定撤销命令。"
-    return 1
-  fi
+  local src="${BASH_SOURCE[0]}" install_dir tmp installed_ver
   install_dir=$(dirname -- "$INSTALL_PATH")
   if [[ -L "$install_dir" || ( -e "$install_dir" && ! -d "$install_dir" ) ]]; then
     warn "安装目录不安全，拒绝安装稳定撤销命令：$install_dir"
+    return 1
+  fi
+  # If the source script cannot be safely located (e.g. run via `curl | bash`),
+  # reuse an already-installed valid managed binary instead of failing outright.
+  if [[ ! -f "$src" || -L "$src" ]]; then
+    if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" && -x "$INSTALL_PATH" ]] \
+       && installed_ver=$("$INSTALL_PATH" version 2>/dev/null) && [[ -n "$installed_ver" ]]; then
+      warn "无法定位当前脚本文件，复用已安装的稳定撤销命令：$INSTALL_PATH (version=$installed_ver)"
+      return 0
+    fi
+    warn "无法安全定位当前脚本文件，且无可复用的已安装命令，不能安装稳定撤销命令。"
     return 1
   fi
   install -d -m 755 -o root -g root "$install_dir"
   if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
     warn "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。"
     return 1
+  fi
+  # Refuse to silently clobber an existing DIFFERENT installed copy: a divergent or
+  # downgraded binary would redirect every other registered user's revoke timer.
+  # Reuse the existing one unless the operator explicitly opts in to reinstall.
+  if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
+    if [[ "${LINUX_TEMP_ADMIN_REINSTALL:-}" != "1" ]]; then
+      installed_ver=$("$INSTALL_PATH" version 2>/dev/null || echo unknown)
+      warn "$INSTALL_PATH 已存在且与当前脚本不同（installed=$installed_ver current=$VERSION）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1。"
+      return 0
+    fi
+    warn "LINUX_TEMP_ADMIN_REINSTALL=1：用当前脚本覆盖已安装的稳定撤销命令。"
   fi
   tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX")
   install -m 700 -o root -g root "$src" "$tmp"
@@ -673,6 +744,30 @@ install_self_for_revoke() {
   chmod 700 "$INSTALL_PATH"
 }
 
+ensure_atd_running() {
+  # at 任务依赖 atd 守护进程；很多发行版装了 at 但默认不启用 atd。
+  # 尽力在不同 init 系统下确认/启动 atd，确保入队的任务能真正触发。
+  if command_exists systemctl; then
+    systemctl is-active --quiet atd 2>/dev/null && return 0
+    systemctl enable --now atd >/dev/null 2>&1 && return 0
+  fi
+  if command_exists rc-service; then
+    rc-service atd status >/dev/null 2>&1 && return 0
+    if command_exists rc-update; then rc-update add atd >/dev/null 2>&1 || true; fi
+    rc-service atd start >/dev/null 2>&1 && return 0
+  fi
+  if command_exists service; then
+    service atd status >/dev/null 2>&1 && return 0
+    if command_exists chkconfig; then chkconfig atd on >/dev/null 2>&1 || true; fi
+    if command_exists update-rc.d; then update-rc.d atd enable >/dev/null 2>&1 || true; fi
+    service atd start >/dev/null 2>&1 && return 0
+  fi
+  if command_exists pgrep; then
+    pgrep -x atd >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
 schedule_at_revoke() {
   local user="$1" hours="$2"
   if ! [[ "$hours" =~ ^[0-9]+$ && "$hours" -ge 1 && "$hours" -le "$MAX_EXPIRE_HOURS" ]]; then
@@ -681,6 +776,10 @@ schedule_at_revoke() {
   fi
   if ! command_exists at; then
     warn "找不到 at，无法创建备用自动删除任务；仅设置账号过期。"
+    return 1
+  fi
+  if ! ensure_atd_running; then
+    warn "atd 守护进程未运行且无法自动启动；放弃 at 自动删除任务，仅设置账号过期。请手动启动 atd 或改用 systemd。"
     return 1
   fi
   if ! install_self_for_revoke; then
@@ -734,12 +833,27 @@ schedule_auto_revoke() {
     return $?
   fi
   exec_start="$(systemd_quote_arg "$INSTALL_PATH") revoke --user $(systemd_quote_arg "$user") --yes"
-  if on_calendar=$(date -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S' 2>/dev/null); then
+  if on_calendar=$(date -u -d "+${hours} hours" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null); then
+    # Absolute UTC anchor: the trigger instant is immune to later timezone/DST
+    # changes and stays aligned with the UTC-based chage expiry date.
     timer_schedule="OnCalendar=$on_calendar
 Persistent=true"
   else
-    warn "当前系统 date 不支持 -d，将使用相对 systemd timer；关机期间不会补触发。"
-    timer_schedule="OnActiveSec=${hours}h"
+    on_calendar=""
+    if command_exists python3; then
+      on_calendar=$(python3 - "$hours" <<'PY'
+import datetime, sys
+print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=int(sys.argv[1]))).strftime('%Y-%m-%d %H:%M:%S UTC'))
+PY
+)
+    fi
+    if [[ -n "$on_calendar" ]]; then
+      timer_schedule="OnCalendar=$on_calendar
+Persistent=true"
+    else
+      warn "无法计算绝对到期时间，将使用相对 systemd timer；每次重启会重置倒计时，账号可能延迟删除。"
+      timer_schedule="OnActiveSec=${hours}h"
+    fi
   fi
 
   if [[ -L "$service_path" || ( -e "$service_path" && ! -f "$service_path" ) || -L "$timer_path" || ( -e "$timer_path" && ! -f "$timer_path" ) ]]; then
@@ -831,10 +945,19 @@ cancel_auto_revoke() {
   fi
   service_path=$(auto_revoke_service_path "$unit" 2>/dev/null || true)
   timer_path=$(auto_revoke_timer_path "$unit" 2>/dev/null || true)
-  [[ -n "$timer_path" && "$timer_path" == "$SYSTEMD_DIR"/* && ! -L "$timer_path" ]] && rm -f "$timer_path" 2>/dev/null || true
-  [[ -n "$service_path" && "$service_path" == "$SYSTEMD_DIR"/* && ! -L "$service_path" ]] && rm -f "$service_path" 2>/dev/null || true
-  if command_exists systemctl; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ -n "$timer_path" && "$timer_path" == "$SYSTEMD_DIR"/* && ! -L "$timer_path" ]]; then
+    rm -f "$timer_path" 2>/dev/null || true
+  fi
+  # When invoked from within the firing systemd service (INVOCATION_ID is set by
+  # systemd), leave the .service file and skip daemon-reload so we don't disturb the
+  # unit currently executing us; the next manual revoke/cleanup will remove it.
+  if [[ -z "${INVOCATION_ID:-}" ]]; then
+    if [[ -n "$service_path" && "$service_path" == "$SYSTEMD_DIR"/* && ! -L "$service_path" ]]; then
+      rm -f "$service_path" 2>/dev/null || true
+    fi
+    if command_exists systemctl; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -869,7 +992,7 @@ is_public_ipv4() {
   [[ ${#octets[@]} -eq 4 ]] || return 1
   local o
   for o in "${octets[@]}"; do
-    [[ "$o" =~ ^[0-9]+$ && $((10#$o)) -le 255 ]] || return 1
+    [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ && $((10#$o)) -le 255 ]] || return 1
   done
   case "${octets[0]}" in
     0|10|127|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255) return 1 ;;
@@ -899,7 +1022,7 @@ get_url_text() {
       status=$?
     fi
   elif command_exists wget; then
-    if output=$(wget -qO- --timeout="$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
+    if output=$(wget -qO- --tries=1 --timeout="$max_time" --dns-timeout="$connect_timeout" --connect-timeout="$connect_timeout" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
@@ -1058,7 +1181,7 @@ lock_user_password() {
   if usermod -L "$user" >/dev/null 2>&1; then
     return 0
   fi
-  warn "锁定账号密码失败，请手动检查：$user"
+  warn "锁定账号密码失败：$user。已停止创建并准备回滚。"
   return 1
 }
 
@@ -1094,7 +1217,11 @@ safe_write_root_file() {
     return 1
   fi
   tmp=$(mktemp "${dir}/.${base}.XXXXXX")
-  cat > "$tmp"
+  if ! cat > "$tmp"; then
+    rm -f "$tmp"
+    warn "写入临时文件失败，已清理：$path"
+    return 1
+  fi
   chown root:root "$tmp" 2>/dev/null || true
   chmod "$mode" "$tmp"
   if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
@@ -1119,7 +1246,6 @@ add_sudo() {
     warn "/etc/sudoers.d 不存在或不安全，无法配置 NOPASSWD sudo。"
     return 1
   fi
-  usermod -aG "$group" "$user"
   local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
   if ! printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" | safe_write_root_file "$file" 440; then
     return 1
@@ -1131,6 +1257,9 @@ add_sudo() {
       return 1
     }
   fi
+  # Add to the sudo/wheel group only AFTER the sudoers file is written and
+  # validated, so a failure never leaves a lingering group membership behind.
+  usermod -aG "$group" "$user"
 }
 
 remove_sudoers_file() {
@@ -1144,7 +1273,7 @@ remove_sudoers_file() {
 write_ssh_key() {
   local user="$1"
   local pubkey_file="$2"
-  local home_dir uid gid ssh_dir auth_file tmp_auth backup_file
+  local home_dir uid gid ssh_dir auth_file tmp_auth
   home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
   if [[ -z "$home_dir" || ! -d "$home_dir" || -L "$home_dir" ]]; then
     err "找不到安全的用户家目录：$user"
@@ -1167,13 +1296,12 @@ write_ssh_key() {
     err "authorized_keys 路径不安全：$auth_file"
     return 1
   fi
-  # 备份旧的 authorized_keys（如果存在）
-  if [[ -f "$auth_file" ]]; then
-    backup_file="$ssh_dir/authorized_keys.backup.$(date +%s).$$"
-    cp -p -- "$auth_file" "$backup_file"
-    chown "$uid:$gid" "$backup_file"
-    chmod 600 "$backup_file"
-  fi
+  # write_ssh_key only ever runs for a freshly created user, so authorized_keys
+  # never pre-exists (no backup needed). Build a temp file, set its owner/mode,
+  # then atomically rename into place. rename(2) preserves the temp file's owner
+  # and mode, so we deliberately do NOT chown/chmod the destination by name after
+  # the mv — doing so would follow an attacker-planted symlink in the user-owned
+  # .ssh directory and chown/chmod an arbitrary root file.
   tmp_auth=$(mktemp "${ssh_dir}/.authorized_keys.XXXXXX")
   cat "$pubkey_file" > "$tmp_auth"
   chown "$uid:$gid" "$tmp_auth"
@@ -1184,8 +1312,6 @@ write_ssh_key() {
     return 1
   fi
   mv -f "$tmp_auth" "$auth_file"
-  chown "$uid:$gid" "$auth_file"
-  chmod 600 "$auth_file"
 }
 
 
@@ -1245,6 +1371,7 @@ EOF
     cat <<EOF
 Sudo 提示:
 已启用 NOPASSWD sudo。此账号只能通过 SSH key 登录；账号密码已锁定。
+注意：NOPASSWD sudo 等于完整 root 权限——该账号可提权为 root，并可能留下 root 拥有的进程、cron、systemd 单元或 SUID 文件等持久化。撤销只删除此账号本身，不会自动清理它以 root 身份创建的东西。
 
 EOF
   else
@@ -1274,6 +1401,17 @@ $revoke_cmd
 
 ----- END LINUX TEMP ADMIN INVITE -----
 EOF
+}
+
+secure_cleanup_tmpdir() {
+  # Best-effort secure removal of the working dir that briefly holds the one-time
+  # private key. shred helps when it landed on a real disk; on tmpfs it is RAM.
+  local d="${1:-}"
+  [[ -n "$d" && -d "$d" ]] || return 0
+  if command_exists shred; then
+    find "$d" -type f -exec shred -u -- {} + 2>/dev/null || true
+  fi
+  rm -rf "$d"
 }
 
 invite() {
@@ -1413,24 +1551,26 @@ EOF
     ensure_dependencies "$deps_mode" false
   fi
 
-  local tmpdir keyfile pubfile expires revoke_cmd sudo_text fingerprint auto_text auto_unit login_shell
-  local created_user="" invite_completed="false"
+  local tmpdir keyfile pubfile expires revoke_cmd sudo_text fingerprint auto_text login_shell
+  local created_user="" invite_completed="false" auto_unit=""
   login_shell=$(resolve_login_shell)
-  tmpdir=$(mktemp -d)
+  # Prefer tmpfs (/dev/shm) for the one-time private key so it never hits a real
+  # disk; fall back to /tmp. Explicit -p avoids a hostile inherited $TMPDIR.
+  tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp)
   chmod 700 "$tmpdir"
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
   cleanup_invite_error() {
     local code=$?
-    trap - ERR EXIT
+    trap - ERR EXIT INT TERM HUP
     if [[ "$invite_completed" != "true" && -n "$created_user" ]]; then
-      rollback_created_user "$created_user" "$auto_unit"
+      rollback_created_user "$created_user" "${auto_unit:-}"
     fi
-    rm -rf "$tmpdir"
+    secure_cleanup_tmpdir "$tmpdir"
     exit "$code"
   }
-  trap cleanup_invite_error ERR
-  trap 'rm -rf "$tmpdir"' EXIT
+  trap cleanup_invite_error ERR INT TERM HUP
+  trap 'secure_cleanup_tmpdir "$tmpdir"' EXIT
 
   ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
   chmod 600 "$keyfile"
@@ -1444,13 +1584,20 @@ EOF
 
   sudo_text="no"
   if [[ "$grant_sudo" == "yes" ]]; then
-    add_sudo "$user"
-    sudo_text="yes"
+    if add_sudo "$user"; then
+      sudo_text="yes"
+    else
+      warn "未能授予 sudo 权限（可能缺少 sudo/wheel 组或 /etc/sudoers.d）；已创建为普通账号：$user"
+      sudo_text="no"
+    fi
   fi
 
   expires=$(expire_datetime_local "$hours")
   revoke_cmd="sudo $INSTALL_PATH revoke --user $user"
   fingerprint=$(ssh-keygen -lf "$pubfile" 2>/dev/null | awk '{print $2}' || true)
+  # Clear any stale auto-revoke job/timer left over for a reused username so an old
+  # at-job/timer cannot later delete this freshly created account.
+  cancel_auto_revoke "$user" >/dev/null 2>&1 || true
   auto_text="no"
   auto_unit=""
   if [[ "$auto_revoke" == "yes" ]]; then
@@ -1463,13 +1610,14 @@ EOF
       revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
     fi
   fi
-  registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"
+  registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit" \
+    || warn "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。"
 
   invite_completed="true"
-  trap - ERR
+  trap - ERR INT TERM HUP
   success "临时账号已创建并登记：$user"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
-  rm -rf "$tmpdir"
+  secure_cleanup_tmpdir "$tmpdir"
   trap - EXIT
 }
 
@@ -1505,8 +1653,9 @@ revoke_user() {
     exit 1
   fi
   if ! user_exists "$user"; then
-    warn "用户不存在：$user。将清理登记记录和自动删除任务（如果存在）。"
+    warn "用户不存在：$user。将清理登记记录、sudoers 文件和自动删除任务（如果存在）。"
     cancel_auto_revoke "$user"
+    remove_sudoers_file "$user"
     registry_remove_user "$user"
     exit 0
   fi
@@ -1560,7 +1709,9 @@ status_user() {
       home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
       if [[ -d "$home_dir/.ssh" ]]; then
         stat -c '.ssh mode=%a owner=%U:%G path=%n' "$home_dir/.ssh" 2>/dev/null || ls -ld "$home_dir/.ssh"
-        [[ -f "$home_dir/.ssh/authorized_keys" ]] && stat -c 'authorized_keys mode=%a owner=%U:%G path=%n' "$home_dir/.ssh/authorized_keys" 2>/dev/null || true
+        if [[ -f "$home_dir/.ssh/authorized_keys" ]]; then
+          stat -c 'authorized_keys mode=%a owner=%U:%G path=%n' "$home_dir/.ssh/authorized_keys" 2>/dev/null || true
+        fi
       fi
       if command_exists chage; then chage -l "$user" || true; fi
       local unit
@@ -1591,11 +1742,13 @@ status_user() {
 
 cleanup_expired() {
   need_root
-  if [[ $# -gt 0 ]]; then
-    err "cleanup-expired 不接受额外参数：$*"
-    usage
-    exit 1
-  fi
+  local compact="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --compact) compact="true"; shift ;;
+      *) err "cleanup-expired 不支持的参数：$1"; usage; exit 1 ;;
+    esac
+  done
   warn "这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。"
   if ! command_exists chage; then
     warn "找不到 chage，无法检查过期时间。"
@@ -1612,7 +1765,7 @@ cleanup_expired() {
     [[ -z "$user" ]] && continue
     local found="false"
     local u
-    for u in "${users[@]}"; do
+    for u in ${users[@]+"${users[@]}"}; do
       [[ "$u" == "$user" ]] && found="true" && break
     done
     [[ "$found" == "false" ]] && users+=("$user")
@@ -1629,6 +1782,18 @@ cleanup_expired() {
       info "用户不存在：$user"
     fi
   done
+  if [[ "$compact" == "true" ]]; then
+    local removed=0 cu _crest
+    if registry_has_users; then
+      while IFS=$'\t' read -r cu _crest; do
+        [[ -z "${cu:-}" ]] && continue
+        if ! user_exists "$cu"; then
+          if registry_remove_user "$cu"; then removed=$((removed + 1)); fi
+        fi
+      done < "$REGISTRY_FILE"
+    fi
+    info "已压实注册表：移除 $removed 条指向已不存在用户的记录（仅清理登记表，不影响任何账号）。"
+  fi
   info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
   show_auto_revoke_timers || true
   show_installed_revoke_status
@@ -1649,10 +1814,11 @@ ${BOLD}Linux 临时管理员管理器${NC} v$VERSION
 EOF
     read -r -p "请选择 [1-5]: " choice
     case "$choice" in
-      1) invite ;;
-      2) revoke_user ;;
-      3) read -r -p "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " u; if [[ -n "$u" ]]; then status_user --user "$u"; else status_user; fi ;;
-      4) cleanup_expired ;;
+      1) ( invite ) || true ;;
+      2) ( revoke_user ) || true ;;
+      3) read -r -p "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " u
+         if [[ -n "$u" ]]; then ( status_user --user "$u" ) || true; else ( status_user ) || true; fi ;;
+      4) ( cleanup_expired ) || true ;;
       5) exit 0 ;;
       *) warn "无效选择" ;;
     esac
