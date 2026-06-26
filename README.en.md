@@ -7,151 +7,59 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> A one-time Linux temporary admin invite script: generate a fresh SSH key, create a temporary user, optionally grant NOPASSWD sudo, and auto-delete the user on expiry by default.
+> One command to grant a collaborator a **time-limited, auto-deleting** temporary SSH admin account. The script prints an invite bundle you forward over private chat; the server stores only the public key, never the private key.
 
-**linux-temp-admin** is useful when you need to temporarily grant SSH access to a trusted collaborator, operator, or automation assistant. It prints a private invite bundle that you can send through a trusted private chat. The server stores only the public key, never the private key.
+**linux-temp-admin** is for temporarily giving a trusted collaborator, ops engineer, or automation agent an SSH admin entry point — without sharing the root password, without leaving long-lived accounts, and with automatic cleanup on expiry.
 
-**Languages / 语言**: [中文](README.md) | English
+[中文](README.md) | English
 
-## Quick install
+## Contents
 
-Download first, then run, so you can inspect the script:
+- [Quick start (30 seconds)](#quick-start-30-seconds)
+- [What it solves](#what-it-solves)
+- [Full walkthrough](#full-walkthrough)
+- [Everyday commands](#everyday-commands)
+- [Common usage](#common-usage)
+- [Reference](#reference)
+- [Security notes](#security-notes)
+- [Development & license](#development--license)
+
+## Quick start (30 seconds)
 
 ```bash
 wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
-chmod +x temp-admin-en.sh
-sudo bash temp-admin-en.sh
-```
-
-Chinese script / 中文脚本:
-
-```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-chmod +x temp-admin.sh
-sudo bash temp-admin.sh
-```
-
-Create a one-time sudo invite directly:
-
-```bash
 sudo bash temp-admin-en.sh invite --sudo
 ```
 
-For non-interactive sudo invites, repeat the full username and explicitly allow private-key output if stdout is not a TTY:
+That's it. The script will:
 
-```bash
-sudo bash temp-admin-en.sh invite \
-  --user xxvcc-a1b2c3d4e5 \
-  --host 203.0.113.10 \
-  --sudo \
-  --yes \
-  --confirm-sudo xxvcc-a1b2c3d4e5 \
-  --allow-non-tty-private-key-output
-```
+1. Generate a fresh SSH key pair and create a temporary user (e.g. `xxvcc-a1b2c3d4e5`);
+2. Print an **invite bundle** in the terminal — forward it to your collaborator, who follows the two commands inside it to log in, **with no need to understand any of the details**;
+3. **Auto-delete** the user, home directory, and key after **24 hours** by default.
 
----
+> The Chinese script is `temp-admin.sh`; usage is identical. Running `sudo bash temp-admin-en.sh` with no subcommand opens an interactive menu.
 
-## Why use it?
+## What it solves
 
-Temporary SSH access often goes wrong because people:
+The usual ways temporary SSH access goes wrong:
 
-- share a root password;
-- keep temporary accounts around forever;
-- forget public keys in `authorized_keys`;
-- lose track of which temporary users were created;
-- forget to revoke sudo access after the job is done.
+- Handing out the root password;
+- Leaving temporary accounts around long after they're needed;
+- Forgetting public keys left in `authorized_keys`;
+- Losing track of which temporary users you created;
+- Not revoking sudo after use.
 
-This script standardizes the workflow: create, print invite bundle, register, inspect, revoke, and auto-delete on expiry.
+This script standardizes the whole flow: **create → print invite bundle → register → inspect → revoke → auto-delete on expiry**.
 
-## Features
+It will **not**: store the private key; generate or print any account/sudo password; modify SSH service config; touch the firewall; or open any inbound port.
 
-- **Generates a fresh SSH key pair every time**.
-- **Default username prefix is `xxvcc`**, e.g. `xxvcc-a1b2c3d4e5`.
-- **Optional NOPASSWD sudo / wheel access**.
-- **Default validity is 24 hours**.
-- **Auto-delete on expiry by default** using persistent systemd `.service/.timer` units first, with an `at` fallback when systemd scheduling is unavailable.
-- **Key-only login**: account password is locked by default, and no account/sudo password is printed.
-- **Deletes the home directory and SSH key when revoked**.
-- **Deletion guard**: by default, `revoke` only deletes users registered by the script; unregistered users require explicit `--force`, and non-interactive deletion also requires `--confirm-force USER`; protected/system users are always refused.
-- **Rollback on failed creation**: if creation fails mid-way, the script tries to cancel auto-revoke tasks and remove the temporary user it just created.
-- **Safer writes for critical files**: registry, sudoers, systemd units, installed revoke command, and `authorized_keys` refuse unsafe symlinks/non-regular files and use atomic writes where practical.
-- **Keeps a local registry of temporary users** so you can select by number when revoking.
-- **Detects missing dependencies** and can install them interactively; auto-install requires typing `YES` or passing `--install-deps`.
-- **Non-TTY private-key output guard**: refuses to print the private key when stdout is not a terminal unless `--allow-non-tty-private-key-output` is passed.
-- **Non-interactive sudo confirmation**: `--sudo --yes` requires `--confirm-sudo USER`.
-- **Separate Chinese and English scripts**: `temp-admin.sh` is the default Chinese script, and `temp-admin-en.sh` is the English script.
-- **Does not modify sshd_config, firewall rules, or open ports**.
-
-## How it works
-
-```text
-Run script
-  ↓
-Generate SSH private key + public key
-  ↓
-Create a temporary user, e.g. xxvcc-a1b2c3d4e5
-  ↓
-Write /home/USER/.ssh/authorized_keys
-  ↓
-Optionally add the user to sudo/wheel
-  ↓
-Register it in /var/lib/linux-temp-admin/users.tsv
-  ↓
-Schedule auto-revoke with a persistent systemd timer by default; use at fallback when systemd scheduling fails
-  ↓
-Print a one-time invite bundle
-```
-
-The script does **not**:
-
-- store private keys;
-- generate, print, write, or log account/sudo passwords;
-- modify SSH daemon configuration;
-- modify firewall rules;
-- open inbound ports.
-
-## Supported systems
-
-### Primary support
-
-- Debian / Ubuntu
-- Common BT/Baota Linux environments
-- RHEL / Rocky / AlmaLinux / Fedora
-
-### Best effort
-
-- Alpine
-- Arch Linux
-
-### Required tools
-
-The script checks for:
-
-- `bash`
-- `ssh-keygen`
-- `useradd` or `adduser`
-- `userdel` or `deluser`
-- `usermod`
-- `chage`
-- `flock`
-- `at` / `atq` / `atrm` only for fallback auto-delete when systemd scheduling is unavailable
-- `sudo` when sudo access is requested
-
-It can install missing dependencies with:
-
-- `apt-get`
-- `dnf`
-- `yum`
-- `apk`
-- `pacman`
-
-## Quick start
+## Full walkthrough
 
 ### 1. Download
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-chmod +x temp-admin.sh
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
+chmod +x temp-admin-en.sh
 ```
 
 ### 2. Create an invite
@@ -160,66 +68,11 @@ chmod +x temp-admin.sh
 sudo bash temp-admin-en.sh invite --sudo
 ```
 
-Set a custom validity period:
+In interactive mode it confirms the details (username, host, validity, sudo, auto-delete) and then prints the invite bundle.
 
-```bash
-sudo bash temp-admin-en.sh invite --sudo --hours 12
-```
+### 3. You get an invite bundle like this (redacted)
 
-Set a custom username prefix (lowercase letters, digits, underscore, and hyphen only; max 20 chars):
-
-```bash
-sudo bash temp-admin-en.sh invite --prefix ops --sudo
-```
-
-Set the Host and SSH port shown in the invite output:
-
-```bash
-sudo bash temp-admin-en.sh invite --host 203.0.113.10 --port 22 --sudo
-```
-
-### 3. Send the invite bundle privately
-
-The script prints an SSH login command, one-time private key, and revoke command. Account password is locked by default, and no account/sudo password is printed. Send it only via a trusted private chat. Never paste it into groups or public pages.
-
-Use the Chinese script with:
-
-```bash
-sudo bash temp-admin.sh invite --sudo
-```
-
-## Non-interactive examples
-
-Auto-install dependencies and create a sudo invite. Non-interactive mode must pass `--host`; `--sudo --yes` must repeat the username, and non-TTY stdout must explicitly allow private-key output:
-
-```bash
-sudo bash temp-admin-en.sh invite \
-  --user xxvcc-a1b2c3d4e5 \
-  --host 203.0.113.10 \
-  --port 22 \
-  --hours 24 \
-  --sudo \
-  --install-deps \
-  --yes \
-  --confirm-sudo xxvcc-a1b2c3d4e5 \
-  --allow-non-tty-private-key-output
-```
-
-Disable auto-delete and keep only account expiry:
-
-```bash
-sudo bash temp-admin-en.sh invite --sudo --no-auto-revoke
-```
-
-Create a normal non-sudo user:
-
-```bash
-sudo bash temp-admin-en.sh invite --no-sudo
-```
-
-## Redacted invite output example
-
-This is only a format example and **cannot be used to log in**. Real private keys are generated at runtime and shown once in the terminal. Account password is locked by default, and no account/sudo password is printed.
+This is only a format example and **cannot be used to log in**. Real private keys are generated at runtime and shown once in the terminal.
 
 ```text
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -247,6 +100,7 @@ chmod 600 './xxvcc-a1b2c3d4e5.key'
 
 Sudo note:
 NOPASSWD sudo is enabled. This account can log in only with the SSH key; account password is locked.
+Note: NOPASSWD sudo is equivalent to full root — this account can escalate to root and may leave behind root-owned processes, cron jobs, systemd units, or SUID files. Revoking only deletes this account itself; it does not clean up anything it created as root.
 
 Revoke command:
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
@@ -261,115 +115,149 @@ Security notes:
 ----- END LINUX TEMP ADMIN INVITE -----
 ```
 
-## Daily operations
+### 4. Forward the bundle to your collaborator over private chat
 
-Show status:
+They only need two steps, **with nothing to install and no knowledge of this tool**:
 
-```bash
-sudo bash temp-admin-en.sh status
-```
+- Copy the "Save private key command" block and run it on their machine → they get the key file;
+- Copy the "SSH login command" and run it → logged in.
 
-Select and delete a user from the registry:
+> ⚠️ The bundle contains a one-time private key. **Send it only over trusted private chat** — never in group chats, tickets, or public pages.
 
-```bash
-sudo bash temp-admin-en.sh revoke
-```
-
-Delete a specific user:
+### 5. Revoke when done (or let it auto-delete on expiry)
 
 ```bash
 sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
-By default, `revoke` only deletes users registered by the script. If the registry entry was lost, you can still `--force`-delete an **account this tool created** (its home GECOS carries the `linux-temp-admin` tag); non-interactive runs must also repeat the full username:
+It auto-deletes the user, home directory, and key after 24 hours by default — but **revoking manually right after use is safest**; don't rely on expiry alone.
+
+## Everyday commands
+
+Show status (registered temp users, expiry, auto-delete timers):
 
 ```bash
-sudo bash temp-admin-en.sh revoke --user USER --force
-sudo bash temp-admin-en.sh revoke --user USER --force --yes --confirm-force USER
+sudo bash temp-admin-en.sh status
+sudo bash temp-admin-en.sh status --user xxvcc-a1b2c3d4e5
 ```
 
-For safety, `--force` will **not** delete a real account created outside this tool — an account that is neither registered nor GECOS-tagged stays protected even with `--confirm-force`. Remove such accounts with the system's `userdel` instead.
+Revoke/delete (pick from the list, or name the user directly):
 
-Show account expiry and auto-delete timers:
+```bash
+sudo bash temp-admin-en.sh revoke
+sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
+```
+
+Inspect account expiry and auto-delete tasks:
 
 ```bash
 sudo bash temp-admin-en.sh expiry-status
-# Backward-compatible alias: sudo bash temp-admin-en.sh cleanup-expired
-# Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched):
+# Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched)
 sudo bash temp-admin-en.sh expiry-status --compact
 ```
 
-## Expiry vs auto-delete
+> Deleting unregistered/foreign accounts has extra guards (anti-mistake); see [Security notes](#security-notes).
 
-Default validity is 24 hours. The script tries to do two things:
+## Common usage
 
-1. set account expiry with `chage -E`;
-2. write `/etc/systemd/system/linux-temp-admin-revoke-USER.service` and `.timer`, using `OnCalendar` + `Persistent=true` for persistent auto-delete first; if systemd scheduling is unavailable or fails, try an `at` fallback job.
-
-Important details:
-
-- `chage -E` is usually date-based, not minute/hour-precise; precise `--hours` auto-revoke depends on the systemd timer or fallback `at` job.
-- Account expiry usually blocks future login but does not delete the user or home directory.
-- Auto-delete calls `revoke`, which deletes the user, home directory, SSH key, sudoers file, and registry entry.
-- If `systemctl` is unavailable or systemd timer creation fails, the script tries an `at` fallback job (and attempts to enable the `atd` daemon); only if `at` is unavailable or `atd` cannot be enabled does it fall back to account expiry only and shows a manual-revoke warning in the invite bundle.
-- If account expiry cannot be set (missing `chage` or `chage` failure), the script stops creation and rolls back the just-created user.
-- In interactive mode, if `--host` is not provided, the script asks before automatic detection. It first tries local public interface addresses and common cloud metadata endpoints; only if that fails does it try `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`, and it clearly reports success or failure. In `--yes` non-interactive mode it will not perform this external lookup and requires explicit `--host`.
-- To troubleshoot public-IP detection failures, temporarily set `LINUX_TEMP_ADMIN_DEBUG_IP=1`; the script prints per-metadata/external-service failure reasons or invalid responses.
-- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port, use `--port` separately. The invite bundle automatically brackets IPv6 addresses in the SSH command.
-
-## Files written
-
-The script may write:
-
-```text
-/usr/local/sbin/linux-temp-admin
-/var/lib/linux-temp-admin/users.tsv
-/etc/systemd/system/linux-temp-admin-revoke-USER.service  # includes lightweight NoNewPrivileges/PrivateTmp hardening
-/etc/systemd/system/linux-temp-admin-revoke-USER.timer
-fallback job in the at queue                    # only when systemd timer is unavailable and at is available
-/etc/sudoers.d/linux-temp-admin-USER       # only when passwordless sudo is enabled
-/home/USER/.ssh/authorized_keys
-```
-
-Auto-delete is managed by persistent systemd timers first. The status command also shows `/usr/local/sbin/linux-temp-admin` install version and permissions.
-
-To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), when the installed version differs from the current script the tool **reuses the existing command instead of overwriting** and prints a notice. To force replacement, set `LINUX_TEMP_ADMIN_REINSTALL=1` before running.
-
-Inspect timers and fallback `at` jobs with:
+Set the validity (hours):
 
 ```bash
-systemctl list-timers --all | grep linux-temp-admin
-atq
+sudo bash temp-admin-en.sh invite --sudo --hours 12
 ```
+
+Without sudo (create a normal account):
+
+```bash
+sudo bash temp-admin-en.sh invite --no-sudo
+```
+
+Set the username prefix / host / port (prefix allows lowercase letters, digits, underscore, hyphen; max 20 chars):
+
+```bash
+sudo bash temp-admin-en.sh invite --prefix ops --sudo
+sudo bash temp-admin-en.sh invite --host 203.0.113.10 --port 22 --sudo
+```
+
+Set account expiry only, without creating an auto-delete task:
+
+```bash
+sudo bash temp-admin-en.sh invite --sudo --no-auto-revoke
+```
+
+**Automation / non-interactive** (in CI or scripts). Non-interactive mode requires `--host`; `--sudo --yes` requires repeating the username for confirmation; when stdout is not a terminal you must also explicitly allow printing the private key:
+
+```bash
+sudo bash temp-admin-en.sh invite \
+  --user xxvcc-a1b2c3d4e5 \
+  --host 203.0.113.10 --port 22 --hours 24 \
+  --sudo --install-deps --yes \
+  --confirm-sudo xxvcc-a1b2c3d4e5 \
+  --allow-non-tty-private-key-output
+```
+
+## Reference
+
+### Supported systems
+
+- **Primary**: Debian / Ubuntu, common BT-panel Linux environments, RHEL / Rocky / AlmaLinux / Fedora
+- **Best effort**: Alpine, Arch Linux
+
+### Dependencies
+
+The script detects them automatically; if missing, it can install them interactively (type `YES` or pass `--install-deps`) via `apt-get` / `dnf` / `yum` / `apk` / `pacman`. Tools used:
+
+- `bash`, `ssh-keygen`, `useradd` or `adduser`, `userdel` or `deluser`, `usermod`, `chage`, `flock`
+- a `date` that can compute a future date (GNU coreutils) or `python3`
+- `at` / `atq` / `atrm`: only as a fallback auto-delete when systemd is unavailable
+- `sudo`: only when granting sudo
+
+### Expiry vs auto-delete
+
+Default validity is 24 hours. The script does two things at once:
+
+1. set the account expiry date with `chage -E` (date-granularity; mainly blocks future login, **does not delete the user**);
+2. write a persistent systemd `.service` + `.timer` first (`OnCalendar` as an absolute UTC time + `Persistent=true`) that calls `revoke` at the deadline to delete the user, home directory, SSH key, sudoers file, and registry entry; if systemd is unavailable or fails, try `at` (and attempt to enable `atd`); only if neither works does it fall back to account expiry only and show a manual-revoke warning in the bundle.
+
+- Hour-precise deletion depends on the systemd timer or the `at` fallback; `chage` is only a date-granularity backstop.
+- In interactive mode without `--host`, the script first asks whether to auto-detect the public IP — trying local interfaces/cloud metadata first, then `https://api.ipify.org`, `https://ifconfig.me/ip`, `https://icanhazip.com`, reporting success or failure clearly. `--yes` mode never does this silently and requires an explicit `--host`. To troubleshoot, set `LINUX_TEMP_ADMIN_DEBUG_IP=1` (diagnostics never print the private key).
+- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port (use `--port`). The SSH command brackets IPv6 addresses automatically.
+
+### Files written
+
+```text
+/usr/local/sbin/linux-temp-admin                              # stable revoke command
+/var/lib/linux-temp-admin/users.tsv                           # local registry
+/etc/systemd/system/linux-temp-admin-revoke-USER.service      # with lightweight NoNewPrivileges/PrivateTmp hardening
+/etc/systemd/system/linux-temp-admin-revoke-USER.timer
+/etc/sudoers.d/linux-temp-admin-USER                          # only when passwordless sudo is enabled
+/home/USER/.ssh/authorized_keys
+# plus a fallback auto-delete job in the at queue when systemd is unavailable
+```
+
+To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), when the installed version differs from the current script the tool **reuses the existing command instead of overwriting** and prints a notice; set `LINUX_TEMP_ADMIN_REINSTALL=1` to force a replacement.
 
 ## Security notes
 
-- The private key is shown only once and is not stored on the server.
-- Account password is locked by default, and no account/sudo password is printed.
-- README examples are redacted placeholders and cannot log into any server.
-- Revoking a user deletes its home directory and SSH key; if the system delete command fails, the script stops and asks you to check manually instead of reporting a false success.
-- Deletion guard: `revoke` only deletes registered users unless `--force` is explicitly used; non-interactive deletion of unregistered users also requires `--confirm-force USER`.
-- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, low-UID system accounts, and any real account **not created by this tool (no `linux-temp-admin` GECOS tag) and not registered** — use the system's `userdel` for the latter.
-- If the local registry is lost/corrupted, revoking those users also requires explicit `--force`; non-interactive deletion also requires `--confirm-force USER`.
-- If account creation fails mid-way, the script tries to cancel auto-revoke tasks, roll back sudoers/registry state, and remove the just-created temporary user.
-- The registry, sudoers, systemd units, `/usr/local/sbin/linux-temp-admin`, and user SSH key files perform basic path-safety checks and refuse to overwrite unsafe symlinks or non-regular files.
-- sudo access is effectively root access; grant it only to trusted parties.
-- Never commit real invite bundles to GitHub, Notion, tickets, or group chats.
-- Revoke immediately after use; do not rely only on expiry.
-- In interactive mode, missing `--host` asks before automatic public-IP detection; the script first tries local/cloud metadata, then external public-IP services if needed, and clearly reports success or failure. `--yes` mode requires explicit `--host`.
-- Set `LINUX_TEMP_ADMIN_DEBUG_IP=1` to troubleshoot public-IP detection; diagnostics never print the private key.
-- When stdout is not a TTY, the script refuses to print the one-time private key unless `--allow-non-tty-private-key-output` is passed.
-- `--sudo --yes` requires `--confirm-sudo USER` to avoid accidentally granting sudo non-interactively.
+- The private key is shown only once and is not stored on the server; the account password is locked by default and no account/sudo password is printed.
+- **NOPASSWD sudo is effectively root** — grant it only to trusted parties; revoking deletes only the account itself, not any root-owned processes, cron jobs, systemd units, or SUID files it left behind.
+- Revoking deletes the home directory and SSH key; if the system delete command fails, the script stops and asks you to check manually instead of reporting a false success.
+- **Anti-mistake guard**: `revoke` only deletes users registered by the script; deleting an unregistered account **created by this tool** (its home GECOS carries the `linux-temp-admin` tag) requires `--force`, and non-interactive runs also require `--confirm-force USER`.
+- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, low-UID system accounts, and any real account **not created by this tool (no tag) and not registered** — use the system's `userdel` for those.
+- If creation fails mid-way, the script tries to roll back (cancel auto-revoke, remove the sudoers/registry entries, delete the just-created user); Ctrl-C mid-invite also triggers rollback.
+- The registry, sudoers, systemd units, revoke command, and user SSH key files undergo symlink / regular-file safety checks and refuse to overwrite unsafe targets.
+- Never commit real invite bundles to GitHub, Notion, tickets, or group chats; revoke immediately after use rather than relying on expiry.
+- When stdout is not a TTY the script refuses to print the private key unless `--allow-non-tty-private-key-output` is passed.
 
-## Validation
+## Development & license
+
+Local checks:
 
 ```bash
 bash -n temp-admin.sh temp-admin-en.sh
 shellcheck -S warning temp-admin.sh temp-admin-en.sh
 ```
 
-The repository includes a GitHub Actions workflow that runs Bash syntax checks and ShellCheck on push and pull request.
+The repo includes a GitHub Actions workflow that runs Bash syntax checks and ShellCheck on push and pull request.
 
-## License
-
-MIT. See [LICENSE](LICENSE).
+License: MIT, see [LICENSE](LICENSE).

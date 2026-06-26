@@ -7,145 +7,53 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> 一次性 Linux 临时管理员邀请脚本：随机生成 SSH 密钥、创建临时用户、可选授予 NOPASSWD sudo，并默认安排到期自动删除。
+> 一条命令,给协作者开一个**有时限、用完自动删**的临时 SSH 管理员账号。脚本输出一份可私聊转发的邀请包;服务器只保存公钥,不保存私钥。
 
-**linux-temp-admin** 适合临时给可信协作者、运维人员或自动化助手开一个 SSH 管理入口。它会输出一份可私聊转发的邀请包；服务器端只保存公钥，不保存私钥。
+**linux-temp-admin** 适合临时给可信的协作者、运维或自动化助手开一个 SSH 管理入口——不发 root 密码、不留长期账号、到期自动回收。
 
-**语言 / Languages**：中文 | [English](README.en.md)
+中文 | [English](README.en.md)
 
-## 一键使用
+## 目录
 
-推荐先下载再执行，便于审阅脚本：
+- [30 秒上手](#30-秒上手)
+- [它解决什么问题](#它解决什么问题)
+- [完整流程](#完整流程)
+- [常用操作](#常用操作)
+- [常见用法](#常见用法)
+- [参考](#参考)
+- [安全说明](#安全说明)
+- [开发与许可证](#开发与许可证)
+
+## 30 秒上手
 
 ```bash
 wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-chmod +x temp-admin.sh
-sudo bash temp-admin.sh
-```
-
-英文脚本 / English script:
-
-```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
-chmod +x temp-admin-en.sh
-sudo bash temp-admin-en.sh
-```
-
-直接创建带 sudo 的一次性邀请：
-
-```bash
 sudo bash temp-admin.sh invite --sudo
 ```
 
-非交互创建 sudo 邀请时需要额外确认用户名，并显式允许非 TTY 输出私钥：
+就这样。脚本会:
 
-```bash
-sudo bash temp-admin.sh invite \
-  --user xxvcc-a1b2c3d4e5 \
-  --host 203.0.113.10 \
-  --sudo \
-  --yes \
-  --confirm-sudo xxvcc-a1b2c3d4e5 \
-  --allow-non-tty-private-key-output
-```
+1. 随机生成一对 SSH 密钥,创建一个临时用户(如 `xxvcc-a1b2c3d4e5`);
+2. 在终端输出**一份邀请包**——私聊发给对方即可,对方照着里面两条命令就能登录,**不需要懂任何细节**;
+3. 默认 **24 小时后自动删除**这个用户、家目录和密钥。
 
----
+> 英文脚本是 `temp-admin-en.sh`,用法相同。不带子命令直接 `sudo bash temp-admin.sh` 会进入交互菜单。
 
-## 为什么需要它？
+## 它解决什么问题
 
-临时给别人开 SSH 权限时，最容易出问题的是：
+临时给别人开 SSH 权限,最容易翻车的是:
 
-- 直接给 root 密码；
-- 长期保留临时账号；
-- 公钥留在 `authorized_keys` 里忘记删除；
-- 不知道之前创建了哪些临时用户；
-- 用完没有撤销 sudo 权限。
+- 直接把 root 密码给出去;
+- 临时账号开完忘了删,长期留着;
+- 公钥留在 `authorized_keys` 里没人清;
+- 不记得自己之前开过哪些临时号;
+- 用完没收回 sudo。
 
-这个脚本把流程标准化：创建、输出邀请包、登记、查看、撤销、到期自动删除。
+这个脚本把整套流程标准化:**创建 → 输出邀请包 → 登记 → 查看 → 撤销 → 到期自动删**。
 
-## 主要特性
+它**不会**:保存私钥;生成或输出任何账号/Sudo 密码;修改 SSH 服务配置;改防火墙;开放任何入站端口。
 
-- **每次随机生成 SSH 密钥对**。
-- **默认用户名前缀 `xxvcc`**，生成如 `xxvcc-a1b2c3d4e5`。
-- **可选 NOPASSWD sudo / wheel 权限**。
-- **默认 24 小时有效期**。
-- **默认尝试自动删除用户**：优先写入持久 systemd `.service/.timer`，失败时尽量使用 `at` 作为备用任务。
-- **Key-only 登录**：账号密码默认锁定，不输出账号/Sudo 密码。
-- **删除用户时删除家目录和 SSH key**。
-- **防误删保护**：默认只允许删除脚本登记用户；删除未登记用户必须显式加 `--force`，非交互还必须加 `--confirm-force USER`；受保护/系统用户始终拒绝删除。
-- **创建失败自动回滚**：创建过程中出错时，会尽量取消自动撤销任务并删除已创建的临时用户。
-- **关键文件安全写入**：登记表、sudoers、systemd unit、安装后的撤销命令和 `authorized_keys` 会拒绝不安全的符号链接/非普通文件，并尽量使用原子写入。
-- **本地登记临时用户**，删除时可编号选择。
-- **依赖自动检测**，缺失时可交互安装；自动安装需要明确输入 `YES` 或传入 `--install-deps`。
-- **非 TTY 私钥输出保护**：stdout 不是终端时默认拒绝输出私钥，需显式加 `--allow-non-tty-private-key-output`。
-- **非交互 sudo 二次确认**：`--sudo --yes` 必须同时传入 `--confirm-sudo USER`。
-- **独立中英文脚本**：`temp-admin.sh` 为中文默认脚本，`temp-admin-en.sh` 为英文脚本。
-- **不修改 sshd_config，不改防火墙，不开放端口**。
-
-## 工作方式
-
-```text
-运行脚本
-  ↓
-随机生成 SSH 私钥 + 公钥
-  ↓
-创建临时用户，例如 xxvcc-a1b2c3d4e5
-  ↓
-写入 /home/USER/.ssh/authorized_keys
-  ↓
-可选加入 sudo/wheel
-  ↓
-登记到 /var/lib/linux-temp-admin/users.tsv
-  ↓
-优先写入持久 systemd timer 安排到期自动 revoke；失败时尽量使用 at 备用任务
-  ↓
-输出一次性邀请包
-```
-
-脚本 **不会**：
-
-- 保存私钥；
-- 生成、输出、写入或记录账号/Sudo 密码；
-- 修改 SSH 服务配置；
-- 修改防火墙；
-- 打开任何入站端口。
-
-## 支持系统
-
-### 主要支持
-
-- Debian / Ubuntu
-- 宝塔常见 Linux 环境
-- RHEL / Rocky / AlmaLinux / Fedora
-
-### 尽力支持
-
-- Alpine
-- Arch Linux
-
-### 需要的工具
-
-脚本会检测：
-
-- `bash`
-- `ssh-keygen`
-- `useradd` 或 `adduser`
-- `userdel` 或 `deluser`
-- `usermod`
-- `chage`
-- `flock`
-- `at` / `atq` / `atrm`（仅在 systemd 自动撤销不可用时用于备用自动删除）
-- `sudo`（仅在选择授予 sudo 权限时需要）
-
-支持使用以下包管理器自动安装缺失依赖：
-
-- `apt-get`
-- `dnf`
-- `yum`
-- `apk`
-- `pacman`
-
-## 快速开始
+## 完整流程
 
 ### 1. 下载
 
@@ -160,66 +68,11 @@ chmod +x temp-admin.sh
 sudo bash temp-admin.sh invite --sudo
 ```
 
-也可以指定有效期：
+交互模式会先让你确认信息(用户名、Host、有效期、是否 sudo、是否到期自动删),确认后输出邀请包。
 
-```bash
-sudo bash temp-admin.sh invite --sudo --hours 12
-```
+### 3. 你会拿到这样一份邀请包（已脱敏）
 
-指定用户名前缀（仅允许小写字母、数字、下划线和连字符，最长 20 字符）：
-
-```bash
-sudo bash temp-admin.sh invite --prefix ops --sudo
-```
-
-指定输出里的 Host 和端口：
-
-```bash
-sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
-```
-
-### 3. 把邀请包私聊发给协作者
-
-脚本会输出 SSH 登录命令、一次性私钥和撤销命令。账号密码默认锁定，不会输出账号/Sudo 密码。只通过可信私聊发送，不要发到群里或公开页面。
-
-英文版使用：
-
-```bash
-sudo bash temp-admin-en.sh invite --sudo
-```
-
-## 非交互式示例
-
-自动安装依赖并创建 sudo 邀请。非交互模式必须指定 `--host`，`--sudo --yes` 必须重复确认用户名，stdout 非 TTY 时还必须显式允许输出私钥：
-
-```bash
-sudo bash temp-admin.sh invite \
-  --user xxvcc-a1b2c3d4e5 \
-  --host 203.0.113.10 \
-  --port 22 \
-  --hours 24 \
-  --sudo \
-  --install-deps \
-  --yes \
-  --confirm-sudo xxvcc-a1b2c3d4e5 \
-  --allow-non-tty-private-key-output
-```
-
-关闭自动删除，仅设置账号过期：
-
-```bash
-sudo bash temp-admin.sh invite --sudo --no-auto-revoke
-```
-
-不授予 sudo：
-
-```bash
-sudo bash temp-admin.sh invite --no-sudo
-```
-
-## 输出邀请包示例（已脱敏）
-
-下面只是格式示例，**不可用于登录**。真实私钥只会在脚本运行时随机生成，并在终端里显示一次。账号密码默认锁定，不会输出账号/Sudo 密码。
+下面只是格式示例,**不能用于登录**。真实私钥只在脚本运行时随机生成、并在终端显示一次。
 
 ```text
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -247,6 +100,7 @@ chmod 600 './xxvcc-a1b2c3d4e5.key'
 
 Sudo 提示:
 已启用 NOPASSWD sudo。此账号只能通过 SSH key 登录；账号密码已锁定。
+注意：NOPASSWD sudo 等于完整 root 权限——该账号可提权为 root，并可能留下 root 拥有的进程、cron、systemd 单元或 SUID 文件等持久化。撤销只删除此账号本身，不会自动清理它以 root 身份创建的东西。
 
 撤销命令:
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
@@ -261,115 +115,149 @@ sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ----- END LINUX TEMP ADMIN INVITE -----
 ```
 
-## 日常操作
+### 4. 把这份邀请包私聊发给协作者
 
-查看状态：
+对方拿到后只需两步,**无需安装任何东西、也不用懂这个工具**:
 
-```bash
-sudo bash temp-admin.sh status
-```
+- 复制「保存私钥命令」那一段,在自己电脑上粘贴运行 → 得到私钥文件;
+- 复制「SSH 登录命令」运行 → 登录成功。
 
-从列表选择并删除用户：
+> ⚠️ 邀请包含一次性私钥,**只通过可信私聊发送**,不要发群里、工单或公开页面。
 
-```bash
-sudo bash temp-admin.sh revoke
-```
-
-直接删除指定用户：
+### 5. 用完撤销（或等它到期自动删）
 
 ```bash
 sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
-默认情况下，`revoke` 只允许删除脚本登记过的用户。若登记记录丢失，可对**本工具创建的账号**（家目录 GECOS 带 `linux-temp-admin` 标记）显式加 `--force` 删除；非交互执行还必须重复完整用户名：
+默认 24 小时后会自动删除用户、家目录和密钥;但**用完立即手动撤销最稳妥**,别只依赖到期兜底。
+
+## 常用操作
+
+查看状态(登记的临时用户、过期时间、自动删除 timer):
 
 ```bash
-sudo bash temp-admin.sh revoke --user USER --force
-sudo bash temp-admin.sh revoke --user USER --force --yes --confirm-force USER
+sudo bash temp-admin.sh status
+sudo bash temp-admin.sh status --user xxvcc-a1b2c3d4e5
 ```
 
-出于安全考虑，`--force` **不会删除本工具之外创建的真实账号**——既未登记、GECOS 也无 `linux-temp-admin` 标记的账号始终受保护，即使配合 `--confirm-force` 也会拒绝。这类账号请直接用系统的 `userdel` 处理。
+撤销/删除(从列表选编号,或直接指定用户名):
 
-查看账号过期和自动删除 timer：
+```bash
+sudo bash temp-admin.sh revoke
+sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
+```
+
+查看账号过期与自动删除任务:
 
 ```bash
 sudo bash temp-admin.sh expiry-status
-# 兼容旧命令：sudo bash temp-admin.sh cleanup-expired
-# 加 --compact 顺带清理登记表中指向已不存在用户的失效条目（只改登记表，不动任何账号）：
+# 加 --compact 顺带清理登记表里指向已不存在用户的失效条目（只改登记表，不动任何账号）
 sudo bash temp-admin.sh expiry-status --compact
 ```
 
-## 关于“过期”和“自动删除”
+> 撤销未登记/陌生账号有额外限制(防误删),见[安全说明](#安全说明)。
 
-默认有效期是 24 小时。脚本会尽量同时做两件事：
+## 常见用法
 
-1. 通过 `chage -E` 设置 Linux 账号过期日期；
-2. 优先写入 `/etc/systemd/system/linux-temp-admin-revoke-USER.service` 和 `.timer`，使用 `OnCalendar` + `Persistent=true` 创建持久自动删除任务；如果 systemd 不可用或创建失败，则尽量使用 `at` 创建备用自动删除任务。
-
-需要注意：
-
-- `chage -E` 通常按日期过期，不是精确到分钟/小时的定时删除；`--hours` 的精确自动撤销依赖 systemd timer 或备用 `at` 任务。
-- 过期通常会阻止后续登录，但不会删除用户和家目录。
-- 自动删除任务会调用 `revoke`，删除用户、家目录、SSH key、sudoers 文件和登记记录。
-- 如果系统没有 `systemctl` 或 systemd timer 创建失败，脚本会尝试使用 `at` 创建备用自动删除任务（并尽量启用 `atd` 守护进程）；如果 `at` 不可用或 `atd` 无法启用，才会降级为只设置账号过期，并在邀请包中提示需要手动撤销。
-- 如果无法设置账号过期日期（缺少 `chage` 或 `chage` 执行失败），脚本会停止创建并回滚刚创建的用户。
-- 交互模式不传 `--host` 时，脚本会先询问是否自动探测；探测会优先尝试本地公网网卡地址和常见云厂商 metadata，失败后才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成功或失败都会给出明确提示；`--yes` 非交互模式不会静默外联，必须显式传入 `--host`。
-- 如需排查公网 IP 探测失败原因，可临时设置 `LINUX_TEMP_ADMIN_DEBUG_IP=1`，脚本会输出每个 metadata/外部服务的失败原因或无效返回。
-- `--host` 只接受普通域名、IPv4 或 IPv6 地址；不要带端口，端口请用 `--port` 单独指定。邀请包中的 SSH 命令会自动为 IPv6 地址加方括号。
-
-## 安装后写入的内容
-
-可能写入：
-
-```text
-/usr/local/sbin/linux-temp-admin
-/var/lib/linux-temp-admin/users.tsv
-/etc/systemd/system/linux-temp-admin-revoke-USER.service  # 包含 NoNewPrivileges/PrivateTmp 轻量限制
-/etc/systemd/system/linux-temp-admin-revoke-USER.timer
-at 任务队列中的备用自动删除任务              # 仅当 systemd timer 不可用且 at 可用时
-/etc/sudoers.d/linux-temp-admin-USER       # 仅在启用免密 sudo 时
-/home/USER/.ssh/authorized_keys
-```
-
-自动删除任务优先由持久 systemd timer 管理；脚本状态页也会显示 `/usr/local/sbin/linux-temp-admin` 的安装版本和权限信息。
-
-为避免一个被改动或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`（会影响其他在册用户的撤销任务），当已安装版本与当前脚本不同时，脚本会**复用现有命令而不覆盖**并打印提示。确需替换时，运行前设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
-
-可手动查看：
+指定有效期(小时):
 
 ```bash
-systemctl list-timers --all | grep linux-temp-admin
-atq
+sudo bash temp-admin.sh invite --sudo --hours 12
 ```
+
+不授予 sudo(创建为普通账号):
+
+```bash
+sudo bash temp-admin.sh invite --no-sudo
+```
+
+指定用户名前缀 / Host / 端口(前缀仅允许小写字母、数字、下划线、连字符,最长 20 字符):
+
+```bash
+sudo bash temp-admin.sh invite --prefix ops --sudo
+sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
+```
+
+只设账号过期、不创建自动删除任务:
+
+```bash
+sudo bash temp-admin.sh invite --sudo --no-auto-revoke
+```
+
+**自动化 / 非交互**(在 CI 或脚本里用)。非交互必须指定 `--host`;`--sudo --yes` 必须重复确认用户名;stdout 不是终端时还要显式允许输出私钥:
+
+```bash
+sudo bash temp-admin.sh invite \
+  --user xxvcc-a1b2c3d4e5 \
+  --host 203.0.113.10 --port 22 --hours 24 \
+  --sudo --install-deps --yes \
+  --confirm-sudo xxvcc-a1b2c3d4e5 \
+  --allow-non-tty-private-key-output
+```
+
+## 参考
+
+### 支持的系统
+
+- **主要支持**:Debian / Ubuntu、宝塔常见 Linux 环境、RHEL / Rocky / AlmaLinux / Fedora
+- **尽力支持**:Alpine、Arch Linux
+
+### 依赖
+
+脚本会自动检测;缺失时可交互安装(需输入 `YES` 或传 `--install-deps`),支持 `apt-get` / `dnf` / `yum` / `apk` / `pacman`。需要的工具:
+
+- `bash`、`ssh-keygen`、`useradd` 或 `adduser`、`userdel` 或 `deluser`、`usermod`、`chage`、`flock`
+- 能计算未来日期的 `date`(GNU coreutils)或 `python3`
+- `at` / `atq` / `atrm`:仅在 systemd 自动撤销不可用时,作备用自动删除
+- `sudo`:仅在选择授予 sudo 时需要
+
+### 关于“过期”和“自动删除”
+
+默认有效期 24 小时。脚本会同时做两件事:
+
+1. 用 `chage -E` 设置账号过期日期(按天,主要用于阻止后续登录,**不会删用户**);
+2. 优先写持久 systemd `.service` + `.timer`(`OnCalendar` 绝对 UTC 时间 + `Persistent=true`),到点调用 `revoke` 删除用户、家目录、SSH key、sudoers 和登记记录;systemd 不可用或失败时尽量用 `at`(并尝试启用 `atd`);两者都不行才降级为只设账号过期,并在邀请包里提示需要手动撤销。
+
+- 精确到小时的自动删除依赖 systemd timer 或备用 `at` 任务;`chage` 只是按天兜底。
+- 交互模式不传 `--host` 时,会先问是否自动探测公网 IP——先尝试本地网卡/云厂商 metadata,失败才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`,成败都有明确提示;`--yes` 模式不会静默外联,必须显式传 `--host`。排查可临时设 `LINUX_TEMP_ADMIN_DEBUG_IP=1`(诊断日志不会输出私钥)。
+- `--host` 只接受普通域名、IPv4 或 IPv6;不要带端口(用 `--port` 单独指定),邀请包中的 SSH 命令会自动为 IPv6 加方括号。
+
+### 写入的文件
+
+```text
+/usr/local/sbin/linux-temp-admin                              # 稳定撤销命令
+/var/lib/linux-temp-admin/users.tsv                           # 本地登记表
+/etc/systemd/system/linux-temp-admin-revoke-USER.service      # 含 NoNewPrivileges/PrivateTmp 轻量限制
+/etc/systemd/system/linux-temp-admin-revoke-USER.timer
+/etc/sudoers.d/linux-temp-admin-USER                          # 仅在启用免密 sudo 时
+/home/USER/.ssh/authorized_keys
+# 以及在 systemd 不可用时,at 队列中的备用自动删除任务
+```
+
+为防止一个被改过或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`(会影响其他在册用户的撤销任务),当已安装版本与当前脚本不同时,脚本会**复用现有命令而不覆盖**并打印提示;确需替换时,运行前设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
 
 ## 安全说明
 
-- 私钥只在创建时显示一次，服务器不保存私钥。
-- 账号密码默认锁定，不输出账号/Sudo 密码。
-- README 示例均为脱敏内容，不能登录任何服务器。
-- 删除用户时会删除家目录和 SSH key；如果系统删除命令失败，脚本会停止并提示手动检查，不会假装撤销成功。
-- 默认防误删：`revoke` 只删除登记用户；未登记用户需要 `--force`，非交互删除还需要 `--confirm-force USER`。
-- 即使使用 `--force`，脚本也会拒绝删除 root、常见系统账号、UID 0 或低 UID 系统账号，以及任何**非本工具创建（GECOS 无 `linux-temp-admin` 标记）且未登记**的真实账号；后者请改用系统 `userdel`。
-- 如果本地登记文件丢失/损坏，撤销时也需要显式加 `--force`；非交互场景同时需要 `--confirm-force USER`。
-- 创建过程中如果出错，脚本会尽量取消自动撤销任务、回滚 sudoers/登记记录并删除刚创建的临时用户。
-- 登记表、sudoers、systemd unit、`/usr/local/sbin/linux-temp-admin` 和用户 SSH key 文件会做基础路径安全检查，拒绝覆盖不安全的符号链接或非普通文件。
-- sudo 权限基本等同 root，请只给可信对象。
-- 不要把真实邀请包提交到 GitHub、Notion、工单或群聊。
-- 用完请立即执行 `revoke`，不要只依赖过期兜底。
-- 交互模式不传 `--host` 会询问是否自动探测公网 IP；脚本会先尝试本地/云元数据，再按需查询外部公网 IP 服务，并明确提示成功或失败；`--yes` 模式必须手动指定 `--host`。
-- 排查公网 IP 探测问题时可设置 `LINUX_TEMP_ADMIN_DEBUG_IP=1` 查看诊断日志；日志不会输出私钥。
-- stdout 不是 TTY 时默认拒绝输出一次性私钥；只有确认输出通道安全时才使用 `--allow-non-tty-private-key-output`。
-- `--sudo --yes` 必须同时传入 `--confirm-sudo USER`，避免非交互误授予 sudo。
+- 私钥只在创建时显示一次,服务器不保存;账号密码默认锁定,不输出任何账号/Sudo 密码。
+- **NOPASSWD sudo 基本等同 root**,只给可信对象;撤销只删除该账号本身,不会清理它以 root 身份留下的进程、cron、systemd 单元或 SUID 文件。
+- 删除用户会一并删除家目录和 SSH key;如果系统删除命令失败,脚本会停下并提示手动检查,不会假装撤销成功。
+- **防误删**:`revoke` 默认只删除脚本登记过的用户;删除未登记但**本工具创建**(家目录 GECOS 带 `linux-temp-admin` 标记)的账号需显式 `--force`,非交互还需 `--confirm-force USER`。
+- 即使使用 `--force`,也会拒绝删除 root、常见系统账号、UID 0、低 UID 系统账号,以及**任何非本工具创建(无标记)且未登记**的真实账号——这类账号请改用系统的 `userdel`。
+- 创建过程中出错会尽量回滚(取消自动撤销、删 sudoers/登记记录、删除刚创建的用户);中途 Ctrl-C 也会触发回滚。
+- 登记表、sudoers、systemd unit、撤销命令和用户 SSH key 文件会做符号链接/普通文件安全检查,拒绝覆盖不安全的目标。
+- 不要把真实邀请包提交到 GitHub、Notion、工单或群聊;用完请立即 `revoke`,不要只依赖到期兜底。
+- stdout 不是 TTY 时默认拒绝输出私钥,只有确认输出通道安全时才用 `--allow-non-tty-private-key-output`。
 
-## 构建 / 校验
+## 开发与许可证
+
+本地校验:
 
 ```bash
 bash -n temp-admin.sh temp-admin-en.sh
 shellcheck -S warning temp-admin.sh temp-admin-en.sh
 ```
 
-仓库已包含 GitHub Actions 工作流，会在 push 和 pull request 时运行 Bash 语法检查与 ShellCheck。
+仓库已包含 GitHub Actions 工作流,会在 push 和 pull request 时自动运行 Bash 语法检查与 ShellCheck。
 
-## 许可证
-
-MIT。详见 [LICENSE](LICENSE)。
+许可证:MIT,详见 [LICENSE](LICENSE)。
