@@ -42,7 +42,9 @@ That's it. The script will:
 
 ## Language
 
-The script ships English and Chinese in a single file. The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` env var > the interactive menu's language prompt > the caller's locale > **English (default)**. To use Chinese:
+The script ships English and Chinese in a single file. The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` env var > an interactive language prompt (shown once when you open the menu **or run any operational subcommand**, as long as you're on a terminal and haven't locked the language via the two options above) > the caller's locale > **English (default)**. To use Chinese:
+
+> Piped runs (`curl ... | sudo bash`), non-terminal environments such as CI, and non-interactive `--yes`/`-y` runs never show the prompt — they fall back to locale/default; pass `--lang zh` or set the env var to force Chinese there. `help`/`version` are never prompted.
 
 ```bash
 sudo bash temp-admin.sh --lang zh invite --sudo

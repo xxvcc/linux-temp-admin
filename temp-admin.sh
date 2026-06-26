@@ -6,7 +6,7 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.1.0"
+VERSION="1.1.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -27,7 +27,8 @@ NC=$'\033[0m'
 
 # --- i18n ----------------------------------------------------------------
 # Active UI language: "zh" or "en". Resolved (first match wins): --lang flag >
-# LINUX_TEMP_ADMIN_LANG env > interactive menu choice > caller locale > English.
+# LINUX_TEMP_ADMIN_LANG env > interactive prompt (menu or any operational
+# subcommand, when on a TTY) > caller locale > English.
 LANG_SEL=""
 LANG_LOCKED="false"
 set_language() {
@@ -43,6 +44,17 @@ resolve_language() {
   if set_language "${LINUX_TEMP_ADMIN_LANG:-}"; then LANG_LOCKED="true"; return 0; fi
   set_language "${LINUX_TEMP_ADMIN_ORIG_LOCALE:-}" && return 0
   LANG_SEL="en"
+}
+# Ask for the UI language interactively. No-op when the language is locked (via
+# --lang or LINUX_TEMP_ADMIN_LANG) or stdin is not a terminal, so piped and
+# automated runs are never blocked. The prompt is written to stderr so stdout
+# stays clean for subcommands whose output may be captured (e.g. the invite pack).
+prompt_language() {
+  [[ "$LANG_LOCKED" == "true" || ! -t 0 ]] && return 0
+  printf '%s\n' "Select language / 选择语言:  1) English  2) 中文" >&2
+  local _lc
+  read -r -p "Choice [1-2] (Enter = $LANG_SEL): " _lc
+  case "$_lc" in 2|zh*|中*) LANG_SEL="zh" ;; 1|en*) LANG_SEL="en" ;; esac
 }
 # m "<zh>" "<en>" -> prints the active language's text (caller expands variables).
 m() { if [[ "$LANG_SEL" == "zh" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
@@ -1943,11 +1955,6 @@ cleanup_expired() {
 
 menu() {
   need_root
-  if [[ "$LANG_LOCKED" != "true" && -t 0 ]]; then
-    printf '%s\n' "Select language / 选择语言:  1) English  2) 中文"
-    read -r -p "Choice [1-2] (Enter = $LANG_SEL): " _lc
-    case "$_lc" in 2|zh*|中*) LANG_SEL="zh" ;; 1|en*) LANG_SEL="en" ;; esac
-  fi
   while true; do
     if [[ "$LANG_SEL" == "zh" ]]; then
     cat <<EOF
@@ -1999,6 +2006,18 @@ main() {
   set -- ${args[@]+"${args[@]}"}
   resolve_language
   local cmd="${1:-}"
+  # Offer an interactive language choice for the no-arg menu and every operational
+  # command. Two extra guards beyond prompt_language()'s own (locked / non-TTY):
+  # help/version are excluded, and a --yes/-y run is treated as non-interactive so
+  # it never blocks on the prompt even when launched from a terminal.
+  local a noninteractive="false"
+  for a in "$@"; do case "$a" in --yes|-y) noninteractive="true"; break ;; esac; done
+  if [[ "$noninteractive" != "true" ]]; then
+    case "$cmd" in
+      ""|invite|create|revoke|delete-user|remove|status|cleanup-expired|expiry-status)
+        prompt_language ;;
+    esac
+  fi
   case "$cmd" in
     "" ) menu ;;
     invite|create) shift; invite "$@" ;;

@@ -42,7 +42,9 @@ sudo bash temp-admin.sh invite --sudo
 
 ## 语言
 
-脚本把中文和英文合在**一个文件**里。界面语言按以下顺序确定:`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 交互菜单首次的语言选择 > 系统 locale 自动判断 > **默认英文**。
+脚本把中文和英文合在**一个文件**里。界面语言按以下顺序确定:`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 交互式语言选择(进入菜单**或运行任意操作类子命令**时,只要在终端里且没用上面两种方式锁定语言,都会先问一次) > 系统 locale 自动判断 > **默认英文**。
+
+> 用管道跑(`curl ... | sudo bash`)、在 CI 等非终端环境里、或带了 `--yes`/`-y` 非交互运行时,都不会弹出语言提示,直接按 locale/默认走;此时想用中文请加 `--lang zh` 或设环境变量。`help`/`version` 也不会问。
 
 中文环境(`zh_*` locale)会自动用中文;否则用 `--lang zh` 或设环境变量:
 
