@@ -16,6 +16,7 @@
 ## Contents
 
 - [Quick start (30 seconds)](#quick-start-30-seconds)
+- [Language](#language)
 - [What it solves](#what-it-solves)
 - [Full walkthrough](#full-walkthrough)
 - [Everyday commands](#everyday-commands)
@@ -27,8 +28,8 @@
 ## Quick start (30 seconds)
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
-sudo bash temp-admin-en.sh invite --sudo
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
+sudo bash temp-admin.sh invite --sudo
 ```
 
 That's it. The script will:
@@ -37,7 +38,17 @@ That's it. The script will:
 2. Print an **invite bundle** in the terminal — forward it to your collaborator, who follows the two commands inside it to log in, **with no need to understand any of the details**;
 3. **Auto-delete** the user, home directory, and key after **24 hours** by default.
 
-> The Chinese script is `temp-admin.sh`; usage is identical. Running `sudo bash temp-admin-en.sh` with no subcommand opens an interactive menu.
+> Running `sudo bash temp-admin.sh` with no subcommand opens an interactive menu.
+
+## Language
+
+The script ships English and Chinese in a single file. The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` env var > the interactive menu's language prompt > the caller's locale > **English (default)**. To use Chinese:
+
+```bash
+sudo bash temp-admin.sh --lang zh invite --sudo
+# or, once per shell:
+export LINUX_TEMP_ADMIN_LANG=zh
+```
 
 ## What it solves
 
@@ -58,14 +69,14 @@ It will **not**: store the private key; generate or print any account/sudo passw
 ### 1. Download
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin-en.sh
-chmod +x temp-admin-en.sh
+wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
+chmod +x temp-admin.sh
 ```
 
 ### 2. Create an invite
 
 ```bash
-sudo bash temp-admin-en.sh invite --sudo
+sudo bash temp-admin.sh invite --sudo
 ```
 
 In interactive mode it confirms the details (username, host, validity, sudo, auto-delete) and then prints the invite bundle.
@@ -127,7 +138,7 @@ They only need two steps, **with nothing to install and no knowledge of this too
 ### 5. Revoke when done (or let it auto-delete on expiry)
 
 ```bash
-sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
+sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
 It auto-deletes the user, home directory, and key after 24 hours by default — but **revoking manually right after use is safest**; don't rely on expiry alone.
@@ -137,23 +148,23 @@ It auto-deletes the user, home directory, and key after 24 hours by default — 
 Show status (registered temp users, expiry, auto-delete timers):
 
 ```bash
-sudo bash temp-admin-en.sh status
-sudo bash temp-admin-en.sh status --user xxvcc-a1b2c3d4e5
+sudo bash temp-admin.sh status
+sudo bash temp-admin.sh status --user xxvcc-a1b2c3d4e5
 ```
 
 Revoke/delete (pick from the list, or name the user directly):
 
 ```bash
-sudo bash temp-admin-en.sh revoke
-sudo bash temp-admin-en.sh revoke --user xxvcc-a1b2c3d4e5
+sudo bash temp-admin.sh revoke
+sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
 ```
 
 Inspect account expiry and auto-delete tasks:
 
 ```bash
-sudo bash temp-admin-en.sh expiry-status
+sudo bash temp-admin.sh expiry-status
 # Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched)
-sudo bash temp-admin-en.sh expiry-status --compact
+sudo bash temp-admin.sh expiry-status --compact
 ```
 
 > Deleting unregistered/foreign accounts has extra guards (anti-mistake); see [Security notes](#security-notes).
@@ -163,32 +174,32 @@ sudo bash temp-admin-en.sh expiry-status --compact
 Set the validity (hours):
 
 ```bash
-sudo bash temp-admin-en.sh invite --sudo --hours 12
+sudo bash temp-admin.sh invite --sudo --hours 12
 ```
 
 Without sudo (create a normal account):
 
 ```bash
-sudo bash temp-admin-en.sh invite --no-sudo
+sudo bash temp-admin.sh invite --no-sudo
 ```
 
 Set the username prefix / host / port (prefix allows lowercase letters, digits, underscore, hyphen; max 20 chars):
 
 ```bash
-sudo bash temp-admin-en.sh invite --prefix ops --sudo
-sudo bash temp-admin-en.sh invite --host 203.0.113.10 --port 22 --sudo
+sudo bash temp-admin.sh invite --prefix ops --sudo
+sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
 ```
 
 Set account expiry only, without creating an auto-delete task:
 
 ```bash
-sudo bash temp-admin-en.sh invite --sudo --no-auto-revoke
+sudo bash temp-admin.sh invite --sudo --no-auto-revoke
 ```
 
 **Automation / non-interactive** (in CI or scripts). Non-interactive mode requires `--host`; `--sudo --yes` requires repeating the username for confirmation; when stdout is not a terminal you must also explicitly allow printing the private key:
 
 ```bash
-sudo bash temp-admin-en.sh invite \
+sudo bash temp-admin.sh invite \
   --user xxvcc-a1b2c3d4e5 \
   --host 203.0.113.10 --port 22 --hours 24 \
   --sudo --install-deps --yes \
@@ -254,8 +265,8 @@ To avoid a modified or downgraded copy silently overwriting the shared `/usr/loc
 Local checks:
 
 ```bash
-bash -n temp-admin.sh temp-admin-en.sh
-shellcheck -S warning temp-admin.sh temp-admin-en.sh
+bash -n temp-admin.sh
+shellcheck -S warning temp-admin.sh
 ```
 
 The repo includes a GitHub Actions workflow that runs Bash syntax checks and ShellCheck on push and pull request.

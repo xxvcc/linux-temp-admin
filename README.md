@@ -16,6 +16,7 @@
 ## 目录
 
 - [30 秒上手](#30-秒上手)
+- [语言](#语言)
 - [它解决什么问题](#它解决什么问题)
 - [完整流程](#完整流程)
 - [常用操作](#常用操作)
@@ -37,7 +38,19 @@ sudo bash temp-admin.sh invite --sudo
 2. 在终端输出**一份邀请包**——私聊发给对方即可,对方照着里面两条命令就能登录,**不需要懂任何细节**;
 3. 默认 **24 小时后自动删除**这个用户、家目录和密钥。
 
-> 英文脚本是 `temp-admin-en.sh`,用法相同。不带子命令直接 `sudo bash temp-admin.sh` 会进入交互菜单。
+> 不带子命令直接 `sudo bash temp-admin.sh` 会进入交互菜单。脚本中英双语合一,见下方[语言](#语言)。
+
+## 语言
+
+脚本把中文和英文合在**一个文件**里。界面语言按以下顺序确定:`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 交互菜单首次的语言选择 > 系统 locale 自动判断 > **默认英文**。
+
+中文环境(`zh_*` locale)会自动用中文;否则用 `--lang zh` 或设环境变量:
+
+```bash
+sudo bash temp-admin.sh --lang zh invite --sudo
+# 或在当前 shell 里设一次:
+export LINUX_TEMP_ADMIN_LANG=zh
+```
 
 ## 它解决什么问题
 
@@ -254,8 +267,8 @@ sudo bash temp-admin.sh invite \
 本地校验:
 
 ```bash
-bash -n temp-admin.sh temp-admin-en.sh
-shellcheck -S warning temp-admin.sh temp-admin-en.sh
+bash -n temp-admin.sh
+shellcheck -S warning temp-admin.sh
 ```
 
 仓库已包含 GitHub Actions 工作流,会在 push 和 pull request 时自动运行 Bash 语法检查与 ShellCheck。

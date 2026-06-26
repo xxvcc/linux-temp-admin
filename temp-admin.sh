@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# Capture the caller's locale before forcing LC_ALL=C, to default the UI language.
+LINUX_TEMP_ADMIN_ORIG_LOCALE="${LC_ALL:-${LANG:-}}"
 export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.0.0"
+VERSION="1.1.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -23,6 +25,28 @@ BLUE=$'\033[0;34m'
 BOLD=$'\033[1m'
 NC=$'\033[0m'
 
+# --- i18n ----------------------------------------------------------------
+# Active UI language: "zh" or "en". Resolved (first match wins): --lang flag >
+# LINUX_TEMP_ADMIN_LANG env > interactive menu choice > caller locale > English.
+LANG_SEL=""
+LANG_LOCKED="false"
+set_language() {
+  local v="${1,,}"
+  case "$v" in
+    zh*|cn*) LANG_SEL="zh" ;;
+    en*)     LANG_SEL="en" ;;
+    *) return 1 ;;
+  esac
+}
+resolve_language() {
+  [[ -n "$LANG_SEL" ]] && return 0
+  if set_language "${LINUX_TEMP_ADMIN_LANG:-}"; then LANG_LOCKED="true"; return 0; fi
+  set_language "${LINUX_TEMP_ADMIN_ORIG_LOCALE:-}" && return 0
+  LANG_SEL="en"
+}
+# m "<zh>" "<en>" -> prints the active language's text (caller expands variables).
+m() { if [[ "$LANG_SEL" == "zh" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
 info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
 success() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
 warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*" >&2; }
@@ -30,12 +54,13 @@ err() { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
 
 need_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    err "请使用 root 运行：sudo bash $SCRIPT_NAME"
+    err "$(m "请使用 root 运行：sudo bash $SCRIPT_NAME" "Please run as root: sudo bash $SCRIPT_NAME")"
     exit 1
   fi
 }
 
 usage() {
+  if [[ "$LANG_SEL" == "zh" ]]; then
   cat <<EOF
 $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
 
@@ -73,6 +98,45 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME revoke --user xxvcc-a1b2c3
   bash $SCRIPT_NAME status --user xxvcc-a1b2c3
 EOF
+  else
+  cat <<EOF
+$SCRIPT_NAME v$VERSION - Linux one-time temporary admin invite script
+
+Usage
+  bash $SCRIPT_NAME                         Interactive menu
+  bash $SCRIPT_NAME invite                  Create one-time admin invite
+  bash $SCRIPT_NAME revoke --user USER      Revoke/delete temp user
+  bash $SCRIPT_NAME status [--user USER]    Show status
+  bash $SCRIPT_NAME cleanup-expired [--compact]  Show expiry/auto-delete status (--compact prunes stale registry entries)
+  bash $SCRIPT_NAME expiry-status           Show expiry/auto-revoke status
+  bash $SCRIPT_NAME help                    Show help
+
+Options
+  --prefix PREFIX        Username prefix, default: $DEFAULT_PREFIX
+  --user USER            Specify username
+  --host HOST            Host shown in invite
+  --port PORT            SSH port, auto-detected or 22
+  --hours HOURS          Valid hours, default: $DEFAULT_EXPIRE_HOURS, max: $MAX_EXPIRE_HOURS
+  --sudo                 Grant NOPASSWD sudo/wheel
+  --no-sudo              Do not grant sudo/wheel
+  --yes                  Skip confirmation
+  --confirm-sudo USER    Required with --sudo --yes; repeat the full username
+  --allow-non-tty-private-key-output
+                         Allow private key output when stdout is not a TTY (dangerous)
+  --install-deps         Auto-install missing dependencies
+  --no-install-deps      Never install dependencies
+  --auto-revoke          Auto-delete user on expiry, default
+  --no-auto-revoke       Disable auto-delete, keep account expiry only
+  --force                Allow revoke of unregistered users (dangerous)
+  --confirm-force USER   Required with --force --yes for unregistered users; repeat the full username
+
+Examples
+  bash $SCRIPT_NAME invite
+  bash $SCRIPT_NAME invite --prefix xxvcc --hours 12 --sudo
+  bash $SCRIPT_NAME revoke --user xxvcc-a1b2c3
+  bash $SCRIPT_NAME status --user xxvcc-a1b2c3
+EOF
+  fi
 }
 
 confirm_yes() {
@@ -82,7 +146,7 @@ confirm_yes() {
     return 0
   fi
   printf "\n${YELLOW}%s${NC}\n" "$prompt"
-  read -r -p "请输入 YES 确认继续: " ans
+  read -r -p "$(m "请输入 YES 确认继续: " "Type YES to confirm: ")" ans
   [[ "$ans" == "YES" ]]
 }
 
@@ -90,7 +154,7 @@ require_value() {
   local opt="$1"
   local value="${2:-}"
   if [[ -z "$value" || "$value" == --* ]]; then
-    err "参数 $opt 缺少值。"
+    err "$(m "参数 $opt 缺少值。" "Missing value for option $opt.")"
     usage
     exit 1
   fi
@@ -119,7 +183,7 @@ install_packages() {
     yum) yum install -y "${packages[@]}" ;;
     apk) apk add --no-cache "${packages[@]}" ;;
     pacman) pacman -Syu --noconfirm --needed "${packages[@]}" ;;
-    *) err "不支持的包管理器：$pm"; return 1 ;;
+    *) err "$(m "不支持的包管理器：$pm" "Unsupported package manager: $pm")"; return 1 ;;
   esac
 }
 
@@ -177,8 +241,8 @@ unique_words() {
 }
 
 can_compute_future_date() {
-  # 设置账号过期需要能算出未来日期：优先 GNU date，其次 python3。
-  # busybox 的 date 不支持相对格式（如 "+1 day"），需借助 coreutils 或 python3。
+  # Setting account expiry needs computing a future date: prefer GNU date, then python3.
+  # busybox date does not support relative formats (e.g. "+1 day"); coreutils or python3 is needed.
   date -u -d "+1 day" +%F >/dev/null 2>&1 || command_exists python3
 }
 
@@ -207,12 +271,12 @@ ensure_dependencies() {
     return 0
   fi
 
-  warn "检测到缺少依赖：${missing[*]}"
+  warn "$(m "检测到缺少依赖：${missing[*]}" "Missing dependencies detected: ${missing[*]}")"
 
   local pm
   pm=$(pkg_manager)
   if [[ -z "$pm" ]]; then
-    err "未找到支持的包管理器（apt/dnf/yum/apk/pacman）。请手动安装缺失依赖后重试。"
+    err "$(m "未找到支持的包管理器（apt/dnf/yum/apk/pacman）。请手动安装缺失依赖后重试。" "No supported package manager found (apt/dnf/yum/apk/pacman). Please install missing dependencies manually and retry.")"
     return 1
   fi
 
@@ -220,17 +284,17 @@ ensure_dependencies() {
   case "$mode" in
     auto) install="true" ;;
     never)
-      err "依赖缺失且已指定不自动安装。"
+      err "$(m "依赖缺失且已指定不自动安装。" "Dependencies are missing and auto-install is disabled.")"
       return 1
       ;;
     ask|*)
-      read -r -p "是否使用 $pm 自动安装缺失依赖？请输入 YES 确认: " ans
+      read -r -p "$(m "是否使用 $pm 自动安装缺失依赖？请输入 YES 确认: " "Use $pm to install missing dependencies automatically? Type YES to confirm: ")" ans
       if [[ "$ans" == "YES" ]]; then install="true"; fi
       ;;
   esac
 
   if [[ "$install" != "true" ]]; then
-    err "已取消安装依赖。请手动安装后重试。"
+    err "$(m "已取消安装依赖。请手动安装后重试。" "Dependency installation cancelled. Please install manually and retry.")"
     return 1
   fi
 
@@ -247,13 +311,13 @@ ensure_dependencies() {
   done
   pkgs_text=$(printf '%s' "$pkgs_text" | unique_words)
   if [[ -z "$pkgs_text" ]]; then
-    err "无法映射缺失依赖到安装包：${missing[*]}"
+    err "$(m "无法映射缺失依赖到安装包：${missing[*]}" "Could not map missing tools to packages: ${missing[*]}")"
     return 1
   fi
 
   local pkgs=()
   read -r -a pkgs <<< "$pkgs_text"
-  info "安装依赖包：$pkgs_text"
+  info "$(m "安装依赖包：$pkgs_text" "Installing dependency packages: $pkgs_text")"
   install_packages "$pm" "${pkgs[@]}"
   hash -r 2>/dev/null || true
 
@@ -269,11 +333,11 @@ ensure_dependencies() {
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
   if [[ ${#still_missing[@]} -gt 0 ]]; then
-    err "安装后仍缺少：${still_missing[*]}。请手动处理后重试。"
+    err "$(m "安装后仍缺少：${still_missing[*]}。请手动处理后重试。" "Still missing after install: ${still_missing[*]}. Please fix manually and retry.")"
     return 1
   fi
 
-  success "依赖检查通过。"
+  success "$(m "依赖检查通过。" "Dependency check passed.")"
 }
 
 random_hex() {
@@ -383,7 +447,7 @@ terminate_user_processes() {
   local user="$1" uid
   uid=$(id -u -- "$user" 2>/dev/null || true)
   if [[ -z "$uid" || ! "$uid" =~ ^[0-9]+$ ]]; then
-    warn "无法获取 UID，跳过终止用户进程：$user"
+    warn "$(m "无法获取 UID，跳过终止用户进程：$user" "Unable to get UID; skipping process termination for: $user")"
     return 0
   fi
   pkill -TERM -u "$uid" 2>/dev/null || true
@@ -445,16 +509,16 @@ registry_plain_file_exists() {
 
 registry_init() {
   if [[ -L "$REGISTRY_DIR" ]]; then
-    err "安全检查失败：注册表目录是符号链接，拒绝使用：$REGISTRY_DIR"
+    err "$(m "安全检查失败：注册表目录是符号链接，拒绝使用：$REGISTRY_DIR" "Security check failed: registry directory is a symlink; refusing to use it: $REGISTRY_DIR")"
     return 1
   fi
   if [[ -e "$REGISTRY_DIR" && ! -d "$REGISTRY_DIR" ]]; then
-    err "安全检查失败：注册表路径不是目录：$REGISTRY_DIR"
+    err "$(m "安全检查失败：注册表路径不是目录：$REGISTRY_DIR" "Security check failed: registry path is not a directory: $REGISTRY_DIR")"
     return 1
   fi
   install -d -m 700 -o root -g root "$REGISTRY_DIR"
   if [[ -L "$REGISTRY_DIR" || ! -d "$REGISTRY_DIR" ]]; then
-    err "安全检查失败：注册表目录不安全：$REGISTRY_DIR"
+    err "$(m "安全检查失败：注册表目录不安全：$REGISTRY_DIR" "Security check failed: registry directory is unsafe: $REGISTRY_DIR")"
     return 1
   fi
   chown root:root "$REGISTRY_DIR" 2>/dev/null || true
@@ -463,18 +527,18 @@ registry_init() {
   local f
   for f in "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"; do
     if [[ -L "$f" ]]; then
-      err "安全检查失败：注册表文件是符号链接，拒绝使用：$f"
+      err "$(m "安全检查失败：注册表文件是符号链接，拒绝使用：$f" "Security check failed: registry file is a symlink; refusing to use it: $f")"
       return 1
     fi
     if [[ -e "$f" && ! -f "$f" ]]; then
-      err "安全检查失败：注册表路径不是普通文件：$f"
+      err "$(m "安全检查失败：注册表路径不是普通文件：$f" "Security check failed: registry path is not a regular file: $f")"
       return 1
     fi
     if [[ ! -e "$f" ]]; then
       : > "$f"
     fi
     if [[ -L "$f" || ! -f "$f" ]]; then
-      err "安全检查失败：注册表文件不安全：$f"
+      err "$(m "安全检查失败：注册表文件不安全：$f" "Security check failed: registry file is unsafe: $f")"
       return 1
     fi
     chown root:root "$f" 2>/dev/null || true
@@ -487,17 +551,17 @@ registry_lock() {
   registry_init || return 1
   printf -v "$__fd_var" '%s' ""
   if ! command_exists flock; then
-    warn "找不到 flock，登记文件并发保护已降级。"
+    warn "$(m "找不到 flock，登记文件并发保护已降级。" "flock not found; registry concurrent-write protection is degraded.")"
     return 0
   fi
   if [[ -L "$REGISTRY_LOCK_FILE" || ! -f "$REGISTRY_LOCK_FILE" ]]; then
-    err "注册表锁文件不安全：$REGISTRY_LOCK_FILE"
+    err "$(m "注册表锁文件不安全：$REGISTRY_LOCK_FILE" "Registry lock file is unsafe: $REGISTRY_LOCK_FILE")"
     return 1
   fi
   local fd
   exec {fd}>"$REGISTRY_LOCK_FILE"
   if ! flock "$fd"; then
-    warn "获取注册表锁失败，操作可能存在并发风险。"
+    warn "$(m "获取注册表锁失败，操作可能存在并发风险。" "Failed to acquire registry lock; concurrent-write risk.")"
     exec {fd}>&-
     return 1
   fi
@@ -518,14 +582,14 @@ registry_remove_user_unlocked() {
   tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
   if ! awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"; then
     rm -f "$tmp"
-    warn "重写注册表失败（awk 退出非零，可能磁盘已满），已取消写入以避免截断注册表。"
+    warn "$(m "重写注册表失败（awk 退出非零，可能磁盘已满），已取消写入以避免截断注册表。" "Failed to rewrite the registry (awk exited non-zero, disk may be full); aborted the write to avoid truncating the registry.")"
     return 1
   fi
   chown root:root "$tmp" 2>/dev/null || true
   chmod 600 "$tmp"
   if [[ -L "$REGISTRY_FILE" || ! -f "$REGISTRY_FILE" ]]; then
     rm -f "$tmp"
-    warn "注册表路径不再安全，已取消写入。"
+    warn "$(m "注册表路径不再安全，已取消写入。" "Registry path became unsafe; write cancelled.")"
     return 1
   fi
   mv -f "$tmp" "$REGISTRY_FILE"
@@ -547,12 +611,12 @@ registry_record_user() {
   local lock_fd
   registry_lock lock_fd || return 1
   if ! registry_remove_user_unlocked "$user" 2>/dev/null; then
-    warn "更新注册表时删除旧记录失败，已取消追加。"
+    warn "$(m "更新注册表时删除旧记录失败，已取消追加。" "Failed to remove old registry record while updating; append cancelled.")"
     registry_unlock "$lock_fd"
     return 1
   fi
   if [[ -L "$REGISTRY_FILE" || ! -f "$REGISTRY_FILE" ]]; then
-    warn "注册表路径不安全，已忽略追加。"
+    warn "$(m "注册表路径不安全，已忽略追加。" "Registry path is unsafe; ignoring append.")"
     registry_unlock "$lock_fd"
     return 1
   fi
@@ -586,7 +650,7 @@ registry_has_users() {
 
 registry_list_users() {
   if ! registry_has_users; then
-    warn "暂无脚本登记的临时用户。"
+    warn "$(m "暂无脚本登记的临时用户。" "No registered temporary users.")"
     return 1
   fi
   local i=0 user created expires sudo_enabled _legacy_nopasswd host port fingerprint auto_revoke auto_unit state
@@ -609,20 +673,20 @@ registry_select_user() {
   fi
 
   if [[ ${#users[@]} -eq 0 ]]; then
-    warn "没有找到仍存在的已登记临时用户。"
-    read -r -p "请输入要撤销/删除的用户名: " user
+    warn "$(m "没有找到仍存在的已登记临时用户。" "No existing registered temporary users found.")"
+    read -r -p "$(m "请输入要撤销/删除的用户名: " "Enter username to revoke/delete: ")" user
     printf '%s\n' "$user"
     return 0
   fi
 
-  echo "已登记的临时用户：" >&2
+  printf '%s\n' "$(m "已登记的临时用户：" "Registered temporary users")" >&2
   local idx
   for idx in "${!users[@]}"; do
     printf '%2d) %s\n' "$((idx + 1))" "${users[$idx]}" >&2
   done
-  echo "也可以直接输入用户名。" >&2
+  printf '%s\n' "$(m "也可以直接输入用户名。" "You can also type a username directly.")" >&2
   local choice
-  read -r -p "请选择要删除的编号/用户名: " choice
+  read -r -p "$(m "请选择要删除的编号/用户名: " "Select number or username to delete: ")" choice
   if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#users[@]} )); then
     printf '%s\n' "${users[$((choice - 1))]}"
   else
@@ -635,7 +699,7 @@ auto_revoke_unit_name() {
   if command_exists systemd-escape && escaped=$(systemd-escape -- "$user" 2>/dev/null) && [[ -n "$escaped" ]]; then
     printf '%s-revoke-%s' "$MANAGED_TAG" "$escaped"
   else
-    # 回退路径：去除所有非安全字符，防止路径穿越
+    # Fallback: strip unsafe chars to prevent path traversal
     local safe="${user//[^a-zA-Z0-9_-]/}"
     [[ -n "$safe" ]] || safe="unknown"
     printf '%s-revoke-%s' "$MANAGED_TAG" "$safe"
@@ -645,7 +709,7 @@ auto_revoke_unit_name() {
 auto_revoke_service_path() {
   local unit="$1"
   if [[ "$unit" == *"/"* ]]; then
-    err "systemd unit 名称含有非法字符: $unit"
+    err "$(m "systemd unit 名称含有非法字符: $unit" "systemd unit name contains illegal characters: $unit")"
     return 1
   fi
   printf '%s/%s.service' "$SYSTEMD_DIR" "$unit"
@@ -654,7 +718,7 @@ auto_revoke_service_path() {
 auto_revoke_timer_path() {
   local unit="$1"
   if [[ "$unit" == *"/"* ]]; then
-    err "systemd unit 名称含有非法字符: $unit"
+    err "$(m "systemd unit 名称含有非法字符: $unit" "systemd unit name contains illegal characters: $unit")"
     return 1
   fi
   printf '%s/%s.timer' "$SYSTEMD_DIR" "$unit"
@@ -675,11 +739,11 @@ systemd_quote_arg() {
 
 show_installed_revoke_status() {
   if [[ -L "$INSTALL_PATH" ]]; then
-    warn "稳定撤销命令是符号链接，出于安全考虑不执行：$INSTALL_PATH"
+    warn "$(m "稳定撤销命令是符号链接，出于安全考虑不执行：$INSTALL_PATH" "Stable revoke command is a symlink; refusing to execute it for safety: $INSTALL_PATH")"
     return 0
   fi
   if [[ ! -f "$INSTALL_PATH" ]]; then
-    warn "稳定撤销命令未安装：$INSTALL_PATH；创建自动删除任务时会自动安装。"
+    warn "$(m "稳定撤销命令未安装：$INSTALL_PATH；创建自动删除任务时会自动安装。" "Stable revoke command is not installed: $INSTALL_PATH; auto-delete task creation installs it automatically.")"
     return 0
   fi
   local installed_version="unknown" mode_owner=""
@@ -692,9 +756,9 @@ show_installed_revoke_status() {
   else
     installed_version="not-executable-by-current-user"
   fi
-  info "稳定撤销命令：$INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}"
+  info "$(m "稳定撤销命令：$INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}" "Stable revoke command: $INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}")"
   if [[ "$installed_version" != "unknown" && "$installed_version" != "not-executable-by-current-user" && "$installed_version" != "$VERSION" ]]; then
-    warn "稳定撤销命令版本与当前脚本不同；下一次创建自动删除任务会重新安装当前脚本。"
+    warn "$(m "稳定撤销命令版本与当前脚本不同；下一次创建自动删除任务会重新安装当前脚本。" "Stable revoke command version differs from the current script; the next auto-delete task creation will reinstall the current script.")"
   fi
 }
 
@@ -702,7 +766,7 @@ install_self_for_revoke() {
   local src="${BASH_SOURCE[0]}" install_dir tmp installed_ver
   install_dir=$(dirname -- "$INSTALL_PATH")
   if [[ -L "$install_dir" || ( -e "$install_dir" && ! -d "$install_dir" ) ]]; then
-    warn "安装目录不安全，拒绝安装稳定撤销命令：$install_dir"
+    warn "$(m "安装目录不安全，拒绝安装稳定撤销命令：$install_dir" "Install directory is unsafe; refusing stable revoke installation: $install_dir")"
     return 1
   fi
   # If the source script cannot be safely located (e.g. run via `curl | bash`),
@@ -710,15 +774,15 @@ install_self_for_revoke() {
   if [[ ! -f "$src" || -L "$src" ]]; then
     if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" && -x "$INSTALL_PATH" ]] \
        && installed_ver=$("$INSTALL_PATH" version 2>/dev/null) && [[ -n "$installed_ver" ]]; then
-      warn "无法定位当前脚本文件，复用已安装的稳定撤销命令：$INSTALL_PATH (version=$installed_ver)"
+      warn "$(m "无法定位当前脚本文件，复用已安装的稳定撤销命令：$INSTALL_PATH (version=$installed_ver)" "Cannot locate the current script file; reusing the already-installed stable revoke command: $INSTALL_PATH (version=$installed_ver)")"
       return 0
     fi
-    warn "无法安全定位当前脚本文件，且无可复用的已安装命令，不能安装稳定撤销命令。"
+    warn "$(m "无法安全定位当前脚本文件，且无可复用的已安装命令，不能安装稳定撤销命令。" "Cannot safely locate the current script file and no reusable installed command exists; cannot install the stable revoke command.")"
     return 1
   fi
   install -d -m 755 -o root -g root "$install_dir"
   if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
-    warn "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。"
+    warn "$(m "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。" "$INSTALL_PATH is not a safe regular file; refusing installation to prevent TOCTOU attack.")"
     return 1
   fi
   # Refuse to silently clobber an existing DIFFERENT installed copy: a divergent or
@@ -727,16 +791,16 @@ install_self_for_revoke() {
   if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
     if [[ "${LINUX_TEMP_ADMIN_REINSTALL:-}" != "1" ]]; then
       installed_ver=$("$INSTALL_PATH" version 2>/dev/null || echo unknown)
-      warn "$INSTALL_PATH 已存在且与当前脚本不同（installed=$installed_ver current=$VERSION）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1。"
+      warn "$(m "$INSTALL_PATH 已存在且与当前脚本不同（installed=$installed_ver current=$VERSION）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1。" "$INSTALL_PATH already exists and differs from the current script (installed=$installed_ver current=$VERSION); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 to replace it.")"
       return 0
     fi
-    warn "LINUX_TEMP_ADMIN_REINSTALL=1：用当前脚本覆盖已安装的稳定撤销命令。"
+    warn "$(m "LINUX_TEMP_ADMIN_REINSTALL=1：用当前脚本覆盖已安装的稳定撤销命令。" "LINUX_TEMP_ADMIN_REINSTALL=1: overwriting the installed stable revoke command with the current script.")"
   fi
   tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX")
   install -m 700 -o root -g root "$src" "$tmp"
   if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
     rm -f "$tmp"
-    warn "$INSTALL_PATH 安全状态变化，拒绝覆盖。"
+    warn "$(m "$INSTALL_PATH 安全状态变化，拒绝覆盖。" "$INSTALL_PATH safety state changed; refusing overwrite.")"
     return 1
   fi
   mv -f "$tmp" "$INSTALL_PATH"
@@ -745,8 +809,8 @@ install_self_for_revoke() {
 }
 
 ensure_atd_running() {
-  # at 任务依赖 atd 守护进程；很多发行版装了 at 但默认不启用 atd。
-  # 尽力在不同 init 系统下确认/启动 atd，确保入队的任务能真正触发。
+  # at jobs depend on the atd daemon; many distros install at but leave atd disabled.
+  # Best-effort to confirm/start atd across init systems so queued jobs actually fire.
   if command_exists systemctl; then
     systemctl is-active --quiet atd 2>/dev/null && return 0
     systemctl enable --now atd >/dev/null 2>&1 && return 0
@@ -771,33 +835,33 @@ ensure_atd_running() {
 schedule_at_revoke() {
   local user="$1" hours="$2"
   if ! [[ "$hours" =~ ^[0-9]+$ && "$hours" -ge 1 && "$hours" -le "$MAX_EXPIRE_HOURS" ]]; then
-    warn "无效的小时数，无法创建 at 自动删除任务。"
+    warn "$(m "无效的小时数，无法创建 at 自动删除任务。" "Invalid hours value, cannot create at auto-revoke task.")"
     return 1
   fi
   if ! command_exists at; then
-    warn "找不到 at，无法创建备用自动删除任务；仅设置账号过期。"
+    warn "$(m "找不到 at，无法创建备用自动删除任务；仅设置账号过期。" "at not found; fallback auto-delete task cannot be created; account expiry only.")"
     return 1
   fi
   if ! ensure_atd_running; then
-    warn "atd 守护进程未运行且无法自动启动；放弃 at 自动删除任务，仅设置账号过期。请手动启动 atd 或改用 systemd。"
+    warn "$(m "atd 守护进程未运行且无法自动启动；放弃 at 自动删除任务，仅设置账号过期。请手动启动 atd 或改用 systemd。" "atd daemon is not running and could not be started automatically; giving up on the at auto-delete task, account expiry only. Please start atd manually or use systemd.")"
     return 1
   fi
   if ! install_self_for_revoke; then
-    warn "安装 $INSTALL_PATH 失败，无法创建备用自动删除任务；仅设置账号过期。"
+    warn "$(m "安装 $INSTALL_PATH 失败，无法创建备用自动删除任务；仅设置账号过期。" "Failed to install $INSTALL_PATH; fallback auto-delete task cannot be created; account expiry only.")"
     return 1
   fi
   local output job_id install_arg user_arg
   install_arg=$(shell_quote_arg "$INSTALL_PATH")
   user_arg=$(shell_quote_arg "$user")
   if ! output=$(printf "%s revoke --user %s --yes\n" "$install_arg" "$user_arg" | at now + "$hours" hours 2>&1); then
-    warn "创建 at 自动删除任务失败：$output"
+    warn "$(m "创建 at 自动删除任务失败：$output" "Failed to create at auto-revoke job: $output")"
     return 1
   fi
-  # 尝试多种格式解析 job id（兼容不同版本的 at 输出）
+  # Try multiple output formats for compatibility with different at versions
   job_id=$(awk '/^job[[:space:]]+[0-9]+/ {print $2; exit}' <<< "$output")
   [[ -n "$job_id" && "$job_id" =~ ^[0-9]+$ ]] || job_id=$(awk 'NF && $1 ~ /^[0-9]+$/ {print $1; exit}' <<< "$output")
   if [[ -z "$job_id" || ! "$job_id" =~ ^[0-9]+$ ]]; then
-    warn "无法识别 at 自动删除任务编号：$output"
+    warn "$(m "无法识别 at 自动删除任务编号：$output" "Unable to parse at job id: $output")"
     return 1
   fi
   printf 'at:%s\n' "$job_id"
@@ -806,28 +870,28 @@ schedule_at_revoke() {
 schedule_auto_revoke() {
   local user="$1" hours="$2"
   if ! command_exists systemctl; then
-    warn "找不到 systemctl，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "找不到 systemctl，将尝试使用 at 创建备用自动删除任务。" "systemctl not found; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
   if ! install_self_for_revoke; then
-    warn "安装 $INSTALL_PATH 失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "安装 $INSTALL_PATH 失败，将尝试使用 at 创建备用自动删除任务。" "Failed to install $INSTALL_PATH; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
   if ! valid_username "$user"; then
-    warn "自动删除任务用户名不合法，拒绝创建 systemd unit：$user"
+    warn "$(m "自动删除任务用户名不合法，拒绝创建 systemd unit：$user" "Invalid auto-delete username; refusing to create systemd unit: $user")"
     return 1
   fi
   local unit service_path timer_path timer_schedule on_calendar exec_start
   unit=$(auto_revoke_unit_name "$user")
   if ! service_path=$(auto_revoke_service_path "$unit") || [[ -z "$service_path" ]]; then
-    warn "生成 systemd service 路径失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "生成 systemd service 路径失败，将尝试使用 at 创建备用自动删除任务。" "Failed to generate systemd service path; falling back to at.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
   if ! timer_path=$(auto_revoke_timer_path "$unit") || [[ -z "$timer_path" ]]; then
-    warn "生成 systemd timer 路径失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "生成 systemd timer 路径失败，将尝试使用 at 创建备用自动删除任务。" "Failed to generate systemd timer path; falling back to at.")"
     rm -f "$service_path"
     schedule_at_revoke "$user" "$hours"
     return $?
@@ -851,13 +915,13 @@ PY
       timer_schedule="OnCalendar=$on_calendar
 Persistent=true"
     else
-      warn "无法计算绝对到期时间，将使用相对 systemd timer；每次重启会重置倒计时，账号可能延迟删除。"
+      warn "$(m "无法计算绝对到期时间，将使用相对 systemd timer；每次重启会重置倒计时，账号可能延迟删除。" "Cannot compute an absolute expiry time; falling back to a relative systemd timer whose countdown resets on every reboot, so deletion may be delayed.")"
       timer_schedule="OnActiveSec=${hours}h"
     fi
   fi
 
   if [[ -L "$service_path" || ( -e "$service_path" && ! -f "$service_path" ) || -L "$timer_path" || ( -e "$timer_path" && ! -f "$timer_path" ) ]]; then
-    warn "systemd unit 路径不安全，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "systemd unit 路径不安全，将尝试使用 at 创建备用自动删除任务。" "systemd unit path is unsafe; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
@@ -875,7 +939,7 @@ User=root
 ExecStart=$exec_start
 EOF_SERVICE
   then
-    warn "写入 systemd service 失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "写入 systemd service 失败，将尝试使用 at 创建备用自动删除任务。" "Failed to write systemd service; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
@@ -895,28 +959,28 @@ WantedBy=timers.target
 EOF_TIMER
   then
     rm -f "$service_path"
-    warn "写入 systemd timer 失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "写入 systemd timer 失败，将尝试使用 at 创建备用自动删除任务。" "Failed to write systemd timer; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
   if command_exists systemd-analyze; then
     systemd-analyze verify "$service_path" "$timer_path" >/dev/null || {
       rm -f "$service_path" "$timer_path"
-      warn "systemd unit 校验失败，将尝试使用 at 创建备用自动删除任务。"
+      warn "$(m "systemd unit 校验失败，将尝试使用 at 创建备用自动删除任务。" "systemd unit validation failed; trying at fallback auto-delete task.")"
       schedule_at_revoke "$user" "$hours"
       return $?
     }
   fi
   if ! systemctl daemon-reload >/dev/null; then
     rm -f "$service_path" "$timer_path"
-    warn "systemd daemon-reload 失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "systemd daemon-reload 失败，将尝试使用 at 创建备用自动删除任务。" "systemd daemon-reload failed; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
   if ! systemctl enable --now "$unit.timer" >/dev/null; then
     rm -f "$service_path" "$timer_path"
     systemctl daemon-reload >/dev/null 2>&1 || true
-    warn "启用 systemd timer 失败，将尝试使用 at 创建备用自动删除任务。"
+    warn "$(m "启用 systemd timer 失败，将尝试使用 at 创建备用自动删除任务。" "Failed to enable systemd timer; trying at fallback auto-delete task.")"
     schedule_at_revoke "$user" "$hours"
     return $?
   fi
@@ -935,11 +999,11 @@ cancel_auto_revoke() {
   fi
   [[ -n "$unit" ]] || unit=$(auto_revoke_unit_name "$user")
   if [[ "$unit" != ${MANAGED_TAG}-revoke-* || "$unit" == *"/"* ]]; then
-    warn "自动删除 unit 名称不在本工具管理范围，跳过清理：$unit"
+    warn "$(m "自动删除 unit 名称不在本工具管理范围，跳过清理：$unit" "Auto-delete unit is outside this tool's managed namespace; skipping cleanup: $unit")"
     return 0
   fi
   if command_exists systemctl; then
-    # 只停止 timer，不主动 stop service；自动删除本身可能正在 service 内运行。
+    # Stop only the timer. Do not stop the service: auto-revoke may be running inside it.
     systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
     systemctl reset-failed "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
   fi
@@ -1007,7 +1071,7 @@ is_public_ipv4() {
 
 ip_probe_debug() {
   if [[ -n "${LINUX_TEMP_ADMIN_DEBUG_IP:-${LINUX_TEMP_ADMIN_DEBUG:-}}" ]]; then
-    warn "IP 探测诊断：$*"
+    warn "$(m "IP 探测诊断：$*" "IP probe diagnostics: $*")"
   fi
 }
 
@@ -1029,7 +1093,7 @@ get_url_text() {
     fi
   else
     rm -f "$tmp_err"
-    ip_probe_debug "找不到 curl/wget，无法请求 $url"
+    ip_probe_debug "$(m "找不到 curl/wget，无法请求 $url" "curl/wget not found; cannot request $url")"
     return 1
   fi
   err=$(tr '\n' ' ' < "$tmp_err" | sed 's/[[:space:]]*$//')
@@ -1041,7 +1105,7 @@ get_url_text() {
   if [[ "$status" -eq 0 ]]; then
     err="empty response"
   fi
-  ip_probe_debug "$url 失败 exit=$status${err:+ error=$err}"
+  ip_probe_debug "$(m "$url 失败 exit=$status${err:+ error=$err}" "$url failed exit=$status${err:+ error=$err}")"
   return 1
 }
 
@@ -1058,7 +1122,7 @@ get_local_public_ip() {
         printf '%s\n' "$ip"
         return 0
       fi
-      ip_probe_debug "$service 返回非公网 IPv4：${ip:0:80}"
+      ip_probe_debug "$(m "$service 返回非公网 IPv4：${ip:0:80}" "$service returned non-public IPv4: ${ip:0:80}")"
     fi
   done
 
@@ -1070,15 +1134,15 @@ get_local_public_ip() {
       fi
     done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
 
-    ip_probe_debug "本地网卡未发现公网 IPv4，继续检查默认路由源地址。"
+    ip_probe_debug "$(m "本地网卡未发现公网 IPv4，继续检查默认路由源地址。" "No public IPv4 on local interfaces; checking default-route source address.")"
     ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="src") {print $(i+1); exit}}' || true)
     if [[ -n "$ip" ]] && is_public_ipv4 "$ip"; then
       printf '%s\n' "$ip"
       return 0
     fi
-    [[ -n "$ip" ]] && ip_probe_debug "默认路由源地址不是公网 IPv4：$ip"
+    [[ -n "$ip" ]] && ip_probe_debug "$(m "默认路由源地址不是公网 IPv4：$ip" "Default-route source address is not public IPv4: $ip")"
   else
-    ip_probe_debug "找不到 ip 命令，无法检查本地网卡地址。"
+    ip_probe_debug "$(m "找不到 ip 命令，无法检查本地网卡地址。" "ip command not found; cannot inspect local interface addresses.")"
   fi
   return 1
 }
@@ -1092,7 +1156,7 @@ get_public_ip() {
         printf '%s\n' "$ip"
         return 0
       fi
-      ip_probe_debug "$service 返回无效 Host：${ip:0:80}"
+      ip_probe_debug "$(m "$service 返回无效 Host：${ip:0:80}" "$service returned invalid host: ${ip:0:80}")"
     fi
     ip=""
   done
@@ -1110,11 +1174,11 @@ ssh_host_for_command() {
 
 expire_date_from_hours() {
   local hours="$1"
-  # chage -E 是按"日期"过期，即该日期 00:00 立即失效。
-  # 如果创建时间在晚上（如 21:00），ceil(hours/24)=1 会导致 chage 在
-  # 次日 00:00（只过了 3 小时）就把账号锁死，远早于 systemd timer
-  # 触发的真正到期时间。因此额外加一天缓冲，确保 timer 先触发，
-  # chage 仅作为最终保险。
+  # chage -E expires on the date at 00:00. If created in the evening
+  # (e.g. 21:00), ceil(hours/24)=1 causes chage to lock the account
+  # at 00:00 the next day -- only 3 hours later, far before the
+  # systemd timer fires. Add one extra day as buffer so the timer
+  # triggers first and chage acts only as a final safeguard.
   local days=$(( (hours + 23) / 24 ))
   days=$(( days + 1 ))
   (( days < 2 )) && days=2
@@ -1154,7 +1218,7 @@ resolve_login_shell() {
   elif [[ -x /bin/sh ]]; then
     printf '%s\n' /bin/sh
   else
-    err "找不到可用登录 shell。"
+    err "$(m "找不到可用登录 shell。" "No usable login shell found.")"
     return 1
   fi
 }
@@ -1163,7 +1227,7 @@ create_user_if_needed() {
   local user="$1"
   local shell_path="$2"
   if user_exists "$user"; then
-    err "用户已存在：$user"
+    err "$(m "用户已存在：$user" "User already exists: $user")"
     exit 1
   fi
   if command_exists useradd; then
@@ -1171,7 +1235,7 @@ create_user_if_needed() {
   elif command_exists adduser; then
     adduser -D -s "$shell_path" -g "${MANAGED_TAG} temporary admin" "$user"
   else
-    err "找不到 useradd/adduser，无法创建用户"
+    err "$(m "找不到 useradd/adduser，无法创建用户" "useradd/adduser not found; cannot create user.")"
     exit 1
   fi
 }
@@ -1181,7 +1245,7 @@ lock_user_password() {
   if usermod -L "$user" >/dev/null 2>&1; then
     return 0
   fi
-  warn "锁定账号密码失败：$user。已停止创建并准备回滚。"
+  warn "$(m "锁定账号密码失败：$user。已停止创建并准备回滚。" "Failed to lock the account password: $user. Aborting creation and preparing to roll back.")"
   return 1
 }
 
@@ -1190,16 +1254,16 @@ set_user_expiry() {
   local hours="$2"
   local date_only
   if ! date_only=$(expire_date_from_hours "$hours"); then
-    err "无法计算账号过期日期，请安装 GNU date 或 python3 后重试。"
+    err "$(m "无法计算账号过期日期，请安装 GNU date 或 python3 后重试。" "Could not calculate account expiry date; install GNU date or python3 and retry.")"
     return 1
   fi
   if command_exists chage; then
     chage -E "$date_only" "$user" || {
-      err "设置账号过期时间失败，已停止创建并准备回滚。"
+      err "$(m "设置账号过期时间失败，已停止创建并准备回滚。" "Failed to set account expiry; stopping creation and rolling back.")"
       return 1
     }
   else
-    err "找不到 chage，无法安全设置账号过期时间。"
+    err "$(m "找不到 chage，无法安全设置账号过期时间。" "chage not found; cannot safely set account expiry.")"
     return 1
   fi
 }
@@ -1209,24 +1273,24 @@ safe_write_root_file() {
   dir=$(dirname -- "$path")
   base=$(basename -- "$path")
   if [[ -L "$dir" || ! -d "$dir" ]]; then
-    warn "目标目录不安全，拒绝写入：$dir"
+    warn "$(m "目标目录不安全，拒绝写入：$dir" "Target directory is unsafe; refusing write: $dir")"
     return 1
   fi
   if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
-    warn "目标文件不安全，拒绝写入：$path"
+    warn "$(m "目标文件不安全，拒绝写入：$path" "Target file is unsafe; refusing write: $path")"
     return 1
   fi
   tmp=$(mktemp "${dir}/.${base}.XXXXXX")
   if ! cat > "$tmp"; then
     rm -f "$tmp"
-    warn "写入临时文件失败，已清理：$path"
+    warn "$(m "写入临时文件失败，已清理：$path" "Failed to write the temporary file, cleaned up: $path")"
     return 1
   fi
   chown root:root "$tmp" 2>/dev/null || true
   chmod "$mode" "$tmp"
   if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
     rm -f "$tmp"
-    warn "目标文件安全状态变化，拒绝覆盖：$path"
+    warn "$(m "目标文件安全状态变化，拒绝覆盖：$path" "Target file safety state changed; refusing overwrite: $path")"
     return 1
   fi
   mv -f "$tmp" "$path"
@@ -1239,11 +1303,11 @@ add_sudo() {
   local group
   group=$(sudo_group)
   if [[ -z "$group" ]]; then
-    warn "未找到 sudo 或 wheel 组，跳过 sudo 授权。"
+    warn "$(m "未找到 sudo 或 wheel 组，跳过 sudo 授权。" "sudo/wheel group not found; skipping sudo grant.")"
     return 1
   fi
   if [[ -L /etc/sudoers.d || ! -d /etc/sudoers.d ]]; then
-    warn "/etc/sudoers.d 不存在或不安全，无法配置 NOPASSWD sudo。"
+    warn "$(m "/etc/sudoers.d 不存在或不安全，无法配置 NOPASSWD sudo。" "/etc/sudoers.d does not exist or is unsafe; cannot configure NOPASSWD sudo.")"
     return 1
   fi
   local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
@@ -1253,7 +1317,7 @@ add_sudo() {
   if command_exists visudo; then
     visudo -cf "$file" >/dev/null || {
       rm -f "$file"
-      err "sudoers 校验失败，已删除 $file"
+      err "$(m "sudoers 校验失败，已删除 $file" "sudoers validation failed, removed $file")"
       return 1
     }
   fi
@@ -1276,24 +1340,24 @@ write_ssh_key() {
   local home_dir uid gid ssh_dir auth_file tmp_auth
   home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
   if [[ -z "$home_dir" || ! -d "$home_dir" || -L "$home_dir" ]]; then
-    err "找不到安全的用户家目录：$user"
+    err "$(m "找不到安全的用户家目录：$user" "Safe home directory not found: $user")"
     return 1
   fi
   uid=$(id -u -- "$user" 2>/dev/null || true)
   gid=$(id -g -- "$user" 2>/dev/null || true)
   if [[ -z "$uid" || -z "$gid" || ! "$uid" =~ ^[0-9]+$ || ! "$gid" =~ ^[0-9]+$ ]]; then
-    err "无法获取 UID/GID：$user"
+    err "$(m "无法获取 UID/GID：$user" "Unable to get UID/GID: $user")"
     return 1
   fi
   ssh_dir="$home_dir/.ssh"
   auth_file="$ssh_dir/authorized_keys"
   if [[ -L "$ssh_dir" || ( -e "$ssh_dir" && ! -d "$ssh_dir" ) ]]; then
-    err "用户 .ssh 路径不安全：$ssh_dir"
+    err "$(m "用户 .ssh 路径不安全：$ssh_dir" "User .ssh path is unsafe: $ssh_dir")"
     return 1
   fi
   install -d -m 700 -o "$uid" -g "$gid" "$ssh_dir"
   if [[ -L "$auth_file" || ( -e "$auth_file" && ! -f "$auth_file" ) ]]; then
-    err "authorized_keys 路径不安全：$auth_file"
+    err "$(m "authorized_keys 路径不安全：$auth_file" "authorized_keys path is unsafe: $auth_file")"
     return 1
   fi
   # write_ssh_key only ever runs for a freshly created user, so authorized_keys
@@ -1308,7 +1372,7 @@ write_ssh_key() {
   chmod 600 "$tmp_auth"
   if [[ -L "$auth_file" || ( -e "$auth_file" && ! -f "$auth_file" ) ]]; then
     rm -f "$tmp_auth"
-    err "authorized_keys 安全状态变化，拒绝覆盖：$auth_file"
+    err "$(m "authorized_keys 安全状态变化，拒绝覆盖：$auth_file" "authorized_keys safety state changed; refusing overwrite: $auth_file")"
     return 1
   fi
   mv -f "$tmp_auth" "$auth_file"
@@ -1329,12 +1393,12 @@ delete_user_with_home() {
 rollback_created_user() {
   local user="$1" unit="${2:-}"
   [[ -n "${user:-}" ]] || return 0
-  warn "创建过程中出错，正在回滚临时用户：$user"
+  warn "$(m "创建过程中出错，正在回滚临时用户：$user" "Creation failed; rolling back temporary user: $user")"
   cancel_auto_revoke "$user" "$unit" || true
   terminate_user_processes "$user"
   remove_sudoers_file "$user" || true
   if user_exists "$user"; then
-    delete_user_with_home "$user" || warn "回滚时删除用户失败，请手动检查：$user"
+    delete_user_with_home "$user" || warn "$(m "回滚时删除用户失败，请手动检查：$user" "Rollback failed to remove user; please check manually: $user")"
   fi
   registry_remove_user "$user" || true
 }
@@ -1343,6 +1407,7 @@ print_invite() {
   local host="$1" port="$2" user="$3" expires="$4" sudo_enabled="$5" private_key_file="$6" revoke_cmd="$7" auto_revoke="$8" auto_unit="$9"
   local ssh_host
   ssh_host=$(ssh_host_for_command "$host")
+  if [[ "$LANG_SEL" == "zh" ]]; then
   cat <<EOF
 
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -1367,27 +1432,79 @@ EOF_KEY
 chmod 600 './${user}.key'
 
 EOF
+  else
+  cat <<EOF
+
+----- BEGIN LINUX TEMP ADMIN INVITE -----
+
+Host: $host
+Port: $port
+User: $user
+Expires: $expires
+Sudo: $sudo_enabled
+Login: SSH key only
+Password login: locked
+Auto revoke: $auto_revoke
+Auto revoke unit: $auto_unit
+
+SSH login command:
+ssh -i ./${user}.key -p $port ${user}@${ssh_host}
+
+Save private key command:
+cat > './${user}.key' <<'EOF_KEY'
+$(cat "$private_key_file")
+EOF_KEY
+chmod 600 './${user}.key'
+
+EOF
+  fi
   if [[ "$sudo_enabled" == "yes" ]]; then
+    if [[ "$LANG_SEL" == "zh" ]]; then
     cat <<EOF
 Sudo 提示:
 已启用 NOPASSWD sudo。此账号只能通过 SSH key 登录；账号密码已锁定。
 注意：NOPASSWD sudo 等于完整 root 权限——该账号可提权为 root，并可能留下 root 拥有的进程、cron、systemd 单元或 SUID 文件等持久化。撤销只删除此账号本身，不会自动清理它以 root 身份创建的东西。
 
 EOF
+    else
+    cat <<EOF
+Sudo note:
+NOPASSWD sudo is enabled. This account can log in only with the SSH key; account password is locked.
+Note: NOPASSWD sudo is equivalent to full root — this account can escalate to root and may leave behind root-owned processes, cron jobs, systemd units, or SUID files. Revoking only deletes this account itself; it does not clean up anything it created as root.
+
+EOF
+    fi
   else
+    if [[ "$LANG_SEL" == "zh" ]]; then
     cat <<EOF
 Sudo 提示:
 未授予 sudo 权限，此账号是普通用户；账号密码已锁定。
 
 EOF
+    else
+    cat <<EOF
+Sudo note:
+sudo was not granted; this is a normal user. Account password is locked.
+
+EOF
+    fi
   fi
   if [[ "$auto_revoke" != "yes" ]]; then
+    if [[ "$LANG_SEL" == "zh" ]]; then
     cat <<EOF
 自动删除提示:
 未创建自动删除任务；账号过期只会阻止后续登录，不会删除用户和家目录。请按需手动执行撤销命令。
 
 EOF
+    else
+    cat <<EOF
+Auto-delete note:
+No auto-delete task was created; account expiry only blocks later login and does not delete the user or home directory. Run the revoke command manually when needed.
+
+EOF
+    fi
   fi
+  if [[ "$LANG_SEL" == "zh" ]]; then
   cat <<EOF
 撤销命令:
 $revoke_cmd
@@ -1401,6 +1518,21 @@ $revoke_cmd
 
 ----- END LINUX TEMP ADMIN INVITE -----
 EOF
+  else
+  cat <<EOF
+Revoke command:
+$revoke_cmd
+
+Security notes:
+- The private key is shown only once and is not stored on the server.
+- Account password is locked; no account/sudo password is printed.
+- Send only via trusted private chat; never post in groups or public pages.
+- Run the revoke command immediately after use.
+- The server stores only the public key; deleting the user invalidates this key immediately.
+
+----- END LINUX TEMP ADMIN INVITE -----
+EOF
+  fi
 }
 
 secure_cleanup_tmpdir() {
@@ -1429,7 +1561,7 @@ invite() {
       --hours) require_value "$1" "${2-}"; hours="$2"; shift 2 ;;
       --sudo) grant_sudo="yes"; shift ;;
       --no-sudo) grant_sudo="no"; shift ;;
-      --nopasswd-sudo) warn "--nopasswd-sudo 已废弃：--sudo 现在默认使用 NOPASSWD sudo。"; grant_sudo="yes"; shift ;;
+      --nopasswd-sudo) warn "$(m "--nopasswd-sudo 已废弃：--sudo 现在默认使用 NOPASSWD sudo。" "--nopasswd-sudo is deprecated: --sudo now uses NOPASSWD sudo by default.")"; grant_sudo="yes"; shift ;;
       --yes|-y) assume_yes="true"; shift ;;
       --confirm-sudo) require_value "$1" "${2-}"; confirm_sudo="$2"; shift 2 ;;
       --allow-non-tty-private-key-output) allow_non_tty_key_output="true"; shift ;;
@@ -1437,16 +1569,16 @@ invite() {
       --no-install-deps) deps_mode="never"; shift ;;
       --auto-revoke) auto_revoke="yes"; shift ;;
       --no-auto-revoke) auto_revoke="no"; shift ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "$(m "未知参数：$1" "Unknown option: $1")"; usage; exit 1 ;;
     esac
   done
 
   if [[ ! "$hours" =~ ^[0-9]{1,4}$ || "$hours" -lt 1 || "$hours" -gt "$MAX_EXPIRE_HOURS" ]]; then
-    err "--hours 必须是 1 到 $MAX_EXPIRE_HOURS 之间的整数"
+    err "$(m "--hours 必须是 1 到 $MAX_EXPIRE_HOURS 之间的整数" "--hours must be an integer between 1 and $MAX_EXPIRE_HOURS")"
     exit 1
   fi
   if ! valid_prefix "$prefix"; then
-    err "用户名前缀不合法：$prefix。只能使用小写字母、数字、下划线、连字符，需以字母/下划线开头，不能以 '-' 或 '_' 结尾，最长 20 字符。"
+    err "$(m "用户名前缀不合法：$prefix。只能使用小写字母、数字、下划线、连字符，需以字母/下划线开头，不能以 '-' 或 '_' 结尾，最长 20 字符。" "Invalid username prefix: $prefix. Use lowercase letters, digits, underscore, and hyphen only; start with a letter/underscore; do not end with '-' or '_'; max 20 chars.")"
     exit 1
   fi
 
@@ -1460,46 +1592,46 @@ invite() {
       user=""
     done
     if [[ -z "$user" ]]; then
-      err "多次生成随机用户名均发生冲突，请指定 --user。"
+      err "$(m "多次生成随机用户名均发生冲突，请指定 --user。" "Random username generation collided repeatedly; specify --user.")"
       exit 1
     fi
   fi
   if ! valid_username "$user"; then
-    err "用户名不合法：$user。只能使用小写字母、数字、下划线、连字符，且以字母/下划线开头。"
+    err "$(m "用户名不合法：$user。只能使用小写字母、数字、下划线、连字符，且以字母/下划线开头。" "Invalid username: $user")"
     exit 1
   fi
 
   if [[ -z "$host" ]]; then
     if [[ "$assume_yes" == "true" ]]; then
-      err "--yes 模式不会自动访问外部服务探测公网 IP，请显式传入 --host。"
+      err "$(m "--yes 模式不会自动访问外部服务探测公网 IP，请显式传入 --host。" "--yes mode will not contact external services to detect public IP; pass --host explicitly.")"
       exit 1
     else
-      warn "自动探测会先尝试本地网卡和云厂商 metadata；失败后才访问外部服务：https://api.ipify.org、https://ifconfig.me/ip、https://icanhazip.com"
-      read -r -p "是否自动探测公网 IP？[y/N]: " ans_host
+      warn "$(m "自动探测会先尝试本地网卡和云厂商 metadata；失败后才访问外部服务：https://api.ipify.org、https://ifconfig.me/ip、https://icanhazip.com" "Automatic detection first tries local interfaces and cloud metadata; if that fails, it contacts external services: https://api.ipify.org, https://ifconfig.me/ip, https://icanhazip.com")"
+      read -r -p "$(m "是否自动探测公网 IP？[y/N]: " "Detect public IP automatically?[y/N]: ")" ans_host
       if [[ "$ans_host" =~ ^[Yy]$ ]]; then
         if host=$(get_local_public_ip); then
-          info "已通过本地/云元数据探测公网 IP：$host"
+          info "$(m "已通过本地/云元数据探测公网 IP：$host" "Detected public IP via local/cloud metadata: $host")"
         elif host=$(get_public_ip); then
-          info "已通过外部服务探测公网 IP：$host"
+          info "$(m "已通过外部服务探测公网 IP：$host" "Detected public IP via external service: $host")"
         else
-          warn "自动探测公网 IP 失败，请手动输入服务器公网 IP/域名。"
+          warn "$(m "自动探测公网 IP 失败，请手动输入服务器公网 IP/域名。" "Automatic public IP detection failed; please enter server public IP/domain manually.")"
           host=""
         fi
       fi
     fi
   fi
   if [[ -z "$host" ]]; then
-    read -r -p "请输入服务器公网 IP/域名: " host
+    read -r -p "$(m "请输入服务器公网 IP/域名: " "Enter server public IP/domain: ")" host
   fi
   if ! valid_host "$host"; then
-    err "Host 不合法：$host。请使用普通域名、IPv4 或 IPv6 地址，不要包含端口、空格、引号或 shell 符号。"
+    err "$(m "Host 不合法：$host。请使用普通域名、IPv4 或 IPv6 地址，不要包含端口、空格、引号或 shell 符号。" "Invalid host: $host. Use a normal domain, IPv4, or IPv6 address without ports, spaces, quotes, or shell metacharacters.")"
     exit 1
   fi
   if [[ -z "$port" ]]; then
     port=$(get_ssh_port)
   fi
   if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
-    err "SSH 端口不合法：$port"
+    err "$(m "SSH 端口不合法：$port" "Invalid SSH port: $port")"
     exit 1
   fi
 
@@ -1507,16 +1639,16 @@ invite() {
     if [[ "$assume_yes" == "true" ]]; then
       grant_sudo="no"
     else
-      read -r -p "是否授予 sudo 管理员权限？[y/N]: " ans
+      read -r -p "$(m "是否授予 sudo 管理员权限？[y/N]: " "Grant sudo admin privileges?[y/N]: ")" ans
       if [[ "$ans" =~ ^[Yy]$ ]]; then grant_sudo="yes"; else grant_sudo="no"; fi
     fi
   fi
   if [[ "$grant_sudo" == "yes" && "$assume_yes" == "true" && "$confirm_sudo" != "$user" ]]; then
-    err "拒绝通过 --sudo --yes 授予 sudo：必须同时传入 --confirm-sudo $user。"
+    err "$(m "拒绝通过 --sudo --yes 授予 sudo：必须同时传入 --confirm-sudo $user。" "Refusing to grant sudo via --sudo --yes: also pass --confirm-sudo $user.")"
     exit 1
   fi
   if [[ ! -t 1 && "$allow_non_tty_key_output" != "true" ]]; then
-    err "stdout 不是 TTY，拒绝输出一次性私钥。若确认输出通道安全，请加 --allow-non-tty-private-key-output。"
+    err "$(m "stdout 不是 TTY，拒绝输出一次性私钥。若确认输出通道安全，请加 --allow-non-tty-private-key-output。" "stdout is not a TTY; refusing to print one-time private key. If the output channel is safe, add --allow-non-tty-private-key-output.")"
     exit 1
   fi
 
@@ -1524,11 +1656,12 @@ invite() {
     if [[ "$assume_yes" == "true" ]]; then
       auto_revoke="yes"
     else
-      read -r -p "是否到期后自动删除该用户？[Y/n]: " ans3
+      read -r -p "$(m "是否到期后自动删除该用户？[Y/n]: " "Auto-delete this user on expiry?[Y/n]: ")" ans3
       if [[ -z "$ans3" || "$ans3" =~ ^[Yy]$ ]]; then auto_revoke="yes"; else auto_revoke="no"; fi
     fi
   fi
 
+  if [[ "$LANG_SEL" == "zh" ]]; then
   cat <<EOF
 
 即将创建一次性临时账号：
@@ -1540,8 +1673,21 @@ invite() {
 - 到期自动删除：$auto_revoke
 
 EOF
-  confirm_yes "sudo/SSH 账号属于高权限入口。确认创建请输入 YES。" "$assume_yes" || {
-    warn "已取消。"
+  else
+  cat <<EOF
+
+About to create one-time temporary account
+- User: $user
+- Host: $host
+- SSH port: $port
+- Valid for: $hours hours
+- sudo: $grant_sudo
+- auto-delete on expiry: $auto_revoke
+
+EOF
+  fi
+  confirm_yes "$(m "sudo/SSH 账号属于高权限入口。确认创建请输入 YES。" "sudo/SSH accounts are high-privilege access. Type YES to confirm.")" "$assume_yes" || {
+    warn "$(m "已取消。" "Cancelled.")"
     exit 0
   }
 
@@ -1587,7 +1733,7 @@ EOF
     if add_sudo "$user"; then
       sudo_text="yes"
     else
-      warn "未能授予 sudo 权限（可能缺少 sudo/wheel 组或 /etc/sudoers.d）；已创建为普通账号：$user"
+      warn "$(m "未能授予 sudo 权限（可能缺少 sudo/wheel 组或 /etc/sudoers.d）；已创建为普通账号：$user" "Could not grant sudo (missing sudo/wheel group or /etc/sudoers.d?); created as a normal account: $user")"
       sudo_text="no"
     fi
   fi
@@ -1605,17 +1751,17 @@ EOF
       auto_text="yes"
       revoke_cmd="sudo $INSTALL_PATH revoke --user $user"
     else
-      warn "自动删除任务创建失败：仅设置账号过期；账号过期不会删除用户和家目录，请按需手动执行撤销命令。"
+      warn "$(m "自动删除任务创建失败：仅设置账号过期；账号过期不会删除用户和家目录，请按需手动执行撤销命令。" "Auto-delete task creation failed: account expiry only; expiry will not delete the user or home directory. Run the revoke command manually when needed.")"
       auto_text="no"
       revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
     fi
   fi
   registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit" \
-    || warn "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。"
+    || warn "$(m "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。" "Failed to record in the registry: the account and auto-delete task were created but not registered; verify with status and revoke manually if needed.")"
 
   invite_completed="true"
   trap - ERR INT TERM HUP
-  success "临时账号已创建并登记：$user"
+  success "$(m "临时账号已创建并登记：$user" "Temporary account created and registered: $user")"
   print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
   secure_cleanup_tmpdir "$tmpdir"
   trap - EXIT
@@ -1630,14 +1776,14 @@ revoke_user() {
       --yes|-y) assume_yes="true"; shift ;;
       --force) force="true"; shift ;;
       --confirm-force) require_value "$1" "${2-}"; confirm_force="$2"; shift 2 ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "$(m "未知参数：$1" "Unknown option: $1")"; usage; exit 1 ;;
     esac
   done
   if [[ -z "$user" ]]; then
     user=$(registry_select_user)
   fi
   if ! valid_username "$user"; then
-    err "用户名不合法，拒绝删除：$user"
+    err "$(m "用户名不合法，拒绝删除：$user" "Invalid username; refusing deletion: $user")"
     exit 1
   fi
   local registered="false"
@@ -1645,15 +1791,15 @@ revoke_user() {
     registered="true"
   fi
   if [[ "$force" != "true" && "$registered" != "true" ]]; then
-    err "拒绝删除未登记用户：$user。若确认需要删除默认前缀或其他用户，请加 --force。"
+    err "$(m "拒绝删除未登记用户：$user。若确认需要删除默认前缀或其他用户，请加 --force。" "Refusing to delete an unregistered user: $user. Use --force if you need to delete a default-prefix or other user.")"
     exit 1
   fi
   if [[ "$force" == "true" && "$registered" != "true" && "$assume_yes" == "true" && "$confirm_force" != "$user" ]]; then
-    err "拒绝通过 --force --yes 删除未登记用户：必须同时传入 --confirm-force $user。"
+    err "$(m "拒绝通过 --force --yes 删除未登记用户：必须同时传入 --confirm-force $user。" "Refusing to delete an unregistered user via --force --yes: also pass --confirm-force $user.")"
     exit 1
   fi
   if ! user_exists "$user"; then
-    warn "用户不存在：$user。将清理登记记录、sudoers 文件和自动删除任务（如果存在）。"
+    warn "$(m "用户不存在：$user。将清理登记记录、sudoers 文件和自动删除任务（如果存在）。" "User does not exist: $user. Cleaning up the registry entry, sudoers file, and auto-delete task (if any).")"
     cancel_auto_revoke "$user"
     remove_sudoers_file "$user"
     registry_remove_user "$user"
@@ -1661,32 +1807,28 @@ revoke_user() {
   fi
   if [[ "$assume_yes" != "true" ]]; then
     if [[ "$force" == "true" && "$registered" != "true" ]]; then
-      printf "
-${RED}危险：用户 %s 未在脚本登记中，--force 将删除真实系统用户及其家目录。${NC}
-" "$user"
+      printf '\n%s\n' "${RED}$(m "危险：用户 $user 未在脚本登记中，--force 将删除真实系统用户及其家目录。" "DANGER: user $user is not registered by this script; --force will delete a real system user and its home directory.")${NC}"
     fi
-    printf "
-${YELLOW}将强制下线并删除用户 %s 及其家目录。${NC}
-" "$user"
-    read -r -p "请输入完整用户名 $user 以确认删除: " confirm_user
+    printf '\n%s\n' "${YELLOW}$(m "将强制下线并删除用户 $user 及其家目录。" "Will force logout and delete user $user and its home directory.")${NC}"
+    read -r -p "$(m "请输入完整用户名 $user 以确认删除: " "Type full username $user to confirm deletion: ")" confirm_user
     if [[ "$confirm_user" != "$user" ]]; then
-      warn "确认不匹配，已取消。"
+      warn "$(m "确认不匹配，已取消。" "Confirmation mismatch; cancelled.")"
       exit 0
     fi
   fi
   if is_protected_revoke_target "$user" "$registered"; then
-    err "拒绝删除受保护或系统用户：$user"
+    err "$(m "拒绝删除受保护或系统用户：$user" "Refusing to delete a protected or system user: $user")"
     exit 1
   fi
   cancel_auto_revoke "$user"
   terminate_user_processes "$user"
   remove_sudoers_file "$user"
   if ! delete_user_with_home "$user"; then
-    warn "删除用户失败: $user"
+    warn "$(m "删除用户失败: $user" "Failed to remove user: $user")"
     exit 1
   fi
   registry_remove_user "$user"
-  success "已撤销并删除用户：$user"
+  success "$(m "已撤销并删除用户：$user" "User revoked and deleted: $user")"
 }
 
 status_user() {
@@ -1694,12 +1836,12 @@ status_user() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --user) require_value "$1" "${2-}"; user="$2"; shift 2 ;;
-      *) err "未知参数：$1"; usage; exit 1 ;;
+      *) err "$(m "未知参数：$1" "Unknown option: $1")"; usage; exit 1 ;;
     esac
   done
   if [[ -n "$user" ]]; then
     if ! valid_username "$user"; then
-      err "用户名不合法：$user"
+      err "$(m "用户名不合法：$user" "Invalid username: $user")"
       exit 1
     fi
     if user_exists "$user"; then
@@ -1723,18 +1865,18 @@ status_user() {
       fi
       show_installed_revoke_status
     else
-      err "用户不存在：$user"
+      err "$(m "用户不存在：$user" "User does not exist: $user")"
       exit 1
     fi
     return
   fi
-  info "脚本登记的临时用户："
+  info "$(m "脚本登记的临时用户：" "Registered temporary users:")"
   registry_list_users || true
   printf '\n'
-  info "系统中匹配前缀 $DEFAULT_PREFIX- 的用户："
+  info "$(m "系统中匹配前缀 $DEFAULT_PREFIX- 的用户：" "System users matching prefix $DEFAULT_PREFIX-")"
   getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1 "\t" $6 "\t" $7}' || true
   printf '\n'
-  info "自动删除 timer："
+  info "$(m "自动删除 timer：" "Auto-delete timers")"
   show_auto_revoke_timers || true
   printf '\n'
   show_installed_revoke_status
@@ -1746,12 +1888,12 @@ cleanup_expired() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --compact) compact="true"; shift ;;
-      *) err "cleanup-expired 不支持的参数：$1"; usage; exit 1 ;;
+      *) err "$(m "cleanup-expired 不支持的参数：$1" "cleanup-expired: unsupported argument: $1")"; usage; exit 1 ;;
     esac
   done
-  warn "这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。"
+  warn "$(m "这里只查看账号过期和自动删除状态，不主动删除用户，避免误删。" "This only shows account expiry and auto-delete status; it does not delete users.")"
   if ! command_exists chage; then
-    warn "找不到 chage，无法检查过期时间。"
+    warn "$(m "找不到 chage，无法检查过期时间。" "chage not found; cannot inspect expiry.")"
     return 0
   fi
   local users=()
@@ -1771,7 +1913,7 @@ cleanup_expired() {
     [[ "$found" == "false" ]] && users+=("$user")
   done < <(getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}')
   if [[ ${#users[@]} -eq 0 ]]; then
-    info "没有登记的临时用户或系统默认前缀用户。"
+    info "$(m "没有登记的临时用户或系统默认前缀用户。" "No registered temporary users or system default-prefix users.")"
     return 0
   fi
   for user in "${users[@]}"; do
@@ -1779,7 +1921,7 @@ cleanup_expired() {
     if user_exists "$user"; then
       chage -l "$user" | sed -n '1,8p' || true
     else
-      info "用户不存在：$user"
+      info "$(m "用户不存在：$user" "User does not exist: $user")"
     fi
   done
   if [[ "$compact" == "true" ]]; then
@@ -1792,16 +1934,22 @@ cleanup_expired() {
         fi
       done < "$REGISTRY_FILE"
     fi
-    info "已压实注册表：移除 $removed 条指向已不存在用户的记录（仅清理登记表，不影响任何账号）。"
+    info "$(m "已压实注册表：移除 $removed 条指向已不存在用户的记录（仅清理登记表，不影响任何账号）。" "Compacted the registry: removed $removed entries pointing to users that no longer exist (registry only, no account is touched).")"
   fi
-  info "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。"
+  info "$(m "说明：账号过期只会阻止后续登录；自动删除任务会调用 revoke 删除用户、家目录和 SSH key。" "Note: account expiry only blocks later login; auto-delete calls revoke to delete user, home, and SSH key.")"
   show_auto_revoke_timers || true
   show_installed_revoke_status
 }
 
 menu() {
   need_root
+  if [[ "$LANG_LOCKED" != "true" && -t 0 ]]; then
+    printf '%s\n' "Select language / 选择语言:  1) English  2) 中文"
+    read -r -p "Choice [1-2] (Enter = $LANG_SEL): " _lc
+    case "$_lc" in 2|zh*|中*) LANG_SEL="zh" ;; 1|en*) LANG_SEL="en" ;; esac
+  fi
   while true; do
+    if [[ "$LANG_SEL" == "zh" ]]; then
     cat <<EOF
 
 ${BOLD}Linux 临时管理员管理器${NC} v$VERSION
@@ -1812,20 +1960,44 @@ ${BOLD}Linux 临时管理员管理器${NC} v$VERSION
 4) 查看账号过期/自动删除状态
 5) 退出
 EOF
-    read -r -p "请选择 [1-5]: " choice
+    else
+    cat <<EOF
+
+${BOLD}Linux Temporary Admin Manager${NC} v$VERSION
+
+1) Create one-time temp admin invite
+2) Revoke/delete temp user
+3) Show user status
+4) Show expiry/auto-delete status
+5) Exit
+EOF
+    fi
+    read -r -p "$(m "请选择 [1-5]: " "Select [1-5]: ")" choice
     case "$choice" in
       1) ( invite ) || true ;;
       2) ( revoke_user ) || true ;;
-      3) read -r -p "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " u
+      3) read -r -p "$(m "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " "Username (blank lists ${DEFAULT_PREFIX}-*): ")" u
          if [[ -n "$u" ]]; then ( status_user --user "$u" ) || true; else ( status_user ) || true; fi ;;
       4) ( cleanup_expired ) || true ;;
       5) exit 0 ;;
-      *) warn "无效选择" ;;
+      *) warn "$(m "无效选择" "Invalid choice")" ;;
     esac
   done
 }
 
 main() {
+  # Pull an optional --lang from anywhere in the args (also honored via the
+  # LINUX_TEMP_ADMIN_LANG env var); the remainder is the normal command line.
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lang) shift; if [[ $# -gt 0 ]]; then if set_language "$1"; then LANG_LOCKED="true"; fi; shift; fi ;;
+      --lang=*) if set_language "${1#--lang=}"; then LANG_LOCKED="true"; fi; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  resolve_language
   local cmd="${1:-}"
   case "$cmd" in
     "" ) menu ;;
@@ -1835,7 +2007,7 @@ main() {
     cleanup-expired|expiry-status) shift; cleanup_expired "$@" ;;
     help|-h|--help) usage ;;
     version|--version) echo "$VERSION" ;;
-    *) err "未知命令：$cmd"; usage; exit 1 ;;
+    *) err "$(m "未知命令：$cmd" "Unknown command: $cmd")"; usage; exit 1 ;;
   esac
 }
 

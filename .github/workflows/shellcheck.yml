@@ -20,7 +20,7 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Bash syntax
-        run: bash -n temp-admin.sh temp-admin-en.sh
+        run: bash -n temp-admin.sh
 
       - name: ShellCheck
-        run: shellcheck -S warning temp-admin.sh temp-admin-en.sh
+        run: shellcheck -S warning temp-admin.sh
