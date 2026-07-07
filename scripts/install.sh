@@ -39,6 +39,7 @@ if [ -z "$want" ] || [ "$want" != "$got" ]; then
   exit 1
 fi
 
+mkdir -p "$(dirname "$DEST")"
 cp "$tmp/bin" "${DEST}.new"
 chmod 0755 "${DEST}.new"
 chown root:root "${DEST}.new" 2>/dev/null || true

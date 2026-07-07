@@ -2,7 +2,7 @@
 #
 # UNCONFIGURED: no key is set, so signed self-upgrade is DISABLED and `upgrade`
 # fails closed. To enable it, generate a release keypair and paste the public key
-# hex on a line below (see scripts/keygen.sh and scripts/release.sh):
+# hex on a line below (see `go run ./cmd/lta-release keygen` and scripts/release.sh):
 #
 #   <64-hex-character ed25519 public key on its own line>
 #

@@ -116,6 +116,14 @@ func (a *App) invite(args []string) int {
 		return 1
 	}
 
+	// Refuse a non-TTY stdout up front (before any interactive prompt), so a
+	// piped run fails immediately rather than after the operator answers.
+	if !a.StdoutIsTTY() && !fAllowNonTTY {
+		a.errorf("%s", a.P.M("stdout 非 TTY，拒绝输出一次性私钥（可加 --allow-non-tty-private-key-output）",
+			"stdout is not a TTY; refusing to print the one-time private key (add --allow-non-tty-private-key-output)"))
+		return 1
+	}
+
 	if grantSudo == "ask" {
 		if fYes {
 			grantSudo = "no"
@@ -141,11 +149,6 @@ func (a *App) invite(args []string) int {
 	if grantSudo == "yes" && fYes && *confirmSudo != username {
 		a.errorf("%s", a.P.M("通过 --sudo --yes 授权需同时传入 --confirm-sudo "+username,
 			"granting sudo via --sudo --yes also requires --confirm-sudo "+username))
-		return 1
-	}
-	if !a.StdoutIsTTY() && !fAllowNonTTY {
-		a.errorf("%s", a.P.M("stdout 非 TTY，拒绝输出一次性私钥（可加 --allow-non-tty-private-key-output）",
-			"stdout is not a TTY; refusing to print the one-time private key (add --allow-non-tty-private-key-output)"))
 		return 1
 	}
 
@@ -205,6 +208,12 @@ func (a *App) resolveDeps(needSudo, installDeps, noInstallDeps, yes bool) bool {
 
 // runInvite performs the mutating steps with rollback on any failure.
 func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAuto bool) int {
+	// Preflight the registry before creating anything, so a broken/unsafe
+	// registry fails fast instead of leaving a stray account behind.
+	if err := a.Registry.Init(); err != nil {
+		a.errorf("%s: %v", a.P.M("初始化注册表失败", "registry init failed"), err)
+		return 1
+	}
 	kp, err := sshkey.GenerateEd25519(username + "-" + config.ManagedTag)
 	if err != nil {
 		a.errorf("%s: %v", a.P.M("生成密钥失败", "key generation failed"), err)
@@ -286,9 +295,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		AutoUnit:    autoUnit,
 	}
 	registered := false
-	if err := a.Registry.Init(); err != nil {
-		a.warnf("%s: %v", a.P.M("初始化注册表失败", "registry init failed"), err)
-	} else if err := a.Registry.Record(rec); err != nil {
+	if err := a.Registry.Record(rec); err != nil {
 		a.warnf("%s: %v", a.P.M("登记注册表失败", "registry record failed"), err)
 	} else {
 		registered = true

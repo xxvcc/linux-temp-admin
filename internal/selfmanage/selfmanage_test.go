@@ -32,6 +32,11 @@ func TestNormalizeSig(t *testing.T) {
 	if got := normalizeSig(hexSig); string(got) != string(sig) {
 		t.Error("hex signature should decode to raw")
 	}
+	// raw + a single trailing newline is trimmed to exactly 64 bytes
+	rawNL := append(append([]byte{}, sig...), '\n')
+	if got := normalizeSig(rawNL); string(got) != string(sig) {
+		t.Error("raw signature with a trailing newline should normalize to 64 bytes")
+	}
 }
 
 func toHex(b []byte) string {

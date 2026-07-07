@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"golang.org/x/crypto/ssh"
@@ -55,10 +56,17 @@ func GenerateEd25519(comment string) (*KeyPair, error) {
 // authorizedKey to .ssh/authorized_keys (0600, owned by uid:gid), refusing any
 // symlinked component and never following one.
 func WriteAuthorizedKeys(homeDir string, uid, gid int, authorizedKey []byte) error {
-	if fi, err := os.Lstat(homeDir); err != nil {
+	fi, err := os.Lstat(homeDir)
+	if err != nil {
 		return fmt.Errorf("home directory: %w", err)
-	} else if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("home directory %s is not a safe directory", homeDir)
+	}
+	// The home must belong to the account (or root); refuse to write into a dir
+	// owned by anyone else, so a hijacked home can't redirect the key write.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(uid) && st.Uid != 0 {
+		return fmt.Errorf("home directory %s is not owned by the account or root", homeDir)
 	}
 	sshDir := filepath.Join(homeDir, ".ssh")
 	if fi, err := os.Lstat(sshDir); err == nil {

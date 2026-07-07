@@ -185,16 +185,20 @@ func (m *Manager) probeVersion(bin []byte) (string, error) {
 	return v, nil
 }
 
-// normalizeSig accepts a raw 64-byte signature or a hex-encoded one.
+// normalizeSig accepts a raw 64-byte signature or a hex-encoded one. It handles
+// a lone trailing newline without TrimSpace (which could strip a whitespace-
+// valued edge byte from a genuine raw signature).
 func normalizeSig(b []byte) []byte {
-	s := strings.TrimSpace(string(b))
-	if len(s) == ed25519.SignatureSize*2 {
+	if len(b) == ed25519.SignatureSize {
+		return b
+	}
+	if len(b) == ed25519.SignatureSize+1 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r') {
+		return b[:ed25519.SignatureSize]
+	}
+	if s := strings.TrimSpace(string(b)); len(s) == ed25519.SignatureSize*2 {
 		if raw, err := decodeHex(s); err == nil {
 			return raw
 		}
-	}
-	if len(s) == ed25519.SignatureSize { // raw signature with surrounding whitespace
-		return []byte(s)
 	}
 	return b
 }

@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -54,6 +55,9 @@ func mustArgs(n int) {
 func keygen(privOut string) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	check(err)
+	if dir := filepath.Dir(privOut); dir != "." {
+		check(os.MkdirAll(dir, 0o700))
+	}
 	check(os.WriteFile(privOut, []byte(hex.EncodeToString(priv)+"\n"), 0o600))
 	fmt.Fprintf(os.Stderr, "private key written to %s (keep offline)\n", privOut)
 	fmt.Fprintln(os.Stderr, "paste this public key into internal/selfmanage/release_pubkey.hex:")
