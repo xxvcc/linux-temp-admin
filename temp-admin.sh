@@ -6,7 +6,7 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.2.1"
+VERSION="1.2.3"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -84,12 +84,13 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME revoke --user USER      撤销/删除临时用户
   bash $SCRIPT_NAME status [--user USER]    查看状态
   bash $SCRIPT_NAME cleanup-expired [--compact]  查看过期/自动删除状态（--compact 清理已失效登记）
-  bash $SCRIPT_NAME expiry-status           查看过期/自动删除状态
+  bash $SCRIPT_NAME expiry-status [--compact]  查看过期/自动删除状态（同 cleanup-expired）
   bash $SCRIPT_NAME doctor                  检查依赖与系统配置
   bash $SCRIPT_NAME install [--force]       安装/更新本地稳定命令
-  bash $SCRIPT_NAME upgrade [--yes]         从 GitHub 下载并升级稳定命令
+  bash $SCRIPT_NAME upgrade [--yes] [--force] [--url URL]  从 GitHub 下载并升级稳定命令
   bash $SCRIPT_NAME uninstall [--force]     卸载本地稳定命令
   bash $SCRIPT_NAME help                    显示帮助
+  bash $SCRIPT_NAME version                 显示版本号
 
 常用参数：
   --prefix PREFIX        用户名前缀，默认：$DEFAULT_PREFIX
@@ -107,9 +108,10 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   --no-install-deps      不安装缺失依赖
   --auto-revoke          到期自动删除用户，默认
   --no-auto-revoke       不自动删除，仅设置账号过期
-  --force                revoke 时允许删除未登记用户（危险）
+  --force                revoke 删除未登记用户；install/upgrade/uninstall 强制覆盖或删除（危险）
   --confirm-force USER   与 --force --yes 一起删除未登记用户时，必须重复完整用户名
   --url URL              upgrade 使用的脚本下载地址（默认：$DEFAULT_UPGRADE_URL）
+  --lang zh|en           界面语言，默认跟随环境；也可用环境变量 LINUX_TEMP_ADMIN_LANG
 
 示例：
   bash $SCRIPT_NAME invite
@@ -129,12 +131,13 @@ Usage
   bash $SCRIPT_NAME revoke --user USER      Revoke/delete temp user
   bash $SCRIPT_NAME status [--user USER]    Show status
   bash $SCRIPT_NAME cleanup-expired [--compact]  Show expiry/auto-delete status (--compact prunes stale registry entries)
-  bash $SCRIPT_NAME expiry-status           Show expiry/auto-revoke status
+  bash $SCRIPT_NAME expiry-status [--compact]  Show expiry/auto-delete status (alias of cleanup-expired)
   bash $SCRIPT_NAME doctor                  Check dependencies and system configuration
   bash $SCRIPT_NAME install [--force]       Install/update the stable local command
-  bash $SCRIPT_NAME upgrade [--yes]         Download from GitHub and upgrade the stable command
+  bash $SCRIPT_NAME upgrade [--yes] [--force] [--url URL]  Download from GitHub and upgrade the stable command
   bash $SCRIPT_NAME uninstall [--force]     Uninstall the stable local command
   bash $SCRIPT_NAME help                    Show help
+  bash $SCRIPT_NAME version                 Show version number
 
 Options
   --prefix PREFIX        Username prefix, default: $DEFAULT_PREFIX
@@ -152,9 +155,10 @@ Options
   --no-install-deps      Never install dependencies
   --auto-revoke          Auto-delete user on expiry, default
   --no-auto-revoke       Disable auto-delete, keep account expiry only
-  --force                Allow revoke of unregistered users (dangerous)
+  --force                revoke unregistered users; force-replace/remove for install/upgrade/uninstall (dangerous)
   --confirm-force USER   Required with --force --yes for unregistered users; repeat the full username
   --url URL              Script download URL for upgrade (default: $DEFAULT_UPGRADE_URL)
+  --lang zh|en           UI language (defaults to the environment; also LINUX_TEMP_ADMIN_LANG)
 
 Examples
   bash $SCRIPT_NAME invite
@@ -244,6 +248,13 @@ package_candidates_for_tool() {
       ;;
     sudo) echo "sudo" ;;
     curl) echo "curl" ;;
+    install)
+      case "$pm" in
+        apt|dnf|yum|pacman) echo "coreutils" ;;
+        apk) echo "coreutils" ;;
+        *) echo "" ;;
+      esac
+      ;;
     flock)
       case "$pm" in
         apt|dnf|yum|pacman) echo "util-linux" ;;
@@ -270,8 +281,11 @@ unique_words() {
 
 can_compute_future_date() {
   # Setting account expiry needs computing a future date: prefer GNU date, then python3.
-  # busybox date does not support relative formats (e.g. "+1 day"); coreutils or python3 is needed.
-  date -u -d "+1 day" +%F >/dev/null 2>&1 || command_exists python3
+  # Probe the SAME compound relative form expire_date_from_hours uses ("+H hours
+  # +1 day"), so a date impl that accepts "+1 day" but not the compound form is
+  # not mis-reported as OK and then failing mid-invite. busybox date supports
+  # neither, so it correctly falls through to python3.
+  date -u -d "+0 hours +1 day" +%F >/dev/null 2>&1 || command_exists python3
 }
 
 ensure_dependencies() {
@@ -289,6 +303,7 @@ ensure_dependencies() {
   fi
   command_exists chage || missing+=("chage")
   command_exists flock || missing+=("flock")
+  command_exists install || missing+=("install")
   can_compute_future_date || missing+=("date-compute")
 
   if [[ "$need_sudo" == "true" ]]; then
@@ -357,6 +372,7 @@ ensure_dependencies() {
   if ! command_exists userdel && ! command_exists deluser; then still_missing+=("userdel/deluser"); fi
   command_exists chage || still_missing+=("chage")
   command_exists flock || still_missing+=("flock")
+  command_exists install || still_missing+=("install")
   can_compute_future_date || still_missing+=("date-compute")
   if [[ "$need_sudo" == "true" ]] && ! command_exists sudo; then still_missing+=("sudo"); fi
 
@@ -461,24 +477,86 @@ valid_host() {
 
 user_exists() { id -- "$1" >/dev/null 2>&1; }
 
+# Resolve a single passwd entry by name. getent is not a busybox applet and is
+# often absent on musl/Alpine, so fall back to /etc/passwd. Accounts managed by
+# this tool are always local, so /etc/passwd is authoritative for them. The
+# username is validated ([a-z0-9_-]) before it reaches here; awk matches it as a
+# literal field, avoiding any pattern-injection concern.
+passwd_entry() {
+  local user="$1" line
+  if command_exists getent; then
+    # Use getent's output whenever it produced any, regardless of its exit code,
+    # so a non-zero exit from a partly-failing NSS backend doesn't drop a found
+    # entry or cause a duplicating fall-through. `|| true` keeps a non-zero getent
+    # from aborting this assignment under errexit before the emptiness check.
+    line=$(getent passwd "$user" 2>/dev/null) || true
+    [[ -n "$line" ]] && { printf '%s\n' "$line"; return 0; }
+  fi
+  awk -F: -v u="$user" '$1 == u {print; exit}' /etc/passwd 2>/dev/null
+}
+
+# Enumerate the local passwd database, with the same getent->/etc/passwd fallback.
+passwd_db() {
+  local out
+  if command_exists getent; then
+    out=$(getent passwd 2>/dev/null) || true
+    [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+  fi
+  cat /etc/passwd 2>/dev/null || true
+}
+
+# Send a signal to every process whose real OR effective UID matches, by
+# scanning /proc. Fallback for systems without pkill (not a busybox applet;
+# absent on Alpine). Matching either uid covers both `pkill -u` (effective) and
+# `pkill -U` (real) semantics so no session process is missed.
+signal_uid_processes() {
+  local sig="$1" uid="$2" proc pid ruid euid
+  # Refuse a non-numeric, empty, or root (0) uid: an empty uid would match the
+  # empty ruid of a process that vanished mid-scan (killing an arbitrary pid),
+  # and uid 0 would signal every root process.
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -ge 1 ]] || return 0
+  for proc in /proc/[0-9]*; do
+    [[ -r "$proc/status" ]] || continue
+    ruid=""; euid=""
+    # `|| true` must be OUTSIDE the <(): it has to catch read's own non-zero
+    # (empty input when the process vanished mid-scan), not just awk's, or
+    # errexit would abort the whole revoke/rollback here.
+    read -r ruid euid < <(awk '/^Uid:/ {print $2, $3; exit}' "$proc/status" 2>/dev/null) || true
+    if [[ "$ruid" == "$uid" || "$euid" == "$uid" ]]; then
+      pid=${proc#/proc/}
+      kill "-$sig" "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
 terminate_user_processes() {
   local user="$1" uid
   uid=$(id -u -- "$user" 2>/dev/null || true)
-  if [[ -z "$uid" || ! "$uid" =~ ^[0-9]+$ ]]; then
-    warn "$(m "无法获取 UID，跳过终止用户进程：$user" "Unable to get UID; skipping process termination for: $user")"
+  if [[ -z "$uid" || ! "$uid" =~ ^[0-9]+$ || "$uid" -eq 0 ]]; then
+    warn "$(m "无法获取有效 UID（或为 0），跳过终止用户进程：$user" "Could not get a valid non-root UID; skipping process termination for: $user")"
     return 0
   fi
-  pkill -TERM -u "$uid" 2>/dev/null || true
+  if command_exists pkill; then
+    pkill -TERM -u "$uid" 2>/dev/null || true
+    sleep 2
+    pkill -KILL -u "$uid" 2>/dev/null || true
+    return 0
+  fi
+  # pkill missing (busybox/Alpine): signal by scanning /proc so the account's
+  # live sessions are still forced off before the account is deleted.
+  signal_uid_processes TERM "$uid"
   sleep 2
-  pkill -KILL -u "$uid" 2>/dev/null || true
+  signal_uid_processes KILL "$uid"
 }
 
 account_is_managed() {
-  # An account is considered tool-managed if its GECOS carries our tag
-  # (set via useradd -c "${MANAGED_TAG} temporary admin").
+  # An account is considered tool-managed only if its GECOS carries the exact tag
+  # this tool sets (useradd -c / adduser -g "${MANAGED_TAG} temporary admin"),
+  # not merely the bare tag substring, so a self-set partial GECOS cannot pose as
+  # managed.
   local user="$1" gecos
-  gecos=$(getent passwd "$user" 2>/dev/null | cut -d: -f5)
-  [[ "$gecos" == *"$MANAGED_TAG"* ]]
+  gecos=$(passwd_entry "$user" | cut -d: -f5)
+  [[ "$gecos" == *"$MANAGED_TAG temporary admin"* ]]
 }
 
 is_protected_revoke_target() {
@@ -822,7 +900,10 @@ root_safe_dir() {
 }
 
 valid_installed_version() {
-  [[ "$1" =~ ^[0-9]+([.][0-9]+){1,3}([._+~-][A-Za-z0-9._+~-]+)?$ ]]
+  # Exactly three numeric components (+ optional suffix) to match version_gt's
+  # X.Y.Z parser, so a valid-but-uncomparable 2- or 4-part version can't slip
+  # through extract_script_version and confuse the upgrade comparison.
+  [[ "$1" =~ ^[0-9]+([.][0-9]+){2}([._+~-][A-Za-z0-9._+~-]+)?$ ]]
 }
 
 extract_script_version() {
@@ -875,7 +956,37 @@ download_script_to_file() {
       return 1
     fi
   elif command_exists wget; then
-    if ! wget -qO "$dest" --tries=1 --timeout=30 "$url"; then
+    # curl (preferred, above) confines redirects to https via --proto-redir, so
+    # a hostile origin cannot 3xx-downgrade the fetch to http. wget has no
+    # per-download equivalent (--https-only only governs recursive mode), so on
+    # GNU wget forbid redirects outright with --max-redirect=0; busybox wget
+    # lacks that flag, so probe --help before adding it rather than breaking
+    # minimal builds. Also bound the write with head: wget has no reliable
+    # per-file size cap (--quota is only checked between files), so a hostile URL
+    # could otherwise fill the (tmpfs) download dir before the post-download size
+    # check runs. Reading one byte past the limit keeps that check able to reject
+    # an oversized download.
+    local wget_help wget_opts wget_pre
+    wget_help=$(wget --help 2>&1 || true)
+    wget_opts=(-qO-)
+    wget_pre=()
+    # GNU wget uses --tries/--timeout; busybox wget rejects those long options.
+    # Its -T flag is unreliable (segfaults on some builds), so instead bound the
+    # whole fetch with timeout(1) when available rather than passing -T.
+    if [[ "$wget_help" == *--timeout* ]]; then
+      wget_opts+=(--tries=1 --timeout=30)
+    elif command_exists timeout; then
+      wget_pre=(timeout 30)
+    else
+      # busybox wget with no way to bound the fetch would block for minutes on a
+      # stalled connect. The pre-1.2.3 code passed --timeout (which busybox
+      # rejects = instant fail); preserve that fail-fast instead of hanging.
+      err "$(m "无法为下载设置超时（无 timeout 命令且 wget 不支持 --timeout），已放弃以避免长时间挂起。" "Cannot bound the download with a timeout (no timeout command and wget lacks --timeout); aborting to avoid a long hang.")"
+      return 1
+    fi
+    [[ "$wget_help" == *--max-redirect* ]] && wget_opts+=(--max-redirect=0)
+    if ! ${wget_pre[@]+"${wget_pre[@]}"} wget "${wget_opts[@]}" "$url" 2>/dev/null \
+        | head -c "$((MAX_UPGRADE_BYTES + 1))" > "$dest"; then
       rm -f "$dest"
       err "$(m "下载升级脚本失败：$url" "Failed to download upgrade script: $url")"
       return 1
@@ -894,12 +1005,16 @@ download_script_to_file() {
 }
 
 installed_revoke_version() {
-  local __var="$1" installed_ver
+  # __ver must not collide with any caller's variable name: printf -v writes
+  # through $__var by name, and a same-named local here would shadow the caller's
+  # variable (bash dynamic scope), silently discarding the result. Callers pass
+  # installed_ver / installed_version, so keep this internal name distinct.
+  local __var="$1" __ver
   root_safe_file "$INSTALL_PATH" || return 1
   [[ -x "$INSTALL_PATH" ]] || return 1
-  installed_ver=$("$INSTALL_PATH" version 2>/dev/null) || return 1
-  valid_installed_version "$installed_ver" || return 1
-  printf -v "$__var" '%s' "$installed_ver"
+  __ver=$("$INSTALL_PATH" version 2>/dev/null) || return 1
+  valid_installed_version "$__ver" || return 1
+  printf -v "$__var" '%s' "$__ver"
 }
 
 install_script_file_for_revoke() {
@@ -980,7 +1095,11 @@ install_script_file_for_revoke() {
     warn "$(m "设置稳定命令权限失败：$INSTALL_PATH" "Failed to set stable command permissions: $INSTALL_PATH")"
     return 1
   fi
-  success "$(m "稳定命令已安装：$INSTALL_PATH version=$src_ver" "Stable command installed: $INSTALL_PATH version=$src_ver")"
+  # Write to stderr, not stdout: install_self_for_revoke runs inside
+  # schedule_auto_revoke/schedule_at_revoke whose stdout is captured as the
+  # auto-revoke unit name. Leaking this banner there corrupts the recorded unit
+  # so later revoke/status cannot find and clean up the timer/at job.
+  success "$(m "稳定命令已安装：$INSTALL_PATH version=$src_ver" "Stable command installed: $INSTALL_PATH version=$src_ver")" >&2
 }
 
 show_installed_revoke_status() {
@@ -1206,28 +1325,54 @@ EOF_TIMER
   printf '%s\n' "$unit"
 }
 
+remove_at_jobs_for_user() {
+  # Sweep any at-job whose body runs revoke for this exact user, so a reused
+  # username cannot leave a stale at-job (of a different scheduler type than the
+  # currently recorded unit) behind to later delete a freshly created account.
+  local user="$1" job _rest body needle
+  if ! command_exists atq || ! command_exists at || ! command_exists atrm; then
+    return 0
+  fi
+  # Match the exact command schedule_at_revoke queues (install path + quoted
+  # user + --yes), not a loose substring, so an unrelated at-job that merely
+  # embeds "revoke --user X --yes" is never removed.
+  needle="$(shell_quote_arg "$INSTALL_PATH") revoke --user $(shell_quote_arg "$user") --yes"
+  while read -r job _rest; do
+    [[ "$job" =~ ^[0-9]+$ ]] || continue
+    body=$(at -c "$job" 2>/dev/null) || true
+    if [[ "$body" == *"$needle"* ]]; then
+      atrm "$job" >/dev/null 2>&1 || true
+    fi
+  done < <(atq 2>/dev/null || true)
+}
+
 cancel_auto_revoke() {
-  local user="$1" unit="${2:-}" service_path timer_path
+  local user="$1" unit="${2:-}" service_path timer_path derived
   [[ -n "$unit" ]] || unit=$(registry_unit_for_user "$user" 2>/dev/null || true)
+  # Remove a recorded at-job by id.
   if [[ "$unit" == at:* ]]; then
     local job_id="${unit#at:}"
     if [[ "$job_id" =~ ^[0-9]+$ ]] && command_exists atrm; then
       atrm "$job_id" >/dev/null 2>&1 || true
     fi
-    return 0
   fi
-  [[ -n "$unit" ]] || unit=$(auto_revoke_unit_name "$user")
-  if [[ "$unit" != ${MANAGED_TAG}-revoke-* || "$unit" == *"/"* ]]; then
-    warn "$(m "自动删除 unit 名称不在本工具管理范围，跳过清理：$unit" "Auto-delete unit is outside this tool's managed namespace; skipping cleanup: $unit")"
+  # Always also sweep at-jobs targeting this user (covers a stale at-job when the
+  # recorded unit is a systemd name, or vice versa).
+  remove_at_jobs_for_user "$user"
+  # Always also clean the systemd derived-name units. auto_revoke_unit_name is
+  # deterministic per user, so this covers both a recorded systemd unit and a
+  # stale one left from a previous invite of the same username.
+  derived=$(auto_revoke_unit_name "$user")
+  if [[ -z "$derived" || "$derived" != ${MANAGED_TAG}-revoke-* || "$derived" == *"/"* ]]; then
     return 0
   fi
   if command_exists systemctl; then
     # Stop only the timer. Do not stop the service: auto-revoke may be running inside it.
-    systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
-    systemctl reset-failed "${unit}.timer" "${unit}.service" >/dev/null 2>&1 || true
+    systemctl disable --now "${derived}.timer" >/dev/null 2>&1 || true
+    systemctl reset-failed "${derived}.timer" "${derived}.service" >/dev/null 2>&1 || true
   fi
-  service_path=$(auto_revoke_service_path "$unit" 2>/dev/null || true)
-  timer_path=$(auto_revoke_timer_path "$unit" 2>/dev/null || true)
+  service_path=$(auto_revoke_service_path "$derived" 2>/dev/null || true)
+  timer_path=$(auto_revoke_timer_path "$derived" 2>/dev/null || true)
   if [[ -n "$timer_path" && "$timer_path" == "$SYSTEMD_DIR"/* && ! -L "$timer_path" ]]; then
     rm -f "$timer_path" 2>/dev/null || true
   fi
@@ -1313,7 +1458,26 @@ get_url_text() {
       status=$?
     fi
   elif command_exists wget; then
-    if output=$(wget -qO- --tries=1 --timeout="$max_time" --dns-timeout="$connect_timeout" --connect-timeout="$connect_timeout" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
+    # GNU wget accepts --timeout/--tries/--dns-timeout/--connect-timeout; busybox
+    # wget rejects those long options (making probes fail outright), and its -T is
+    # unreliable (segfaults on some builds), so bound the fetch with timeout(1)
+    # when available instead. Keeps IP autodetection working on busybox.
+    local wget_help wget_opts wget_pre
+    wget_help=$(wget --help 2>&1 || true)
+    wget_opts=(-qO-)
+    wget_pre=()
+    if [[ "$wget_help" == *--timeout* ]]; then
+      wget_opts+=(--tries=1 --timeout="$max_time" --dns-timeout="$connect_timeout" --connect-timeout="$connect_timeout")
+    elif command_exists timeout; then
+      wget_pre=(timeout "$max_time")
+    else
+      # No way to bound busybox wget; a bare fetch could block for minutes on a
+      # stalled connect. This is a best-effort probe with fallbacks, so skip it.
+      rm -f "$tmp_err"
+      ip_probe_debug "$(m "无法为 wget 设置超时，跳过该探测以避免挂起：$url" "Cannot bound wget with a timeout; skipping this probe to avoid a hang: $url")"
+      return 1
+    fi
+    if output=$(${wget_pre[@]+"${wget_pre[@]}"} wget "${wget_opts[@]}" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
     else
       status=$?
@@ -1401,21 +1565,21 @@ ssh_host_for_command() {
 
 expire_date_from_hours() {
   local hours="$1"
-  # chage -E expires on the date at 00:00. If created in the evening
-  # (e.g. 21:00), ceil(hours/24)=1 causes chage to lock the account
-  # at 00:00 the next day -- only 3 hours later, far before the
-  # systemd timer fires. Add one extra day as buffer so the timer
-  # triggers first and chage acts only as a final safeguard.
-  local days=$(( (hours + 23) / 24 ))
-  days=$(( days + 1 ))
-  (( days < 2 )) && days=2
-  if date -u -d "+${days} days" +%F >/dev/null 2>&1; then
-    date -u -d "+${days} days" +%F
+  # chage -E is day-granular and locks the account at 00:00 UTC of the given
+  # date. Anchor to the first midnight strictly after now+hours (the date of
+  # now+hours, plus one day) so the account stays usable for at least the
+  # requested window on every timezone/creation-time, is NEVER locked
+  # prematurely, and still stays as tight as day granularity allows (at most ~1
+  # extra day). When an auto-delete timer is set it fires precisely at now+hours;
+  # chage only backstops it and must not lock before it.
+  if date -u -d "+${hours} hours +1 day" +%F >/dev/null 2>&1; then
+    date -u -d "+${hours} hours +1 day" +%F
   elif command_exists python3; then
-    python3 - "$days" <<'PY'
+    python3 - "$hours" <<'PY'
 import datetime
 import sys
-print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=int(sys.argv[1]))).date().isoformat())
+now = datetime.datetime.now(datetime.timezone.utc)
+print((now + datetime.timedelta(hours=int(sys.argv[1]), days=1)).date().isoformat())
 PY
   else
     return 1
@@ -1583,7 +1747,7 @@ write_ssh_key() {
   local user="$1"
   local pubkey_file="$2"
   local home_dir uid gid ssh_dir auth_file tmp_auth
-  home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
+  home_dir=$(passwd_entry "$user" | cut -d: -f6 | head -n1)
   if [[ -z "$home_dir" || ! -d "$home_dir" || -L "$home_dir" ]]; then
     err "$(m "找不到安全的用户家目录：$user" "Safe home directory not found: $user")"
     return 1
@@ -2027,7 +2191,17 @@ EOF
   if registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"; then
     registry_recorded="true"
   else
-    warn "$(m "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。" "Failed to record in the registry: the account and auto-delete task were created but not registered; verify with status and revoke manually if needed.")"
+    # The auto-delete task runs `revoke --user X --yes` WITHOUT --force, which
+    # refuses an unregistered user. With no registry entry that task can never
+    # delete the account, so cancel it rather than leave an orphan timer/at-job;
+    # the account keeps its chage expiry and the operator revokes with --force.
+    if [[ "$auto_text" == "yes" ]]; then
+      cancel_auto_revoke "$user" "${auto_unit:-}" >/dev/null 2>&1 || true
+      auto_text="no"
+      auto_unit=""
+      revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user --force"
+    fi
+    warn "$(m "登记注册表失败：账号已创建但未登记，已取消自动删除任务（无法删除未登记用户）；请用 status 核对，并用 revoke --force 手动撤销。" "Failed to record in the registry: the account was created but not registered; the auto-delete task was cancelled (it cannot delete an unregistered user). Verify with status and revoke manually with --force.")"
   fi
 
   invite_completed="true"
@@ -2120,9 +2294,9 @@ status_user() {
     fi
     if user_exists "$user"; then
       id -- "$user"
-      getent passwd "$user"
+      passwd_entry "$user"
       local home_dir
-      home_dir=$(getent passwd "$user" | cut -d: -f6 | head -n1)
+      home_dir=$(passwd_entry "$user" | cut -d: -f6 | head -n1)
       if [[ -d "$home_dir/.ssh" ]]; then
         stat -c '.ssh mode=%a owner=%U:%G path=%n' "$home_dir/.ssh" 2>/dev/null || ls -ld "$home_dir/.ssh"
         if [[ -f "$home_dir/.ssh/authorized_keys" ]]; then
@@ -2148,7 +2322,7 @@ status_user() {
   registry_list_users || true
   printf '\n'
   info "$(m "系统中匹配前缀 $DEFAULT_PREFIX- 的用户：" "System users matching prefix $DEFAULT_PREFIX-")"
-  getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1 "\t" $6 "\t" $7}' || true
+  passwd_db | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1 "\t" $6 "\t" $7}' || true
   printf '\n'
   info "$(m "自动删除 timer：" "Auto-delete timers")"
   show_auto_revoke_timers || true
@@ -2185,7 +2359,7 @@ cleanup_expired() {
       [[ "$u" == "$user" ]] && found="true" && break
     done
     [[ "$found" == "false" ]] && users+=("$user")
-  done < <(getent passwd | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}')
+  done < <(passwd_db | awk -F: -v p="^${DEFAULT_PREFIX}-" '$1 ~ p {print $1}')
   if [[ ${#users[@]} -eq 0 ]]; then
     info "$(m "没有登记的临时用户或系统默认前缀用户。" "No registered temporary users or system default-prefix users.")"
     return 0
@@ -2199,14 +2373,19 @@ cleanup_expired() {
     fi
   done
   if [[ "$compact" == "true" ]]; then
-    local removed=0 cu _crest
-    if registry_has_users; then
+    local removed=0 cu _crest lock_fd snapshot
+    # Prune under a single held lock and re-check existence inside it, so a
+    # concurrent invite re-creating a username cannot have its fresh registry
+    # entry dropped by a decision made on now-stale state.
+    if registry_has_users && registry_lock lock_fd; then
+      snapshot=$(cat "$REGISTRY_FILE" 2>/dev/null || true)
       while IFS=$'\t' read -r cu _crest; do
         [[ -z "${cu:-}" ]] && continue
         if ! user_exists "$cu"; then
-          if registry_remove_user "$cu"; then removed=$((removed + 1)); fi
+          if registry_remove_user_unlocked "$cu"; then removed=$((removed + 1)); fi
         fi
-      done < "$REGISTRY_FILE"
+      done <<< "$snapshot"
+      registry_unlock "$lock_fd"
     fi
     info "$(m "已压实注册表：移除 $removed 条指向已不存在用户的记录（仅清理登记表，不影响任何账号）。" "Compacted the registry: removed $removed entries pointing to users that no longer exist (registry only, no account is touched).")"
   fi
@@ -2230,7 +2409,7 @@ doctor_command() {
     warn "$(m "当前不是 root；invite/revoke/install/upgrade/uninstall 需要 root。" "Not running as root; invite/revoke/install/upgrade/uninstall require root.")"
   fi
 
-  for arg in bash ssh-keygen usermod chage flock; do
+  for arg in bash ssh-keygen usermod chage flock install; do
     if command_exists "$arg"; then
       success "$(m "依赖存在：$arg" "Dependency found: $arg")"
     else
@@ -2287,7 +2466,10 @@ doctor_command() {
     warn "$(m "systemctl 和 at 都不存在；只能设置账号过期，不能自动删除用户。" "Neither systemctl nor at is available; only account expiry can be set, not automatic user deletion.")"
   fi
 
-  info "$(m "探测到 SSH 端口：$(get_ssh_port)" "Detected SSH port: $(get_ssh_port)")"
+  # Compute once: m expands BOTH language arguments, so an inline $(get_ssh_port)
+  # in each would run sshd -T twice per doctor.
+  local detected_port; detected_port=$(get_ssh_port)
+  info "$(m "探测到 SSH 端口：$detected_port" "Detected SSH port: $detected_port")"
   show_installed_revoke_status
   return "$rc"
 }

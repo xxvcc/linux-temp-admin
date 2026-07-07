@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## v1.2.3 - 2026-07-07
+
+- Fixed the `wget` upgrade download and public-IP autodetection failing on BusyBox/musl (Alpine): the GNU-only `--timeout`/`--tries`/`--dns-timeout`/`--connect-timeout` options are now probed, and on BusyBox wget the fetch is bounded with `timeout(1)` instead (BusyBox `-T` segfaults on some builds).
+- Made the `/proc` kill fallback and the `getent`->/etc/passwd helpers errexit-safe, so an empty `/proc` status read (process vanished mid-scan) or a non-zero `getent` can no longer abort a revoke/rollback or `status` under `set -e`.
+- Added `install(1)` to the dependency check, `doctor`, and the package map (coreutils), so a BusyBox build without the `install` applet is reported and auto-installable instead of failing cryptically mid-invite.
+- Made the BusyBox `wget` path fail fast when it cannot be time-bounded (no `--timeout` support and no `timeout(1)`) instead of running an unbounded fetch that could hang for minutes on a stalled connect.
+- Aligned the future-date capability probe with the compound `date` expression actually used for expiry, so a `date` that supports simple but not compound offsets can no longer report OK and then fail mid-invite.
+- Hardened the `/proc` kill fallback to no-op for an empty or root (0) UID, and tightened the `at`-job cleanup to match the exact queued revoke command rather than a loose substring.
+- Reworked account expiry to a timezone-aware date (first midnight after `now + hours`) that is never set before the requested window on any creation time, replacing the day-rounding that could lock a `--no-auto-revoke` account early (or, on scheduling failure, keep it loginable ~1 day too long).
+- Made `cancel_auto_revoke` clean up both the systemd units and any matching `at` job, so reusing a username can no longer leave a stale auto-delete task that later removes a freshly created account.
+- Cancelled the pre-created auto-delete task when the registry write fails, so a partly-created account is not left with a task that could never delete an unregistered user.
+- Made `cleanup-expired --compact` prune under a single held lock (re-checking existence inside it) so a concurrent invite cannot lose its fresh registry entry.
+- Documented `--lang`, `version`, `upgrade --force/--url`, and `expiry-status --compact` in `help`/usage; aligned `valid_installed_version` with the 3-component version comparator; matched real-or-effective UID in the pkill fallback; and hardened the getent fallback against duplicate rows.
+
+## v1.2.2 - 2026-07-07
+
+- Fixed `upgrade` silently refusing to replace an existing older install (reported `installed=none` and no-op'd): `installed_revoke_version` shadowed the caller's variable, so the version comparison never saw the installed version.
+- Added a `getent`->/etc/passwd fallback so `invite`/`status`/`revoke` work on musl/BusyBox systems (Alpine) where `getent` is absent, instead of failing mid-creation and rolling back.
+- Added a `/proc`-scanning fallback for forcing off a user's sessions when `pkill` is unavailable (BusyBox/Alpine), so revoke no longer deletes an account while leaving its processes running.
+- Hardened the managed-account check to require the full GECOS tag rather than a bare substring.
+- Avoided running `sshd -T` twice per `doctor` (a bilingual message double-evaluated the port probe).
+- Fixed the auto-delete unit name being corrupted by the "stable command installed" banner, which had let stdout from the install step leak into the recorded systemd/at unit and broke later revoke cleanup and status lookups.
+- Tightened `--no-auto-revoke` account expiry: the extra day-granular safety buffer is now added only when an auto-delete timer will remove the account first, so expiry-only accounts no longer stay loginable up to a day past the requested window.
+- Bounded `wget` upgrade downloads to the configured size limit during transfer instead of only after writing the whole file.
+- Blocked HTTP-downgrade redirects on the `wget` upgrade fallback (`--max-redirect=0` where supported), matching curl's HTTPS-only redirect policy.
+- Added unit coverage for install stdout cleanliness, buffered vs. unbuffered expiry dates, and the wget redirect guard.
+
 ## v1.2.1 - 2026-07-07
 
 - Hardened upgrade downloads with a 1 MiB size limit and cleanup of failed or oversized downloads.

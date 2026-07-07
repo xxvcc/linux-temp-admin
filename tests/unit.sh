@@ -105,6 +105,7 @@ assert_eq "$(systemd_quote_arg $'a"b\\c\nz')" '"a\"b\\c z"' "systemd argument es
 assert_success "valid installed version" valid_installed_version "1.2.3"
 assert_success "valid installed prerelease version" valid_installed_version "1.2.3-rc1"
 assert_failure "invalid installed version text" valid_installed_version "not-a-version"
+assert_failure "installed version rejects 2 components (version_gt cannot parse them)" valid_installed_version "1.2"
 assert_eq "$(extract_script_version "$SCRIPT")" "$VERSION" "extract script version"
 assert_success "newer version compares greater" version_gt "1.2.0" "1.1.2"
 assert_success "major version compares greater" version_gt "2.0.0" "1.9.9"
@@ -117,6 +118,48 @@ assert_success "custom https upgrade URL is valid" valid_upgrade_url "https://ex
 assert_failure "upgrade URL must be https" valid_upgrade_url "http://example.com/temp-admin.sh"
 assert_failure "upgrade URL rejects whitespace" valid_upgrade_url "https://example.com/a b.sh"
 assert_failure "upgrade URL rejects shell metacharacters" valid_upgrade_url "https://example.com/a|b.sh"
+
+# The day-granular chage expiry must never lock before the requested window
+# (accounts stay usable for at least --hours), yet stay within ~1 extra day.
+if date -u -d "+1 day" +%F >/dev/null 2>&1; then
+  for expiry_h in 1 6 12 24 8760; do
+    expiry_date=$(expire_date_from_hours "$expiry_h")
+    lock_epoch=$(date -u -d "$expiry_date 00:00:00" +%s)
+    window_epoch=$(date -u -d "+${expiry_h} hours" +%s)
+    [[ "$lock_epoch" -ge "$window_epoch" ]] \
+      || fail "expiry for ${expiry_h}h ($expiry_date) locks before now+${expiry_h}h (premature)"
+    [[ "$lock_epoch" -le $((window_epoch + 172800)) ]] \
+      || fail "expiry for ${expiry_h}h ($expiry_date) is more than 2 days past the window"
+  done
+fi
+
+# passwd_entry must resolve a local account without getent (musl/Alpine lack it).
+passwd_entry_no_getent=$(
+  command_exists() { [[ "$1" != "getent" ]] && command -v "$1" >/dev/null 2>&1; }
+  passwd_entry "root"
+)
+assert_output_contains "$passwd_entry_no_getent" "root:" "passwd_entry falls back to /etc/passwd when getent is absent"
+
+# passwd_db must not duplicate rows when getent prints output but exits non-zero.
+passwd_db_root_count=$(
+  command_exists() { [[ "$1" == "getent" ]] || command -v "$1" >/dev/null 2>&1; }
+  getent() { printf 'root:x:0:0:root:/root:/bin/bash\n'; return 2; }
+  passwd_db | grep -c '^root:'
+)
+assert_eq "$passwd_db_root_count" "1" "passwd_db does not duplicate rows on getent non-zero-with-output"
+
+# account_is_managed must require the FULL tag, not the bare substring, so a
+# self-set partial GECOS cannot pose as tool-managed.
+managed_full=$(
+  passwd_entry() { printf 'u:x:1000:1000:%s temporary admin,,,:/home/u:/bin/sh\n' "$MANAGED_TAG"; }
+  account_is_managed u && echo yes || echo no
+)
+managed_bare=$(
+  passwd_entry() { printf 'u:x:1000:1000:%s,,,:/home/u:/bin/sh\n' "$MANAGED_TAG"; }
+  account_is_managed u && echo yes || echo no
+)
+assert_eq "$managed_full" "yes" "account_is_managed accepts the full managed GECOS tag"
+assert_eq "$managed_bare" "no" "account_is_managed rejects a bare-tag GECOS substring"
 
 download_tmp=$(mktemp -d)
 download_dest="$download_tmp/temp-admin.sh"
@@ -165,6 +208,94 @@ fi
   fail "oversized download should remove file"
 }
 rm -rf "$download_tmp"
+
+# GNU wget: must use --timeout and forbid redirects (--max-redirect=0).
+wget_probe_tmp=$(mktemp -d)
+(
+  export WGET_ARGS_FILE="$wget_probe_tmp/args"
+  command_exists() { [[ "$1" == "wget" ]]; }
+  wget() {
+    if [[ "${1:-}" == "--help" ]]; then printf '  --timeout=SECS\n  --tries=N\n  --max-redirect=N\n'; return 0; fi
+    printf '%s\n' "$*" > "$WGET_ARGS_FILE"
+    printf 'ok'
+  }
+  download_script_to_file "https://example.com/x.sh" "$wget_probe_tmp/out"
+) >/dev/null 2>&1
+gnu_wget_args=$(cat "$wget_probe_tmp/args" 2>/dev/null)
+assert_output_contains "$gnu_wget_args" "--max-redirect=0" "wget(GNU) forbids redirects when supported"
+assert_output_contains "$gnu_wget_args" "--timeout=30" "wget(GNU) uses --timeout when supported"
+rm -rf "$wget_probe_tmp"
+
+# busybox wget: must NOT pass GNU-only long options and must NOT pass -T (it can
+# segfault on some builds); when timeout(1) exists the fetch is wrapped in it.
+wget_probe_tmp=$(mktemp -d)
+(
+  export WGET_ARGS_FILE="$wget_probe_tmp/args"
+  command_exists() { case "$1" in curl) return 1 ;; *) return 0 ;; esac; }  # wget + timeout present
+  timeout() { printf 'TIMEOUT %s\n' "$1" >> "$WGET_ARGS_FILE"; shift; "$@"; }
+  wget() {
+    if [[ "${1:-}" == "--help" ]]; then printf 'BusyBox wget: -c -q -O FILE\n'; return 1; fi
+    printf 'WGET %s\n' "$*" >> "$WGET_ARGS_FILE"
+    printf 'ok'
+  }
+  download_script_to_file "https://example.com/x.sh" "$wget_probe_tmp/out"
+) >/dev/null 2>&1
+busybox_args=$(cat "$wget_probe_tmp/args" 2>/dev/null)
+[[ "$busybox_args" != *--max-redirect* ]] || { rm -rf "$wget_probe_tmp"; fail "wget(busybox) must not pass --max-redirect"; }
+[[ "$busybox_args" != *--timeout* ]] || { rm -rf "$wget_probe_tmp"; fail "wget(busybox) must not pass --timeout"; }
+[[ "$busybox_args" != *"-T "* ]] || { rm -rf "$wget_probe_tmp"; fail "wget(busybox) must not pass -T (segfaults on some builds)"; }
+[[ "$busybox_args" == *"TIMEOUT 30"* ]] || { rm -rf "$wget_probe_tmp"; fail "wget(busybox) must wrap the fetch in timeout(1) when available"; }
+rm -rf "$wget_probe_tmp"
+
+# busybox wget with no timeout(1) available: must FAIL FAST (return non-zero and
+# never run an unbounded fetch that would hang for minutes on a stalled connect).
+wget_probe_tmp=$(mktemp -d)
+notimeout_rc=0
+(
+  export WGET_ARGS_FILE="$wget_probe_tmp/args"
+  command_exists() { case "$1" in wget) return 0 ;; *) return 1 ;; esac; }  # only wget: no timeout(1)
+  wget() {
+    if [[ "${1:-}" == "--help" ]]; then printf 'BusyBox wget\n'; return 1; fi
+    printf 'RAN %s\n' "$*" >> "$WGET_ARGS_FILE"   # must NOT be reached
+    printf 'ok'
+  }
+  download_script_to_file "https://example.com/x.sh" "$wget_probe_tmp/out"
+) >/dev/null 2>&1 || notimeout_rc=$?
+[[ "$notimeout_rc" -ne 0 ]] || { rm -rf "$wget_probe_tmp"; fail "download must fail fast when busybox wget has no timeout mechanism"; }
+[[ ! -e "$wget_probe_tmp/args" ]] || { rm -rf "$wget_probe_tmp"; fail "download must not run an unbounded busybox wget (no timeout available)"; }
+rm -rf "$wget_probe_tmp"
+
+# Regression: the /proc kill fallback must not abort the caller under set -e when
+# a status read yields no data (a process vanished mid-scan). Call the real
+# function as a bare statement under set -e with a UID that matches nothing and a
+# no-op signal (0), so it scans real /proc (with entries that come and go) but
+# signals no one; it must return cleanly rather than errexit-abort.
+signal_errexit_probe=$(
+  set -Eeuo pipefail
+  signal_uid_processes 0 999999999
+  printf 'survived'
+)
+assert_eq "$signal_errexit_probe" "survived" "signal_uid_processes must not abort under set -e on empty status reads"
+
+# Guard: signal_uid_processes must no-op for uid 0 or an empty uid (never
+# mass-signal root or match a vanished process's empty uid). Use signal 0 so even
+# a broken guard stays harmless.
+signal_guard_zero=$( set -Eeuo pipefail; signal_uid_processes 0 0; printf 'ok' )
+assert_eq "$signal_guard_zero" "ok" "signal_uid_processes no-ops for uid 0"
+signal_guard_empty=$( set -Eeuo pipefail; signal_uid_processes 0 ''; printf 'ok' )
+assert_eq "$signal_guard_empty" "ok" "signal_uid_processes no-ops for an empty uid"
+
+# Regression: passwd_entry must not abort under set -e when getent exits non-zero
+# with output (partly-failing NSS); it should still return that output.
+passwd_entry_nonzero=$(
+  set -Eeuo pipefail
+  command_exists() { [[ "$1" == getent ]] || command -v "$1" >/dev/null 2>&1; }
+  getent() { printf 'svc:x:1234:1234::/nonexistent:/usr/sbin/nologin\n'; return 2; }
+  passwd_entry "svc"
+  printf ' :done'
+)
+assert_output_contains "$passwd_entry_nonzero" "svc:" "passwd_entry returns getent output even when getent exits non-zero"
+assert_output_contains "$passwd_entry_nonzero" ":done" "passwd_entry does not abort under set -e on non-zero getent"
 
 if output=$(bash "$SCRIPT" --lang en doctor --bad 2>&1); then
   fail "unsupported doctor argument should fail"
@@ -216,6 +347,32 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   }
   assert_eq "$(bash "$existing_install" version)" "9.9.9" "cmp-missing auto install keeps existing command"
   rm -rf "$install_tmp"
+
+  # Installing must not print to stdout: install_self_for_revoke runs inside
+  # schedule_auto_revoke/schedule_at_revoke whose stdout becomes the recorded
+  # auto-revoke unit name. A leaked "[OK] installed" banner would corrupt it and
+  # break later timer/at-job cleanup and status lookups.
+  install_stdout_tmp=$(mktemp -d)
+  install_stdout=$(
+    export INSTALL_PATH="$install_stdout_tmp/linux-temp-admin"
+    install_script_file_for_revoke "$SCRIPT" false false 2>/dev/null
+  )
+  rm -rf "$install_stdout_tmp"
+  assert_eq "$install_stdout" "" "install must not emit to stdout (would corrupt auto-revoke unit name)"
+
+  # installed_revoke_version must populate the CALLER's variable even when the
+  # caller names it 'installed_ver' (regression: a same-named internal local
+  # shadowed it, so `upgrade` saw installed=none and silently no-op'd).
+  irv_tmp=$(mktemp -d)
+  (
+    export INSTALL_PATH="$irv_tmp/linux-temp-admin"
+    printf '%s\n' '#!/usr/bin/env bash' '[[ "$1" == version ]] && echo "1.2.0"' > "$INSTALL_PATH"
+    chmod 700 "$INSTALL_PATH"
+    installed_ver="SENTINEL"
+    installed_revoke_version installed_ver || { echo "return-failed"; exit 3; }
+    [[ "$installed_ver" == "1.2.0" ]] || { echo "not-populated:$installed_ver"; exit 4; }
+  ) || fail "installed_revoke_version must populate a caller variable named installed_ver"
+  rm -rf "$irv_tmp"
 
   registry_tmp=$(mktemp -d)
   if (
