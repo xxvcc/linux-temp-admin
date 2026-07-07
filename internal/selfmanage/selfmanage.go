@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -36,6 +37,7 @@ func New(installPath string, maxBytes int64) *Manager {
 		PublicKey:   embeddedPublicKey(),
 		MaxBytes:    maxBytes,
 		Client: &http.Client{
+			Timeout: 60 * time.Second, // bound the whole fetch; a stalled server can't hang upgrade
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 				if req.URL.Scheme != "https" {
 					return fmt.Errorf("refusing redirect to non-https: %s", req.URL)
@@ -177,6 +179,9 @@ func normalizeSig(b []byte) []byte {
 		if raw, err := decodeHex(s); err == nil {
 			return raw
 		}
+	}
+	if len(s) == ed25519.SignatureSize { // raw signature with surrounding whitespace
+		return []byte(s)
 	}
 	return b
 }

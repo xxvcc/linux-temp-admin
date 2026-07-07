@@ -11,11 +11,24 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
+// parseFlags parses fs and rejects trailing positional arguments (which the
+// stdlib flag package would otherwise silently drop).
+func (a *App) parseFlags(fs *flag.FlagSet, args []string) bool {
+	if err := fs.Parse(args); err != nil {
+		return false
+	}
+	if fs.NArg() > 0 {
+		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
+		return false
+	}
+	return true
+}
+
 func (a *App) status(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
 	userFlag := fs.String("user", "", "")
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	if u := *userFlag; u != "" {
@@ -63,7 +76,7 @@ func (a *App) cleanupExpired(args []string) int {
 	fs.SetOutput(a.Err)
 	var compact bool
 	fs.BoolVar(&compact, "compact", false, "")
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	a.warnf("%s", a.P.M("此命令只查看到期/自动删除状态，不主动删除用户。",
@@ -88,7 +101,7 @@ func (a *App) cleanupExpired(args []string) int {
 func (a *App) doctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	a.info(a.P.M("linux-temp-admin 诊断报告", "linux-temp-admin doctor report"))
@@ -124,9 +137,9 @@ func (a *App) menu() int {
 		return 1
 	}
 	for {
-		a.printf("\n%s\n 1) invite\n 2) revoke\n 3) status\n 4) cleanup-expired\n 5) doctor\n 6) %s",
+		a.printf("\n%s\n 1) invite\n 2) revoke\n 3) status\n 4) cleanup-expired\n 5) doctor\n 6) install\n 7) upgrade\n 8) uninstall\n 9) %s",
 			a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"), a.P.M("退出", "exit"))
-		switch a.prompt(a.P.M("请选择 [1-6]: ", "select [1-6]: ")) {
+		switch a.prompt(a.P.M("请选择 [1-9]: ", "select [1-9]: ")) {
 		case "1":
 			a.invite(nil)
 		case "2":
@@ -137,7 +150,13 @@ func (a *App) menu() int {
 			a.cleanupExpired(nil)
 		case "5":
 			a.doctor(nil)
-		case "6", "":
+		case "6":
+			a.install(nil)
+		case "7":
+			a.upgrade(nil)
+		case "8":
+			a.uninstall(nil)
+		case "9", "":
 			return 0
 		default:
 			a.warnf("%s", a.P.M("无效选择", "invalid choice"))

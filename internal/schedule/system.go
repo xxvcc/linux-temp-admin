@@ -25,6 +25,9 @@ func (realSystem) Systemctl(args ...string) error {
 }
 
 func (realSystem) ScheduleAt(command string, hours int) (string, error) {
+	if !ensureAtd() {
+		return "", fmt.Errorf("atd is not running and could not be started; use systemd or start atd")
+	}
 	cmd := exec.Command("at", "now", "+", strconv.Itoa(hours), "hours")
 	cmd.Stdin = strings.NewReader(command + "\n")
 	out, err := cmd.CombinedOutput()
@@ -60,6 +63,33 @@ func parseAtJobID(out string) string {
 		}
 	}
 	return ""
+}
+
+// ensureAtd makes a best effort to confirm/start the atd daemon so queued at
+// jobs actually fire. Returns true if atd appears runnable.
+func ensureAtd() bool {
+	run := func(name string, args ...string) bool { return exec.Command(name, args...).Run() == nil }
+	switch {
+	case has("systemctl"):
+		if run("systemctl", "is-active", "--quiet", "atd") {
+			return true
+		}
+		_ = exec.Command("systemctl", "enable", "--now", "atd").Run()
+		return run("systemctl", "is-active", "--quiet", "atd")
+	case has("rc-service"):
+		if run("rc-service", "atd", "status") {
+			return true
+		}
+		_ = exec.Command("rc-service", "atd", "start").Run()
+		return run("rc-service", "atd", "status")
+	case has("service"):
+		_ = exec.Command("service", "atd", "start").Run()
+		return true // no reliable status probe; assume best effort
+	case has("pgrep"):
+		return run("pgrep", "-x", "atd")
+	default:
+		return true // cannot determine; proceed
+	}
 }
 
 func (realSystem) RemoveAtJobsFor(command string) {

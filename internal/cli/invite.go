@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
@@ -27,17 +28,33 @@ func (a *App) invite(args []string) int {
 	portFlag := fs.Int("port", 0, "")
 	hoursFlag := fs.Int("hours", config.DefaultExpireHours, "")
 	confirmSudo := fs.String("confirm-sudo", "", "")
-	var fSudo, fNoSudo, fAuto, fNoAuto, fYes, fAllowNonTTY bool
+	var fSudo, fNoSudo, fNopasswd, fAuto, fNoAuto, fYes, fAllowNonTTY, fInstallDeps, fNoInstallDeps bool
 	fs.BoolVar(&fSudo, "sudo", false, "")
 	fs.BoolVar(&fNoSudo, "no-sudo", false, "")
+	fs.BoolVar(&fNopasswd, "nopasswd-sudo", false, "") // deprecated alias of --sudo
 	fs.BoolVar(&fAuto, "auto-revoke", false, "")
 	fs.BoolVar(&fNoAuto, "no-auto-revoke", false, "")
 	fs.BoolVar(&fYes, "yes", false, "")
 	fs.BoolVar(&fYes, "y", false, "")
 	fs.BoolVar(&fAllowNonTTY, "allow-non-tty-private-key-output", false, "")
+	fs.BoolVar(&fInstallDeps, "install-deps", false, "")
+	fs.BoolVar(&fNoInstallDeps, "no-install-deps", false, "")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
+	if fs.NArg() > 0 {
+		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
+		return 1
+	}
+	if fNopasswd {
+		fSudo = true
+	}
+	portSet := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "port" {
+			portSet = true
+		}
+	})
 
 	hours := *hoursFlag
 	if !validate.Hours(hours) {
@@ -91,7 +108,7 @@ func (a *App) invite(args []string) int {
 	}
 
 	port := *portFlag
-	if port == 0 {
+	if !portSet {
 		port = sysinfo.SSHPort()
 	}
 	if !validate.Port(port) {
@@ -142,12 +159,48 @@ func (a *App) invite(args []string) int {
 		}
 	}
 
-	if missing := sysinfo.MissingDeps(grantSudo == "yes"); len(missing) > 0 {
-		a.errorf("%s %v", a.P.M("缺少依赖：", "missing dependencies:"), missing)
+	if !a.resolveDeps(grantSudo == "yes", fInstallDeps, fNoInstallDeps, fYes) {
 		return 1
 	}
 
 	return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes")
+}
+
+// resolveDeps ensures the required external account tools are present, optionally
+// installing them via the package manager. Returns false (after reporting) if any
+// remain missing.
+func (a *App) resolveDeps(needSudo, installDeps, noInstallDeps, yes bool) bool {
+	missing := sysinfo.MissingDeps(needSudo)
+	if len(missing) == 0 {
+		return true
+	}
+	pm := sysinfo.PackageManager()
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, label := range missing {
+		if p := sysinfo.PackageCandidate(label, pm); p != "" && !seen[p] {
+			seen[p] = true
+			pkgs = append(pkgs, p)
+		}
+	}
+	doInstall := installDeps
+	if !doInstall && !noInstallDeps && !yes && a.StdinIsTTY() && pm != "" && len(pkgs) > 0 {
+		doInstall = yesish(a.prompt(a.P.M("是否自动安装缺失依赖？[y/N]: ", "install missing dependencies automatically? [y/N]: ")))
+	}
+	if !doInstall || pm == "" || len(pkgs) == 0 {
+		a.errorf("%s %v", a.P.M("缺少依赖：", "missing dependencies:"), missing)
+		return false
+	}
+	a.info(a.P.M("安装依赖：", "installing: ") + strings.Join(pkgs, " "))
+	if err := sysinfo.InstallPackages(pm, pkgs); err != nil {
+		a.errorf("%s: %v", a.P.M("安装依赖失败", "dependency install failed"), err)
+		return false
+	}
+	if still := sysinfo.MissingDeps(needSudo); len(still) > 0 {
+		a.errorf("%s %v", a.P.M("安装后仍缺少：", "still missing after install:"), still)
+		return false
+	}
+	return true
 }
 
 // runInvite performs the mutating steps with rollback on any failure.
@@ -206,7 +259,12 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	autoUnit := ""
 	autoScheduled := false
 	if wantAuto {
-		if unit, err := a.Scheduler.Schedule(username, hours); err == nil {
+		// The auto-revoke task's ExecStart runs the installed stable command, so
+		// ensure a binary is present at InstallPath first (as the bash tool did),
+		// otherwise the timer would fire and fail on a non-installed run.
+		if err := a.ensureStableInstalled(); err != nil {
+			a.warnf("%s: %v", a.P.M("无法安装稳定命令，自动删除改为仅设置到期", "cannot install the stable command; auto-delete falls back to account expiry only"), err)
+		} else if unit, err := a.Scheduler.Schedule(username, hours); err == nil {
 			autoUnit = unit
 			autoScheduled = true
 			cleanups = append(cleanups, func() { a.Scheduler.Cancel(username) })
@@ -226,16 +284,29 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		AutoRevoke:  autoScheduled,
 		AutoUnit:    autoUnit,
 	}
+	registered := false
 	if err := a.Registry.Init(); err != nil {
 		a.warnf("%s: %v", a.P.M("初始化注册表失败", "registry init failed"), err)
 	} else if err := a.Registry.Record(rec); err != nil {
 		a.warnf("%s: %v", a.P.M("登记注册表失败", "registry record failed"), err)
+	} else {
+		registered = true
+	}
+	if !registered {
+		// The account exists but is unregistered: an auto-revoke task could never
+		// delete it (revoke refuses unregistered without --force), and a NOPASSWD
+		// grant should not linger unregistered. Cancel the task and drop sudo.
 		if autoScheduled {
-			// The auto-revoke task cannot delete an unregistered account; cancel it.
 			a.Scheduler.Cancel(username)
 			autoScheduled = false
 			autoUnit = ""
 		}
+		if sudoGranted {
+			a.Sudoers.Remove(username)
+			sudoGranted = false
+		}
+		a.warnf("%s", a.P.M("账号已创建但未登记；请用 revoke --force 手动撤销。",
+			"account created but not registered; revoke manually with --force."))
 	}
 
 	a.printInvite(host, port, username, hours, sudoGranted, autoScheduled, autoUnit, kp)
@@ -263,6 +334,7 @@ User: %s
 Expires: %s
 Sudo: %s
 Login: SSH key only
+Password login: locked
 Auto revoke: %s
 Auto revoke unit: %s
 
@@ -276,13 +348,26 @@ chmod 600 './%s.key'
 
 %s
 sudo %s revoke --user %s
-
------ END LINUX TEMP ADMIN INVITE -----
 `,
 		host, port, username, expiry.DisplayLocal(a.Now(), hours), yesno(sudo), yesno(auto), orNone(autoUnit),
 		a.P.M("SSH 登录命令:", "SSH login command:"), username, port, username, sshHost,
 		a.P.M("保存私钥命令:", "Save private key command:"), username, string(kp.PrivatePEM), username,
 		a.P.M("撤销命令:", "Revoke command:"), a.InstallPath, username)
+
+	if sudo {
+		fmt.Fprint(a.Out, "\n"+a.P.M(
+			"Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥有的持久化；撤销只删除此账号本身。",
+			"Sudo note: NOPASSWD sudo is enabled (equivalent to full root); it may leave root-owned persistence. Revoking only deletes this account itself.")+"\n")
+	}
+	if !auto {
+		fmt.Fprint(a.Out, "\n"+a.P.M(
+			"自动删除提示: 未创建自动删除任务；账号到期只阻止登录，不删除用户，请按需手动撤销。",
+			"Auto-delete note: no auto-delete task was created; expiry only blocks login and does not delete the user. Revoke manually when needed.")+"\n")
+	}
+	fmt.Fprint(a.Out, "\n"+a.P.M(
+		"安全提醒: 私钥只显示这一次、服务器不保存；仅通过可信私聊发送；用完立即撤销。",
+		"Security notes: the private key is shown only once and not stored on the server; send only via trusted private chat; revoke immediately after use.")+
+		"\n\n----- END LINUX TEMP ADMIN INVITE -----\n")
 }
 
 // --- helpers ---
@@ -314,6 +399,27 @@ func isIPv6(host string) bool {
 		}
 	}
 	return false
+}
+
+// ensureStableInstalled installs the running binary at InstallPath if none is
+// present, so a scheduled auto-revoke task can execute it. A pre-existing binary
+// is left as-is.
+func (a *App) ensureStableInstalled() error {
+	if _, err := os.Stat(a.InstallPath); err == nil {
+		return nil
+	}
+	if a.Selfmanage == nil {
+		return fmt.Errorf("self-manager not configured")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	bin, err := os.ReadFile(exe)
+	if err != nil {
+		return err
+	}
+	return a.Selfmanage.Install(bin, false)
 }
 
 func resolveShell() string {

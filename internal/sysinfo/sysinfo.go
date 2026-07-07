@@ -6,6 +6,7 @@ package sysinfo
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -107,6 +108,31 @@ func PackageCandidate(label, pm string) string {
 		return "sudo"
 	}
 	return ""
+}
+
+// InstallPackages installs pkgs using the given package manager.
+func InstallPackages(pm string, pkgs []string) error {
+	var cmd *exec.Cmd
+	switch pm {
+	case "apt":
+		_ = exec.Command("apt-get", "update").Run()
+		cmd = exec.Command("apt-get", append([]string{"install", "-y"}, pkgs...)...)
+	case "dnf":
+		cmd = exec.Command("dnf", append([]string{"install", "-y"}, pkgs...)...)
+	case "yum":
+		cmd = exec.Command("yum", append([]string{"install", "-y"}, pkgs...)...)
+	case "apk":
+		cmd = exec.Command("apk", append([]string{"add", "--no-cache"}, pkgs...)...)
+	case "pacman":
+		cmd = exec.Command("pacman", append([]string{"-Syu", "--noconfirm", "--needed"}, pkgs...)...)
+	default:
+		return fmt.Errorf("unsupported package manager: %q", pm)
+	}
+	cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // SSHPort returns the configured SSH port, preferring `sshd -T`, then

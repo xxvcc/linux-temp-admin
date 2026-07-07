@@ -17,7 +17,7 @@ func (a *App) install(args []string) int {
 	fs.SetOutput(a.Err)
 	var force bool
 	fs.BoolVar(&force, "force", false, "")
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	exe, err := os.Executable()
@@ -48,7 +48,7 @@ func (a *App) uninstall(args []string) int {
 	fs.BoolVar(&force, "force", false, "")
 	fs.BoolVar(&yes, "yes", false, "")
 	fs.BoolVar(&yes, "y", false, "")
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	if !yes {
@@ -76,7 +76,7 @@ func (a *App) upgrade(args []string) int {
 	fs.BoolVar(&force, "force", false, "")
 	fs.BoolVar(&yes, "yes", false, "")
 	fs.BoolVar(&yes, "y", false, "")
-	if err := fs.Parse(args); err != nil {
+	if !a.parseFlags(fs, args) {
 		return 1
 	}
 	binURL := *urlFlag

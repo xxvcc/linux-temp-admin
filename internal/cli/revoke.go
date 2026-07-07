@@ -2,6 +2,7 @@ package cli
 
 import (
 	"flag"
+	"strconv"
 
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -20,6 +21,10 @@ func (a *App) revoke(args []string) int {
 	fs.BoolVar(&fYes, "y", false, "")
 	fs.BoolVar(&fForce, "force", false, "")
 	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
 		return 1
 	}
 
@@ -58,6 +63,10 @@ func (a *App) revoke(args []string) int {
 	}
 
 	if !fYes {
+		if fForce && !registered {
+			a.warnf("%s", a.P.M("危险：用户 "+username+" 未登记，--force 将删除真实系统用户及其家目录。",
+				"DANGER: "+username+" is not registered; --force will delete a real system user and its home directory."))
+		}
 		if a.prompt(a.P.M("请输入完整用户名 "+username+" 以确认删除: ",
 			"type the full username "+username+" to confirm deletion: ")) != username {
 			a.warnf("%s", a.P.M("确认不匹配，已取消", "confirmation mismatch; cancelled"))
@@ -99,5 +108,9 @@ func (a *App) selectUser() string {
 	for i, u := range existing {
 		a.warnf("%2d) %s", i+1, u)
 	}
-	return a.prompt(a.P.M("请输入要撤销/删除的用户名: ", "enter the username to revoke/delete: "))
+	choice := a.prompt(a.P.M("请选择编号或输入用户名: ", "select a number or enter a username: "))
+	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(existing) {
+		return existing[n-1]
+	}
+	return choice
 }

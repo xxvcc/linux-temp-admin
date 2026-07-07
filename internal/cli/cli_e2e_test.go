@@ -17,6 +17,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
@@ -53,6 +54,11 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 
 	regDir := rootDir(t, 0o700)
 	sudoDir := rootDir(t, 0o750)
+	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
+	// A stub at InstallPath so ensureStableInstalled treats it as present.
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
 
 	var out, errb bytes.Buffer
@@ -64,14 +70,15 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		Users:   user.New(),
 		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }},
 		Scheduler: &schedule.Scheduler{
-			SystemdDir: rootDir(t, 0o755), InstallPath: config.InstallPath,
+			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
 		},
 		Registry: &registry.Store{
 			Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
 		},
 		Detector:    netdetect.New(),
-		InstallPath: config.InstallPath,
+		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
+		InstallPath: installPath,
 		Now:         now,
 		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
 		StdoutIsTTY: func() bool { return true },
