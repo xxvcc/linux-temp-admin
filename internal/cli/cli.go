@@ -193,16 +193,23 @@ func (a *App) requireRoot() bool {
 }
 
 // prompt reads a single line, printing the message to stderr first.
-func (a *App) prompt(msg string) string {
-	fmt.Fprint(a.Err, msg)
+// readLine reads one trimmed line. ok is false only at EOF with no data, letting
+// callers tell a blank Enter apart from end-of-input.
+func (a *App) readLine() (line string, ok bool) {
 	if a.inReader == nil {
 		a.inReader = bufio.NewReader(a.In)
 	}
-	line, err := a.inReader.ReadString('\n')
-	if err != nil && line == "" {
-		return ""
+	s, err := a.inReader.ReadString('\n')
+	if err != nil && s == "" {
+		return "", false
 	}
-	return strings.TrimSpace(line)
+	return strings.TrimSpace(s), true
+}
+
+func (a *App) prompt(msg string) string {
+	fmt.Fprint(a.Err, msg)
+	s, _ := a.readLine()
+	return s
 }
 
 func (a *App) usage() {

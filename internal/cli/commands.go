@@ -143,7 +143,12 @@ func (a *App) menu() int {
 	for {
 		a.printf("\n%s\n 1) invite\n 2) revoke\n 3) status\n 4) cleanup-expired\n 5) doctor\n 6) install\n 7) upgrade\n 8) uninstall\n 9) %s",
 			a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"), a.P.M("退出", "exit"))
-		switch a.prompt(a.P.M("请选择 [1-9]: ", "select [1-9]: ")) {
+		fmt.Fprint(a.Err, a.P.M("请选择 [1-9]: ", "select [1-9]: "))
+		choice, ok := a.readLine()
+		if !ok {
+			return 0 // EOF
+		}
+		switch choice {
 		case "1":
 			a.invite(nil)
 		case "2":
@@ -160,9 +165,9 @@ func (a *App) menu() int {
 			a.upgrade(nil)
 		case "8":
 			a.uninstall(nil)
-		case "9", "":
+		case "9":
 			return 0
-		default:
+		default: // includes a blank line
 			a.warnf("%s", a.P.M("无效选择", "invalid choice"))
 		}
 	}

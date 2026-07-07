@@ -52,7 +52,12 @@ func (a *App) uninstall(args []string) int {
 		return 1
 	}
 	if !force {
-		if recs, err := a.Registry.List(); err == nil && len(recs) > 0 {
+		recs, err := a.Registry.List()
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("无法读取注册表，拒绝卸载（可用 --force）", "cannot read the registry; refusing to uninstall (use --force)"), err)
+			return 1
+		}
+		if len(recs) > 0 {
 			a.errorf("%s", a.P.M("仍有登记用户，拒绝卸载稳定命令；请先 revoke/cleanup，或用 --force。",
 				"registered users still exist; refusing to uninstall — revoke/cleanup first, or use --force."))
 			return 1

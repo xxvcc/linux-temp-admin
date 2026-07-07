@@ -16,7 +16,8 @@ jobs:
         with:
           go-version: '1.25'
       - name: Vet
-        run: go vet ./...
+        # -printf.funcs also checks our concatenating log helpers (printf/errorf/warnf)
+        run: go vet -printf.funcs=printf,errorf,warnf ./...
       - name: Test (race)
         run: go test -race ./...
       - name: Gofmt check
