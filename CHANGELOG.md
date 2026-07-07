@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## v2.0.0 - Go rewrite
+
+Full rewrite of the tool in Go, shipped as a single static binary. The bash tool
+remains as the `v1.x` maintenance line; the two can coexist.
+
+- Same commands and behavior as v1.2.3 (invite / revoke / status / cleanup-expired
+  / doctor / install / upgrade / uninstall / menu, bilingual zh/en, `--lang`).
+- Native implementations replace the external tools the bash version shelled out
+  to: ed25519 keygen (no `ssh-keygen`), HTTP with context timeouts (no
+  `curl`/`wget`), Go `time` (no `date`), `/etc/passwd` parsing (no `getent`),
+  atomic fd-based writes (no `install`), `syscall.Flock` (no `flock`), and a
+  `/proc` scan (no `pkill`) — eliminating whole classes of shell/`set -e`/BusyBox
+  portability bugs. Only the account tools (`useradd`/`usermod`/`chage`/`userdel`
+  or BusyBox `adduser`/`deluser`), `systemctl`/`at`, and `visudo`/`sudo` are still
+  invoked, via argv (no shell).
+- **Signature-verified self-upgrade**: `upgrade` downloads over HTTPS and verifies
+  a detached ed25519 signature against an embedded release key before installing,
+  failing closed — the authenticated upgrade the bash tool never had.
+- The one-time private key stays in memory and is printed once (never written to
+  disk). TOCTOU-safe atomic root writes (fd-based owner/mode, `O_NOFOLLOW`,
+  rename-not-follow). flock-guarded registry with atomic rewrite.
+- Clean break from v1 state: separate registry directory
+  (`/var/lib/linux-temp-admin/v2/`) and systemd unit namespace; `doctor` detects
+  and reports leftover v1 artifacts without touching them.
+- Tested: per-package unit tests, a 119-input differential parity harness vs the
+  bash validators, root integration tests (symlink-attack, concurrent-flock,
+  real invite→revoke lifecycle, signature accept/reject), all under `-race`;
+  static amd64/arm64 cross-builds. Reviewed by a multi-agent parity/security audit.
+- Release/signing: `docs/releasing.md`, `scripts/release.sh`, `scripts/install.sh`.
+
 ## v1.2.3 - 2026-07-07
 
 - Fixed the `wget` upgrade download and public-IP autodetection failing on BusyBox/musl (Alpine): the GNU-only `--timeout`/`--tries`/`--dns-timeout`/`--connect-timeout` options are now probed, and on BusyBox wget the fetch is bounded with `timeout(1)` instead (BusyBox `-T` segfaults on some builds).

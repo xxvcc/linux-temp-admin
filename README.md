@@ -13,6 +13,36 @@
 
 中文 | [English](README.en.md)
 
+---
+
+## ⚙️ v2(Go 重写)
+
+同一工具已用 **Go 重写**为**单静态二进制**——零运行时依赖,glibc/musl 通吃(含 Alpine/BusyBox),把 `ssh-keygen`/`curl`/`wget`/`date`/`getent`/`install`/`flock`/`pkill` 全部原生化,并新增了 **ed25519 签名校验的自升级**(bash 版没有的)。子命令与行为对齐 v1.2.3。
+
+**安装(下载即校验 SHA-256):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
+```
+
+**用法**(与 v1 一致):
+
+```bash
+sudo linux-temp-admin invite --hours 12 --sudo     # 创建一次性临时管理员
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3   # 撤销/删除
+sudo linux-temp-admin status                       # 查看状态
+sudo linux-temp-admin doctor                       # 系统诊断
+sudo linux-temp-admin upgrade                      # 验签后自升级
+linux-temp-admin --lang zh help                    # 中/英界面
+```
+
+- **升级**下载二进制 + 分离签名,用内嵌公钥 ed25519 **验签后**才安装(fail-closed)。发布/签名见 [docs/releasing.md](docs/releasing.md)。
+- v2 使用独立的注册表目录(`/var/lib/linux-temp-admin/v2/`),**不接管 v1 状态**;`doctor` 会检测并提示遗留的 v1 工件。已在 v1 机器上部署的账号,请先用 v1 的 `revoke` 排空。
+
+下方文档描述当前稳定发布的 **v1(bash)** 版本;两者可共存。
+
+---
+
 ## 目录
 
 - [30 秒上手](#30-秒上手)

@@ -13,6 +13,45 @@
 
 [中文](README.md) | English
 
+---
+
+## ⚙️ v2 (Go rewrite)
+
+The same tool has been **rewritten in Go** as a **single static binary** — zero
+runtime dependencies, glibc/musl alike (including Alpine/BusyBox). It does
+`ssh-keygen`/`curl`/`wget`/`date`/`getent`/`install`/`flock`/`pkill` natively and
+adds an **ed25519-signature-verified self-upgrade** (which the bash tool lacked).
+Subcommands and behavior match v1.2.3.
+
+**Install (downloads and verifies the SHA-256):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
+```
+
+**Usage** (same as v1):
+
+```bash
+sudo linux-temp-admin invite --hours 12 --sudo     # create a one-time temp admin
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3   # revoke / delete
+sudo linux-temp-admin status                       # show status
+sudo linux-temp-admin doctor                       # system diagnostics
+sudo linux-temp-admin upgrade                      # signature-verified self-upgrade
+linux-temp-admin --lang en help                    # zh/en UI
+```
+
+- **Upgrade** downloads the binary + a detached signature and installs only after
+  ed25519 verification against the embedded key (fail-closed). Release/signing:
+  see [docs/releasing.md](docs/releasing.md).
+- v2 uses a separate registry directory (`/var/lib/linux-temp-admin/v2/`) and does
+  **not** adopt v1 state; `doctor` detects and reports leftover v1 artifacts. On a
+  box already running v1, drain accounts with the v1 `revoke` first.
+
+The documentation below covers the currently-released **v1 (bash)** tool; the two
+can coexist.
+
+---
+
 ## Contents
 
 - [Quick start (30 seconds)](#quick-start-30-seconds)
