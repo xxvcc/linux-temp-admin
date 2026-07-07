@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
       - name: Vet
         run: go vet ./...
       - name: Test (race)
@@ -26,6 +26,16 @@ jobs:
             echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
           fi
 
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Integration tests (root)
+        run: sudo -E env "PATH=$PATH" go test -race -tags integration ./...
+
   static-cross-build:
     runs-on: ubuntu-latest
     strategy:
@@ -35,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
       - name: Static build ${{ matrix.goarch }}
         env:
           CGO_ENABLED: '0'
