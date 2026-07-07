@@ -72,7 +72,7 @@ sudo linux-temp-admin install --force   # force-replace the stable command with 
 sudo linux-temp-admin uninstall         # uninstall the stable command
 ```
 
-`upgrade` accepts HTTPS URLs only, parses the downloaded version, and runs `bash -n` before replacing anything; it only overwrites when the downloaded version is newer. Use `--force --url URL` for repair or an intentional rollback. `uninstall` refuses to remove the stable command while registered users still exist, because that could break expiry auto-revoke jobs; use `--force` only after accepting that risk.
+`upgrade` accepts HTTPS URLs only, caps downloads at 1 MiB, parses the downloaded version, and runs `bash -n` before replacing anything; it only overwrites when the downloaded version is newer. Use `--force --url URL` for repair or an intentional rollback. `uninstall` refuses to remove the stable command while registered users still exist, because that could break expiry auto-revoke jobs; use `--force` only after accepting that risk.
 
 ## What it solves
 

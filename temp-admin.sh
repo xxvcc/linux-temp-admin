@@ -6,10 +6,11 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.2.0"
+VERSION="1.2.1"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
+MAX_UPGRADE_BYTES="1048576"
 DEFAULT_SHELL="/bin/bash"
 MANAGED_TAG="linux-temp-admin"
 REGISTRY_DIR="/var/lib/linux-temp-admin"
@@ -533,13 +534,19 @@ registry_init() {
     err "$(m "安全检查失败：注册表路径不是目录：$REGISTRY_DIR" "Security check failed: registry path is not a directory: $REGISTRY_DIR")"
     return 1
   fi
-  install -d -m 700 -o root -g root "$REGISTRY_DIR"
+  if ! install -d -m 700 -o root -g root "$REGISTRY_DIR"; then
+    err "$(m "创建注册表目录失败：$REGISTRY_DIR" "Failed to create registry directory: $REGISTRY_DIR")"
+    return 1
+  fi
   if [[ -L "$REGISTRY_DIR" || ! -d "$REGISTRY_DIR" ]]; then
     err "$(m "安全检查失败：注册表目录不安全：$REGISTRY_DIR" "Security check failed: registry directory is unsafe: $REGISTRY_DIR")"
     return 1
   fi
   chown root:root "$REGISTRY_DIR" 2>/dev/null || true
-  chmod 700 "$REGISTRY_DIR"
+  if ! chmod 700 "$REGISTRY_DIR"; then
+    err "$(m "设置注册表目录权限失败：$REGISTRY_DIR" "Failed to set registry directory permissions: $REGISTRY_DIR")"
+    return 1
+  fi
 
   local f
   for f in "$REGISTRY_FILE" "$REGISTRY_LOCK_FILE"; do
@@ -552,14 +559,20 @@ registry_init() {
       return 1
     fi
     if [[ ! -e "$f" ]]; then
-      : > "$f"
+      if ! : > "$f"; then
+        err "$(m "创建注册表文件失败：$f" "Failed to create registry file: $f")"
+        return 1
+      fi
     fi
     if [[ -L "$f" || ! -f "$f" ]]; then
       err "$(m "安全检查失败：注册表文件不安全：$f" "Security check failed: registry file is unsafe: $f")"
       return 1
     fi
     chown root:root "$f" 2>/dev/null || true
-    chmod 600 "$f"
+    if ! chmod 600 "$f"; then
+      err "$(m "设置注册表文件权限失败：$f" "Failed to set registry file permissions: $f")"
+      return 1
+    fi
   done
 }
 
@@ -596,22 +609,36 @@ registry_remove_user_unlocked() {
   local user="$1"
   registry_plain_file_exists "$REGISTRY_FILE" || return 0
   local tmp
-  tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX")
+  if ! tmp=$(mktemp "${REGISTRY_DIR}/users.tsv.tmp.XXXXXX"); then
+    warn "$(m "创建注册表临时文件失败，已取消写入。" "Failed to create registry temporary file; write cancelled.")"
+    return 1
+  fi
   if ! awk -F '\t' -v u="$user" '$1 != u {print}' "$REGISTRY_FILE" > "$tmp"; then
     rm -f "$tmp"
     warn "$(m "重写注册表失败（awk 退出非零，可能磁盘已满），已取消写入以避免截断注册表。" "Failed to rewrite the registry (awk exited non-zero, disk may be full); aborted the write to avoid truncating the registry.")"
     return 1
   fi
   chown root:root "$tmp" 2>/dev/null || true
-  chmod 600 "$tmp"
+  if ! chmod 600 "$tmp"; then
+    rm -f "$tmp"
+    warn "$(m "设置注册表临时文件权限失败，已取消写入。" "Failed to set registry temporary file permissions; write cancelled.")"
+    return 1
+  fi
   if [[ -L "$REGISTRY_FILE" || ! -f "$REGISTRY_FILE" ]]; then
     rm -f "$tmp"
     warn "$(m "注册表路径不再安全，已取消写入。" "Registry path became unsafe; write cancelled.")"
     return 1
   fi
-  mv -f "$tmp" "$REGISTRY_FILE"
+  if ! mv -f "$tmp" "$REGISTRY_FILE"; then
+    rm -f "$tmp"
+    warn "$(m "替换注册表失败，已取消写入。" "Failed to replace the registry; write cancelled.")"
+    return 1
+  fi
   chown root:root "$REGISTRY_FILE" 2>/dev/null || true
-  chmod 600 "$REGISTRY_FILE"
+  if ! chmod 600 "$REGISTRY_FILE"; then
+    warn "$(m "设置注册表权限失败：$REGISTRY_FILE" "Failed to set registry permissions: $REGISTRY_FILE")"
+    return 1
+  fi
 }
 
 registry_record_user() {
@@ -639,10 +666,18 @@ registry_record_user() {
   fi
   local created
   created=$(date '+%F %T %Z')
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$user" "$created" "$expires" "$sudo_enabled" "$nopasswd" "$host" "$port" "$fingerprint" "$auto_revoke" "$auto_unit" >> "$REGISTRY_FILE"
+  if ! printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$user" "$created" "$expires" "$sudo_enabled" "$nopasswd" "$host" "$port" "$fingerprint" "$auto_revoke" "$auto_unit" >> "$REGISTRY_FILE"; then
+    warn "$(m "追加注册表失败（可能磁盘已满或权限异常），账号已创建但未登记。" "Failed to append to the registry (disk may be full or permissions invalid); account was created but not registered.")"
+    registry_unlock "$lock_fd"
+    return 1
+  fi
   chown root:root "$REGISTRY_FILE" 2>/dev/null || true
-  chmod 600 "$REGISTRY_FILE"
+  if ! chmod 600 "$REGISTRY_FILE"; then
+    warn "$(m "设置注册表权限失败：$REGISTRY_FILE" "Failed to set registry permissions: $REGISTRY_FILE")"
+    registry_unlock "$lock_fd"
+    return 1
+  fi
   registry_unlock "$lock_fd"
 }
 
@@ -802,15 +837,19 @@ extract_script_version() {
 
 version_gt() {
   local newer="$1" older="$2"
-  [[ "$newer" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
-  local newer_major="${BASH_REMATCH[1]}" newer_minor="${BASH_REMATCH[2]}" newer_patch="${BASH_REMATCH[3]}"
-  [[ "$older" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
-  local older_major="${BASH_REMATCH[1]}" older_minor="${BASH_REMATCH[2]}" older_patch="${BASH_REMATCH[3]}"
+  [[ "$newer" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]] || return 1
+  local newer_major="${BASH_REMATCH[1]}" newer_minor="${BASH_REMATCH[2]}" newer_patch="${BASH_REMATCH[3]}" newer_suffix="${BASH_REMATCH[4]}"
+  [[ "$older" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]] || return 1
+  local older_major="${BASH_REMATCH[1]}" older_minor="${BASH_REMATCH[2]}" older_patch="${BASH_REMATCH[3]}" older_suffix="${BASH_REMATCH[4]}"
   (( 10#$newer_major > 10#$older_major )) && return 0
   (( 10#$newer_major < 10#$older_major )) && return 1
   (( 10#$newer_minor > 10#$older_minor )) && return 0
   (( 10#$newer_minor < 10#$older_minor )) && return 1
-  (( 10#$newer_patch > 10#$older_patch ))
+  (( 10#$newer_patch > 10#$older_patch )) && return 0
+  (( 10#$newer_patch < 10#$older_patch )) && return 1
+  [[ -z "$newer_suffix" && -n "$older_suffix" ]] && return 0
+  [[ -n "$newer_suffix" && -z "$older_suffix" ]] && return 1
+  [[ "$newer_suffix" > "$older_suffix" ]]
 }
 
 valid_upgrade_url() {
@@ -830,11 +869,26 @@ download_script_to_file() {
     return 1
   }
   if command_exists curl; then
-    curl -fsSL --connect-timeout 5 --max-time 30 "$url" -o "$dest"
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 30 --max-filesize "$MAX_UPGRADE_BYTES" "$url" -o "$dest"; then
+      rm -f "$dest"
+      err "$(m "下载升级脚本失败：$url" "Failed to download upgrade script: $url")"
+      return 1
+    fi
   elif command_exists wget; then
-    wget -qO "$dest" --tries=1 --timeout=30 "$url"
+    if ! wget -qO "$dest" --tries=1 --timeout=30 "$url"; then
+      rm -f "$dest"
+      err "$(m "下载升级脚本失败：$url" "Failed to download upgrade script: $url")"
+      return 1
+    fi
   else
     err "$(m "找不到 curl/wget，无法下载升级脚本。" "curl/wget not found; cannot download upgrade script.")"
+    return 1
+  fi
+  local bytes
+  bytes=$(wc -c < "$dest" 2>/dev/null | tr -d '[:space:]' || printf '0')
+  if [[ ! "$bytes" =~ ^[0-9]+$ || "$bytes" -le 0 || "$bytes" -gt "$MAX_UPGRADE_BYTES" ]]; then
+    rm -f "$dest"
+    err "$(m "下载的脚本大小异常：${bytes:-0} bytes" "Downloaded script size is invalid: ${bytes:-0} bytes")"
     return 1
   fi
 }
@@ -876,27 +930,56 @@ install_script_file_for_revoke() {
     warn "$(m "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。" "$INSTALL_PATH is not a safe regular file; refusing installation to prevent TOCTOU attack.")"
     return 1
   fi
-  if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
-    if [[ "$replace" != "true" ]]; then
-      if [[ "$reuse_existing" == "true" ]] && installed_revoke_version installed_ver; then
-        warn "$(m "$INSTALL_PATH 已存在且与源脚本不同（installed=$installed_ver source=$src_ver）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1 或使用 install/upgrade --force。" "$INSTALL_PATH already exists and differs from the source script (installed=$installed_ver source=$src_ver); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 or use install/upgrade --force to replace it.")"
-        return 0
+  if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]]; then
+    local differs="unknown"
+    if command_exists cmp; then
+      if cmp -s -- "$src" "$INSTALL_PATH"; then
+        differs="false"
+      else
+        differs="true"
       fi
-      warn "$(m "$INSTALL_PATH 已存在且与源脚本不同；未覆盖。确认要替换时请使用 --force。" "$INSTALL_PATH already exists and differs from the source script; not overwritten. Use --force to replace it.")"
-      return 1
     fi
-    warn "$(m "正在用源脚本覆盖已安装的稳定撤销命令：$INSTALL_PATH (source=$src_ver)" "Overwriting the installed stable revoke command with the source script: $INSTALL_PATH (source=$src_ver)")"
+    if [[ "$differs" != "false" ]]; then
+      local diff_zh="与源脚本不同" diff_en="differs from the source script"
+      if [[ "$differs" == "unknown" ]]; then
+        diff_zh="无法确认是否与源脚本不同"
+        diff_en="cannot be confirmed whether it differs from the source script"
+      fi
+      if [[ "$replace" != "true" ]]; then
+        if [[ "$reuse_existing" == "true" ]] && installed_revoke_version installed_ver; then
+          warn "$(m "$INSTALL_PATH 已存在且$diff_zh（installed=$installed_ver source=$src_ver）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1 或使用 install/upgrade --force。" "$INSTALL_PATH already exists and $diff_en (installed=$installed_ver source=$src_ver); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 or use install/upgrade --force to replace it.")"
+          return 0
+        fi
+        warn "$(m "$INSTALL_PATH 已存在且$diff_zh；未覆盖。确认要替换时请使用 --force。" "$INSTALL_PATH already exists and $diff_en; not overwritten. Use --force to replace it.")"
+        return 1
+      fi
+      warn "$(m "正在用源脚本覆盖已安装的稳定撤销命令：$INSTALL_PATH (source=$src_ver)" "Overwriting the installed stable revoke command with the source script: $INSTALL_PATH (source=$src_ver)")"
+    fi
   fi
-  tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX")
-  install -m 700 -o root -g root "$src" "$tmp"
+  if ! tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX"); then
+    warn "$(m "创建安装临时文件失败：$install_dir" "Failed to create install temporary file: $install_dir")"
+    return 1
+  fi
+  if ! install -m 700 -o root -g root "$src" "$tmp"; then
+    rm -f "$tmp"
+    warn "$(m "复制源脚本到安装临时文件失败：$tmp" "Failed to copy source script to install temporary file: $tmp")"
+    return 1
+  fi
   if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
     rm -f "$tmp"
     warn "$(m "$INSTALL_PATH 安全状态变化，拒绝覆盖。" "$INSTALL_PATH safety state changed; refusing overwrite.")"
     return 1
   fi
-  mv -f "$tmp" "$INSTALL_PATH"
+  if ! mv -f "$tmp" "$INSTALL_PATH"; then
+    rm -f "$tmp"
+    warn "$(m "安装稳定命令失败，未能替换：$INSTALL_PATH" "Failed to install stable command; could not replace: $INSTALL_PATH")"
+    return 1
+  fi
   chown root:root "$INSTALL_PATH" 2>/dev/null || true
-  chmod 700 "$INSTALL_PATH"
+  if ! chmod 700 "$INSTALL_PATH"; then
+    warn "$(m "设置稳定命令权限失败：$INSTALL_PATH" "Failed to set stable command permissions: $INSTALL_PATH")"
+    return 1
+  fi
   success "$(m "稳定命令已安装：$INSTALL_PATH version=$src_ver" "Stable command installed: $INSTALL_PATH version=$src_ver")"
 }
 
@@ -924,7 +1007,7 @@ show_installed_revoke_status() {
   fi
   info "$(m "稳定撤销命令：$INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}" "Stable revoke command: $INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}")"
   if [[ "$installed_version" != "unknown-or-invalid" && "$installed_version" != "not-executable-by-current-user" && "$installed_version" != "$VERSION" ]]; then
-    warn "$(m "稳定撤销命令版本与当前脚本不同；下一次创建自动删除任务会重新安装当前脚本。" "Stable revoke command version differs from the current script; the next auto-delete task creation will reinstall the current script.")"
+    warn "$(m "稳定撤销命令版本与当前脚本不同；自动删除任务会复用现有命令，除非显式使用 --force 或 LINUX_TEMP_ADMIN_REINSTALL=1。" "Stable revoke command version differs from the current script; auto-delete tasks will reuse the existing command unless --force or LINUX_TEMP_ADMIN_REINSTALL=1 is used.")"
   fi
 }
 
@@ -1219,7 +1302,10 @@ ip_probe_debug() {
 get_url_text() {
   local url="$1" max_time="${2:-3}" connect_timeout="${3:-1}"
   local output="" status=0 tmp_err err=""
-  tmp_err=$(mktemp -t linux-temp-admin.XXXXXX)
+  if ! tmp_err=$(mktemp -t linux-temp-admin.XXXXXX); then
+    ip_probe_debug "$(m "创建临时错误日志失败，无法请求 $url" "Failed to create temporary error log; cannot request $url")"
+    return 1
+  fi
   if command_exists curl; then
     if output=$(curl -fsS --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" 2>"$tmp_err" | tr -d '\r\n'); then
       status=0
@@ -1425,22 +1511,36 @@ safe_write_root_file() {
     warn "$(m "目标文件不安全，拒绝写入：$path" "Target file is unsafe; refusing write: $path")"
     return 1
   fi
-  tmp=$(mktemp "${dir}/.${base}.XXXXXX")
+  if ! tmp=$(mktemp "${dir}/.${base}.XXXXXX"); then
+    warn "$(m "创建临时文件失败，拒绝写入：$path" "Failed to create temporary file; refusing write: $path")"
+    return 1
+  fi
   if ! cat > "$tmp"; then
     rm -f "$tmp"
     warn "$(m "写入临时文件失败，已清理：$path" "Failed to write the temporary file, cleaned up: $path")"
     return 1
   fi
   chown root:root "$tmp" 2>/dev/null || true
-  chmod "$mode" "$tmp"
+  if ! chmod "$mode" "$tmp"; then
+    rm -f "$tmp"
+    warn "$(m "设置临时文件权限失败，已清理：$path" "Failed to set temporary file permissions, cleaned up: $path")"
+    return 1
+  fi
   if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
     rm -f "$tmp"
     warn "$(m "目标文件安全状态变化，拒绝覆盖：$path" "Target file safety state changed; refusing overwrite: $path")"
     return 1
   fi
-  mv -f "$tmp" "$path"
+  if ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"
+    warn "$(m "替换目标文件失败，已清理临时文件：$path" "Failed to replace target file; temporary file cleaned up: $path")"
+    return 1
+  fi
   chown root:root "$path" 2>/dev/null || true
-  chmod "$mode" "$path"
+  if ! chmod "$mode" "$path"; then
+    warn "$(m "设置目标文件权限失败：$path" "Failed to set target file permissions: $path")"
+    return 1
+  fi
 }
 
 add_sudo() {
@@ -1500,7 +1600,10 @@ write_ssh_key() {
     err "$(m "用户 .ssh 路径不安全：$ssh_dir" "User .ssh path is unsafe: $ssh_dir")"
     return 1
   fi
-  install -d -m 700 -o "$uid" -g "$gid" "$ssh_dir"
+  if ! install -d -m 700 -o "$uid" -g "$gid" "$ssh_dir"; then
+    err "$(m "创建用户 .ssh 目录失败：$ssh_dir" "Failed to create user .ssh directory: $ssh_dir")"
+    return 1
+  fi
   if [[ -L "$auth_file" || ( -e "$auth_file" && ! -f "$auth_file" ) ]]; then
     err "$(m "authorized_keys 路径不安全：$auth_file" "authorized_keys path is unsafe: $auth_file")"
     return 1
@@ -1511,16 +1614,30 @@ write_ssh_key() {
   # and mode, so we deliberately do NOT chown/chmod the destination by name after
   # the mv — doing so would follow an attacker-planted symlink in the user-owned
   # .ssh directory and chown/chmod an arbitrary root file.
-  tmp_auth=$(mktemp "${ssh_dir}/.authorized_keys.XXXXXX")
-  cat "$pubkey_file" > "$tmp_auth"
-  chown "$uid:$gid" "$tmp_auth"
-  chmod 600 "$tmp_auth"
+  if ! tmp_auth=$(mktemp "${ssh_dir}/.authorized_keys.XXXXXX"); then
+    err "$(m "创建 authorized_keys 临时文件失败：$ssh_dir" "Failed to create authorized_keys temporary file: $ssh_dir")"
+    return 1
+  fi
+  if ! cat "$pubkey_file" > "$tmp_auth"; then
+    rm -f "$tmp_auth"
+    err "$(m "写入 authorized_keys 临时文件失败：$auth_file" "Failed to write authorized_keys temporary file: $auth_file")"
+    return 1
+  fi
+  if ! chown "$uid:$gid" "$tmp_auth" || ! chmod 600 "$tmp_auth"; then
+    rm -f "$tmp_auth"
+    err "$(m "设置 authorized_keys 临时文件权限失败：$auth_file" "Failed to set authorized_keys temporary file ownership/permissions: $auth_file")"
+    return 1
+  fi
   if [[ -L "$auth_file" || ( -e "$auth_file" && ! -f "$auth_file" ) ]]; then
     rm -f "$tmp_auth"
     err "$(m "authorized_keys 安全状态变化，拒绝覆盖：$auth_file" "authorized_keys safety state changed; refusing overwrite: $auth_file")"
     return 1
   fi
-  mv -f "$tmp_auth" "$auth_file"
+  if ! mv -f "$tmp_auth" "$auth_file"; then
+    rm -f "$tmp_auth"
+    err "$(m "替换 authorized_keys 失败：$auth_file" "Failed to replace authorized_keys: $auth_file")"
+    return 1
+  fi
 }
 
 
@@ -1837,18 +1954,25 @@ EOF
   }
 
   if [[ "$grant_sudo" == "yes" ]]; then
-    ensure_dependencies "$deps_mode" true
+    ensure_dependencies "$deps_mode" true || exit 1
   else
-    ensure_dependencies "$deps_mode" false
+    ensure_dependencies "$deps_mode" false || exit 1
   fi
 
   local tmpdir keyfile pubfile expires revoke_cmd sudo_text fingerprint auto_text login_shell
-  local created_user="" invite_completed="false" auto_unit=""
-  login_shell=$(resolve_login_shell)
+  local created_user="" invite_completed="false" auto_unit="" registry_recorded="false"
+  login_shell=$(resolve_login_shell) || exit 1
   # Prefer tmpfs (/dev/shm) for the one-time private key so it never hits a real
   # disk; fall back to /tmp. Explicit -p avoids a hostile inherited $TMPDIR.
-  tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp)
-  chmod 700 "$tmpdir"
+  if ! tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp); then
+    err "$(m "创建临时目录失败，无法生成一次性私钥。" "Failed to create temporary directory; cannot generate one-time private key.")"
+    exit 1
+  fi
+  if ! chmod 700 "$tmpdir"; then
+    secure_cleanup_tmpdir "$tmpdir"
+    err "$(m "设置临时目录权限失败：$tmpdir" "Failed to set temporary directory permissions: $tmpdir")"
+    exit 1
+  fi
   keyfile="$tmpdir/${user}.key"
   pubfile="$keyfile.pub"
   cleanup_invite_error() {
@@ -1860,18 +1984,17 @@ EOF
     secure_cleanup_tmpdir "$tmpdir"
     exit "$code"
   }
-  trap cleanup_invite_error ERR INT TERM HUP
-  trap 'secure_cleanup_tmpdir "$tmpdir"' EXIT
+  trap cleanup_invite_error ERR EXIT INT TERM HUP
 
-  ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null
-  chmod 600 "$keyfile"
-  chmod 644 "$pubfile"
+  ssh-keygen -t ed25519 -N '' -C "${user}-${MANAGED_TAG}" -f "$keyfile" >/dev/null || exit 1
+  chmod 600 "$keyfile" || exit 1
+  chmod 644 "$pubfile" || exit 1
 
-  create_user_if_needed "$user" "$login_shell"
+  create_user_if_needed "$user" "$login_shell" || exit 1
   created_user="$user"
-  lock_user_password "$user"
-  write_ssh_key "$user" "$pubfile"
-  set_user_expiry "$user" "$hours"
+  lock_user_password "$user" || exit 1
+  write_ssh_key "$user" "$pubfile" || exit 1
+  set_user_expiry "$user" "$hours" || exit 1
 
   sudo_text="no"
   if [[ "$grant_sudo" == "yes" ]]; then
@@ -1901,15 +2024,21 @@ EOF
       revoke_cmd="sudo bash $SCRIPT_NAME revoke --user $user"
     fi
   fi
-  registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit" \
-    || warn "$(m "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。" "Failed to record in the registry: the account and auto-delete task were created but not registered; verify with status and revoke manually if needed.")"
+  if registry_record_user "$user" "$expires" "$sudo_text" "no" "$host" "$port" "${fingerprint:-unknown}" "$auto_text" "$auto_unit"; then
+    registry_recorded="true"
+  else
+    warn "$(m "登记注册表失败：账号与自动删除任务已创建，但未写入登记表；请用 status 核对，必要时手动撤销。" "Failed to record in the registry: the account and auto-delete task were created but not registered; verify with status and revoke manually if needed.")"
+  fi
 
   invite_completed="true"
-  trap - ERR INT TERM HUP
-  success "$(m "临时账号已创建并登记：$user" "Temporary account created and registered: $user")"
-  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}"
+  if [[ "$registry_recorded" == "true" ]]; then
+    success "$(m "临时账号已创建并登记：$user" "Temporary account created and registered: $user")"
+  else
+    warn "$(m "临时账号已创建但未登记：$user" "Temporary account created but not registered: $user")"
+  fi
+  print_invite "$host" "$port" "$user" "$expires" "$sudo_text" "$keyfile" "$revoke_cmd" "$auto_text" "${auto_unit:-none}" || exit 1
   secure_cleanup_tmpdir "$tmpdir"
-  trap - EXIT
+  trap - ERR EXIT INT TERM HUP
 }
 
 revoke_user() {
@@ -1947,7 +2076,7 @@ revoke_user() {
     warn "$(m "用户不存在：$user。将清理登记记录、sudoers 文件和自动删除任务（如果存在）。" "User does not exist: $user. Cleaning up the registry entry, sudoers file, and auto-delete task (if any).")"
     cancel_auto_revoke "$user"
     remove_sudoers_file "$user"
-    registry_remove_user "$user"
+    registry_remove_user "$user" || warn "$(m "清理注册表记录失败，请手动检查：$user" "Failed to clean up registry record; please check manually: $user")"
     exit 0
   fi
   if [[ "$assume_yes" != "true" ]]; then
@@ -1972,7 +2101,7 @@ revoke_user() {
     warn "$(m "删除用户失败: $user" "Failed to remove user: $user")"
     exit 1
   fi
-  registry_remove_user "$user"
+  registry_remove_user "$user" || warn "$(m "用户已删除，但清理注册表记录失败，请手动检查：$user" "User was deleted, but registry cleanup failed; please check manually: $user")"
   success "$(m "已撤销并删除用户：$user" "User revoked and deleted: $user")"
 }
 
@@ -2176,7 +2305,7 @@ install_command() {
     err "$(m "无法安全定位当前脚本文件，不能安装。请先下载为本地文件后运行。" "Cannot safely locate the current script file; cannot install. Download it as a local file first.")"
     exit 1
   fi
-  install_script_file_for_revoke "$src" "$force" false
+  install_script_file_for_revoke "$src" "$force" false || exit 1
   show_installed_revoke_status
 }
 
@@ -2214,7 +2343,10 @@ uninstall_command() {
     warn "$(m "已取消。" "Cancelled.")"
     return 0
   fi
-  rm -f "$INSTALL_PATH"
+  if ! rm -f "$INSTALL_PATH"; then
+    err "$(m "删除稳定命令失败：$INSTALL_PATH" "Failed to remove stable command: $INSTALL_PATH")"
+    exit 1
+  fi
   success "$(m "已卸载稳定命令：$INSTALL_PATH" "Stable command uninstalled: $INSTALL_PATH")"
 }
 
@@ -2231,21 +2363,43 @@ upgrade_command() {
     esac
   done
 
-  tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp)
-  chmod 700 "$tmpdir"
-  tmpfile="$tmpdir/temp-admin.sh"
-  if ! download_script_to_file "$url" "$tmpfile"; then
-    rm -rf "$tmpdir"
+  if ! tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp); then
+    err "$(m "创建升级临时目录失败。" "Failed to create upgrade temporary directory.")"
     return 1
   fi
-  chmod 600 "$tmpfile"
-  if ! remote_ver=$(extract_script_version "$tmpfile"); then
+  if ! chmod 700 "$tmpdir"; then
     rm -rf "$tmpdir"
+    err "$(m "设置升级临时目录权限失败：$tmpdir" "Failed to set upgrade temporary directory permissions: $tmpdir")"
+    return 1
+  fi
+  cleanup_upgrade_error() {
+    local code=$?
+    trap - ERR EXIT INT TERM HUP
+    rm -rf "$tmpdir"
+    exit "$code"
+  }
+  cleanup_upgrade_tmpdir() {
+    rm -rf "$tmpdir"
+    trap - ERR EXIT INT TERM HUP
+  }
+  trap cleanup_upgrade_error ERR EXIT INT TERM HUP
+  tmpfile="$tmpdir/temp-admin.sh"
+  if ! download_script_to_file "$url" "$tmpfile"; then
+    cleanup_upgrade_tmpdir
+    return 1
+  fi
+  if ! chmod 600 "$tmpfile"; then
+    cleanup_upgrade_tmpdir
+    err "$(m "设置下载脚本权限失败，已放弃升级。" "Failed to set downloaded script permissions; upgrade aborted.")"
+    return 1
+  fi
+  if ! remote_ver=$(extract_script_version "$tmpfile"); then
+    cleanup_upgrade_tmpdir
     err "$(m "下载的脚本缺少有效版本号，已放弃升级。" "Downloaded script has no valid version; upgrade aborted.")"
     return 1
   fi
   if ! bash -n "$tmpfile"; then
-    rm -rf "$tmpdir"
+    cleanup_upgrade_tmpdir
     err "$(m "下载的脚本语法检查失败，已放弃升级。" "Downloaded script failed Bash syntax validation; upgrade aborted.")"
     return 1
   fi
@@ -2253,26 +2407,26 @@ upgrade_command() {
   if installed_revoke_version installed_ver; then
     if [[ "$force" != "true" ]] && ! version_gt "$remote_ver" "$installed_ver"; then
       success "$(m "稳定命令已是最新或更高版本：installed=$installed_ver downloaded=$remote_ver" "Stable command is already up to date or newer: installed=$installed_ver downloaded=$remote_ver")"
-      rm -rf "$tmpdir"
+      cleanup_upgrade_tmpdir
       return 0
     fi
   elif [[ -e "$INSTALL_PATH" && "$force" != "true" ]]; then
-    rm -rf "$tmpdir"
+    cleanup_upgrade_tmpdir
     err "$(m "已安装路径存在但不是可安全识别的本工具命令；确认替换请使用 --force。" "Install path exists but is not a safely recognized command from this tool; use --force to replace it.")"
     return 1
   fi
 
   info "$(m "准备升级稳定命令：installed=$installed_ver downloaded=$remote_ver url=$url" "Preparing to upgrade stable command: installed=$installed_ver downloaded=$remote_ver url=$url")"
   if ! confirm_yes "$(m "升级会覆盖 $INSTALL_PATH。确认请输入 YES。" "Upgrade will overwrite $INSTALL_PATH. Type YES to confirm.")" "$assume_yes"; then
-    rm -rf "$tmpdir"
+    cleanup_upgrade_tmpdir
     warn "$(m "已取消。" "Cancelled.")"
     return 0
   fi
   if ! install_script_file_for_revoke "$tmpfile" true false; then
-    rm -rf "$tmpdir"
+    cleanup_upgrade_tmpdir
     return 1
   fi
-  rm -rf "$tmpdir"
+  cleanup_upgrade_tmpdir
   show_installed_revoke_status
 }
 

@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v1.2.1 - 2026-07-07
+
+- Hardened upgrade downloads with a 1 MiB size limit and cleanup of failed or oversized downloads.
+- Made critical write paths explicitly check copy, append, chmod, and rename failures instead of relying on `errexit`.
+- Ensured interactive-menu invite/install/upgrade failure paths abort cleanly and preserve rollback behavior.
+- Corrected invite/revoke/uninstall status reporting when registry cleanup or file removal fails.
+- Added unit coverage for failed upgrade downloads, oversized downloads, and registry append failures.
+
 ## v1.2.0 - 2026-07-07
 
 - Added `doctor`, `install`, `upgrade`, and `uninstall` commands.

@@ -108,13 +108,63 @@ assert_failure "invalid installed version text" valid_installed_version "not-a-v
 assert_eq "$(extract_script_version "$SCRIPT")" "$VERSION" "extract script version"
 assert_success "newer version compares greater" version_gt "1.2.0" "1.1.2"
 assert_success "major version compares greater" version_gt "2.0.0" "1.9.9"
+assert_success "final release compares greater than prerelease" version_gt "1.2.0" "1.2.0-rc1"
 assert_failure "same version is not greater" version_gt "1.2.0" "1.2.0"
 assert_failure "older version is not greater" version_gt "1.1.9" "1.2.0"
+assert_failure "prerelease is not greater than final" version_gt "1.2.0-rc1" "1.2.0"
 assert_success "default upgrade URL is valid" valid_upgrade_url "$DEFAULT_UPGRADE_URL"
 assert_success "custom https upgrade URL is valid" valid_upgrade_url "https://example.com/temp-admin.sh"
 assert_failure "upgrade URL must be https" valid_upgrade_url "http://example.com/temp-admin.sh"
 assert_failure "upgrade URL rejects whitespace" valid_upgrade_url "https://example.com/a b.sh"
 assert_failure "upgrade URL rejects shell metacharacters" valid_upgrade_url "https://example.com/a|b.sh"
+
+download_tmp=$(mktemp -d)
+download_dest="$download_tmp/temp-admin.sh"
+if (
+  command_exists() { [[ "$1" == "curl" ]]; }
+  curl() {
+    local out=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s' 'partial' > "$out"
+    return 22
+  }
+  download_script_to_file "https://example.com/temp-admin.sh" "$download_dest"
+) >/dev/null 2>&1; then
+  rm -rf "$download_tmp"
+  fail "download failure should fail"
+fi
+[[ ! -e "$download_dest" ]] || {
+  rm -rf "$download_tmp"
+  fail "download failure should remove partial file"
+}
+if (
+  export MAX_UPGRADE_BYTES=4
+  command_exists() { [[ "$1" == "curl" ]]; }
+  curl() {
+    local out=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s' '12345' > "$out"
+  }
+  download_script_to_file "https://example.com/temp-admin.sh" "$download_dest"
+) >/dev/null 2>&1; then
+  rm -rf "$download_tmp"
+  fail "oversized download should fail"
+fi
+[[ ! -e "$download_dest" ]] || {
+  rm -rf "$download_tmp"
+  fail "oversized download should remove file"
+}
+rm -rf "$download_tmp"
 
 if output=$(bash "$SCRIPT" --lang en doctor --bad 2>&1); then
   fail "unsupported doctor argument should fail"
@@ -135,6 +185,56 @@ if output=$(bash "$SCRIPT" --lang en upgrade --url http://example.com/temp-admin
   fail "unsafe upgrade URL should fail"
 fi
 assert_output_contains "$output" "Upgrade URL is unsafe or invalid" "upgrade rejects unsafe URL"
+
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  install_tmp=$(mktemp -d)
+  existing_install="$install_tmp/linux-temp-admin"
+  printf '%s\n' '#!/usr/bin/env bash' '[[ "${1:-}" == "version" ]] && echo "9.9.9"' > "$existing_install"
+  chmod 700 "$existing_install"
+  if (
+    export INSTALL_PATH="$existing_install"
+    command_exists() {
+      [[ "$1" == "cmp" ]] && return 1
+      command -v "$1" >/dev/null 2>&1
+    }
+    install_script_file_for_revoke "$SCRIPT" false false
+  ) >/dev/null 2>&1; then
+    rm -rf "$install_tmp"
+    fail "install should refuse to overwrite without cmp and without force"
+  fi
+  assert_eq "$(bash "$existing_install" version)" "9.9.9" "cmp-missing install refusal keeps existing command"
+  (
+    export INSTALL_PATH="$existing_install"
+    command_exists() {
+      [[ "$1" == "cmp" ]] && return 1
+      command -v "$1" >/dev/null 2>&1
+    }
+    install_script_file_for_revoke "$SCRIPT" false true
+  ) >/dev/null 2>&1 || {
+    rm -rf "$install_tmp"
+    fail "auto install should reuse existing command when cmp is unavailable"
+  }
+  assert_eq "$(bash "$existing_install" version)" "9.9.9" "cmp-missing auto install keeps existing command"
+  rm -rf "$install_tmp"
+
+  registry_tmp=$(mktemp -d)
+  if (
+    export REGISTRY_DIR="$registry_tmp/registry"
+    export REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
+    export REGISTRY_LOCK_FILE="$REGISTRY_DIR/users.lock"
+    printf() {
+      if [[ "${1:-}" == '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' ]]; then
+        return 1
+      fi
+      builtin printf "$@"
+    }
+    registry_record_user "xxvcc-audit" "2099-01-01" "no" "no" "example.com" "22" "SHA256:test" "no" ""
+  ) >/dev/null 2>&1; then
+    rm -rf "$registry_tmp"
+    fail "registry append failure should fail"
+  fi
+  rm -rf "$registry_tmp"
+fi
 
 fallback_unit=$(
   command_exists() { return 1; }
