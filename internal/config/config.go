@@ -39,4 +39,10 @@ const (
 	// AutoRevokeUnitPrefix namespaces v2 systemd units (v1 used
 	// "linux-temp-admin-revoke-"), so v2 and v1 units never collide.
 	AutoRevokeUnitPrefix = ManagedTag + "-v2-revoke-"
+
+	// ReleaseBaseURL is where signed release binaries are published; the upgrade
+	// binary is ReleaseBaseURL + BinaryAssetPrefix + GOARCH and its detached
+	// signature is that URL + ".sig".
+	ReleaseBaseURL    = "https://github.com/xxvcc/linux-temp-admin/releases/latest/download/"
+	BinaryAssetPrefix = ManagedTag + "-linux-"
 )

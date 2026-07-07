@@ -21,6 +21,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"golang.org/x/term"
@@ -35,11 +36,12 @@ type App struct {
 
 	P i18n.Printer
 
-	Users     *user.Manager
-	Sudoers   *sudoers.Manager
-	Scheduler *schedule.Scheduler
-	Registry  *registry.Store
-	Detector  *netdetect.Detector
+	Users      *user.Manager
+	Sudoers    *sudoers.Manager
+	Scheduler  *schedule.Scheduler
+	Registry   *registry.Store
+	Detector   *netdetect.Detector
+	Selfmanage *selfmanage.Manager
 
 	InstallPath string
 	Now         func() time.Time
@@ -61,6 +63,7 @@ func NewApp(lang i18n.Lang) *App {
 		Scheduler:   schedule.New(),
 		Registry:    registry.Default(),
 		Detector:    netdetect.New(),
+		Selfmanage:  selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
 		InstallPath: config.InstallPath,
 		Now:         time.Now,
 		RandHex:     randHex,
@@ -148,6 +151,12 @@ func (a *App) Dispatch(args []string) int {
 		return a.cleanupExpired(args)
 	case "doctor", "check":
 		return a.doctor(args)
+	case "install":
+		return a.install(args)
+	case "upgrade", "update":
+		return a.upgrade(args)
+	case "uninstall":
+		return a.uninstall(args)
 	case "":
 		return a.menu()
 	default:

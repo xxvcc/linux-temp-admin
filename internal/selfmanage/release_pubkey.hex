@@ -1,0 +1,9 @@
+# linux-temp-admin release signing public key (ed25519, hex-encoded, 64 hex chars).
+#
+# UNCONFIGURED: no key is set, so signed self-upgrade is DISABLED and `upgrade`
+# fails closed. To enable it, generate a release keypair and paste the public key
+# hex on a line below (see scripts/keygen.sh and scripts/release.sh):
+#
+#   <64-hex-character ed25519 public key on its own line>
+#
+# Keep the matching PRIVATE key offline; only the release pipeline uses it.
