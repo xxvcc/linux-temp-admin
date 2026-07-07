@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `bash temp-admin.sh --version` or `linux-temp-admin --version`.
+      placeholder: "1.2.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / init system
+      placeholder: "Ubuntu 24.04, systemd"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Redact private keys, invite bundles, hostnames, and public IPs if needed.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Do not paste private keys or real invite bundles.
+      render: text

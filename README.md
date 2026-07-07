@@ -17,6 +17,7 @@
 
 - [30 秒上手](#30-秒上手)
 - [语言](#语言)
+- [安装、升级与诊断](#安装升级与诊断)
 - [它解决什么问题](#它解决什么问题)
 - [完整流程](#完整流程)
 - [常用操作](#常用操作)
@@ -53,6 +54,27 @@ sudo bash temp-admin.sh --lang zh invite --sudo
 # 或在当前 shell 里设一次:
 export LINUX_TEMP_ADMIN_LANG=zh
 ```
+
+## 安装、升级与诊断
+
+脚本可以直接用 `sudo bash temp-admin.sh ...` 运行；如果你希望系统里有稳定命令，先安装到 `/usr/local/sbin/linux-temp-admin`：
+
+```bash
+sudo bash temp-admin.sh install
+linux-temp-admin doctor
+```
+
+常用维护命令：
+
+```bash
+sudo linux-temp-admin doctor            # 检查依赖、sudoers.d、systemd/at、登记表和稳定命令
+sudo linux-temp-admin upgrade           # 从 GitHub 下载 main 分支脚本并升级稳定命令
+sudo linux-temp-admin upgrade --yes     # 非交互确认
+sudo linux-temp-admin install --force   # 用当前本地脚本强制替换稳定命令
+sudo linux-temp-admin uninstall         # 卸载稳定命令
+```
+
+`upgrade` 只接受 HTTPS 地址，下载后会解析版本并运行 `bash -n`，只有版本更新时才覆盖；如需修复或回退到自定义地址，可使用 `--force --url URL`。`uninstall` 默认会拒绝在仍有登记用户时删除稳定命令，避免影响到期自动撤销任务；确认风险后才使用 `--force`。
 
 ## 它解决什么问题
 
@@ -250,7 +272,7 @@ sudo bash temp-admin.sh invite \
 # 以及在 systemd 不可用时,at 队列中的备用自动删除任务
 ```
 
-为防止一个被改过或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`(会影响其他在册用户的撤销任务),当已安装版本与当前脚本不同时,脚本会**复用现有命令而不覆盖**并打印提示;确需替换时,运行前设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
+为防止一个被改过或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`(会影响其他在册用户的撤销任务),内部自动安装逻辑在发现已安装版本与当前脚本不同时会**复用现有命令而不覆盖**并打印提示;确需替换时,可使用 `install --force` / `upgrade --force`,或在自动撤销安装路径中设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
 
 ## 安全说明
 
@@ -265,6 +287,8 @@ sudo bash temp-admin.sh invite \
 - stdout 不是 TTY 时默认拒绝输出私钥,只有确认输出通道安全时才用 `--allow-non-tty-private-key-output`。
 
 ## 开发与许可证
+
+贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md);安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 本地校验:
 

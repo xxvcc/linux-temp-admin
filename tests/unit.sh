@@ -38,6 +38,9 @@ assert_output_contains() {
 
 assert_eq "$(bash "$SCRIPT" --version)" "$VERSION" "version command"
 assert_eq "$(bash "$SCRIPT" --lang zh version)" "$VERSION" "version command with --lang"
+help_output=$(bash "$SCRIPT" --lang en help)
+assert_output_contains "$help_output" "bash temp-admin.sh doctor" "help includes doctor"
+assert_output_contains "$help_output" "bash temp-admin.sh upgrade" "help includes upgrade"
 
 source_output=$(bash -c 'source "$1"; declare -F valid_host >/dev/null' _ "$SCRIPT" 2>&1) \
   || fail "source guard failed: $source_output"
@@ -102,6 +105,36 @@ assert_eq "$(systemd_quote_arg $'a"b\\c\nz')" '"a\"b\\c z"' "systemd argument es
 assert_success "valid installed version" valid_installed_version "1.2.3"
 assert_success "valid installed prerelease version" valid_installed_version "1.2.3-rc1"
 assert_failure "invalid installed version text" valid_installed_version "not-a-version"
+assert_eq "$(extract_script_version "$SCRIPT")" "$VERSION" "extract script version"
+assert_success "newer version compares greater" version_gt "1.2.0" "1.1.2"
+assert_success "major version compares greater" version_gt "2.0.0" "1.9.9"
+assert_failure "same version is not greater" version_gt "1.2.0" "1.2.0"
+assert_failure "older version is not greater" version_gt "1.1.9" "1.2.0"
+assert_success "default upgrade URL is valid" valid_upgrade_url "$DEFAULT_UPGRADE_URL"
+assert_success "custom https upgrade URL is valid" valid_upgrade_url "https://example.com/temp-admin.sh"
+assert_failure "upgrade URL must be https" valid_upgrade_url "http://example.com/temp-admin.sh"
+assert_failure "upgrade URL rejects whitespace" valid_upgrade_url "https://example.com/a b.sh"
+assert_failure "upgrade URL rejects shell metacharacters" valid_upgrade_url "https://example.com/a|b.sh"
+
+if output=$(bash "$SCRIPT" --lang en doctor --bad 2>&1); then
+  fail "unsupported doctor argument should fail"
+fi
+assert_output_contains "$output" "doctor: unsupported argument: --bad" "doctor unsupported argument"
+
+if output=$(bash "$SCRIPT" --lang en install --bad 2>&1); then
+  fail "unsupported install argument should fail"
+fi
+assert_output_contains "$output" "install: unsupported argument: --bad" "install unsupported argument"
+
+if output=$(bash "$SCRIPT" --lang en uninstall --bad 2>&1); then
+  fail "unsupported uninstall argument should fail"
+fi
+assert_output_contains "$output" "uninstall: unsupported argument: --bad" "uninstall unsupported argument"
+
+if output=$(bash "$SCRIPT" --lang en upgrade --url http://example.com/temp-admin.sh --yes 2>&1); then
+  fail "unsafe upgrade URL should fail"
+fi
+assert_output_contains "$output" "Upgrade URL is unsafe or invalid" "upgrade rejects unsafe URL"
 
 fallback_unit=$(
   command_exists() { return 1; }

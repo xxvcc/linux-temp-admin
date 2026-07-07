@@ -17,6 +17,7 @@
 
 - [Quick start (30 seconds)](#quick-start-30-seconds)
 - [Language](#language)
+- [Install, upgrade, and doctor](#install-upgrade-and-doctor)
 - [What it solves](#what-it-solves)
 - [Full walkthrough](#full-walkthrough)
 - [Everyday commands](#everyday-commands)
@@ -51,6 +52,27 @@ sudo bash temp-admin.sh --lang zh invite --sudo
 # or, once per shell:
 export LINUX_TEMP_ADMIN_LANG=zh
 ```
+
+## Install, upgrade, and doctor
+
+You can run the script directly with `sudo bash temp-admin.sh ...`. If you want a stable system command, install it to `/usr/local/sbin/linux-temp-admin`:
+
+```bash
+sudo bash temp-admin.sh install
+sudo linux-temp-admin doctor
+```
+
+Common maintenance commands:
+
+```bash
+sudo linux-temp-admin doctor            # check dependencies, sudoers.d, systemd/at, registry, and stable command
+sudo linux-temp-admin upgrade           # download the main-branch script from GitHub and upgrade the stable command
+sudo linux-temp-admin upgrade --yes     # non-interactive confirmation
+sudo linux-temp-admin install --force   # force-replace the stable command with the current local script
+sudo linux-temp-admin uninstall         # uninstall the stable command
+```
+
+`upgrade` accepts HTTPS URLs only, parses the downloaded version, and runs `bash -n` before replacing anything; it only overwrites when the downloaded version is newer. Use `--force --url URL` for repair or an intentional rollback. `uninstall` refuses to remove the stable command while registered users still exist, because that could break expiry auto-revoke jobs; use `--force` only after accepting that risk.
 
 ## What it solves
 
@@ -248,7 +270,7 @@ Default validity is 24 hours. The script does two things at once:
 # plus a fallback auto-delete job in the at queue when systemd is unavailable
 ```
 
-To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), when the installed version differs from the current script the tool **reuses the existing command instead of overwriting** and prints a notice; set `LINUX_TEMP_ADMIN_REINSTALL=1` to force a replacement.
+To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), the internal auto-install path **reuses the existing command instead of overwriting it** when the installed version differs from the current script. To replace it intentionally, use `install --force` / `upgrade --force`, or set `LINUX_TEMP_ADMIN_REINSTALL=1` for the auto-revoke installation path.
 
 ## Security notes
 
@@ -263,6 +285,8 @@ To avoid a modified or downgraded copy silently overwriting the shared `/usr/loc
 - When stdout is not a TTY the script refuses to print the private key unless `--allow-non-tty-private-key-output` is passed.
 
 ## Development & license
+
+Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately as described in [SECURITY.md](SECURITY.md). See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Local checks:
 

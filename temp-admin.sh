@@ -6,7 +6,7 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.1.2"
+VERSION="1.2.0"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -17,6 +17,7 @@ REGISTRY_FILE="$REGISTRY_DIR/users.tsv"
 REGISTRY_LOCK_FILE="$REGISTRY_DIR/users.lock"
 INSTALL_PATH="/usr/local/sbin/linux-temp-admin"
 SYSTEMD_DIR="/etc/systemd/system"
+DEFAULT_UPGRADE_URL="https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh"
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -83,6 +84,10 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   bash $SCRIPT_NAME status [--user USER]    查看状态
   bash $SCRIPT_NAME cleanup-expired [--compact]  查看过期/自动删除状态（--compact 清理已失效登记）
   bash $SCRIPT_NAME expiry-status           查看过期/自动删除状态
+  bash $SCRIPT_NAME doctor                  检查依赖与系统配置
+  bash $SCRIPT_NAME install [--force]       安装/更新本地稳定命令
+  bash $SCRIPT_NAME upgrade [--yes]         从 GitHub 下载并升级稳定命令
+  bash $SCRIPT_NAME uninstall [--force]     卸载本地稳定命令
   bash $SCRIPT_NAME help                    显示帮助
 
 常用参数：
@@ -103,12 +108,15 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   --no-auto-revoke       不自动删除，仅设置账号过期
   --force                revoke 时允许删除未登记用户（危险）
   --confirm-force USER   与 --force --yes 一起删除未登记用户时，必须重复完整用户名
+  --url URL              upgrade 使用的脚本下载地址（默认：$DEFAULT_UPGRADE_URL）
 
 示例：
   bash $SCRIPT_NAME invite
   bash $SCRIPT_NAME invite --prefix xxvcc --hours 12 --sudo
   bash $SCRIPT_NAME revoke --user xxvcc-a1b2c3
   bash $SCRIPT_NAME status --user xxvcc-a1b2c3
+  bash $SCRIPT_NAME doctor
+  bash $SCRIPT_NAME upgrade
 EOF
   else
   cat <<EOF
@@ -121,6 +129,10 @@ Usage
   bash $SCRIPT_NAME status [--user USER]    Show status
   bash $SCRIPT_NAME cleanup-expired [--compact]  Show expiry/auto-delete status (--compact prunes stale registry entries)
   bash $SCRIPT_NAME expiry-status           Show expiry/auto-revoke status
+  bash $SCRIPT_NAME doctor                  Check dependencies and system configuration
+  bash $SCRIPT_NAME install [--force]       Install/update the stable local command
+  bash $SCRIPT_NAME upgrade [--yes]         Download from GitHub and upgrade the stable command
+  bash $SCRIPT_NAME uninstall [--force]     Uninstall the stable local command
   bash $SCRIPT_NAME help                    Show help
 
 Options
@@ -141,12 +153,15 @@ Options
   --no-auto-revoke       Disable auto-delete, keep account expiry only
   --force                Allow revoke of unregistered users (dangerous)
   --confirm-force USER   Required with --force --yes for unregistered users; repeat the full username
+  --url URL              Script download URL for upgrade (default: $DEFAULT_UPGRADE_URL)
 
 Examples
   bash $SCRIPT_NAME invite
   bash $SCRIPT_NAME invite --prefix xxvcc --hours 12 --sudo
   bash $SCRIPT_NAME revoke --user xxvcc-a1b2c3
   bash $SCRIPT_NAME status --user xxvcc-a1b2c3
+  bash $SCRIPT_NAME doctor
+  bash $SCRIPT_NAME upgrade
 EOF
   fi
 }
@@ -775,6 +790,55 @@ valid_installed_version() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+){1,3}([._+~-][A-Za-z0-9._+~-]+)?$ ]]
 }
 
+extract_script_version() {
+  local script="$1" version_line version
+  [[ -f "$script" && ! -L "$script" ]] || return 1
+  version_line=$(awk -F= '$1 == "VERSION" {print $2; exit}' "$script" 2>/dev/null) || return 1
+  version="${version_line%\"}"
+  version="${version#\"}"
+  valid_installed_version "$version" || return 1
+  printf '%s\n' "$version"
+}
+
+version_gt() {
+  local newer="$1" older="$2"
+  [[ "$newer" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+  local newer_major="${BASH_REMATCH[1]}" newer_minor="${BASH_REMATCH[2]}" newer_patch="${BASH_REMATCH[3]}"
+  [[ "$older" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+  local older_major="${BASH_REMATCH[1]}" older_minor="${BASH_REMATCH[2]}" older_patch="${BASH_REMATCH[3]}"
+  (( 10#$newer_major > 10#$older_major )) && return 0
+  (( 10#$newer_major < 10#$older_major )) && return 1
+  (( 10#$newer_minor > 10#$older_minor )) && return 0
+  (( 10#$newer_minor < 10#$older_minor )) && return 1
+  (( 10#$newer_patch > 10#$older_patch ))
+}
+
+valid_upgrade_url() {
+  local url="$1"
+  [[ ${#url} -ge 8 && ${#url} -le 2048 ]] || return 1
+  [[ "$url" == https://* ]] || return 1
+  case "$url" in
+    *[[:space:]]*|*\"*|*"'"*|*\`*|*\<*|*\>*|*\|*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+download_script_to_file() {
+  local url="$1" dest="$2"
+  valid_upgrade_url "$url" || {
+    err "$(m "升级地址不安全或不合法：$url" "Upgrade URL is unsafe or invalid: $url")"
+    return 1
+  }
+  if command_exists curl; then
+    curl -fsSL --connect-timeout 5 --max-time 30 "$url" -o "$dest"
+  elif command_exists wget; then
+    wget -qO "$dest" --tries=1 --timeout=30 "$url"
+  else
+    err "$(m "找不到 curl/wget，无法下载升级脚本。" "curl/wget not found; cannot download upgrade script.")"
+    return 1
+  fi
+}
+
 installed_revoke_version() {
   local __var="$1" installed_ver
   root_safe_file "$INSTALL_PATH" || return 1
@@ -782,6 +846,58 @@ installed_revoke_version() {
   installed_ver=$("$INSTALL_PATH" version 2>/dev/null) || return 1
   valid_installed_version "$installed_ver" || return 1
   printf -v "$__var" '%s' "$installed_ver"
+}
+
+install_script_file_for_revoke() {
+  local src="$1" replace="${2:-false}" reuse_existing="${3:-true}" install_dir tmp installed_ver src_ver
+  [[ -f "$src" && ! -L "$src" ]] || {
+    warn "$(m "无法安全定位源脚本文件：$src" "Cannot safely locate source script file: $src")"
+    return 1
+  }
+  if ! src_ver=$(extract_script_version "$src"); then
+    warn "$(m "源脚本缺少有效版本号，拒绝安装：$src" "Source script has no valid version; refusing installation: $src")"
+    return 1
+  fi
+  if ! bash -n "$src"; then
+    warn "$(m "源脚本语法检查失败，拒绝安装：$src" "Source script failed Bash syntax validation; refusing installation: $src")"
+    return 1
+  fi
+  install_dir=$(dirname -- "$INSTALL_PATH")
+  if [[ -L "$install_dir" || ( -e "$install_dir" && ! -d "$install_dir" ) ]]; then
+    warn "$(m "安装目录不安全，拒绝安装稳定撤销命令：$install_dir" "Install directory is unsafe; refusing stable revoke installation: $install_dir")"
+    return 1
+  fi
+  install -d -m 755 -o root -g root "$install_dir"
+  if ! root_safe_dir "$install_dir"; then
+    warn "$(m "安装目录不是 root 拥有的安全目录，拒绝安装稳定撤销命令：$install_dir $(path_mode_owner "$install_dir")" "Install directory is not a safely root-owned directory; refusing stable revoke installation: $install_dir $(path_mode_owner "$install_dir")")"
+    return 1
+  fi
+  if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
+    warn "$(m "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。" "$INSTALL_PATH is not a safe regular file; refusing installation to prevent TOCTOU attack.")"
+    return 1
+  fi
+  if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
+    if [[ "$replace" != "true" ]]; then
+      if [[ "$reuse_existing" == "true" ]] && installed_revoke_version installed_ver; then
+        warn "$(m "$INSTALL_PATH 已存在且与源脚本不同（installed=$installed_ver source=$src_ver）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1 或使用 install/upgrade --force。" "$INSTALL_PATH already exists and differs from the source script (installed=$installed_ver source=$src_ver); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 or use install/upgrade --force to replace it.")"
+        return 0
+      fi
+      warn "$(m "$INSTALL_PATH 已存在且与源脚本不同；未覆盖。确认要替换时请使用 --force。" "$INSTALL_PATH already exists and differs from the source script; not overwritten. Use --force to replace it.")"
+      return 1
+    fi
+    warn "$(m "正在用源脚本覆盖已安装的稳定撤销命令：$INSTALL_PATH (source=$src_ver)" "Overwriting the installed stable revoke command with the source script: $INSTALL_PATH (source=$src_ver)")"
+  fi
+  tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX")
+  install -m 700 -o root -g root "$src" "$tmp"
+  if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
+    rm -f "$tmp"
+    warn "$(m "$INSTALL_PATH 安全状态变化，拒绝覆盖。" "$INSTALL_PATH safety state changed; refusing overwrite.")"
+    return 1
+  fi
+  mv -f "$tmp" "$INSTALL_PATH"
+  chown root:root "$INSTALL_PATH" 2>/dev/null || true
+  chmod 700 "$INSTALL_PATH"
+  success "$(m "稳定命令已安装：$INSTALL_PATH version=$src_ver" "Stable command installed: $INSTALL_PATH version=$src_ver")"
 }
 
 show_installed_revoke_status() {
@@ -813,12 +929,7 @@ show_installed_revoke_status() {
 }
 
 install_self_for_revoke() {
-  local src="${BASH_SOURCE[0]}" install_dir tmp installed_ver
-  install_dir=$(dirname -- "$INSTALL_PATH")
-  if [[ -L "$install_dir" || ( -e "$install_dir" && ! -d "$install_dir" ) ]]; then
-    warn "$(m "安装目录不安全，拒绝安装稳定撤销命令：$install_dir" "Install directory is unsafe; refusing stable revoke installation: $install_dir")"
-    return 1
-  fi
+  local src="${BASH_SOURCE[0]}" installed_ver replace="false"
   # If the source script cannot be safely located (e.g. run via `curl | bash`),
   # reuse an already-installed valid managed binary instead of failing outright.
   if [[ ! -f "$src" || -L "$src" ]]; then
@@ -829,39 +940,8 @@ install_self_for_revoke() {
     warn "$(m "无法安全定位当前脚本文件，且无可复用的已安装命令，不能安装稳定撤销命令。" "Cannot safely locate the current script file and no reusable installed command exists; cannot install the stable revoke command.")"
     return 1
   fi
-  install -d -m 755 -o root -g root "$install_dir"
-  if ! root_safe_dir "$install_dir"; then
-    warn "$(m "安装目录不是 root 拥有的安全目录，拒绝安装稳定撤销命令：$install_dir $(path_mode_owner "$install_dir")" "Install directory is not a safely root-owned directory; refusing stable revoke installation: $install_dir $(path_mode_owner "$install_dir")")"
-    return 1
-  fi
-  if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
-    warn "$(m "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。" "$INSTALL_PATH is not a safe regular file; refusing installation to prevent TOCTOU attack.")"
-    return 1
-  fi
-  # Refuse to silently clobber an existing DIFFERENT installed copy: a divergent or
-  # downgraded binary would redirect every other registered user's revoke timer.
-  # Reuse the existing one unless the operator explicitly opts in to reinstall.
-  if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
-    if [[ "${LINUX_TEMP_ADMIN_REINSTALL:-}" != "1" ]]; then
-      if ! installed_revoke_version installed_ver; then
-        warn "$(m "$INSTALL_PATH 已存在且与当前脚本不同，但不是可安全复用的本工具命令；拒绝执行或覆盖。确认要替换时请设 LINUX_TEMP_ADMIN_REINSTALL=1。" "$INSTALL_PATH already exists and differs from the current script, but it is not a safely reusable managed command; refusing to execute or overwrite it. Set LINUX_TEMP_ADMIN_REINSTALL=1 to replace it.")"
-        return 1
-      fi
-      warn "$(m "$INSTALL_PATH 已存在且与当前脚本不同（installed=$installed_ver current=$VERSION）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1。" "$INSTALL_PATH already exists and differs from the current script (installed=$installed_ver current=$VERSION); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 to replace it.")"
-      return 0
-    fi
-    warn "$(m "LINUX_TEMP_ADMIN_REINSTALL=1：用当前脚本覆盖已安装的稳定撤销命令。" "LINUX_TEMP_ADMIN_REINSTALL=1: overwriting the installed stable revoke command with the current script.")"
-  fi
-  tmp=$(mktemp "${install_dir}/.linux-temp-admin.XXXXXX")
-  install -m 700 -o root -g root "$src" "$tmp"
-  if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
-    rm -f "$tmp"
-    warn "$(m "$INSTALL_PATH 安全状态变化，拒绝覆盖。" "$INSTALL_PATH safety state changed; refusing overwrite.")"
-    return 1
-  fi
-  mv -f "$tmp" "$INSTALL_PATH"
-  chown root:root "$INSTALL_PATH" 2>/dev/null || true
-  chmod 700 "$INSTALL_PATH"
+  [[ "${LINUX_TEMP_ADMIN_REINSTALL:-}" == "1" ]] && replace="true"
+  install_script_file_for_revoke "$src" "$replace" true
 }
 
 ensure_atd_running() {
@@ -2006,6 +2086,196 @@ cleanup_expired() {
   show_installed_revoke_status
 }
 
+doctor_command() {
+  local rc=0 arg
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      *) err "$(m "doctor 不支持的参数：$1" "doctor: unsupported argument: $1")"; usage; exit 1 ;;
+    esac
+  done
+
+  info "$(m "linux-temp-admin 诊断报告 v$VERSION" "linux-temp-admin doctor report v$VERSION")"
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    success "$(m "当前以 root 运行。" "Running as root.")"
+  else
+    warn "$(m "当前不是 root；invite/revoke/install/upgrade/uninstall 需要 root。" "Not running as root; invite/revoke/install/upgrade/uninstall require root.")"
+  fi
+
+  for arg in bash ssh-keygen usermod chage flock; do
+    if command_exists "$arg"; then
+      success "$(m "依赖存在：$arg" "Dependency found: $arg")"
+    else
+      warn "$(m "缺少依赖：$arg" "Missing dependency: $arg")"
+      rc=1
+    fi
+  done
+  if command_exists useradd || command_exists adduser; then
+    success "$(m "依赖存在：useradd/adduser" "Dependency found: useradd/adduser")"
+  else
+    warn "$(m "缺少依赖：useradd/adduser" "Missing dependency: useradd/adduser")"
+    rc=1
+  fi
+  if command_exists userdel || command_exists deluser; then
+    success "$(m "依赖存在：userdel/deluser" "Dependency found: userdel/deluser")"
+  else
+    warn "$(m "缺少依赖：userdel/deluser" "Missing dependency: userdel/deluser")"
+    rc=1
+  fi
+  if can_compute_future_date; then
+    success "$(m "可以计算未来日期。" "Future date calculation is available.")"
+  else
+    warn "$(m "无法计算未来日期；请安装 GNU date/coreutils 或 python3。" "Cannot compute future dates; install GNU date/coreutils or python3.")"
+    rc=1
+  fi
+  if command_exists sudo; then
+    success "$(m "sudo 命令存在。" "sudo command found.")"
+  else
+    warn "$(m "sudo 命令不存在；--sudo 邀请会降级为普通账号。" "sudo command not found; --sudo invites will fall back to normal accounts.")"
+  fi
+
+  if [[ -d /etc/sudoers.d && ! -L /etc/sudoers.d ]] && root_safe_dir /etc/sudoers.d; then
+    success "$(m "/etc/sudoers.d 看起来安全。" "/etc/sudoers.d looks safe.")"
+  else
+    warn "$(m "/etc/sudoers.d 不存在、是符号链接或权限/属主不安全；NOPASSWD sudo 可能不可用。" "/etc/sudoers.d is missing, a symlink, or has unsafe owner/mode; NOPASSWD sudo may be unavailable.")"
+  fi
+
+  if [[ -e "$REGISTRY_DIR" ]]; then
+    if [[ -d "$REGISTRY_DIR" && ! -L "$REGISTRY_DIR" ]]; then
+      success "$(m "注册表目录存在且不是符号链接：$REGISTRY_DIR" "Registry directory exists and is not a symlink: $REGISTRY_DIR")"
+    else
+      warn "$(m "注册表路径不安全：$REGISTRY_DIR" "Registry path is unsafe: $REGISTRY_DIR")"
+      rc=1
+    fi
+  else
+    info "$(m "注册表目录尚未创建：$REGISTRY_DIR" "Registry directory has not been created yet: $REGISTRY_DIR")"
+  fi
+
+  if command_exists systemctl; then
+    success "$(m "systemctl 存在，可尝试 systemd 自动删除任务。" "systemctl found; systemd auto-delete tasks can be attempted.")"
+  elif command_exists at; then
+    warn "$(m "systemctl 不存在，将依赖 at 备用自动删除任务。" "systemctl not found; at fallback auto-delete tasks will be used.")"
+  else
+    warn "$(m "systemctl 和 at 都不存在；只能设置账号过期，不能自动删除用户。" "Neither systemctl nor at is available; only account expiry can be set, not automatic user deletion.")"
+  fi
+
+  info "$(m "探测到 SSH 端口：$(get_ssh_port)" "Detected SSH port: $(get_ssh_port)")"
+  show_installed_revoke_status
+  return "$rc"
+}
+
+install_command() {
+  need_root
+  local force="false" src="${BASH_SOURCE[0]}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force="true"; shift ;;
+      *) err "$(m "install 不支持的参数：$1" "install: unsupported argument: $1")"; usage; exit 1 ;;
+    esac
+  done
+  if [[ ! -f "$src" || -L "$src" ]]; then
+    err "$(m "无法安全定位当前脚本文件，不能安装。请先下载为本地文件后运行。" "Cannot safely locate the current script file; cannot install. Download it as a local file first.")"
+    exit 1
+  fi
+  install_script_file_for_revoke "$src" "$force" false
+  show_installed_revoke_status
+}
+
+uninstall_command() {
+  need_root
+  local force="false" assume_yes="false" installed_ver="unknown"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force="true"; shift ;;
+      --yes|-y) assume_yes="true"; shift ;;
+      *) err "$(m "uninstall 不支持的参数：$1" "uninstall: unsupported argument: $1")"; usage; exit 1 ;;
+    esac
+  done
+  if registry_has_users && [[ "$force" != "true" ]]; then
+    err "$(m "检测到仍有登记用户，拒绝卸载稳定命令；请先 revoke/cleanup，或确认风险后使用 --force。" "Registered users still exist; refusing to uninstall the stable command. Revoke/cleanup first, or use --force after accepting the risk.")"
+    exit 1
+  fi
+  if [[ ! -e "$INSTALL_PATH" ]]; then
+    success "$(m "稳定命令未安装：$INSTALL_PATH" "Stable command is not installed: $INSTALL_PATH")"
+    return 0
+  fi
+  if [[ -L "$INSTALL_PATH" || ! -f "$INSTALL_PATH" ]]; then
+    err "$(m "稳定命令路径不安全，拒绝删除：$INSTALL_PATH" "Stable command path is unsafe; refusing to delete: $INSTALL_PATH")"
+    exit 1
+  fi
+  if ! root_safe_file "$INSTALL_PATH"; then
+    err "$(m "稳定命令不是 root 拥有的安全文件，拒绝删除：$INSTALL_PATH $(path_mode_owner "$INSTALL_PATH")" "Stable command is not a safely root-owned file; refusing to delete: $INSTALL_PATH $(path_mode_owner "$INSTALL_PATH")")"
+    exit 1
+  fi
+  if ! installed_revoke_version installed_ver && [[ "$force" != "true" ]]; then
+    err "$(m "稳定命令不像本工具的有效脚本，拒绝删除；确认要删除请加 --force。" "Stable command does not look like a valid script from this tool; refusing to delete. Use --force to remove it.")"
+    exit 1
+  fi
+  if ! confirm_yes "$(m "将删除稳定命令：$INSTALL_PATH (version=$installed_ver)。确认请输入 YES。" "This will delete the stable command: $INSTALL_PATH (version=$installed_ver). Type YES to confirm.")" "$assume_yes"; then
+    warn "$(m "已取消。" "Cancelled.")"
+    return 0
+  fi
+  rm -f "$INSTALL_PATH"
+  success "$(m "已卸载稳定命令：$INSTALL_PATH" "Stable command uninstalled: $INSTALL_PATH")"
+}
+
+upgrade_command() {
+  need_root
+  local url="$DEFAULT_UPGRADE_URL" force="false" assume_yes="false"
+  local tmpdir tmpfile remote_ver installed_ver="none"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url) require_value "$1" "${2-}"; url="$2"; shift 2 ;;
+      --force) force="true"; shift ;;
+      --yes|-y) assume_yes="true"; shift ;;
+      *) err "$(m "upgrade 不支持的参数：$1" "upgrade: unsupported argument: $1")"; usage; exit 1 ;;
+    esac
+  done
+
+  tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp)
+  chmod 700 "$tmpdir"
+  tmpfile="$tmpdir/temp-admin.sh"
+  if ! download_script_to_file "$url" "$tmpfile"; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  chmod 600 "$tmpfile"
+  if ! remote_ver=$(extract_script_version "$tmpfile"); then
+    rm -rf "$tmpdir"
+    err "$(m "下载的脚本缺少有效版本号，已放弃升级。" "Downloaded script has no valid version; upgrade aborted.")"
+    return 1
+  fi
+  if ! bash -n "$tmpfile"; then
+    rm -rf "$tmpdir"
+    err "$(m "下载的脚本语法检查失败，已放弃升级。" "Downloaded script failed Bash syntax validation; upgrade aborted.")"
+    return 1
+  fi
+
+  if installed_revoke_version installed_ver; then
+    if [[ "$force" != "true" ]] && ! version_gt "$remote_ver" "$installed_ver"; then
+      success "$(m "稳定命令已是最新或更高版本：installed=$installed_ver downloaded=$remote_ver" "Stable command is already up to date or newer: installed=$installed_ver downloaded=$remote_ver")"
+      rm -rf "$tmpdir"
+      return 0
+    fi
+  elif [[ -e "$INSTALL_PATH" && "$force" != "true" ]]; then
+    rm -rf "$tmpdir"
+    err "$(m "已安装路径存在但不是可安全识别的本工具命令；确认替换请使用 --force。" "Install path exists but is not a safely recognized command from this tool; use --force to replace it.")"
+    return 1
+  fi
+
+  info "$(m "准备升级稳定命令：installed=$installed_ver downloaded=$remote_ver url=$url" "Preparing to upgrade stable command: installed=$installed_ver downloaded=$remote_ver url=$url")"
+  if ! confirm_yes "$(m "升级会覆盖 $INSTALL_PATH。确认请输入 YES。" "Upgrade will overwrite $INSTALL_PATH. Type YES to confirm.")" "$assume_yes"; then
+    rm -rf "$tmpdir"
+    warn "$(m "已取消。" "Cancelled.")"
+    return 0
+  fi
+  if ! install_script_file_for_revoke "$tmpfile" true false; then
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  rm -rf "$tmpdir"
+  show_installed_revoke_status
+}
+
 menu() {
   need_root
   while true; do
@@ -2018,7 +2288,11 @@ ${BOLD}Linux 临时管理员管理器${NC} v$VERSION
 2) 撤销/删除临时用户
 3) 查看用户状态
 4) 查看账号过期/自动删除状态
-5) 退出
+5) 系统诊断
+6) 安装/更新当前脚本为稳定命令
+7) 从 GitHub 升级稳定命令
+8) 卸载稳定命令
+9) 退出
 EOF
     else
     cat <<EOF
@@ -2029,17 +2303,25 @@ ${BOLD}Linux Temporary Admin Manager${NC} v$VERSION
 2) Revoke/delete temp user
 3) Show user status
 4) Show expiry/auto-delete status
-5) Exit
+5) Run system doctor
+6) Install/update current script as stable command
+7) Upgrade stable command from GitHub
+8) Uninstall stable command
+9) Exit
 EOF
     fi
-    read -r -p "$(m "请选择 [1-5]: " "Select [1-5]: ")" choice
+    read -r -p "$(m "请选择 [1-9]: " "Select [1-9]: ")" choice
     case "$choice" in
       1) ( invite ) || true ;;
       2) ( revoke_user ) || true ;;
       3) read -r -p "$(m "用户名（留空列出 ${DEFAULT_PREFIX}-*）: " "Username (blank lists ${DEFAULT_PREFIX}-*): ")" u
          if [[ -n "$u" ]]; then ( status_user --user "$u" ) || true; else ( status_user ) || true; fi ;;
       4) ( cleanup_expired ) || true ;;
-      5) exit 0 ;;
+      5) ( doctor_command ) || true ;;
+      6) ( install_command ) || true ;;
+      7) ( upgrade_command ) || true ;;
+      8) ( uninstall_command ) || true ;;
+      9) exit 0 ;;
       *) warn "$(m "无效选择" "Invalid choice")" ;;
     esac
   done
@@ -2089,7 +2371,7 @@ main() {
   for a in "$@"; do case "$a" in --yes|-y) noninteractive="true"; break ;; esac; done
   if [[ "$noninteractive" != "true" ]]; then
     case "$cmd" in
-      ""|invite|create|revoke|delete-user|remove|status|cleanup-expired|expiry-status)
+      ""|invite|create|revoke|delete-user|remove|status|cleanup-expired|expiry-status|doctor|check|install|upgrade|update|uninstall)
         prompt_language ;;
     esac
   fi
@@ -2099,6 +2381,10 @@ main() {
     revoke|delete-user|remove) shift; revoke_user "$@" ;;
     status) shift; status_user "$@" ;;
     cleanup-expired|expiry-status) shift; cleanup_expired "$@" ;;
+    doctor|check) shift; doctor_command "$@" ;;
+    install) shift; install_command "$@" ;;
+    upgrade|update) shift; upgrade_command "$@" ;;
+    uninstall) shift; uninstall_command "$@" ;;
     help|-h|--help) usage ;;
     version|--version) echo "$VERSION" ;;
     *) err "$(m "未知命令：$cmd" "Unknown command: $cmd")"; usage; exit 1 ;;
