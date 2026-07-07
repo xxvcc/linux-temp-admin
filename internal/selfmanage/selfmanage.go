@@ -52,12 +52,19 @@ func New(installPath string, maxBytes int64) *Manager {
 // If the target exists, is byte-identical, install is a no-op; if it differs and
 // force is false, it refuses.
 func (m *Manager) Install(srcBytes []byte, force bool) error {
-	if cur, err := os.ReadFile(m.InstallPath); err == nil {
-		if string(cur) == string(srcBytes) {
-			return nil
+	if fi, err := os.Lstat(m.InstallPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink; refusing", m.InstallPath)
 		}
-		if !force {
-			return fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
+		if fi.Mode().IsRegular() {
+			if cur, err := os.ReadFile(m.InstallPath); err == nil {
+				if string(cur) == string(srcBytes) {
+					return nil
+				}
+				if !force {
+					return fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
+				}
+			}
 		}
 	}
 	return fsutil.WriteRootFile(m.InstallPath, srcBytes, 0o755)
@@ -144,6 +151,12 @@ func (m *Manager) download(url string, max int64) ([]byte, error) {
 // install path, executes `<tmp> version`, and returns the validated version.
 func (m *Manager) probeVersion(bin []byte) (string, error) {
 	dir := filepath.Dir(m.InstallPath)
+	// The install dir must be root-owned and not group/world-writable before we
+	// write+exec a temp binary in it (a writable dir could let a local user swap
+	// the temp between close and exec).
+	if err := fsutil.RootSafeDir(dir); err != nil {
+		return "", fmt.Errorf("install dir unsafe: %w", err)
+	}
 	f, err := os.CreateTemp(dir, ".lta-upgrade-*")
 	if err != nil {
 		return "", err

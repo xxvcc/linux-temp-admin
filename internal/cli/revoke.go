@@ -56,9 +56,12 @@ func (a *App) revoke(args []string) int {
 	if !user.Exists(username) {
 		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/自动删除任务："+username,
 			"user does not exist; cleaning up registry/sudoers/auto-delete task: "+username))
-		a.Scheduler.Cancel(username)
+		recordedUnit, _ := a.Registry.UnitFor(username)
+		a.Scheduler.Cancel(username, recordedUnit)
 		a.Sudoers.Remove(username)
-		_ = a.Registry.Remove(username)
+		if err := a.Registry.Remove(username); err != nil {
+			a.warnf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
+		}
 		return 0
 	}
 
@@ -80,7 +83,8 @@ func (a *App) revoke(args []string) int {
 		return 1
 	}
 
-	a.Scheduler.Cancel(username)
+	recordedUnit, _ := a.Registry.UnitFor(username)
+	a.Scheduler.Cancel(username, recordedUnit)
 	if pw, ok := user.Lookup(username); ok {
 		user.TerminateProcesses(pw.UID)
 	}

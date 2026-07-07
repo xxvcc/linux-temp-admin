@@ -25,6 +25,8 @@ type System interface {
 	ScheduleAt(command string, hours int) (jobID string, err error)
 	// RemoveAtJobsFor atrm's every queued job whose body contains command.
 	RemoveAtJobsFor(command string)
+	// AtrmJob removes a specific at job by id (no-op if id is empty/invalid).
+	AtrmJob(id string)
 }
 
 // Scheduler writes units / queues jobs. Paths and time source are fields for tests.
@@ -146,7 +148,12 @@ func (s *Scheduler) scheduleAt(user string, hours int) (string, error) {
 // reused username never leaves a stale task behind. When running inside the
 // firing systemd service (INVOCATION_ID set), the .service file is left and
 // daemon-reload skipped so the currently-executing unit is not disturbed.
-func (s *Scheduler) Cancel(user string) {
+func (s *Scheduler) Cancel(user, recordedUnit string) {
+	// Remove a specifically-recorded at job even where atq is unavailable (so
+	// RemoveAtJobsFor's body sweep can't run).
+	if strings.HasPrefix(recordedUnit, "at:") {
+		s.Sys.AtrmJob(strings.TrimPrefix(recordedUnit, "at:"))
+	}
 	s.Sys.RemoveAtJobsFor(s.RevokeCommand(user))
 
 	unit := s.UnitName(user)

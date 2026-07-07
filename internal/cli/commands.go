@@ -104,6 +104,7 @@ func (a *App) doctor(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
+	rc := 0
 	a.info(a.P.M("linux-temp-admin 诊断报告", "linux-temp-admin doctor report"))
 	if a.Geteuid() == 0 {
 		a.success(a.P.M("当前以 root 运行。", "running as root."))
@@ -115,6 +116,9 @@ func (a *App) doctor(args []string) int {
 			a.success(a.P.M("依赖存在：", "dependency found: ") + d.Label)
 		} else {
 			a.warnf("%s%s", a.P.M("缺少依赖：", "missing dependency: "), d.Label)
+			if d.Label != "sudo" { // sudo is only needed for --sudo invites
+				rc = 1
+			}
 		}
 	}
 	a.info(a.P.M("包管理器：", "package manager: ") + orNone(sysinfo.PackageManager()))
@@ -129,7 +133,7 @@ func (a *App) doctor(args []string) int {
 	for _, f := range legacy.New().Findings() {
 		a.warnf("%s", f)
 	}
-	return 0
+	return rc
 }
 
 func (a *App) menu() int {

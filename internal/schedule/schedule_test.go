@@ -16,6 +16,7 @@ type fakeSystem struct {
 	atHours      int
 	atID         string
 	removedFor   []string
+	atrmd        []string
 }
 
 func (f *fakeSystem) HasSystemctl() bool { return f.hasSystemctl }
@@ -29,6 +30,7 @@ func (f *fakeSystem) ScheduleAt(command string, hours int) (string, error) {
 	return f.atID, nil
 }
 func (f *fakeSystem) RemoveAtJobsFor(command string) { f.removedFor = append(f.removedFor, command) }
+func (f *fakeSystem) AtrmJob(id string)              { f.atrmd = append(f.atrmd, id) }
 
 func newScheduler(dir string, sys System) *Scheduler {
 	return &Scheduler{
@@ -103,7 +105,7 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	os.WriteFile(svc, []byte("x"), 0o644)
 	os.WriteFile(tmr, []byte("x"), 0o644)
 
-	s.Cancel("xxvcc-a1")
+	s.Cancel("xxvcc-a1", "")
 
 	if len(sys.removedFor) != 1 || sys.removedFor[0] != s.RevokeCommand("xxvcc-a1") {
 		t.Errorf("RemoveAtJobsFor = %v", sys.removedFor)

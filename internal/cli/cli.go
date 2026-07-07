@@ -49,6 +49,8 @@ type App struct {
 	StdoutIsTTY func() bool
 	StdinIsTTY  func() bool
 	Geteuid     func() int
+
+	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
 
 // NewApp builds an App with real collaborators and the resolved language.
@@ -104,6 +106,7 @@ func callerLocale() string {
 // extractLang pulls --lang/--lang=VAL from anywhere in args (an explicit flag
 // value), returning the selector and the remaining args.
 func extractLang(args []string) (lang string, rest []string, err error) {
+	sawLang := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -111,15 +114,17 @@ func extractLang(args []string) (lang string, rest []string, err error) {
 			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
 				return "", nil, fmt.Errorf("--lang requires a value: zh or en")
 			}
+			sawLang = true
 			lang = args[i+1]
 			i++
 		case strings.HasPrefix(a, "--lang="):
+			sawLang = true
 			lang = strings.TrimPrefix(a, "--lang=")
 		default:
 			rest = append(rest, a)
 		}
 	}
-	if lang != "" {
+	if sawLang { // validate even for an empty --lang= value
 		if _, ok := i18n.Parse(lang); !ok {
 			return "", nil, fmt.Errorf("--lang only supports zh or en: %s", lang)
 		}
@@ -190,15 +195,18 @@ func (a *App) requireRoot() bool {
 // prompt reads a single line, printing the message to stderr first.
 func (a *App) prompt(msg string) string {
 	fmt.Fprint(a.Err, msg)
-	sc := bufio.NewScanner(a.In)
-	if sc.Scan() {
-		return strings.TrimSpace(sc.Text())
+	if a.inReader == nil {
+		a.inReader = bufio.NewReader(a.In)
 	}
-	return ""
+	line, err := a.inReader.ReadString('\n')
+	if err != nil && line == "" {
+		return ""
+	}
+	return strings.TrimSpace(line)
 }
 
 func (a *App) usage() {
 	fmt.Fprintf(a.Out, "%s v%s\n\n%s\n", config.ManagedTag, buildinfo.Version,
-		a.P.M("用法： invite | revoke | status | cleanup-expired | doctor | version | help  （--lang zh|en）",
-			"Usage: invite | revoke | status | cleanup-expired | doctor | version | help  (--lang zh|en)"))
+		a.P.M("用法： invite | revoke | status | cleanup-expired | doctor | install | upgrade | uninstall | version | help  （无参数进入菜单；--lang zh|en）",
+			"Usage: invite | revoke | status | cleanup-expired | doctor | install | upgrade | uninstall | version | help  (no args = menu; --lang zh|en)"))
 }

@@ -158,7 +158,7 @@ func sshPortFromSshdT() (int, bool) {
 	sc := bufio.NewScanner(strings.NewReader(string(out)))
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) == 2 && strings.EqualFold(fields[0], "port") {
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
 			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
 				return p, true
 			}
@@ -181,9 +181,9 @@ func sshPortFromConfig(path string) (int, bool) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) == 2 && strings.EqualFold(fields[0], "port") {
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
 			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
-				port = p // last wins, matching the bash awk
+				port = p // last wins, matching the bash awk (extra trailing tokens tolerated)
 			}
 		}
 	}

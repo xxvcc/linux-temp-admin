@@ -10,8 +10,9 @@ const (
 	DefaultExpireHours = 24
 	// MaxExpireHours caps --hours (one year).
 	MaxExpireHours = 8760
-	// MaxUpgradeBytes caps a downloaded upgrade payload (1 MiB).
-	MaxUpgradeBytes = 1 << 20
+	// MaxUpgradeBytes caps a downloaded upgrade payload (64 MiB): v2 releases are
+	// static binaries (~7 MiB), not the small bash script v1 downloaded.
+	MaxUpgradeBytes = 64 << 20
 	// DefaultShell is the preferred login shell for created accounts.
 	DefaultShell = "/bin/bash"
 

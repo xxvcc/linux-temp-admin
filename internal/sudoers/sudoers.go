@@ -13,6 +13,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
 // filePrefix namespaces the drop-in files this tool manages.
@@ -39,6 +40,11 @@ func (m *Manager) filePath(user string) string {
 // effective. On any validation/verification failure the file is removed and an
 // error returned. user must already be a validated username.
 func (m *Manager) Grant(user string) error {
+	// Defense in depth: never let an unvalidated username reach a sudoers line,
+	// even if a future caller forgets to validate.
+	if !validate.Username(user) {
+		return fmt.Errorf("refusing sudoers grant for invalid username %q", user)
+	}
 	fi, err := os.Lstat(m.Dir)
 	if err != nil {
 		return fmt.Errorf("sudoers dir: %w", err)
@@ -46,16 +52,28 @@ func (m *Manager) Grant(user string) error {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("%s is not a safe directory", m.Dir)
 	}
-	path := m.filePath(user)
 	content := []byte(fmt.Sprintf("%s ALL=(ALL) NOPASSWD:ALL\n", user))
+	// Validate a throwaway copy BEFORE the drop-in goes live in sudoers.d, so a
+	// syntactically broken file never briefly breaks sudo system-wide.
+	if m.Validate != nil {
+		tmp, err := os.CreateTemp("", "lta-sudoers-*")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		_, werr := tmp.Write(content)
+		_ = tmp.Close()
+		if werr == nil {
+			werr = m.Validate(tmpName)
+		}
+		_ = os.Remove(tmpName)
+		if werr != nil {
+			return fmt.Errorf("sudoers validation failed: %w", werr)
+		}
+	}
+	path := m.filePath(user)
 	if err := fsutil.WriteRootFile(path, content, 0o440); err != nil {
 		return err
-	}
-	if m.Validate != nil {
-		if err := m.Validate(path); err != nil {
-			_ = os.Remove(path)
-			return fmt.Errorf("sudoers validation failed: %w", err)
-		}
 	}
 	if m.Verify != nil {
 		if err := m.Verify(user); err != nil {

@@ -69,27 +69,50 @@ func parseAtJobID(out string) string {
 // jobs actually fire. Returns true if atd appears runnable.
 func ensureAtd() bool {
 	run := func(name string, args ...string) bool { return exec.Command(name, args...).Run() == nil }
-	switch {
-	case has("systemctl"):
+	// Try each init system in turn (not first-match), returning as soon as atd is
+	// confirmed runnable; do not claim success without confirmation.
+	if has("systemctl") {
 		if run("systemctl", "is-active", "--quiet", "atd") {
 			return true
 		}
 		_ = exec.Command("systemctl", "enable", "--now", "atd").Run()
-		return run("systemctl", "is-active", "--quiet", "atd")
-	case has("rc-service"):
+		if run("systemctl", "is-active", "--quiet", "atd") {
+			return true
+		}
+	}
+	if has("rc-service") {
 		if run("rc-service", "atd", "status") {
 			return true
 		}
 		_ = exec.Command("rc-service", "atd", "start").Run()
-		return run("rc-service", "atd", "status")
-	case has("service"):
-		_ = exec.Command("service", "atd", "start").Run()
-		return true // no reliable status probe; assume best effort
-	case has("pgrep"):
-		return run("pgrep", "-x", "atd")
-	default:
-		return true // cannot determine; proceed
+		if run("rc-service", "atd", "status") {
+			return true
+		}
 	}
+	if has("service") {
+		if run("service", "atd", "status") {
+			return true
+		}
+		if run("service", "atd", "start") { // start exit 0 = running
+			return true
+		}
+	}
+	if has("pgrep") {
+		return run("pgrep", "-x", "atd")
+	}
+	return true // no way to probe; proceed best-effort rather than disable at entirely
+}
+
+func (realSystem) AtrmJob(id string) {
+	if id == "" || !has("atrm") {
+		return
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return
+		}
+	}
+	_ = exec.Command("atrm", id).Run()
 }
 
 func (realSystem) RemoveAtJobsFor(command string) {

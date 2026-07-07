@@ -51,6 +51,13 @@ func (a *App) uninstall(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
+	if !force {
+		if recs, err := a.Registry.List(); err == nil && len(recs) > 0 {
+			a.errorf("%s", a.P.M("仍有登记用户，拒绝卸载稳定命令；请先 revoke/cleanup，或用 --force。",
+				"registered users still exist; refusing to uninstall — revoke/cleanup first, or use --force."))
+			return 1
+		}
+	}
 	if !yes {
 		if a.prompt(a.P.M("确认删除 "+a.InstallPath+" 请输入 YES: ", "type YES to remove "+a.InstallPath+": ")) != "YES" {
 			a.warnf("%s", a.P.M("已取消", "cancelled"))

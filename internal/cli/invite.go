@@ -255,7 +255,8 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	}
 
 	// Clear any stale schedule left by a reused username before scheduling.
-	a.Scheduler.Cancel(username)
+	staleUnit, _ := a.Registry.UnitFor(username)
+	a.Scheduler.Cancel(username, staleUnit)
 	autoUnit := ""
 	autoScheduled := false
 	if wantAuto {
@@ -267,7 +268,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		} else if unit, err := a.Scheduler.Schedule(username, hours); err == nil {
 			autoUnit = unit
 			autoScheduled = true
-			cleanups = append(cleanups, func() { a.Scheduler.Cancel(username) })
+			cleanups = append(cleanups, func() { a.Scheduler.Cancel(username, unit) })
 		} else {
 			a.warnf("%s: %v", a.P.M("自动删除任务创建失败，仅设置到期", "auto-delete scheduling failed; account expiry only"), err)
 		}
@@ -297,7 +298,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		// delete it (revoke refuses unregistered without --force), and a NOPASSWD
 		// grant should not linger unregistered. Cancel the task and drop sudo.
 		if autoScheduled {
-			a.Scheduler.Cancel(username)
+			a.Scheduler.Cancel(username, autoUnit)
 			autoScheduled = false
 			autoUnit = ""
 		}
@@ -309,12 +310,16 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			"account created but not registered; revoke manually with --force."))
 	}
 
-	a.printInvite(host, port, username, hours, sudoGranted, autoScheduled, autoUnit, kp)
-	a.success(a.P.M("临时账号已创建："+username, "temporary account created: "+username))
+	a.printInvite(host, port, username, hours, sudoGranted, autoScheduled, autoUnit, registered, kp)
+	if registered {
+		a.success(a.P.M("临时账号已创建并登记："+username, "temporary account created and registered: "+username))
+	} else {
+		a.warnf("%s", a.P.M("临时账号已创建但未登记："+username, "temporary account created but not registered: "+username))
+	}
 	return 0
 }
 
-func (a *App) printInvite(host string, port int, username string, hours int, sudo, auto bool, autoUnit string, kp *sshkey.KeyPair) {
+func (a *App) printInvite(host string, port int, username string, hours int, sudo, auto bool, autoUnit string, registered bool, kp *sshkey.KeyPair) {
 	sshHost := host
 	if isIPv6(host) {
 		sshHost = "[" + host + "]"
@@ -324,6 +329,12 @@ func (a *App) printInvite(host string, port int, username string, hours int, sud
 			return "yes"
 		}
 		return "no"
+	}
+	// An unregistered account (registry write failed) can only be revoked with
+	// --force, so print that in the copy-paste revoke command.
+	revokeSuffix := ""
+	if !registered {
+		revokeSuffix = " --force"
 	}
 	fmt.Fprintf(a.Out, `
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -347,12 +358,12 @@ cat > './%s.key' <<'EOF_KEY'
 chmod 600 './%s.key'
 
 %s
-sudo %s revoke --user %s
+sudo %s revoke --user %s%s
 `,
 		host, port, username, expiry.DisplayLocal(a.Now(), hours), yesno(sudo), yesno(auto), orNone(autoUnit),
 		a.P.M("SSH 登录命令:", "SSH login command:"), username, port, username, sshHost,
 		a.P.M("保存私钥命令:", "Save private key command:"), username, string(kp.PrivatePEM), username,
-		a.P.M("撤销命令:", "Revoke command:"), a.InstallPath, username)
+		a.P.M("撤销命令:", "Revoke command:"), a.InstallPath, username, revokeSuffix)
 
 	if sudo {
 		fmt.Fprint(a.Out, "\n"+a.P.M(

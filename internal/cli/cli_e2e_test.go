@@ -30,6 +30,7 @@ func (fakeSched) Systemctl(...string) error              { return nil }
 func (fakeSched) HasAt() bool                            { return true }
 func (fakeSched) ScheduleAt(string, int) (string, error) { return "1", nil }
 func (fakeSched) RemoveAtJobsFor(string)                 {}
+func (fakeSched) AtrmJob(string)                         {}
 
 func rootDir(t *testing.T, mode os.FileMode) string {
 	t.Helper()

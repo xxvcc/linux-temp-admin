@@ -152,7 +152,12 @@ func UpgradeURL(u string) bool {
 	if !strings.HasPrefix(u, "https://") {
 		return false
 	}
-	return !strings.ContainsAny(u, " \t\r\n\"'`<>|")
+	for _, r := range u { // reject all control characters (covers \t \r \n \v \f, NUL, DEL)
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return !strings.ContainsAny(u, " \"'`<>|")
 }
 
 // InstalledVersion reports whether v is a comparable version string: exactly
