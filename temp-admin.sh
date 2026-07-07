@@ -6,7 +6,7 @@ export LC_ALL=C
 umask 077
 
 SCRIPT_NAME="temp-admin.sh"
-VERSION="1.1.1"
+VERSION="1.1.2"
 DEFAULT_PREFIX="xxvcc"
 DEFAULT_EXPIRE_HOURS="24"
 MAX_EXPIRE_HOURS="8760"
@@ -91,8 +91,8 @@ $SCRIPT_NAME v$VERSION - Linux 一次性临时管理员邀请脚本
   --host HOST            邀请包中显示的服务器地址
   --port PORT            SSH 端口，自动探测，失败则 22
   --hours HOURS          有效期小时数，默认：$DEFAULT_EXPIRE_HOURS，最大：$MAX_EXPIRE_HOURS
-  --sudo                 授予 NOPASSWD sudo/wheel 权限
-  --no-sudo              不授予 sudo/wheel 权限
+  --sudo                 授予 NOPASSWD sudo 权限
+  --no-sudo              不授予 sudo 权限
   --yes                  跳过确认
   --confirm-sudo USER    与 --sudo --yes 一起授予 sudo 时，必须重复完整用户名
   --allow-non-tty-private-key-output
@@ -129,8 +129,8 @@ Options
   --host HOST            Host shown in invite
   --port PORT            SSH port, auto-detected or 22
   --hours HOURS          Valid hours, default: $DEFAULT_EXPIRE_HOURS, max: $MAX_EXPIRE_HOURS
-  --sudo                 Grant NOPASSWD sudo/wheel
-  --no-sudo              Do not grant sudo/wheel
+  --sudo                 Grant NOPASSWD sudo
+  --no-sudo              Do not grant sudo
   --yes                  Skip confirmation
   --confirm-sudo USER    Required with --sudo --yes; repeat the full username
   --allow-non-tty-private-key-output
@@ -443,16 +443,6 @@ valid_host() {
   return 0
 }
 
-sudo_group() {
-  if getent group sudo >/dev/null 2>&1; then
-    echo "sudo"
-  elif getent group wheel >/dev/null 2>&1; then
-    echo "wheel"
-  else
-    echo ""
-  fi
-}
-
 user_exists() { id -- "$1" >/dev/null 2>&1; }
 
 terminate_user_processes() {
@@ -749,6 +739,51 @@ systemd_quote_arg() {
   printf '"%s"' "$value"
 }
 
+path_mode_owner() {
+  local path="$1"
+  if command_exists stat; then
+    stat -c 'mode=%a owner=%U:%G' -- "$path" 2>/dev/null || true
+  fi
+}
+
+path_owned_by_root_not_group_world_writable() {
+  local path="$1" kind="$2" uid mode perms group_digit other_digit
+  case "$kind" in
+    file) [[ -f "$path" && ! -L "$path" ]] || return 1 ;;
+    dir) [[ -d "$path" && ! -L "$path" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  command_exists stat || return 1
+  read -r uid mode < <(stat -c '%u %a' -- "$path" 2>/dev/null) || return 1
+  [[ "$uid" == "0" && "$mode" =~ ^[0-9]+$ ]] || return 1
+  perms="${mode: -3}"
+  [[ ${#perms} -eq 3 ]] || return 1
+  group_digit="${perms:1:1}"
+  other_digit="${perms:2:1}"
+  [[ ! "$group_digit" =~ [2367] && ! "$other_digit" =~ [2367] ]]
+}
+
+root_safe_file() {
+  path_owned_by_root_not_group_world_writable "$1" file
+}
+
+root_safe_dir() {
+  path_owned_by_root_not_group_world_writable "$1" dir
+}
+
+valid_installed_version() {
+  [[ "$1" =~ ^[0-9]+([.][0-9]+){1,3}([._+~-][A-Za-z0-9._+~-]+)?$ ]]
+}
+
+installed_revoke_version() {
+  local __var="$1" installed_ver
+  root_safe_file "$INSTALL_PATH" || return 1
+  [[ -x "$INSTALL_PATH" ]] || return 1
+  installed_ver=$("$INSTALL_PATH" version 2>/dev/null) || return 1
+  valid_installed_version "$installed_ver" || return 1
+  printf -v "$__var" '%s' "$installed_ver"
+}
+
 show_installed_revoke_status() {
   if [[ -L "$INSTALL_PATH" ]]; then
     warn "$(m "稳定撤销命令是符号链接，出于安全考虑不执行：$INSTALL_PATH" "Stable revoke command is a symlink; refusing to execute it for safety: $INSTALL_PATH")"
@@ -759,17 +794,20 @@ show_installed_revoke_status() {
     return 0
   fi
   local installed_version="unknown" mode_owner=""
-  if command_exists stat; then
-    mode_owner=$(stat -c 'mode=%a owner=%U:%G' "$INSTALL_PATH" 2>/dev/null || true)
+  mode_owner=$(path_mode_owner "$INSTALL_PATH")
+  if ! root_safe_file "$INSTALL_PATH"; then
+    warn "$(m "稳定撤销命令不是 root 拥有的安全文件，出于安全考虑不执行：$INSTALL_PATH ${mode_owner:-}" "Stable revoke command is not a safely root-owned file; refusing to execute it: $INSTALL_PATH ${mode_owner:-}")"
+    return 0
   fi
   if [[ -x "$INSTALL_PATH" ]]; then
-    installed_version=$("$INSTALL_PATH" version 2>/dev/null || true)
-    [[ -n "$installed_version" ]] || installed_version="unknown"
+    if ! installed_revoke_version installed_version; then
+      installed_version="unknown-or-invalid"
+    fi
   else
     installed_version="not-executable-by-current-user"
   fi
   info "$(m "稳定撤销命令：$INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}" "Stable revoke command: $INSTALL_PATH version=$installed_version current=$VERSION ${mode_owner:-}")"
-  if [[ "$installed_version" != "unknown" && "$installed_version" != "not-executable-by-current-user" && "$installed_version" != "$VERSION" ]]; then
+  if [[ "$installed_version" != "unknown-or-invalid" && "$installed_version" != "not-executable-by-current-user" && "$installed_version" != "$VERSION" ]]; then
     warn "$(m "稳定撤销命令版本与当前脚本不同；下一次创建自动删除任务会重新安装当前脚本。" "Stable revoke command version differs from the current script; the next auto-delete task creation will reinstall the current script.")"
   fi
 }
@@ -784,8 +822,7 @@ install_self_for_revoke() {
   # If the source script cannot be safely located (e.g. run via `curl | bash`),
   # reuse an already-installed valid managed binary instead of failing outright.
   if [[ ! -f "$src" || -L "$src" ]]; then
-    if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" && -x "$INSTALL_PATH" ]] \
-       && installed_ver=$("$INSTALL_PATH" version 2>/dev/null) && [[ -n "$installed_ver" ]]; then
+    if installed_revoke_version installed_ver; then
       warn "$(m "无法定位当前脚本文件，复用已安装的稳定撤销命令：$INSTALL_PATH (version=$installed_ver)" "Cannot locate the current script file; reusing the already-installed stable revoke command: $INSTALL_PATH (version=$installed_ver)")"
       return 0
     fi
@@ -793,6 +830,10 @@ install_self_for_revoke() {
     return 1
   fi
   install -d -m 755 -o root -g root "$install_dir"
+  if ! root_safe_dir "$install_dir"; then
+    warn "$(m "安装目录不是 root 拥有的安全目录，拒绝安装稳定撤销命令：$install_dir $(path_mode_owner "$install_dir")" "Install directory is not a safely root-owned directory; refusing stable revoke installation: $install_dir $(path_mode_owner "$install_dir")")"
+    return 1
+  fi
   if [[ -L "$INSTALL_PATH" || ( -e "$INSTALL_PATH" && ! -f "$INSTALL_PATH" ) ]]; then
     warn "$(m "$INSTALL_PATH 不是安全的普通文件，拒绝安装以防止 TOCTOU 攻击。" "$INSTALL_PATH is not a safe regular file; refusing installation to prevent TOCTOU attack.")"
     return 1
@@ -802,7 +843,10 @@ install_self_for_revoke() {
   # Reuse the existing one unless the operator explicitly opts in to reinstall.
   if [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" ]] && command_exists cmp && ! cmp -s -- "$src" "$INSTALL_PATH"; then
     if [[ "${LINUX_TEMP_ADMIN_REINSTALL:-}" != "1" ]]; then
-      installed_ver=$("$INSTALL_PATH" version 2>/dev/null || echo unknown)
+      if ! installed_revoke_version installed_ver; then
+        warn "$(m "$INSTALL_PATH 已存在且与当前脚本不同，但不是可安全复用的本工具命令；拒绝执行或覆盖。确认要替换时请设 LINUX_TEMP_ADMIN_REINSTALL=1。" "$INSTALL_PATH already exists and differs from the current script, but it is not a safely reusable managed command; refusing to execute or overwrite it. Set LINUX_TEMP_ADMIN_REINSTALL=1 to replace it.")"
+        return 1
+      fi
       warn "$(m "$INSTALL_PATH 已存在且与当前脚本不同（installed=$installed_ver current=$VERSION）；为避免影响其他用户的撤销任务，复用现有命令、未覆盖。如需替换请设 LINUX_TEMP_ADMIN_REINSTALL=1。" "$INSTALL_PATH already exists and differs from the current script (installed=$installed_ver current=$VERSION); reusing the existing command without overwriting to avoid disrupting other users' revoke tasks. Set LINUX_TEMP_ADMIN_REINSTALL=1 to replace it.")"
       return 0
     fi
@@ -1076,8 +1120,13 @@ is_public_ipv4() {
   [[ "${octets[0]}" -eq 100 && "${octets[1]}" -ge 64 && "${octets[1]}" -le 127 ]] && return 1
   [[ "${octets[0]}" -eq 169 && "${octets[1]}" -eq 254 ]] && return 1
   [[ "${octets[0]}" -eq 172 && "${octets[1]}" -ge 16 && "${octets[1]}" -le 31 ]] && return 1
+  [[ "${octets[0]}" -eq 192 && "${octets[1]}" -eq 0 && "${octets[2]}" -eq 0 ]] && return 1
+  [[ "${octets[0]}" -eq 192 && "${octets[1]}" -eq 0 && "${octets[2]}" -eq 2 ]] && return 1
+  [[ "${octets[0]}" -eq 192 && "${octets[1]}" -eq 88 && "${octets[2]}" -eq 99 ]] && return 1
   [[ "${octets[0]}" -eq 192 && "${octets[1]}" -eq 168 ]] && return 1
   [[ "${octets[0]}" -eq 198 && ( "${octets[1]}" -eq 18 || "${octets[1]}" -eq 19 ) ]] && return 1
+  [[ "${octets[0]}" -eq 198 && "${octets[1]}" -eq 51 && "${octets[2]}" -eq 100 ]] && return 1
+  [[ "${octets[0]}" -eq 203 && "${octets[1]}" -eq 0 && "${octets[2]}" -eq 113 ]] && return 1
   return 0
 }
 
@@ -1288,6 +1337,10 @@ safe_write_root_file() {
     warn "$(m "目标目录不安全，拒绝写入：$dir" "Target directory is unsafe; refusing write: $dir")"
     return 1
   fi
+  if ! root_safe_dir "$dir"; then
+    warn "$(m "目标目录不是 root 拥有的安全目录，拒绝写入：$dir $(path_mode_owner "$dir")" "Target directory is not a safely root-owned directory; refusing write: $dir $(path_mode_owner "$dir")")"
+    return 1
+  fi
   if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
     warn "$(m "目标文件不安全，拒绝写入：$path" "Target file is unsafe; refusing write: $path")"
     return 1
@@ -1311,18 +1364,16 @@ safe_write_root_file() {
 }
 
 add_sudo() {
-  local user="$1"
-  local group
-  group=$(sudo_group)
-  if [[ -z "$group" ]]; then
-    warn "$(m "未找到 sudo 或 wheel 组，跳过 sudo 授权。" "sudo/wheel group not found; skipping sudo grant.")"
+  local user="$1" file sudo_policy
+  if ! command_exists sudo; then
+    warn "$(m "未找到 sudo 命令，跳过 sudo 授权。" "sudo command not found; skipping sudo grant.")"
     return 1
   fi
   if [[ -L /etc/sudoers.d || ! -d /etc/sudoers.d ]]; then
     warn "$(m "/etc/sudoers.d 不存在或不安全，无法配置 NOPASSWD sudo。" "/etc/sudoers.d does not exist or is unsafe; cannot configure NOPASSWD sudo.")"
     return 1
   fi
-  local file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
+  file="/etc/sudoers.d/${MANAGED_TAG}-${user}"
   if ! printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$user" | safe_write_root_file "$file" 440; then
     return 1
   fi
@@ -1333,9 +1384,11 @@ add_sudo() {
       return 1
     }
   fi
-  # Add to the sudo/wheel group only AFTER the sudoers file is written and
-  # validated, so a failure never leaves a lingering group membership behind.
-  usermod -aG "$group" "$user"
+  if ! sudo_policy=$(sudo -n -l -U "$user" 2>/dev/null) || [[ ! "$sudo_policy" =~ (^|[[:space:]])NOPASSWD: ]]; then
+    rm -f "$file"
+    err "$(m "sudoers 策略未实际授予 $user NOPASSWD sudo，已删除 $file。请确认 /etc/sudoers 包含 /etc/sudoers.d。" "sudoers policy did not actually grant $user NOPASSWD sudo; removed $file. Ensure /etc/sudoers includes /etc/sudoers.d.")"
+    return 1
+  fi
 }
 
 remove_sudoers_file() {
@@ -1745,7 +1798,7 @@ EOF
     if add_sudo "$user"; then
       sudo_text="yes"
     else
-      warn "$(m "未能授予 sudo 权限（可能缺少 sudo/wheel 组或 /etc/sudoers.d）；已创建为普通账号：$user" "Could not grant sudo (missing sudo/wheel group or /etc/sudoers.d?); created as a normal account: $user")"
+      warn "$(m "未能授予 sudo 权限（可能缺少 sudo、/etc/sudoers.d 未启用或策略校验失败）；已创建为普通账号：$user" "Could not grant sudo (sudo missing, /etc/sudoers.d not enabled, or policy validation failed); created as a normal account: $user")"
       sudo_text="no"
     fi
   fi
@@ -1998,12 +2051,34 @@ main() {
   local args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --lang) shift; if [[ $# -gt 0 ]]; then if set_language "$1"; then LANG_LOCKED="true"; fi; shift; fi ;;
-      --lang=*) if set_language "${1#--lang=}"; then LANG_LOCKED="true"; fi; shift ;;
+      --lang)
+        shift
+        if [[ $# -eq 0 || "$1" == --* ]]; then
+          err "$(m "--lang 缺少值，请使用 zh 或 en。" "--lang requires a value: zh or en.")"
+          usage
+          exit 1
+        fi
+        if ! set_language "$1"; then
+          err "$(m "--lang 只支持 zh 或 en：$1" "--lang only supports zh or en: $1")"
+          usage
+          exit 1
+        fi
+        LANG_LOCKED="true"
+        shift
+        ;;
+      --lang=*)
+        if ! set_language "${1#--lang=}"; then
+          err "$(m "--lang 只支持 zh 或 en：${1#--lang=}" "--lang only supports zh or en: ${1#--lang=}")"
+          usage
+          exit 1
+        fi
+        LANG_LOCKED="true"
+        shift
+        ;;
       *) args+=("$1"); shift ;;
     esac
   done
-  set -- ${args[@]+"${args[@]}"}
+  set -- "${args[@]}"
   resolve_language
   local cmd="${1:-}"
   # Offer an interactive language choice for the no-arg menu and every operational
@@ -2030,4 +2105,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

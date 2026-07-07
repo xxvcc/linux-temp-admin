@@ -269,10 +269,11 @@ sudo bash temp-admin.sh invite \
 本地校验:
 
 ```bash
-bash -n temp-admin.sh
-shellcheck -S warning temp-admin.sh
+bash -n temp-admin.sh tests/unit.sh
+shellcheck -S warning temp-admin.sh tests/unit.sh
+bash tests/unit.sh
 ```
 
-仓库已包含 GitHub Actions 工作流,会在 push 和 pull request 时自动运行 Bash 语法检查与 ShellCheck。
+仓库已包含 GitHub Actions 工作流,会在 push 和 pull request 时自动运行 Bash 语法检查、ShellCheck 与单元测试。
 
 许可证:MIT,详见 [LICENSE](LICENSE)。

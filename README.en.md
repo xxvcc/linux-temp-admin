@@ -267,10 +267,11 @@ To avoid a modified or downgraded copy silently overwriting the shared `/usr/loc
 Local checks:
 
 ```bash
-bash -n temp-admin.sh
-shellcheck -S warning temp-admin.sh
+bash -n temp-admin.sh tests/unit.sh
+shellcheck -S warning temp-admin.sh tests/unit.sh
+bash tests/unit.sh
 ```
 
-The repo includes a GitHub Actions workflow that runs Bash syntax checks and ShellCheck on push and pull request.
+The repo includes a GitHub Actions workflow that runs Bash syntax checks, ShellCheck, and unit tests on push and pull request.
 
 License: MIT, see [LICENSE](LICENSE).
