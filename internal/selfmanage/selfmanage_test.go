@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-func TestEmbeddedPublicKeyUnconfigured(t *testing.T) {
-	// The shipped placeholder must parse as "no key" so upgrades fail closed.
-	if embeddedPublicKey() != nil {
-		t.Error("shipped release_pubkey.hex should be unconfigured (nil)")
+func TestEmbeddedPublicKeyConfigured(t *testing.T) {
+	// A release signing key is embedded, so signed upgrades are enabled.
+	if len(embeddedPublicKey()) != ed25519.PublicKeySize {
+		t.Errorf("embedded release key must be a %d-byte ed25519 key, got %d", ed25519.PublicKeySize, len(embeddedPublicKey()))
 	}
 }
 

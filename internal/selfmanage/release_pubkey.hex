@@ -1,9 +1,8 @@
 # linux-temp-admin release signing public key (ed25519, hex-encoded, 64 hex chars).
 #
-# UNCONFIGURED: no key is set, so signed self-upgrade is DISABLED and `upgrade`
-# fails closed. To enable it, generate a release keypair and paste the public key
-# hex on a line below (see `go run ./cmd/lta-release keygen` and scripts/release.sh):
+# CONFIGURED: signed self-upgrade is ENABLED. `upgrade` verifies each downloaded
+# release binary against this key before installing it, failing closed on any
+# mismatch. The matching PRIVATE key is held OFFLINE by the maintainer (generated
+# via `go run ./cmd/lta-release keygen`); only scripts/release.sh uses it.
 #
-#   <64-hex-character ed25519 public key on its own line>
-#
-# Keep the matching PRIVATE key offline; only the release pipeline uses it.
+982471fb0c9f82f76143c89d045f8a931180f8cca27dad5286bb2000614eaf1c
