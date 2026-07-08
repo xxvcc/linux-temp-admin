@@ -1,11 +1,23 @@
-home/
-race/
-sshdir/
-victimtarget/
-
-# Go
+# Build artifacts — root-level binaries from `go build ./cmd/...`
 /linux-temp-admin
+/lta-release
+# ...and if built from inside a command's package dir
+/cmd/*/linux-temp-admin
+/cmd/*/lta-release
+
+# Go test / coverage output
 *.test
 *.out
 coverage.txt
+
+# Release staging (produced by scripts/release.sh)
 /dist/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local tool config (not part of the repo; keep the ignore with the repo)
+.claude/
