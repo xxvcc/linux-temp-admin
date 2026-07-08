@@ -36,6 +36,11 @@ type Scheduler struct {
 	UnitPrefix  string
 	Now         func() time.Time
 	Sys         System
+	// UnderUnit reports whether the current process is executing inside the given
+	// systemd service (i.e. the firing auto-revoke run for that unit); when true,
+	// Cancel leaves that .service file in place rather than deleting the file it is
+	// running from. Defaults to a /proc/self/cgroup check; injectable for tests.
+	UnderUnit func(unit string) bool
 }
 
 // New returns a Scheduler backed by real systemctl/at.
@@ -46,7 +51,22 @@ func New() *Scheduler {
 		UnitPrefix:  config.AutoRevokeUnitPrefix,
 		Now:         time.Now,
 		Sys:         realSystem{},
+		UnderUnit:   runningUnderFiringUnit,
 	}
+}
+
+// runningUnderFiringUnit reports whether the current process is executing inside
+// the systemd service <unit>.service — i.e. this run is the auto-revoke task
+// firing for this very unit, so Cancel must not delete the .service file it is
+// running from. It reads /proc/self/cgroup, whose path for a service contains
+// "<unit>.service". If that is unavailable it falls back to the coarse "any
+// systemd scope" signal (INVOCATION_ID), erring toward leaving the file rather
+// than risking removal of a live unit.
+func runningUnderFiringUnit(unit string) bool {
+	if b, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		return strings.Contains(string(b), unit+".service")
+	}
+	return os.Getenv("INVOCATION_ID") != ""
 }
 
 // UnitName is the deterministic systemd unit basename for user (validated
@@ -145,9 +165,10 @@ func (s *Scheduler) scheduleAt(user string, hours int) (string, error) {
 
 // Cancel removes the auto-revoke task for user. It always sweeps a matching at
 // job AND cleans the systemd units, regardless of which was recorded, so a
-// reused username never leaves a stale task behind. When running inside the
-// firing systemd service (INVOCATION_ID set), the .service file is left and
-// daemon-reload skipped so the currently-executing unit is not disturbed.
+// reused username never leaves a stale task behind. Only when this run is the
+// firing service for THIS unit (UnderUnit) is the .service file left and
+// daemon-reload skipped, so it never deletes the file it is executing from; a
+// manual revoke — even from another systemd scope — cleans the .service up.
 func (s *Scheduler) Cancel(user, recordedUnit string) {
 	// Remove a specifically-recorded at job even where atq is unavailable (so
 	// RemoveAtJobsFor's body sweep can't run).
@@ -166,7 +187,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) {
 	}
 	timerPath := filepath.Join(s.SystemdDir, unit+".timer")
 	removeIfNotSymlink(timerPath)
-	if os.Getenv("INVOCATION_ID") == "" {
+	if s.UnderUnit == nil || !s.UnderUnit(unit) {
 		removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".service"))
 		if s.Sys.HasSystemctl() {
 			_ = s.Sys.Systemctl("daemon-reload")

@@ -173,7 +173,6 @@ func sshPortFromConfig(path string) (int, bool) {
 		return 0, false
 	}
 	defer f.Close()
-	port := 0
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -183,12 +182,12 @@ func sshPortFromConfig(path string) (int, bool) {
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
 			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
-				port = p // last wins, matching the bash awk (extra trailing tokens tolerated)
+				// First Port wins: sshd listens on every Port directive, and
+				// sshPortFromSshdT returns the first, so the config fallback matches it
+				// for a consistent hint (rather than the bash awk's last-wins).
+				return p, true
 			}
 		}
-	}
-	if port != 0 {
-		return port, true
 	}
 	return 0, false
 }

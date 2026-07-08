@@ -15,7 +15,7 @@ func TestSSHPortFromConfig(t *testing.T) {
 	}{
 		{"explicit", "Port 2222\n", 2222, true},
 		{"commented", "#Port 2222\n", 0, false},
-		{"last wins", "Port 1000\nPort 2020\n", 2020, true},
+		{"first wins", "Port 1000\nPort 2020\n", 1000, true},
 		{"indented", "   Port 2200\n", 2200, true},
 		{"none", "PermitRootLogin no\n", 0, false},
 		{"out of range", "Port 99999\n", 0, false},

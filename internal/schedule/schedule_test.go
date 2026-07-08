@@ -96,14 +96,10 @@ func TestScheduleNoBackend(t *testing.T) {
 }
 
 func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
-	// Force the "not running under the firing service" branch deterministically.
-	// CI runners (and any systemd-managed shell) set INVOCATION_ID in the ambient
-	// environment, which would otherwise make Cancel keep the .service file and skip
-	// daemon-reload — see TestCancelUnderFiringServiceLeavesServiceFile.
-	t.Setenv("INVOCATION_ID", "")
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
+	s.UnderUnit = func(string) bool { return false } // not the firing service -> full cleanup
 	unit := s.UnitName("xxvcc-a1")
 	svc := filepath.Join(dir, unit+".service")
 	tmr := filepath.Join(dir, unit+".timer")
@@ -139,10 +135,10 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 // and removes the .timer file, but leaves its own .service file and skips
 // daemon-reload so the currently-executing unit is not disturbed.
 func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
-	t.Setenv("INVOCATION_ID", "deadbeefcafe") // simulate running as the firing service
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
+	s.UnderUnit = func(string) bool { return true } // simulate running as the firing service
 	unit := s.UnitName("xxvcc-a1")
 	svc := filepath.Join(dir, unit+".service")
 	tmr := filepath.Join(dir, unit+".timer")
