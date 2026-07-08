@@ -27,14 +27,47 @@ build carrying the new key.)
 
 ## Cut a release
 
+The build runs in CI; **signing stays offline** — the signing key never touches
+GitHub Actions. Two steps:
+
+**1. Tag → CI builds a draft.** Push a `v2+` tag. The `Release` workflow
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)) builds the
+static `linux/amd64` + `linux/arm64` binaries (`-trimpath`, version stamped from
+the tag), writes `SHA256SUMS`, and stages them in a **draft** GitHub Release.
+
 ```sh
-LTA_SIGN_KEY=~/.lta/signing.key scripts/release.sh 2.0.0
-gh release create v2.0.0 dist/linux-temp-admin-linux-* dist/SHA256SUMS --title v2.0.0
+git tag -a v2.0.1 -m "linux-temp-admin v2.0.1"
+git push origin v2.0.1        # CI builds + stages the draft
 ```
 
-`release.sh` builds static `linux/amd64` and `linux/arm64` binaries (version
-stamped via `-ldflags -X`), signs each (`<binary>.sig`, raw 64-byte ed25519),
-and writes `SHA256SUMS`.
+**2. Sign offline → publish.** On the machine that holds the signing key, sign
+the exact CI-built binaries and publish:
+
+```sh
+LTA_SIGN_KEY=~/.lta/signing.key scripts/sign-release.sh v2.0.1
+```
+
+[`sign-release.sh`](../scripts/sign-release.sh) downloads the draft's binaries,
+verifies their checksums, signs each (`<binary>.sig`, raw 64-byte ed25519),
+**verifies every signature against the embedded public key (fails closed)**,
+refreshes `SHA256SUMS` to cover the `.sig` files, uploads them, and flips the
+release from draft to published. It signs the bytes CI actually published, so
+the signature is valid for the exact assets users download — no reproducible
+build assumption required.
+
+The release is public only after step 2, so users never see an unsigned release.
+
+### Fully local fallback
+
+If CI is unavailable, build, sign, and publish entirely locally in one shot:
+
+```sh
+LTA_SIGN_KEY=~/.lta/signing.key scripts/release.sh 2.0.1
+gh release create v2.0.1 dist/linux-temp-admin-linux-* dist/SHA256SUMS --title v2.0.1
+```
+
+`release.sh` uses the same `-trimpath` static build as CI, so it reproduces the
+same binaries; it signs each and writes `SHA256SUMS` (covering the sigs too).
 
 ## Install / upgrade on a host
 
@@ -61,3 +94,7 @@ and writes `SHA256SUMS`.
 - **Bootstrap install**: TLS + SHA-256 checksum (both fetched over HTTPS).
 - **Upgrades**: TLS + an ed25519 signature that only the offline private key can
   produce, verified in-process before anything is written.
+- **Release provenance**: binaries are built in CI (auditable workflow logs,
+  `-trimpath` reproducible) but signed offline — the signing key is never present
+  in GitHub Actions, so a compromised CI cannot mint a binary that passes
+  `upgrade`'s signature check.

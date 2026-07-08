@@ -21,7 +21,7 @@ go build -o dist/lta-release ./cmd/lta-release
 for arch in amd64 arm64; do
   out="dist/linux-temp-admin-linux-${arch}"
   CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
-    -tags osusergo,netgo \
+    -trimpath -tags osusergo,netgo \
     -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION}" \
     -o "$out" ./cmd/linux-temp-admin
   ./dist/lta-release sign "$LTA_SIGN_KEY" "$out"   # writes ${out}.sig

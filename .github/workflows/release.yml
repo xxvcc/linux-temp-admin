@@ -1,0 +1,92 @@
+name: Release
+
+# Build the v2 static binaries + checksums when a version tag is pushed, and
+# stage them in a DRAFT GitHub Release. Signing is NOT done here: the ed25519
+# signing key stays offline. The maintainer runs scripts/sign-release.sh locally
+# to sign the CI-built binaries and publish the release. See docs/releasing.md.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Derive version and gate (v2+ only; v1.x is the bash tool)
+        id: v
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          major="${version%%.*}"
+          if [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${major}" -ge 2 ]]; then
+            echo "go_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${GITHUB_REF_NAME} is not a v2+ tag; skipping the Go release build (v1.x is bash-only)."
+          fi
+
+      - name: Build static binaries (amd64, arm64)
+        if: steps.v.outputs.go_release == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          rm -rf dist && mkdir -p dist
+          for arch in amd64 arm64; do
+            out="dist/linux-temp-admin-linux-${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -trimpath -tags osusergo,netgo \
+              -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION}" \
+              -o "$out" ./cmd/linux-temp-admin
+            echo "built $out"
+          done
+          ( cd dist && sha256sum linux-temp-admin-linux-* > SHA256SUMS )
+          echo "----- SHA256SUMS -----"; cat dist/SHA256SUMS
+
+      - name: Sanity-check the amd64 binary
+        if: steps.v.outputs.go_release == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          got="$(./dist/linux-temp-admin-linux-amd64 version)"
+          [ "$got" = "$VERSION" ] || { echo "version mismatch: got '$got', want '$VERSION'"; exit 1; }
+          file dist/linux-temp-admin-linux-amd64 | grep -q 'statically linked' \
+            || { echo "binary is not statically linked"; exit 1; }
+          echo "ok: version=$got, statically linked"
+
+      - name: Stage DRAFT release with unsigned binaries + checksums
+        if: steps.v.outputs.go_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          notes="Automated CI build for ${TAG}. **Draft** — detached ed25519 signatures (\`*.sig\`) are added by the maintainer offline via scripts/sign-release.sh, which then publishes this release. Do not rely on a draft's assets."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; updating assets (--clobber)"
+            gh release upload "$TAG" \
+              dist/linux-temp-admin-linux-amd64 \
+              dist/linux-temp-admin-linux-arm64 \
+              dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" \
+              dist/linux-temp-admin-linux-amd64 \
+              dist/linux-temp-admin-linux-arm64 \
+              dist/SHA256SUMS \
+              --draft --title "$TAG" --notes "$notes"
+          fi
+          echo "Draft release staged. Sign & publish locally: LTA_SIGN_KEY=~/.lta/signing.key scripts/sign-release.sh $TAG"
