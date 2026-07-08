@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -39,8 +40,17 @@ func New(installPath string, maxBytes int64) *Manager {
 		Client: &http.Client{
 			Timeout: 60 * time.Second, // bound the whole fetch; a stalled server can't hang upgrade
 			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				// A redirect target is chosen by the (possibly hostile) release
+				// server, so it must stay https and must not point at a private/
+				// reserved address — otherwise a compromised host could pivot the
+				// root-run fetch into an SSRF against link-local cloud metadata or an
+				// internal service. The initial, operator-supplied URL is not subject
+				// to this check, so a deliberate internal mirror still works.
 				if req.URL.Scheme != "https" {
 					return fmt.Errorf("refusing redirect to non-https: %s", req.URL)
+				}
+				if err := refusePrivateRedirect(req.URL.Hostname()); err != nil {
+					return err
 				}
 				return nil
 			},
@@ -205,4 +215,34 @@ func normalizeSig(b []byte) []byte {
 		}
 	}
 	return b
+}
+
+// refusePrivateRedirect errors unless host resolves entirely to routable public
+// addresses. A redirect that points at a private/reserved endpoint is rejected so
+// a hostile release host cannot use the upgrade fetch as an SSRF pivot.
+func refusePrivateRedirect(host string) error {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve redirect host %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if !isPublicIP(ip) {
+			return fmt.Errorf("refusing redirect to non-public address (%s -> %s)", host, ip)
+		}
+	}
+	return nil
+}
+
+// isPublicIP reports whether ip is a routable public address — not loopback,
+// private (RFC1918/ULA), link-local, CGNAT (RFC6598), multicast, or unspecified.
+func isPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	// CGNAT 100.64.0.0/10 — where some cloud metadata services live.
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64 {
+		return false
+	}
+	return true
 }

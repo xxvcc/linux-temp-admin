@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+Low-severity hardening from the follow-up audit:
+
+- **upgrade: reject redirects to private/reserved addresses.** An `upgrade` HTTPS
+  redirect is refused if it resolves to a loopback / private / link-local / CGNAT
+  address, so a compromised release host cannot use the root-run fetch as an SSRF
+  pivot (e.g. to cloud metadata). The initial, operator-supplied `--url` is
+  unaffected, so a deliberate internal mirror still works.
+- **auto-revoke: stop orphaning systemd `.service` files.** `revoke` now precisely
+  detects whether it is the firing auto-revoke service for a unit (via the process
+  cgroup) rather than treating any systemd scope as such, so a manual `revoke` run
+  from a systemd-managed shell no longer leaves an orphaned `.service` behind.
+- **SSH port hint: consistent selection.** With multiple `Port` directives in
+  `sshd_config`, the config fallback now reports the first (matching `sshd -T`)
+  instead of the last.
+
 ## v2.0.1 - Security & correctness audit fixes
 
 Follow-up hardening from a multi-pass security audit of the v2 rewrite. No new
