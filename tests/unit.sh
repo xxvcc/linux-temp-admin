@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# The v1 tool is deprecated and prints a startup warning; silence it here (and in
+# every `bash "$SCRIPT" ...` subprocess, via export) so assertions stay stable.
+export LTA_SUPPRESS_DEPRECATION=1
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT_DIR/temp-admin.sh"
 

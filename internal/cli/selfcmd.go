@@ -34,6 +34,7 @@ func (a *App) install(args []string) int {
 		a.errorf("%v", err)
 		return 1
 	}
+	a.audit("install", "", "ok", a.InstallPath, nil)
 	a.success(a.P.M("已安装稳定命令："+a.InstallPath, "installed the stable command: "+a.InstallPath))
 	return 0
 }
@@ -73,6 +74,7 @@ func (a *App) uninstall(args []string) int {
 		a.errorf("%v", err)
 		return 1
 	}
+	a.audit("uninstall", "", "ok", a.InstallPath, nil)
 	a.success(a.P.M("已卸载稳定命令", "uninstalled the stable command"))
 	return 0
 }
@@ -113,6 +115,7 @@ func (a *App) upgrade(args []string) int {
 		a.success(a.P.M("已是最新版本："+buildinfo.Version, "already up to date: "+buildinfo.Version))
 		return 0
 	}
+	a.audit("upgrade", "", "ok", buildinfo.Version+" -> "+newVer, nil)
 	a.success(a.P.M("已升级到 "+newVer, "upgraded to "+newVer))
 	return 0
 }

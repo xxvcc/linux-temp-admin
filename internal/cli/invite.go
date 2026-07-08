@@ -229,6 +229,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	}
 	failf := func(format string, args ...any) int {
 		a.errorf(format, args...)
+		a.audit("account.create", username, "fail", fmt.Sprintf(format, args...), nil)
 		rollback()
 		return 1
 	}
@@ -323,12 +324,28 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	}
 
 	a.printInvite(host, port, username, hours, sudoGranted, autoScheduled, autoUnit, registered, kp)
+	a.audit("account.create", username, "ok", "", map[string]string{
+		"host":        host,
+		"port":        fmt.Sprintf("%d", port),
+		"sudo":        ynStr(sudoGranted),
+		"auto":        ynStr(autoScheduled),
+		"registered":  ynStr(registered),
+		"fingerprint": kp.Fingerprint,
+	})
 	if registered {
 		a.success(a.P.M("临时账号已创建并登记："+username, "temporary account created and registered: "+username))
 	} else {
 		a.warnf("%s", a.P.M("临时账号已创建但未登记："+username, "temporary account created but not registered: "+username))
 	}
 	return 0
+}
+
+// ynStr renders a bool as "yes"/"no" for audit fields.
+func ynStr(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 func (a *App) printInvite(host string, port int, username string, hours int, sudo, auto bool, autoUnit string, registered bool, kp *sshkey.KeyPair) {

@@ -62,6 +62,7 @@ func (a *App) revoke(args []string) int {
 		if err := a.Registry.Remove(username); err != nil {
 			a.warnf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
 		}
+		a.audit("account.cleanup", username, "ok", "user absent; cleaned registry/sudoers/schedule", nil)
 		return 0
 	}
 
@@ -91,11 +92,13 @@ func (a *App) revoke(args []string) int {
 	a.Sudoers.Remove(username)
 	if err := a.Users.Delete(username); err != nil {
 		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), err)
+		a.audit("account.delete", username, "fail", err.Error(), nil)
 		return 1
 	}
 	if err := a.Registry.Remove(username); err != nil {
 		a.warnf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
 	}
+	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(fForce), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
 	return 0
 }

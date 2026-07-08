@@ -38,8 +38,9 @@ linux-temp-admin --lang zh help                    # 中/英界面
 
 - **升级**下载二进制 + 分离签名,用内嵌公钥 ed25519 **验签后**才安装(fail-closed)。发布/签名见 [docs/releasing.md](docs/releasing.md)。
 - v2 使用独立的注册表目录(`/var/lib/linux-temp-admin/v2/`),**不接管 v1 状态**;`doctor` 会检测并提示遗留的 v1 工件。已在 v1 机器上部署的账号,请先用 v1 的 `revoke` 排空。
+- **操作审计日志**:每次特权操作(创建/删除账号、install/upgrade/uninstall)以 JSON 行追加写入 root 属主的 `/var/log/linux-temp-admin/audit.log`,记录时间、操作者(sudo 调用者)、动作、目标与结果。
 
-下方文档描述当前稳定发布的 **v1(bash)** 版本;两者可共存。
+> ⚠️ **v1(bash)已弃用、不再维护**——请使用上面的 v2。下方 v1 文档仅供仍在运行 v1 的用户参考;v1 启动时会打印弃用提示(可用 `LTA_SUPPRESS_DEPRECATION=1` 关闭)。两者仍可共存。
 
 ---
 
