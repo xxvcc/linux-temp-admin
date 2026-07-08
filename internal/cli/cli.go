@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/audit"
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
@@ -42,6 +43,7 @@ type App struct {
 	Registry   *registry.Store
 	Detector   *netdetect.Detector
 	Selfmanage *selfmanage.Manager
+	Audit      *audit.Logger
 
 	InstallPath string
 	Now         func() time.Time
@@ -66,6 +68,7 @@ func NewApp(lang i18n.Lang) *App {
 		Registry:    registry.Default(),
 		Detector:    netdetect.New(),
 		Selfmanage:  selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
+		Audit:       audit.Default(),
 		InstallPath: config.InstallPath,
 		Now:         time.Now,
 		RandHex:     randHex,
@@ -182,6 +185,17 @@ func (a *App) warnf(format string, args ...any) {
 }
 func (a *App) info(s string)    { fmt.Fprintln(a.Out, a.P.M("[信息] ", "[INFO] ")+s) }
 func (a *App) success(s string) { fmt.Fprintln(a.Out, a.P.M("[完成] ", "[OK] ")+s) }
+
+// audit records a privileged operation to the audit log. Best-effort: a write
+// failure is reported but never blocks or fails the operation itself.
+func (a *App) audit(action, target, result, detail string, fields map[string]string) {
+	if a.Audit == nil {
+		return
+	}
+	if err := a.Audit.Log(audit.Event{Action: action, Target: target, Result: result, Detail: detail, Fields: fields}); err != nil {
+		a.warnf("%s: %v", a.P.M("写入审计日志失败", "audit log write failed"), err)
+	}
+}
 
 // requireRoot returns false (and reports) if not effectively root.
 func (a *App) requireRoot() bool {

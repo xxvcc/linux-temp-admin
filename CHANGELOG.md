@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## v2.1.0 - Operation audit log; v1 deprecation
+
+- **Operation audit log (new).** Every privileged mutating operation — account
+  create/delete, and install / uninstall / upgrade — is appended as a JSON line to
+  a root-owned, append-only `/var/log/linux-temp-admin/audit.log` (0600), recording
+  the timestamp, actor (the invoking user under sudo, plus the effective uid),
+  action, target, result, and key parameters. Writes are best-effort and never
+  block or fail the operation itself. (An on-host log is tamperable by root;
+  forward it to a remote collector for tamper-evidence.)
+- **v1 (bash) tool deprecated.** `temp-admin.sh` is no longer maintained and now
+  prints a deprecation notice at startup pointing to the v2 Go tool (suppress with
+  `LTA_SUPPRESS_DEPRECATION=1`). It still runs; no further features or fixes.
+
 ## v2.0.2 - Audit follow-up hardening
 
 Low-severity hardening from the follow-up audit:

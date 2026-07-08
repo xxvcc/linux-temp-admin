@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/audit"
 	"github.com/xxvcc/linux-temp-admin/internal/cli"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
@@ -61,6 +62,7 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
+	auditFile := filepath.Join(rootDir(t, 0o700), "audit.log")
 
 	var out, errb bytes.Buffer
 	app := &cli.App{
@@ -77,8 +79,12 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		Registry: &registry.Store{
 			Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
 		},
-		Detector:    netdetect.New(),
-		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
+		Detector:   netdetect.New(),
+		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
+		Audit: &audit.Logger{
+			Dir: filepath.Dir(auditFile), File: auditFile, Now: now,
+			Actor: func() (string, int) { return "e2e", 0 },
+		},
 		InstallPath: installPath,
 		Now:         now,
 		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
@@ -122,6 +128,11 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			t.Errorf("invite output missing %q", want)
 		}
 	}
+	if b, err := os.ReadFile(auditFile); err != nil {
+		t.Errorf("audit log after invite: %v", err)
+	} else if !strings.Contains(string(b), `"account.create"`) || !strings.Contains(string(b), username) {
+		t.Errorf("audit log missing account.create for %s:\n%s", username, b)
+	}
 
 	// --- revoke ---
 	out.Reset()
@@ -138,5 +149,10 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(sudoDir, "linux-temp-admin-"+username)); !os.IsNotExist(err) {
 		t.Error("sudoers drop-in should be removed after revoke")
+	}
+	if b, err := os.ReadFile(auditFile); err != nil {
+		t.Errorf("audit log after revoke: %v", err)
+	} else if !strings.Contains(string(b), `"account.delete"`) {
+		t.Errorf("audit log missing account.delete:\n%s", b)
 	}
 }

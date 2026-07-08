@@ -46,9 +46,15 @@ linux-temp-admin --lang en help                    # zh/en UI
 - v2 uses a separate registry directory (`/var/lib/linux-temp-admin/v2/`) and does
   **not** adopt v1 state; `doctor` detects and reports leftover v1 artifacts. On a
   box already running v1, drain accounts with the v1 `revoke` first.
+- **Operation audit log**: every privileged action (account create/delete,
+  install/upgrade/uninstall) is appended as a JSON line to the root-owned
+  `/var/log/linux-temp-admin/audit.log`, recording the time, actor (the invoking
+  sudo user), action, target, and result.
 
-The documentation below covers the currently-released **v1 (bash)** tool; the two
-can coexist.
+> ⚠️ **v1 (bash) is deprecated and no longer maintained** — use v2 above. The v1
+> documentation below remains for existing users; v1 now prints a deprecation
+> warning at startup (suppress with `LTA_SUPPRESS_DEPRECATION=1`). The two can
+> still coexist.
 
 ---
 

@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+#
+# DEPRECATED (v1). This bash implementation is no longer maintained. Use the v2
+# Go rewrite instead — a single static binary with signature-verified upgrades:
+#   https://github.com/xxvcc/linux-temp-admin
+# It still runs and emits a deprecation warning at startup (suppress with
+# LTA_SUPPRESS_DEPRECATION=1). No new features or fixes will land here.
+#
 set -Eeuo pipefail
 # Capture the caller's locale before forcing LC_ALL=C, to default the UI language.
 LINUX_TEMP_ADMIN_ORIG_LOCALE="${LC_ALL:-${LANG:-}}"
@@ -2707,6 +2714,11 @@ main() {
   done
   set -- "${args[@]}"
   resolve_language
+  # v1 (this bash tool) is deprecated: the maintained implementation is the v2 Go
+  # rewrite. Warn once per run (suppressible for tests/automation) but keep working.
+  if [[ -z "${LTA_SUPPRESS_DEPRECATION:-}" ]]; then
+    warn "$(m "bash 版(v1)已弃用、不再维护；请改用 v2 Go 版：https://github.com/xxvcc/linux-temp-admin" "The bash tool (v1) is DEPRECATED and no longer maintained; use the v2 Go tool instead: https://github.com/xxvcc/linux-temp-admin")"
+  fi
   local cmd="${1:-}"
   # Offer an interactive language choice for the no-arg menu and every operational
   # command. Two extra guards beyond prompt_language()'s own (locked / non-TTY):
