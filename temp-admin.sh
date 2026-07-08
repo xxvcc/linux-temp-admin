@@ -2475,14 +2475,16 @@ doctor_command() {
 }
 
 install_command() {
-  need_root
   local force="false" src="${BASH_SOURCE[0]}"
+  # Validate arguments before the privilege check, so an unsupported argument is
+  # reported even when run as non-root (matches doctor).
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force="true"; shift ;;
       *) err "$(m "install 不支持的参数：$1" "install: unsupported argument: $1")"; usage; exit 1 ;;
     esac
   done
+  need_root
   if [[ ! -f "$src" || -L "$src" ]]; then
     err "$(m "无法安全定位当前脚本文件，不能安装。请先下载为本地文件后运行。" "Cannot safely locate the current script file; cannot install. Download it as a local file first.")"
     exit 1
@@ -2492,8 +2494,8 @@ install_command() {
 }
 
 uninstall_command() {
-  need_root
   local force="false" assume_yes="false" installed_ver="unknown"
+  # Validate arguments before the privilege check (matches doctor/install).
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force="true"; shift ;;
@@ -2501,6 +2503,7 @@ uninstall_command() {
       *) err "$(m "uninstall 不支持的参数：$1" "uninstall: unsupported argument: $1")"; usage; exit 1 ;;
     esac
   done
+  need_root
   if registry_has_users && [[ "$force" != "true" ]]; then
     err "$(m "检测到仍有登记用户，拒绝卸载稳定命令；请先 revoke/cleanup，或确认风险后使用 --force。" "Registered users still exist; refusing to uninstall the stable command. Revoke/cleanup first, or use --force after accepting the risk.")"
     exit 1
@@ -2533,9 +2536,10 @@ uninstall_command() {
 }
 
 upgrade_command() {
-  need_root
   local url="$DEFAULT_UPGRADE_URL" force="false" assume_yes="false"
   local tmpdir tmpfile remote_ver installed_ver="none"
+  # Validate arguments before the privilege check (matches doctor/install), so a
+  # bad argument or an unsafe URL is reported regardless of who runs it.
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --url) require_value "$1" "${2-}"; url="$2"; shift 2 ;;
@@ -2544,6 +2548,11 @@ upgrade_command() {
       *) err "$(m "upgrade 不支持的参数：$1" "upgrade: unsupported argument: $1")"; usage; exit 1 ;;
     esac
   done
+  if ! valid_upgrade_url "$url"; then
+    err "$(m "升级地址不安全或不合法：$url" "Upgrade URL is unsafe or invalid: $url")"
+    exit 1
+  fi
+  need_root
 
   if ! tmpdir=$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d -p /tmp); then
     err "$(m "创建升级临时目录失败。" "Failed to create upgrade temporary directory.")"
