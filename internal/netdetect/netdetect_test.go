@@ -7,23 +7,24 @@ import (
 	"time"
 )
 
-func TestPublicIPReturnsValidHostAndSkipsInvalid(t *testing.T) {
-	// First service returns a private IP (rejected by validate.Host? private is a
-	// valid *host* syntactically) -> use a clearly-invalid one to force skip.
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("not a host!!\n"))
+func TestPublicIPReturnsPublicAndSkipsPrivate(t *testing.T) {
+	// A service echoing a private IP must be skipped (it is not a public IP), even
+	// though it is a syntactically valid host; detection falls through to the next
+	// service, which reports a routable public address.
+	priv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("10.0.0.5\n"))
 	}))
-	defer bad.Close()
+	defer priv.Close()
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("203.0.113.7\n"))
+		w.Write([]byte("8.8.8.8\n"))
 	}))
 	defer good.Close()
 
 	d := New()
-	d.ExternalServices = []string{bad.URL, good.URL}
+	d.ExternalServices = []string{priv.URL, good.URL}
 	ip, ok := d.PublicIP(2 * time.Second)
-	if !ok || ip != "203.0.113.7" {
-		t.Fatalf("PublicIP = %q, %v; want 203.0.113.7,true", ip, ok)
+	if !ok || ip != "8.8.8.8" {
+		t.Fatalf("PublicIP = %q, %v; want 8.8.8.8,true", ip, ok)
 	}
 }
 

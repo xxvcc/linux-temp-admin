@@ -77,7 +77,13 @@ func (m *Manager) Grant(user string) error {
 	}
 	if m.Verify != nil {
 		if err := m.Verify(user); err != nil {
-			_ = os.Remove(path)
+			// The drop-in is already live (WriteRootFile succeeded), so the grant is
+			// real — back it out. If removal also fails, surface that loudly rather
+			// than swallowing it, because the caller must know a NOPASSWD grant may
+			// still be on disk and needs manual cleanup.
+			if rmErr := os.Remove(path); rmErr != nil {
+				return fmt.Errorf("sudo policy did not take effect (%w) and rollback failed: %v; NOPASSWD drop-in may persist at %s", err, rmErr, path)
+			}
 			return fmt.Errorf("sudo policy did not take effect: %w", err)
 		}
 	}

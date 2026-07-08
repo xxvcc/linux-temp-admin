@@ -57,13 +57,17 @@ func (m *Manager) Install(srcBytes []byte, force bool) error {
 			return fmt.Errorf("%s is a symlink; refusing", m.InstallPath)
 		}
 		if fi.Mode().IsRegular() {
-			if cur, err := os.ReadFile(m.InstallPath); err == nil {
-				if string(cur) == string(srcBytes) {
-					return nil
+			cur, rerr := os.ReadFile(m.InstallPath)
+			if rerr == nil && string(cur) == string(srcBytes) {
+				return nil // already installed and byte-identical
+			}
+			if !force {
+				// Fail closed: never replace an existing binary without --force, even
+				// if it could not be read back for the identical-bytes comparison.
+				if rerr != nil {
+					return fmt.Errorf("%s exists but could not be read (%v); use --force to replace", m.InstallPath, rerr)
 				}
-				if !force {
-					return fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
-				}
+				return fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
 			}
 		}
 	}

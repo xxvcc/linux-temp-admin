@@ -60,7 +60,7 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"tmp500", false, true},          // managed system uid but unregistered
 		{"tmp500", true, false},          // managed + registered system uid -> deletable
 		{"human", false, true},           // real uid, unregistered human
-		{"human", true, false},           // real uid, registered -> deletable
+		{"human", true, true},            // real uid, registered but NOT managed -> protected (stale entry / name reuse)
 		{"tmp1000", false, false},        // managed real uid -> deletable even unregistered
 	}
 	for _, c := range cases {

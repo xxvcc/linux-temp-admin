@@ -83,14 +83,17 @@ func (d *Detector) LocalPublicIP(perReq time.Duration) (string, bool) {
 	return "", false
 }
 
-// PublicIP queries external echo services, returning the first valid host.
-// perReq bounds each request.
+// PublicIP queries external echo services, returning the first routable public
+// IPv4 they report. perReq bounds each request. It applies the same PublicIPv4
+// filter as the metadata path, so a service that echoes a private/reserved/
+// loopback address (or a bare hostname) is rejected rather than fed into the
+// invite as a bogus "public IP".
 func (d *Detector) PublicIP(perReq time.Duration) (string, bool) {
 	for _, svc := range d.ExternalServices {
 		ctx, cancel := context.WithTimeout(context.Background(), perReq)
 		ip, err := d.fetch(ctx, svc)
 		cancel()
-		if err == nil && validate.Host(ip) {
+		if err == nil && validate.PublicIPv4(ip) {
 			return ip, true
 		}
 	}
