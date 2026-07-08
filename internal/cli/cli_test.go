@@ -44,10 +44,10 @@ func TestExtractLang(t *testing.T) {
 		{[]string{"invite", "--host", "x"}, "", []string{"invite", "--host", "x"}, false},
 		{[]string{"--lang", "zh", "status"}, "zh", []string{"status"}, false},
 		{[]string{"status", "--lang=en"}, "en", []string{"status"}, false},
-		{[]string{"--lang="}, "", nil, true},       // empty value must error
+		{[]string{"--lang="}, "", nil, true},           // empty value must error
 		{[]string{"--lang", "fr", "x"}, "", nil, true}, // invalid value
-		{[]string{"--lang"}, "", nil, true},        // missing value
-		{[]string{"--lang", "--yes"}, "", nil, true}, // value looks like a flag
+		{[]string{"--lang"}, "", nil, true},            // missing value
+		{[]string{"--lang", "--yes"}, "", nil, true},   // value looks like a flag
 	}
 	for _, c := range cases {
 		lang, rest, err := extractLang(c.args)

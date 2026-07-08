@@ -3,17 +3,27 @@
 v2 ships signed static binaries. `upgrade` verifies an **ed25519 signature**
 against a public key embedded in the binary, failing closed on any mismatch.
 
-## One-time: create the signing key
+## Signing key
+
+The release signing key is **already configured**: the public key is committed in
+[`internal/selfmanage/release_pubkey.hex`](../internal/selfmanage/release_pubkey.hex),
+and the private key is held offline by the maintainer (`~/.lta/signing.key`, mode
+`0600`). `upgrade` verifies each release against it. If no key were embedded,
+`upgrade` fails closed (signed upgrade disabled).
+
+**Back up the private key** in ≥2 offline places and treat it like a root
+credential: losing it means no future release will verify on existing installs
+(they carry the old public key), and a leak lets anyone sign malicious updates.
+
+To rotate, or set up on a fresh maintainer machine:
 
 ```sh
 go run ./cmd/lta-release keygen ~/.lta/signing.key   # prints the PUBLIC key hex
 ```
 
-- Keep `~/.lta/signing.key` **offline**; only the release step uses it.
-- Paste the printed public-key hex onto its own line in
-  [`internal/selfmanage/release_pubkey.hex`](../internal/selfmanage/release_pubkey.hex),
-  then commit that change. Until a valid key is embedded, `upgrade` refuses
-  (signed upgrade disabled) — this is intentional fail-closed behavior.
+Replace the hex line in `internal/selfmanage/release_pubkey.hex` with the printed
+public key and commit. (Rotation only takes effect on installs that upgrade to a
+build carrying the new key.)
 
 ## Cut a release
 

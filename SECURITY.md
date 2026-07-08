@@ -6,7 +6,8 @@
 
 | Version | Supported |
 | --- | --- |
-| 1.2.x | Yes |
+| 2.x (Go) | Yes |
+| 1.2.x (bash) | Yes |
 | 1.1.x | Critical fixes only |
 | < 1.1 | No |
 
@@ -48,3 +49,4 @@ Out of scope:
 - Revoke access immediately after use; do not rely only on expiry.
 - Grant `--sudo` only to users you trust with full root access.
 - Keep `/usr/local/sbin/linux-temp-admin` root-owned and not group/world writable.
+- v2: `upgrade` verifies an ed25519 signature against the embedded release key before installing (fails closed); the `install.sh` bootstrap verifies the published SHA-256 checksum over HTTPS. Report any way to bypass either check.

@@ -159,8 +159,12 @@ the shipping version until v2.0 is cut.
 - **Scope creep**: parity is substantial; resist adding features during the port.
 - **arch matrix**: amd64 + arm64 to start; add others on demand.
 
-## Next step
+## Status
 
-With decisions locked, start **P0 (scaffold + CI)** and **P1 (leaf packages with
-ported tests)**, so the geometry — "compiles, tests green, behavior matches bash"
-— is visible early, then proceed phase by phase.
+**Complete.** P0–P6 are all landed on the `go-rewrite` branch: full feature
+parity with v1.2.3, native ed25519 keygen, signed self-upgrade (fail-closed),
+static amd64/arm64 builds, `-race`-clean portable + root integration tests,
+`gofmt`/`vet` clean, and three line-by-line audit rounds. The release signing key
+is configured (`internal/selfmanage/release_pubkey.hex`) and v2.0.0 artifacts are
+built and signature-verified. Remaining: merge to `main` and publish the GitHub
+Release. See [releasing.md](releasing.md) for the release procedure.
