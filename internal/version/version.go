@@ -6,6 +6,7 @@ package version
 import (
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 var re = regexp.MustCompile(`^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$`)
@@ -55,6 +56,60 @@ func Greater(newer, older string) bool {
 	if n.suffix != "" && o.suffix == "" {
 		return false
 	}
-	// Both final or both prereleases: lexicographic (matches bash [[ > ]]).
-	return n.suffix > o.suffix
+	// Both final or both prereleases: compare naturally so embedded numbers order
+	// numerically (rc10 > rc9), not byte-lexicographically (which ranked "rc9" above
+	// "rc10" and would let a signed older prerelease pass the not-newer upgrade gate).
+	return naturalCompare(n.suffix, o.suffix) > 0
 }
+
+// naturalCompare orders two strings so that runs of digits compare by numeric value
+// (with leading zeros ignored) and everything else compares byte-wise. It returns
+// -1, 0, or 1. This gives "-rc2" < "-rc10" while keeping a stable total order.
+func naturalCompare(a, b string) int {
+	ia, ib := 0, 0
+	for ia < len(a) && ib < len(b) {
+		if isDigit(a[ia]) && isDigit(b[ib]) {
+			ja, jb := ia, ib
+			for ja < len(a) && isDigit(a[ja]) {
+				ja++
+			}
+			for jb < len(b) && isDigit(b[jb]) {
+				jb++
+			}
+			na := strings.TrimLeft(a[ia:ja], "0")
+			nb := strings.TrimLeft(b[ib:jb], "0")
+			if len(na) != len(nb) { // more significant digits => larger number
+				if len(na) < len(nb) {
+					return -1
+				}
+				return 1
+			}
+			if na != nb { // equal length: lexical order equals numeric order
+				if na < nb {
+					return -1
+				}
+				return 1
+			}
+			ia, ib = ja, jb
+			continue
+		}
+		if a[ia] != b[ib] {
+			if a[ia] < b[ib] {
+				return -1
+			}
+			return 1
+		}
+		ia++
+		ib++
+	}
+	switch { // the shorter remaining string sorts first
+	case ia < len(a):
+		return 1
+	case ib < len(b):
+		return -1
+	default:
+		return 0
+	}
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }

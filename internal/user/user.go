@@ -59,10 +59,24 @@ func Lookup(name string) (Passwd, bool) {
 func Exists(name string) bool { _, ok := Lookup(name); return ok }
 
 // IsManaged reports whether name's GECOS carries the exact managed tag this tool
-// sets — not a bare substring, so a self-set partial GECOS cannot pose as managed.
+// sets — an exact match on the GECOS full-name subfield, not a bare substring, so
+// a self-set partial GECOS cannot pose as managed.
 func IsManaged(name string) bool {
 	pw, ok := Lookup(name)
-	return ok && strings.Contains(pw.GECOS, config.ManagedGECOS)
+	return ok && hasManagedGECOS(pw.GECOS)
+}
+
+// hasManagedGECOS reports whether a GECOS value is exactly the managed tag. It
+// compares the first comma-separated subfield (the "full name"), because some
+// account tools (and chfn) pad GECOS with trailing commas for the empty
+// office/phone subfields; a plain substring match would let any GECOS that merely
+// contains the tag pose as managed.
+func hasManagedGECOS(gecos string) bool {
+	name := gecos
+	if i := strings.IndexByte(gecos, ','); i >= 0 {
+		name = gecos[:i]
+	}
+	return name == config.ManagedGECOS
 }
 
 // protectedNames are never deletable regardless of registration.
@@ -76,8 +90,10 @@ var protectedNames = map[string]bool{
 // IsProtectedRevokeTarget reports whether deleting name must be refused. registered
 // says whether the tool's registry lists it. A UID-0 or blocklisted account is
 // always protected; a system-range UID (<1000) is protected unless it is a
-// registered, managed temp account; a real UID>=1000 account that is neither
-// registered nor managed is protected (almost certainly a human/service account).
+// registered, managed temp account; a real UID>=1000 account is protected unless it
+// carries the managed GECOS marker — so a real account that merely reuses the name of
+// a since-deleted temp account is never touched, even if a stale registry entry still
+// names it.
 func IsProtectedRevokeTarget(name string, registered bool) bool {
 	if protectedNames[name] || strings.HasPrefix(name, "systemd-") {
 		return true
@@ -90,11 +106,16 @@ func IsProtectedRevokeTarget(name string, registered bool) bool {
 	if pw.UID == 0 {
 		return true
 	}
-	managed := strings.Contains(pw.GECOS, config.ManagedGECOS)
+	managed := hasManagedGECOS(pw.GECOS)
 	if pw.UID < 1000 {
 		return !(registered && managed)
 	}
-	return !registered && !managed
+	// A registry entry is name-keyed and can outlive the account it named (stale
+	// entries are pruned only by an explicit `cleanup-expired --compact`), so a reused
+	// username could inherit a stale entry that wrongly vouches for a real account. The
+	// managed GECOS marker, by contrast, is per-account and reuse-proof, so it — not
+	// `registered` — is what makes a real-UID account safe to delete.
+	return !managed
 }
 
 // Runner executes account-management commands; injectable for tests.

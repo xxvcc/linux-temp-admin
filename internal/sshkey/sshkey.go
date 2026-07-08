@@ -64,8 +64,13 @@ func WriteAuthorizedKeys(homeDir string, uid, gid int, authorizedKey []byte) err
 		return fmt.Errorf("home directory %s is not a safe directory", homeDir)
 	}
 	// The home must belong to the account (or root); refuse to write into a dir
-	// owned by anyone else, so a hijacked home can't redirect the key write.
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Uid != uint32(uid) && st.Uid != 0 {
+	// owned by anyone else, so a hijacked home can't redirect the key write. Fail
+	// closed if ownership can't be determined (mirrors fsutil's stat handling).
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine owner of home directory %s", homeDir)
+	}
+	if st.Uid != uint32(uid) && st.Uid != 0 {
 		return fmt.Errorf("home directory %s is not owned by the account or root", homeDir)
 	}
 	sshDir := filepath.Join(homeDir, ".ssh")

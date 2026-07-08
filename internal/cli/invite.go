@@ -259,6 +259,11 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			sudoGranted = true
 			cleanups = append(cleanups, func() { a.Sudoers.Remove(username) })
 		} else {
+			// Grant may have written a live drop-in before its verification step
+			// failed; remove it unconditionally so a failed grant can never leave an
+			// unregistered NOPASSWD grant behind. Remove only ever touches the
+			// managed-prefixed file for this user, so it is safe to call blindly.
+			a.Sudoers.Remove(username)
 			a.warnf("%s: %v", a.P.M("授予 sudo 失败，创建为普通账号", "sudo grant failed; created as a normal account"), err)
 		}
 	}

@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## v2.0.1 - Security & correctness audit fixes
+
+Follow-up hardening from a multi-pass security audit of the v2 rewrite. No new
+features and no command/flag changes; existing behavior is unchanged except for the
+`revoke` protection fix noted below.
+
+- **revoke: never delete a real account via a stale registry entry.** A UID>=1000
+  account is now protected unless it carries the tool's managed GECOS marker — a
+  per-account, reuse-proof signal — instead of trusting a name-keyed registry entry
+  that can outlive a deleted temp account and be inherited by a later real user of
+  the same name. The managed check is now an exact GECOS-field match, not a
+  substring, matching its documented guarantee.
+- **invite: a failed sudo grant can no longer leave a NOPASSWD drop-in behind.** The
+  drop-in is removed on any grant/verification failure, and a removal failure is
+  reported rather than silently swallowed.
+- **upgrade: version comparison is numeric-aware for prereleases** (`rc10` > `rc9`),
+  closing an anti-rollback gap where a signed older prerelease could pass the
+  "not newer" gate and a genuine prerelease upgrade could be skipped.
+- **public-IP auto-detection rejects private/reserved addresses** on the external
+  echo path too (previously only the cloud-metadata path filtered them).
+- Fail-closed hardening: refuse the SSH-key write when the home directory's owner
+  cannot be determined; refuse to replace an installed binary that cannot be read
+  back unless `--force` is given.
+
 ## v2.0.0 - Go rewrite
 
 Full rewrite of the tool in Go, shipped as a single static binary. The bash tool

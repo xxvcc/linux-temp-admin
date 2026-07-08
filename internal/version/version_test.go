@@ -15,6 +15,11 @@ func TestGreater(t *testing.T) {
 		{"1.2.0-rc1", "1.2.0", false},     // prerelease is not greater than final
 		{"not-a-version", "1.2.0", false}, // unparseable => false
 		{"1.2.0", "nope", false},          // unparseable older => false
+		{"1.2.3-rc10", "1.2.3-rc9", true}, // numeric-aware suffix: rc10 > rc9
+		{"1.2.3-rc9", "1.2.3-rc10", false},
+		{"1.2.3-rc2", "1.2.3-rc2", false},   // identical prerelease is not greater
+		{"1.2.10", "1.2.9", true},           // numeric core, not lexical
+		{"1.0.0-beta", "1.0.0-alpha", true}, // non-numeric suffix still compares
 	}
 	for _, c := range cases {
 		if got := Greater(c.newer, c.older); got != c.want {
