@@ -96,6 +96,11 @@ func TestScheduleNoBackend(t *testing.T) {
 }
 
 func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
+	// Force the "not running under the firing service" branch deterministically.
+	// CI runners (and any systemd-managed shell) set INVOCATION_ID in the ambient
+	// environment, which would otherwise make Cancel keep the .service file and skip
+	// daemon-reload — see TestCancelUnderFiringServiceLeavesServiceFile.
+	t.Setenv("INVOCATION_ID", "")
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
@@ -126,6 +131,42 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing systemctl %q; calls=%v", want, sys.calls)
 		}
+	}
+}
+
+// TestCancelUnderFiringServiceLeavesServiceFile documents the INVOCATION_ID guard:
+// when Cancel runs inside the firing systemd service, it still disables the timer
+// and removes the .timer file, but leaves its own .service file and skips
+// daemon-reload so the currently-executing unit is not disturbed.
+func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
+	t.Setenv("INVOCATION_ID", "deadbeefcafe") // simulate running as the firing service
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	unit := s.UnitName("xxvcc-a1")
+	svc := filepath.Join(dir, unit+".service")
+	tmr := filepath.Join(dir, unit+".timer")
+	os.WriteFile(svc, []byte("x"), 0o644)
+	os.WriteFile(tmr, []byte("x"), 0o644)
+
+	s.Cancel("xxvcc-a1", "")
+
+	if _, err := os.Lstat(tmr); !os.IsNotExist(err) {
+		t.Error("timer file should still be removed under the firing service")
+	}
+	if _, err := os.Lstat(svc); err != nil {
+		t.Error("service file should be left in place under the firing service")
+	}
+	var seen []string
+	for _, c := range sys.calls {
+		seen = append(seen, c[0])
+	}
+	joined := strings.Join(seen, ",")
+	if !strings.Contains(joined, "disable") || !strings.Contains(joined, "reset-failed") {
+		t.Errorf("expected disable + reset-failed even under the firing service; calls=%v", sys.calls)
+	}
+	if strings.Contains(joined, "daemon-reload") {
+		t.Errorf("daemon-reload must be skipped under the firing service; calls=%v", sys.calls)
 	}
 }
 
