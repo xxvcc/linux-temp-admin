@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.0 - Full Chinese UI; v1 removed
+
+- **Chinese is now the default UI language.** Precedence is unchanged (`--lang` >
+  `LINUX_TEMP_ADMIN_LANG` > `LC_ALL`/`LANG` > fallback), but the fallback is now
+  Chinese instead of English. Most servers run with no `LANG` set, so the Chinese
+  UI of this Chinese-first project was almost never reached. An `en*` flag, env
+  var, or locale still selects English; a locale in some third language (say
+  `de_DE`) now gets Chinese where it previously got English.
+- **Interactive menu is now fully localized.** Menu entries 1–8 previously printed
+  bare English subcommand names in both languages, so `--lang zh` (or a `zh_*`
+  locale) produced a Chinese title and heading over an English menu body. Each
+  entry now carries a translated description, and label and dispatch live in one
+  table so a reordered entry can no longer run the wrong command.
+- **Host detection no longer interrogates before it looks.** `invite` without
+  `--host` used to ask "detect public IP? [y/N]" before doing anything, so the
+  common case cost an extra keystroke and defaulted to No. Cloud metadata and
+  local interfaces — neither of which leaves the host or its link — are now
+  probed silently, and what they find prefills the host prompt (Enter accepts,
+  or type over it). The external echo services (`api.ipify.org` and friends)
+  still require an explicit yes, because that step discloses the server to a
+  third party. `--yes` mode is unchanged: it never reaches out and still
+  requires `--host`.
+- Restored the `TerminateProcesses` uid guard test that was lost with the v1
+  unit-test suite: `kill` is now indirected so a test can prove a non-positive
+  uid signals nothing, without signalling every root process when the guard
+  regresses.
+- **v1 (bash) tool removed.** `temp-admin.sh`, its unit tests, and its ShellCheck
+  workflow are deleted, along with the `internal/legacy` detector and the leftover
+  v1 artifact warnings `doctor` used to print. The ShellCheck workflow now lints
+  `scripts/` instead. Both READMEs are rewritten to document the Go tool directly
+  rather than carrying the v1 manual below a deprecation banner.
+  - Upgrading from v1 is no longer assisted: drain v1 accounts with a v1 checkout
+    (git tag `v1.2.3`) before removing its registry at
+    `/var/lib/linux-temp-admin/users.tsv` and its
+    `linux-temp-admin-revoke-*` systemd units. This tool never touched them; it
+    only reported them.
+
 ## v2.1.0 - Operation audit log; v1 deprecation
 
 - **Operation audit log (new).** Every privileged mutating operation — account
