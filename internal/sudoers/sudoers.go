@@ -100,7 +100,7 @@ func (m *Manager) Remove(user string) {
 }
 
 // visudoValidate syntax-checks a sudoers file. If visudo is unavailable the
-// check is skipped (best-effort, matching the bash tool).
+// check is skipped (best-effort).
 func visudoValidate(path string) error {
 	if _, err := exec.LookPath("visudo"); err != nil {
 		return nil

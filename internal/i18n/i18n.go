@@ -1,7 +1,7 @@
 // Package i18n resolves the UI language and prints bilingual (zh/en) messages.
-// It mirrors the bash tool: language precedence is explicit flag > env var >
-// caller locale > English, and messages are supplied inline as (zh, en) pairs
-// (the bash `m "<zh>" "<en>"` idiom) rather than via a keyed catalog.
+// Language precedence is explicit flag > env var > caller locale > English, and
+// messages are supplied inline as (zh, en) pairs at the call site rather than
+// via a keyed catalog.
 package i18n
 
 import "strings"

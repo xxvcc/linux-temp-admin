@@ -1,6 +1,5 @@
 // Package fsutil provides atomic, symlink-safe file and directory writes for
-// privileged (root-owned) paths, replacing the bash tool's `install -d`/
-// `safe_write_root_file` logic. Ownership and mode are set on file descriptors
+// privileged (root-owned) paths. Ownership and mode are set on file descriptors
 // (fchown/fchmod), and the destination is never chown/chmod'd by name after the
 // final rename, so an attacker-planted symlink at the target is never followed.
 package fsutil

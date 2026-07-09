@@ -14,8 +14,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Output of `linux-temp-admin version` (v2) or `bash temp-admin.sh --version` (v1).
-      placeholder: "2.0.0"
+      description: Output of `linux-temp-admin version`.
+      placeholder: "2.1.0"
     validations:
       required: true
   - type: input

@@ -19,11 +19,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
 
-      - name: Bash syntax
-        run: bash -n temp-admin.sh tests/unit.sh
+      - name: Shell syntax
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/release.sh scripts/sign-release.sh
 
       - name: ShellCheck
-        run: shellcheck -S warning temp-admin.sh tests/unit.sh
-
-      - name: Unit tests
-        run: bash tests/unit.sh
+        run: shellcheck -S warning scripts/*.sh

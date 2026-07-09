@@ -1,10 +1,9 @@
 // Package registry stores the tool-managed temporary accounts. This file defines
-// the v2 on-disk record format (a tab-separated line per account) and its
+// the on-disk record format (a tab-separated line per account) and its
 // parsing/formatting; the locked file store (flock, atomic rewrite, symlink
-// guards) is added in a later phase.
+// guards) lives in store.go.
 //
-// v2 is a clean break from v1: a schema header marks the format, and the field
-// set drops v1's legacy "nopasswd" column.
+// The file opens with a schema header so a future format change is detectable.
 package registry
 
 import (

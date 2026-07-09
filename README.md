@@ -7,40 +7,13 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> 一条命令,给协作者开一个**有时限、用完自动删**的临时 SSH 管理员账号。脚本输出一份可私聊转发的邀请包;服务器只保存公钥,不保存私钥。
+> 一条命令，给协作者开一个**有时限、用完自动删**的临时 SSH 管理员账号。工具输出一份可私聊转发的邀请包；服务器只保存公钥，不保存私钥。
 
 **linux-temp-admin** 适合临时给可信的协作者、运维或自动化助手开一个 SSH 管理入口——不发 root 密码、不留长期账号、到期自动回收。
 
+它是一个**单静态二进制**：零运行时依赖，glibc/musl 通吃（含 Alpine/BusyBox），密钥生成、下载、日期计算、文件锁、进程清理全部原生实现，并支持 **ed25519 签名校验的自升级**。
+
 中文 | [English](README.en.md)
-
----
-
-## ⚙️ v2(Go 重写)
-
-同一工具已用 **Go 重写**为**单静态二进制**——零运行时依赖,glibc/musl 通吃(含 Alpine/BusyBox),把 `ssh-keygen`/`curl`/`wget`/`date`/`getent`/`install`/`flock`/`pkill` 全部原生化,并新增了 **ed25519 签名校验的自升级**(bash 版没有的)。子命令与行为对齐 v1.2.3。
-
-**安装(下载即校验 SHA-256):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
-```
-
-**用法**(与 v1 一致):
-
-```bash
-sudo linux-temp-admin invite --hours 12 --sudo     # 创建一次性临时管理员
-sudo linux-temp-admin revoke --user xxvcc-a1b2c3   # 撤销/删除
-sudo linux-temp-admin status                       # 查看状态
-sudo linux-temp-admin doctor                       # 系统诊断
-sudo linux-temp-admin upgrade                      # 验签后自升级
-linux-temp-admin --lang zh help                    # 中/英界面
-```
-
-- **升级**下载二进制 + 分离签名,用内嵌公钥 ed25519 **验签后**才安装(fail-closed)。发布/签名见 [docs/releasing.md](docs/releasing.md)。
-- v2 使用独立的注册表目录(`/var/lib/linux-temp-admin/v2/`),**不接管 v1 状态**;`doctor` 会检测并提示遗留的 v1 工件。已在 v1 机器上部署的账号,请先用 v1 的 `revoke` 排空。
-- **操作审计日志**:每次特权操作(创建/删除账号、install/upgrade/uninstall)以 JSON 行追加写入 root 属主的 `/var/log/linux-temp-admin/audit.log`,记录时间、操作者(sudo 调用者)、动作、目标与结果。
-
-> ⚠️ **v1(bash)已弃用、不再维护**——请使用上面的 v2。下方 v1 文档仅供仍在运行 v1 的用户参考;v1 启动时会打印弃用提示(可用 `LTA_SUPPRESS_DEPRECATION=1` 关闭)。两者仍可共存。
 
 ---
 
@@ -60,87 +33,95 @@ linux-temp-admin --lang zh help                    # 中/英界面
 ## 30 秒上手
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-sudo bash temp-admin.sh invite --sudo
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
+sudo linux-temp-admin invite --sudo
 ```
 
-就这样。脚本会:
+就这样。工具会：
 
-1. 随机生成一对 SSH 密钥,创建一个临时用户(如 `xxvcc-a1b2c3d4e5`);
-2. 在终端输出**一份邀请包**——私聊发给对方即可,对方照着里面两条命令就能登录,**不需要懂任何细节**;
+1. 随机生成一对 SSH 密钥，创建一个临时用户（如 `xxvcc-a1b2c3d4e5`）；
+2. 在终端输出**一份邀请包**——私聊发给对方即可，对方照着里面两条命令就能登录，**不需要懂任何细节**；
 3. 默认 **24 小时后自动删除**这个用户、家目录和密钥。
 
-> 不带子命令直接 `sudo bash temp-admin.sh` 会进入交互菜单。脚本中英双语合一,见下方[语言](#语言)。
+> 不带子命令直接 `sudo linux-temp-admin` 会进入交互菜单。界面中英双语，见下方[语言](#语言)。
 
 ## 语言
 
-脚本把中文和英文合在**一个文件**里。界面语言按以下顺序确定:`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 交互式语言选择(进入菜单**或运行任意操作类子命令**时,只要在终端里且没用上面两种方式锁定语言,都会先问一次) > 系统 locale 自动判断 > **默认英文**。
+界面语言按以下顺序确定：`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 系统 locale（`LC_ALL`，其次 `LANG`）> **默认英文**。
 
-> 用管道跑(`curl ... | sudo bash`)、在 CI 等非终端环境里、或带了 `--yes`/`-y` 非交互运行时,都不会弹出语言提示,直接按 locale/默认走;此时想用中文请加 `--lang zh` 或设环境变量。`help`/`version` 也不会问。
-
-中文环境(`zh_*` locale)会自动用中文;否则用 `--lang zh` 或设环境变量:
+中文环境（`zh_*` locale）会自动用中文；否则用 `--lang zh` 或设环境变量：
 
 ```bash
-sudo bash temp-admin.sh --lang zh invite --sudo
-# 或在当前 shell 里设一次:
+sudo linux-temp-admin --lang zh invite --sudo
+# 或在当前 shell 里设一次：
 export LINUX_TEMP_ADMIN_LANG=zh
 ```
 
 ## 安装、升级与诊断
 
-脚本可以直接用 `sudo bash temp-admin.sh ...` 运行；如果你希望系统里有稳定命令，先安装到 `/usr/local/sbin/linux-temp-admin`：
+推荐用安装脚本：它按架构（amd64 / arm64）下载最新发布的二进制，**校验 SHA-256** 后再装到 `/usr/local/sbin/linux-temp-admin`。
 
 ```bash
-sudo bash temp-admin.sh install
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
 linux-temp-admin doctor
 ```
+
+如果你手上已经有二进制，也可以让它把自己安装成稳定命令：`sudo ./linux-temp-admin install`。
 
 常用维护命令：
 
 ```bash
-sudo linux-temp-admin doctor            # 检查依赖、sudoers.d、systemd/at、登记表和稳定命令
-sudo linux-temp-admin upgrade           # 从 GitHub 下载 main 分支脚本并升级稳定命令
+sudo linux-temp-admin doctor            # 检查依赖、sudoers.d、包管理器、init 系统、SSH 端口
+sudo linux-temp-admin upgrade           # 从 GitHub 下载并验签后升级稳定命令
 sudo linux-temp-admin upgrade --yes     # 非交互确认
-sudo linux-temp-admin install --force   # 用当前本地脚本强制替换稳定命令
 sudo linux-temp-admin uninstall         # 卸载稳定命令
+
+sudo ./linux-temp-admin install --force # 用手头这个二进制强制覆盖已装的稳定命令
 ```
 
-`upgrade` 只接受 HTTPS 地址，下载上限为 1 MiB，下载后会解析版本并运行 `bash -n`，只有版本更新时才覆盖；如需修复或回退到自定义地址，可使用 `--force --url URL`。`uninstall` 默认会拒绝在仍有登记用户时删除稳定命令，避免影响到期自动撤销任务；确认风险后才使用 `--force`。
+`upgrade` 会下载二进制和分离签名，用**内嵌的 ed25519 公钥验签通过后**才安装（fail-closed，验签不过就中止）；只接受 HTTPS 地址（重定向也必须是 HTTPS），下载上限 64 MiB，且只有版本更新时才覆盖。需要修复或回退到自定义地址时用 `--force --url URL`。发布与签名流程见 [docs/releasing.md](docs/releasing.md)。
+
+`install` 复制的是**当前正在运行的那个二进制**。所以它只在你运行的是别处的副本时才有意义，比如 `sudo ./linux-temp-admin install`——路径前面的 `./` 是关键。如果你运行的就是已安装的 `/usr/local/sbin/linux-temp-admin`，它会拿自己覆盖自己，字节完全相同，属于空操作（加不加 `--force` 都一样）。
+
+当目标路径上已有一个**内容不同**的二进制时，`install` 会拒绝覆盖，必须显式 `--force`——避免一个被改过或降级的副本静默替换掉共享的 `/usr/local/sbin/linux-temp-admin`，影响其他在册用户的自动撤销任务。`uninstall` 同理，在仍有登记用户时默认拒绝卸载。
+
+日常更新请用 `upgrade`（会验签），而不是 `install --force`。
+
+**操作审计日志**：每次特权操作（创建/删除账号、install/upgrade/uninstall）以 JSON 行追加写入 root 属主的 `/var/log/linux-temp-admin/audit.log`，记录时间、操作者（`SUDO_USER`）、动作、目标与结果。
 
 ## 它解决什么问题
 
-临时给别人开 SSH 权限,最容易翻车的是:
+临时给别人开 SSH 权限，最容易翻车的是：
 
-- 直接把 root 密码给出去;
-- 临时账号开完忘了删,长期留着;
-- 公钥留在 `authorized_keys` 里没人清;
-- 不记得自己之前开过哪些临时号;
+- 直接把 root 密码给出去；
+- 临时账号开完忘了删，长期留着；
+- 公钥留在 `authorized_keys` 里没人清；
+- 不记得自己之前开过哪些临时号；
 - 用完没收回 sudo。
 
-这个脚本把整套流程标准化:**创建 → 输出邀请包 → 登记 → 查看 → 撤销 → 到期自动删**。
+这个工具把整套流程标准化：**创建 → 输出邀请包 → 登记 → 查看 → 撤销 → 到期自动删**。
 
-它**不会**:保存私钥;生成或输出任何账号/Sudo 密码;修改 SSH 服务配置;改防火墙;开放任何入站端口。
+它**不会**：保存私钥；生成或输出任何账号/Sudo 密码；修改 SSH 服务配置；改防火墙；开放任何入站端口。
 
 ## 完整流程
 
-### 1. 下载
+### 1. 安装
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-chmod +x temp-admin.sh
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
 ```
 
 ### 2. 创建邀请
 
 ```bash
-sudo bash temp-admin.sh invite --sudo
+sudo linux-temp-admin invite --sudo
 ```
 
-交互模式会先让你确认信息(用户名、Host、有效期、是否 sudo、是否到期自动删),确认后输出邀请包。
+交互模式会先让你确认信息（用户名、Host、有效期、是否 sudo、是否到期自动删），确认后输出邀请包。
 
 ### 3. 你会拿到这样一份邀请包（已脱敏）
 
-下面只是格式示例,**不能用于登录**。真实私钥只在脚本运行时随机生成、并在终端显示一次。
+下面只是格式示例，**不能用于登录**。真实私钥只在运行时随机生成、并在终端显示一次。
 
 ```text
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -148,12 +129,12 @@ sudo bash temp-admin.sh invite --sudo
 Host: 203.0.113.10
 Port: 22
 User: xxvcc-a1b2c3d4e5
-Expires: 2026-05-17 01:00:00 CST
+Expires: 2026-07-09 01:00:00 CST
 Sudo: yes
 Login: SSH key only
 Password login: locked
 Auto revoke: yes
-Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3d4e5
+Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
 
 SSH 登录命令:
 ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
@@ -166,97 +147,92 @@ cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 EOF_KEY
 chmod 600 './xxvcc-a1b2c3d4e5.key'
 
-Sudo 提示:
-已启用 NOPASSWD sudo。此账号只能通过 SSH key 登录；账号密码已锁定。
-注意：NOPASSWD sudo 等于完整 root 权限——该账号可提权为 root，并可能留下 root 拥有的进程、cron、systemd 单元或 SUID 文件等持久化。撤销只删除此账号本身，不会自动清理它以 root 身份创建的东西。
-
 撤销命令:
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 
-安全提醒:
-- 私钥只显示这一次，服务器不保存私钥。
-- 账号密码已锁定，不会输出账号/Sudo 密码。
-- 只通过可信私聊发送，不要发群里或公开页面。
-- 用完请立即执行撤销命令。
-- 服务器上只保存公钥，删除用户后这把私钥立即失效。
+Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥有的持久化；撤销只删除此账号本身。
+
+安全提醒: 私钥只显示这一次、服务器不保存；仅通过可信私聊发送；用完立即撤销。
 
 ----- END LINUX TEMP ADMIN INVITE -----
 ```
 
+> 邀请包里的字段名和命令块保持英文/固定格式，方便原样复制转发；中文只出现在说明行上。
+
 ### 4. 把这份邀请包私聊发给协作者
 
-对方拿到后只需两步,**无需安装任何东西、也不用懂这个工具**:
+对方拿到后只需两步，**无需安装任何东西、也不用懂这个工具**：
 
-- 复制「保存私钥命令」那一段,在自己电脑上粘贴运行 → 得到私钥文件;
+- 复制「保存私钥命令」那一段，在自己电脑上粘贴运行 → 得到私钥文件；
 - 复制「SSH 登录命令」运行 → 登录成功。
 
-> ⚠️ 邀请包含一次性私钥,**只通过可信私聊发送**,不要发群里、工单或公开页面。
+> ⚠️ 邀请包含一次性私钥，**只通过可信私聊发送**，不要发群里、工单或公开页面。
 
 ### 5. 用完撤销（或等它到期自动删）
 
 ```bash
-sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-默认 24 小时后会自动删除用户、家目录和密钥;但**用完立即手动撤销最稳妥**,别只依赖到期兜底。
+默认 24 小时后会自动删除用户、家目录和密钥；但**用完立即手动撤销最稳妥**，别只依赖到期兜底。
 
 ## 常用操作
 
-查看状态(登记的临时用户、过期时间、自动删除 timer):
+查看状态（登记的临时用户、过期时间、自动删除 timer）：
 
 ```bash
-sudo bash temp-admin.sh status
-sudo bash temp-admin.sh status --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin status
+sudo linux-temp-admin status --user xxvcc-a1b2c3d4e5
 ```
 
-撤销/删除(从列表选编号,或直接指定用户名):
+撤销/删除（从列表选编号，或直接指定用户名）：
 
 ```bash
-sudo bash temp-admin.sh revoke
-sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin revoke
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-查看账号过期与自动删除任务:
+查看账号过期与自动删除任务：
 
 ```bash
-sudo bash temp-admin.sh expiry-status
+sudo linux-temp-admin cleanup-expired
 # 加 --compact 顺带清理登记表里指向已不存在用户的失效条目（只改登记表，不动任何账号）
-sudo bash temp-admin.sh expiry-status --compact
+sudo linux-temp-admin cleanup-expired --compact
 ```
 
-> 撤销未登记/陌生账号有额外限制(防误删),见[安全说明](#安全说明)。
+> `cleanup-expired` **只查看**到期/自动删除状态，不会主动删除任何用户；删除请用 `revoke`。撤销未登记/陌生账号有额外限制（防误删），见[安全说明](#安全说明)。
 
 ## 常见用法
 
-指定有效期(小时):
+指定有效期（小时，1 到 8760）：
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --hours 12
+sudo linux-temp-admin invite --sudo --hours 12
 ```
 
-不授予 sudo(创建为普通账号):
+不授予 sudo（创建为普通账号）：
 
 ```bash
-sudo bash temp-admin.sh invite --no-sudo
+sudo linux-temp-admin invite --no-sudo
 ```
 
-指定用户名前缀 / Host / 端口(前缀仅允许小写字母、数字、下划线、连字符,最长 20 字符):
+指定用户名前缀 / Host / 端口（前缀仅允许小写字母、数字、下划线、连字符，最长 20 字符）：
 
 ```bash
-sudo bash temp-admin.sh invite --prefix ops --sudo
-sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
+sudo linux-temp-admin invite --prefix ops --sudo
+sudo linux-temp-admin invite --host 203.0.113.10 --port 22 --sudo
 ```
 
-只设账号过期、不创建自动删除任务:
+只设账号过期、不创建自动删除任务：
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --no-auto-revoke
+sudo linux-temp-admin invite --sudo --no-auto-revoke
 ```
 
-**自动化 / 非交互**(在 CI 或脚本里用)。非交互必须指定 `--host`;`--sudo --yes` 必须重复确认用户名;stdout 不是终端时还要显式允许输出私钥:
+**自动化 / 非交互**（在 CI 或脚本里用）。非交互必须指定 `--host`；`--sudo --yes` 必须重复确认用户名；stdout 不是终端时还要显式允许输出私钥：
 
 ```bash
-sudo bash temp-admin.sh invite \
+sudo linux-temp-admin invite \
   --user xxvcc-a1b2c3d4e5 \
   --host 203.0.113.10 --port 22 --hours 24 \
   --sudo --install-deps --yes \
@@ -268,67 +244,71 @@ sudo bash temp-admin.sh invite \
 
 ### 支持的系统
 
-- **主要支持**:Debian / Ubuntu、宝塔常见 Linux 环境、RHEL / Rocky / AlmaLinux / Fedora
-- **尽力支持**:Alpine、Arch Linux
+- **主要支持**：Debian / Ubuntu、宝塔常见 Linux 环境、RHEL / Rocky / AlmaLinux / Fedora
+- **尽力支持**：Alpine、Arch Linux
 
 ### 依赖
 
-脚本会自动检测;缺失时可交互安装(需输入 `YES` 或传 `--install-deps`),支持 `apt-get` / `dnf` / `yum` / `apk` / `pacman`。需要的工具:
+二进制本身零运行时依赖。它只调用系统自带的**账号管理工具**；这些工具缺失时可交互安装（需确认或传 `--install-deps`），支持 `apt-get` / `dnf` / `yum` / `apk` / `pacman`：
 
-- `bash`、`ssh-keygen`、`useradd` 或 `adduser`、`userdel` 或 `deluser`、`usermod`、`chage`、`flock`
-- 能计算未来日期的 `date`(GNU coreutils)或 `python3`
-- `at` / `atq` / `atrm`:仅在 systemd 自动撤销不可用时,作备用自动删除
-- `sudo`:仅在选择授予 sudo 时需要
+- `useradd` 或 `adduser`、`userdel` 或 `deluser`、`usermod`、`chage`
+- `sudo`：仅在选择授予 sudo 时需要
 
-### 关于“过期”和“自动删除”
+`doctor` 会逐项检查上面这些工具，外加包管理器、init 系统、`/etc/sudoers.d` 的安全性和探测到的 SSH 端口。
 
-默认有效期 24 小时。脚本会同时做两件事:
+`at` / `atd` 是 systemd 不可用时自动删除的备用后端。它**不在依赖检查里，也不会被自动安装**：两者都不可用时，自动删除会降级为只设账号过期，并在邀请包里提示需要手动撤销。
 
-1. 用 `chage -E` 设置账号过期日期(按天,主要用于阻止后续登录,**不会删用户**);
-2. 优先写持久 systemd `.service` + `.timer`(`OnCalendar` 绝对 UTC 时间 + `Persistent=true`),到点调用 `revoke` 删除用户、家目录、SSH key、sudoers 和登记记录;systemd 不可用或失败时尽量用 `at`(并尝试启用 `atd`);两者都不行才降级为只设账号过期,并在邀请包里提示需要手动撤销。
+### 关于"过期"和"自动删除"
 
-- 精确到小时的自动删除依赖 systemd timer 或备用 `at` 任务;`chage` 只是按天兜底。
-- 交互模式不传 `--host` 时,会先问是否自动探测公网 IP——先尝试本地网卡/云厂商 metadata,失败才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`,成败都有明确提示;`--yes` 模式不会静默外联,必须显式传 `--host`。排查可临时设 `LINUX_TEMP_ADMIN_DEBUG_IP=1`(诊断日志不会输出私钥)。
-- `--host` 只接受普通域名、IPv4 或 IPv6;不要带端口(用 `--port` 单独指定),邀请包中的 SSH 命令会自动为 IPv6 加方括号。
+默认有效期 24 小时。工具会同时做两件事：
+
+1. 用 `chage -E` 设置账号过期日期（按天，主要用于阻止后续登录，**不会删用户**）；
+2. 优先写持久 systemd `.service` + `.timer`（`OnCalendar` 绝对 UTC 时间 + `Persistent=true`，服务单元带 `NoNewPrivileges` 等轻量限制），到点调用 `revoke` 删除用户、家目录、SSH key、sudoers 和登记记录；systemd 不可用或失败时尽量用 `at`（并尝试启用 `atd`）；两者都不行才降级为只设账号过期，并在邀请包里提示需要手动撤销。
+
+- 精确到小时的自动删除依赖 systemd timer 或备用 `at` 任务；`chage` 只是按天兜底。
+- 自动删除任务的 `ExecStart` 调用的是**已安装的稳定命令**，所以选择自动删除时，工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在。
+- 交互模式不传 `--host` 时，会先问是否自动探测公网 IP——先尝试云厂商 metadata 和本地网卡，失败才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成败都有明确提示；`--yes` 模式不会静默外联，必须显式传 `--host`。
+- `--host` 只接受普通域名、IPv4 或 IPv6；不要带端口（用 `--port` 单独指定），邀请包中的 SSH 命令会自动为 IPv6 加方括号。
 
 ### 写入的文件
 
 ```text
-/usr/local/sbin/linux-temp-admin                              # 稳定撤销命令
-/var/lib/linux-temp-admin/users.tsv                           # 本地登记表
-/etc/systemd/system/linux-temp-admin-revoke-USER.service      # 含 NoNewPrivileges/PrivateTmp 轻量限制
-/etc/systemd/system/linux-temp-admin-revoke-USER.timer
-/etc/sudoers.d/linux-temp-admin-USER                          # 仅在启用免密 sudo 时
+/usr/local/sbin/linux-temp-admin                             # 稳定撤销命令
+/var/lib/linux-temp-admin/v2/registry.tsv                    # 本地登记表（root:root 0600，目录 0700）
+/var/log/linux-temp-admin/audit.log                          # 操作审计日志（root:root 0600，目录 0700）
+/etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # 含 NoNewPrivileges 等轻量限制
+/etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer
+/etc/sudoers.d/linux-temp-admin-USER                         # 仅在启用免密 sudo 时
 /home/USER/.ssh/authorized_keys
-# 以及在 systemd 不可用时,at 队列中的备用自动删除任务
+# 以及在 systemd 不可用时，at 队列中的备用自动删除任务
 ```
-
-为防止一个被改过或降级的副本静默覆盖共享的 `/usr/local/sbin/linux-temp-admin`(会影响其他在册用户的撤销任务),内部自动安装逻辑在发现已安装版本与当前脚本不同时会**复用现有命令而不覆盖**并打印提示;确需替换时,可使用 `install --force` / `upgrade --force`,或在自动撤销安装路径中设置 `LINUX_TEMP_ADMIN_REINSTALL=1`。
 
 ## 安全说明
 
-- 私钥只在创建时显示一次,服务器不保存;账号密码默认锁定,不输出任何账号/Sudo 密码。
-- **NOPASSWD sudo 基本等同 root**,只给可信对象;撤销只删除该账号本身,不会清理它以 root 身份留下的进程、cron、systemd 单元或 SUID 文件。
-- 删除用户会一并删除家目录和 SSH key;如果系统删除命令失败,脚本会停下并提示手动检查,不会假装撤销成功。
-- **防误删**:`revoke` 默认只删除脚本登记过的用户;删除未登记但**本工具创建**(家目录 GECOS 带 `linux-temp-admin` 标记)的账号需显式 `--force`,非交互还需 `--confirm-force USER`。
-- 即使使用 `--force`,也会拒绝删除 root、常见系统账号、UID 0、低 UID 系统账号,以及**任何非本工具创建(无标记)且未登记**的真实账号——这类账号请改用系统的 `userdel`。
-- 创建过程中出错会尽量回滚(取消自动撤销、删 sudoers/登记记录、删除刚创建的用户);中途 Ctrl-C 也会触发回滚。
-- 登记表、sudoers、systemd unit、撤销命令和用户 SSH key 文件会做符号链接/普通文件安全检查,拒绝覆盖不安全的目标。
-- 不要把真实邀请包提交到 GitHub、Notion、工单或群聊;用完请立即 `revoke`,不要只依赖到期兜底。
-- stdout 不是 TTY 时默认拒绝输出私钥,只有确认输出通道安全时才用 `--allow-non-tty-private-key-output`。
+- 私钥只在创建时显示一次，服务器不保存；账号密码默认锁定，不输出任何账号/Sudo 密码。
+- **NOPASSWD sudo 基本等同 root**，只给可信对象；撤销只删除该账号本身，不会清理它以 root 身份留下的进程、cron、systemd 单元或 SUID 文件。
+- 删除用户会一并删除家目录和 SSH key；如果系统删除命令失败，工具会停下并提示手动检查，不会假装撤销成功。
+- **防误删**：`revoke` 默认只删除本工具登记过的用户；删除未登记但**本工具创建**（GECOS 带 `linux-temp-admin` 标记）的账号需显式 `--force`，非交互还需 `--confirm-force USER`。
+- 即使使用 `--force`，也会拒绝删除 root、常见系统账号、UID 0、低 UID 系统账号，以及**任何非本工具创建（无标记）且未登记**的真实账号——这类账号请改用系统的 `userdel`。
+- 创建过程中出错会尽量回滚（取消自动撤销、删 sudoers/登记记录、删除刚创建的用户）。
+- 登记表、sudoers、systemd unit、撤销命令和用户 SSH key 文件会做符号链接/普通文件安全检查，拒绝覆盖不安全的目标。
+- 升级只接受 HTTPS 并强制 ed25519 验签，验签失败即中止，不会安装未签名或签名不符的二进制。
+- 不要把真实邀请包提交到 GitHub、Notion、工单或群聊；用完请立即 `revoke`，不要只依赖到期兜底。
+- stdout 不是 TTY 时默认拒绝输出私钥，只有确认输出通道安全时才用 `--allow-non-tty-private-key-output`。
 
 ## 开发与许可证
 
-贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md);安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
-本地校验:
+本地校验（需要 Go 1.25+）：
 
 ```bash
-bash -n temp-admin.sh tests/unit.sh
-shellcheck -S warning temp-admin.sh tests/unit.sh
-bash tests/unit.sh
+go build ./...
+go vet -printf.funcs=printf,errorf,warnf ./...
+test -z "$(gofmt -l .)"
+go test -race ./...
 ```
 
-仓库已包含 GitHub Actions 工作流,会在 push 和 pull request 时自动运行 Bash 语法检查、ShellCheck 与单元测试。
+仓库已包含 GitHub Actions 工作流，会在 push 和 pull request 时自动运行构建、vet、gofmt、测试，以及对 `scripts/` 的 ShellCheck。
 
-许可证:MIT,详见 [LICENSE](LICENSE)。
+许可证：MIT，详见 [LICENSE](LICENSE)。

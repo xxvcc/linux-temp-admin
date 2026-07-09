@@ -7,54 +7,13 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> One command to grant a collaborator a **time-limited, auto-deleting** temporary SSH admin account. The script prints an invite bundle you forward over private chat; the server stores only the public key, never the private key.
+> One command to grant a collaborator a **time-limited, auto-deleting** temporary SSH admin account. The tool prints an invite bundle you forward over private chat; the server stores only the public key, never the private key.
 
 **linux-temp-admin** is for temporarily giving a trusted collaborator, ops engineer, or automation agent an SSH admin entry point — without sharing the root password, without leaving long-lived accounts, and with automatic cleanup on expiry.
 
+It ships as a **single static binary**: zero runtime dependencies, glibc/musl alike (including Alpine/BusyBox). Key generation, downloads, date arithmetic, file locking, and process cleanup are all native, and it supports an **ed25519-signature-verified self-upgrade**.
+
 [中文](README.md) | English
-
----
-
-## ⚙️ v2 (Go rewrite)
-
-The same tool has been **rewritten in Go** as a **single static binary** — zero
-runtime dependencies, glibc/musl alike (including Alpine/BusyBox). It does
-`ssh-keygen`/`curl`/`wget`/`date`/`getent`/`install`/`flock`/`pkill` natively and
-adds an **ed25519-signature-verified self-upgrade** (which the bash tool lacked).
-Subcommands and behavior match v1.2.3.
-
-**Install (downloads and verifies the SHA-256):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
-```
-
-**Usage** (same as v1):
-
-```bash
-sudo linux-temp-admin invite --hours 12 --sudo     # create a one-time temp admin
-sudo linux-temp-admin revoke --user xxvcc-a1b2c3   # revoke / delete
-sudo linux-temp-admin status                       # show status
-sudo linux-temp-admin doctor                       # system diagnostics
-sudo linux-temp-admin upgrade                      # signature-verified self-upgrade
-linux-temp-admin --lang en help                    # zh/en UI
-```
-
-- **Upgrade** downloads the binary + a detached signature and installs only after
-  ed25519 verification against the embedded key (fail-closed). Release/signing:
-  see [docs/releasing.md](docs/releasing.md).
-- v2 uses a separate registry directory (`/var/lib/linux-temp-admin/v2/`) and does
-  **not** adopt v1 state; `doctor` detects and reports leftover v1 artifacts. On a
-  box already running v1, drain accounts with the v1 `revoke` first.
-- **Operation audit log**: every privileged action (account create/delete,
-  install/upgrade/uninstall) is appended as a JSON line to the root-owned
-  `/var/log/linux-temp-admin/audit.log`, recording the time, actor (the invoking
-  sudo user), action, target, and result.
-
-> ⚠️ **v1 (bash) is deprecated and no longer maintained** — use v2 above. The v1
-> documentation below remains for existing users; v1 now prints a deprecation
-> warning at startup (suppress with `LTA_SUPPRESS_DEPRECATION=1`). The two can
-> still coexist.
 
 ---
 
@@ -74,85 +33,95 @@ linux-temp-admin --lang en help                    # zh/en UI
 ## Quick start (30 seconds)
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-sudo bash temp-admin.sh invite --sudo
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
+sudo linux-temp-admin invite --sudo
 ```
 
-That's it. The script will:
+That's it. The tool will:
 
 1. Generate a fresh SSH key pair and create a temporary user (e.g. `xxvcc-a1b2c3d4e5`);
-2. Print an **invite bundle** in the terminal — forward it to your collaborator, who follows the two commands inside it to log in, **with no need to understand any of the details**;
-3. **Auto-delete** the user, home directory, and key after **24 hours** by default.
+2. Print **an invite bundle** — forward it over private chat, and the recipient logs in by running the two commands inside it, **without needing to understand any of this**;
+3. Delete that user, its home directory, and its key **automatically after 24 hours** by default.
 
-> Running `sudo bash temp-admin.sh` with no subcommand opens an interactive menu.
+> Running `sudo linux-temp-admin` with no subcommand opens an interactive menu. The UI is bilingual; see [Language](#language).
 
 ## Language
 
-The script ships English and Chinese in a single file. The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` env var > an interactive language prompt (shown once when you open the menu **or run any operational subcommand**, as long as you're on a terminal and haven't locked the language via the two options above) > the caller's locale > **English (default)**. To use Chinese:
+The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the system locale (`LC_ALL`, then `LANG`) > **English by default**.
 
-> Piped runs (`curl ... | sudo bash`), non-terminal environments such as CI, and non-interactive `--yes`/`-y` runs never show the prompt — they fall back to locale/default; pass `--lang zh` or set the env var to force Chinese there. `help`/`version` are never prompted.
+A Chinese locale (`zh_*`) selects Chinese automatically; otherwise pass `--lang zh` or set the environment variable:
 
 ```bash
-sudo bash temp-admin.sh --lang zh invite --sudo
-# or, once per shell:
+sudo linux-temp-admin --lang zh invite --sudo
+# or once per shell:
 export LINUX_TEMP_ADMIN_LANG=zh
 ```
 
 ## Install, upgrade, and doctor
 
-You can run the script directly with `sudo bash temp-admin.sh ...`. If you want a stable system command, install it to `/usr/local/sbin/linux-temp-admin`:
+The install script is the recommended path: it downloads the latest released binary for your architecture (amd64 / arm64), **verifies its SHA-256**, and installs it to `/usr/local/sbin/linux-temp-admin`.
 
 ```bash
-sudo bash temp-admin.sh install
-sudo linux-temp-admin doctor
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
+linux-temp-admin doctor
 ```
 
-Common maintenance commands:
+If you already have the binary, it can install itself as the stable command: `sudo ./linux-temp-admin install`.
+
+Everyday maintenance:
 
 ```bash
-sudo linux-temp-admin doctor            # check dependencies, sudoers.d, systemd/at, registry, and stable command
-sudo linux-temp-admin upgrade           # download the main-branch script from GitHub and upgrade the stable command
+sudo linux-temp-admin doctor            # check dependencies, sudoers.d, package manager, init system, SSH port
+sudo linux-temp-admin upgrade           # download, verify the signature, and upgrade the stable command
 sudo linux-temp-admin upgrade --yes     # non-interactive confirmation
-sudo linux-temp-admin install --force   # force-replace the stable command with the current local script
-sudo linux-temp-admin uninstall         # uninstall the stable command
+sudo linux-temp-admin uninstall         # remove the stable command
+
+sudo ./linux-temp-admin install --force # force-overwrite the installed command with the binary in hand
 ```
 
-`upgrade` accepts HTTPS URLs only, caps downloads at 1 MiB, parses the downloaded version, and runs `bash -n` before replacing anything; it only overwrites when the downloaded version is newer. Use `--force --url URL` for repair or an intentional rollback. `uninstall` refuses to remove the stable command while registered users still exist, because that could break expiry auto-revoke jobs; use `--force` only after accepting that risk.
+`upgrade` downloads the binary and a detached signature, and installs only **after the embedded ed25519 public key verifies it** (fail-closed: a bad signature aborts the upgrade). It accepts HTTPS only (redirects must stay HTTPS), caps the download at 64 MiB, and overwrites only when the downloaded version is newer. To repair or roll back to a custom location, use `--force --url URL`. For the release and signing flow, see [docs/releasing.md](docs/releasing.md).
+
+`install` copies **the binary that is currently running**. It is therefore only meaningful when you run a copy from somewhere else — `sudo ./linux-temp-admin install`, where the leading `./` is the point. If you run the already-installed `/usr/local/sbin/linux-temp-admin`, it copies itself over itself: the bytes are identical, so it is a no-op (with or without `--force`).
+
+When a binary with **different** contents already sits at the target path, `install` refuses to overwrite it unless you pass `--force` — this stops a modified or downgraded copy from silently replacing the shared `/usr/local/sbin/linux-temp-admin` and breaking other registered users' auto-revoke tasks. Likewise, `uninstall` refuses by default while registered users still exist.
+
+For routine updates use `upgrade` (which verifies the signature), not `install --force`.
+
+**Operation audit log**: every privileged action (account create/delete, install/upgrade/uninstall) is appended as a JSON line to the root-owned `/var/log/linux-temp-admin/audit.log`, recording the time, actor (`SUDO_USER`), action, target, and result.
 
 ## What it solves
 
-The usual ways temporary SSH access goes wrong:
+Granting someone temporary SSH access usually goes wrong in these ways:
 
-- Handing out the root password;
-- Leaving temporary accounts around long after they're needed;
-- Forgetting public keys left in `authorized_keys`;
-- Losing track of which temporary users you created;
-- Not revoking sudo after use.
+- handing out the root password;
+- creating a temporary account and forgetting to delete it;
+- leaving a public key in `authorized_keys` that nobody cleans up;
+- losing track of which temporary accounts you have opened;
+- never taking back sudo.
 
-This script standardizes the whole flow: **create → print invite bundle → register → inspect → revoke → auto-delete on expiry**.
+This tool standardizes the whole flow: **create → print invite bundle → register → inspect → revoke → auto-delete on expiry**.
 
-It will **not**: store the private key; generate or print any account/sudo password; modify SSH service config; touch the firewall; or open any inbound port.
+It does **not**: store the private key; generate or print any account/sudo password; modify the SSH server configuration; touch the firewall; or open any inbound port.
 
 ## Full walkthrough
 
-### 1. Download
+### 1. Install
 
 ```bash
-wget https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh
-chmod +x temp-admin.sh
+curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
 ```
 
 ### 2. Create an invite
 
 ```bash
-sudo bash temp-admin.sh invite --sudo
+sudo linux-temp-admin invite --sudo
 ```
 
-In interactive mode it confirms the details (username, host, validity, sudo, auto-delete) and then prints the invite bundle.
+Interactive mode asks you to confirm the details (username, host, lifetime, sudo, auto-delete) before printing the bundle.
 
 ### 3. You get an invite bundle like this (redacted)
 
-This is only a format example and **cannot be used to log in**. Real private keys are generated at runtime and shown once in the terminal.
+The following is a format sample only and **cannot be used to log in**. The real private key is generated at run time and shown once, in your terminal.
 
 ```text
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
@@ -160,12 +129,12 @@ This is only a format example and **cannot be used to log in**. Real private key
 Host: 203.0.113.10
 Port: 22
 User: xxvcc-a1b2c3d4e5
-Expires: 2026-05-17 01:00:00 CST
+Expires: 2026-07-09 01:00:00 CST
 Sudo: yes
 Login: SSH key only
 Password login: locked
 Auto revoke: yes
-Auto revoke unit: linux-temp-admin-revoke-xxvcc-a1b2c3d4e5
+Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
 
 SSH login command:
 ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
@@ -173,102 +142,97 @@ ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
 Save private key command:
 cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
-[REDACTED: one-time private key generated at runtime]
+[REDACTED: one-time private key generated at run time]
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 './xxvcc-a1b2c3d4e5.key'
 
-Sudo note:
-NOPASSWD sudo is enabled. This account can log in only with the SSH key; account password is locked.
-Note: NOPASSWD sudo is equivalent to full root — this account can escalate to root and may leave behind root-owned processes, cron jobs, systemd units, or SUID files. Revoking only deletes this account itself; it does not clean up anything it created as root.
-
 Revoke command:
 sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 
-Security notes:
-- The private key is shown only once and is not stored on the server.
-- Account password is locked; no account/sudo password is printed.
-- Send only via trusted private chat; never post in groups or public pages.
-- Run the revoke command immediately after use.
-- The server stores only the public key; deleting the user invalidates this key immediately.
+Sudo note: NOPASSWD sudo is enabled (equivalent to full root); it may leave root-owned persistence. Revoking only deletes this account itself.
+
+Security notes: the private key is shown only once and not stored on the server; send only via trusted private chat; revoke immediately after use.
 
 ----- END LINUX TEMP ADMIN INVITE -----
 ```
 
+> The bundle's field names and command blocks stay in English and keep a fixed format so it can be forwarded verbatim; only the caption lines are localized.
+
 ### 4. Forward the bundle to your collaborator over private chat
 
-They only need two steps, **with nothing to install and no knowledge of this tool**:
+They only need two steps, **without installing anything or understanding this tool**:
 
-- Copy the "Save private key command" block and run it on their machine → they get the key file;
-- Copy the "SSH login command" and run it → logged in.
+- copy the "Save private key command" block, paste and run it locally → they get the key file;
+- copy the "SSH login command" and run it → they are in.
 
-> ⚠️ The bundle contains a one-time private key. **Send it only over trusted private chat** — never in group chats, tickets, or public pages.
+> ⚠️ The bundle contains a one-time private key. **Send it only over trusted private chat** — never in a group, a ticket, or a public page.
 
 ### 5. Revoke when done (or let it auto-delete on expiry)
 
 ```bash
-sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-It auto-deletes the user, home directory, and key after 24 hours by default — but **revoking manually right after use is safest**; don't rely on expiry alone.
+The user, home directory, and key are deleted automatically after 24 hours by default, but **revoking manually as soon as you are done is safest** — do not rely on expiry alone.
 
 ## Everyday commands
 
-Show status (registered temp users, expiry, auto-delete timers):
+Show status (registered temporary users, expiry, auto-delete timer):
 
 ```bash
-sudo bash temp-admin.sh status
-sudo bash temp-admin.sh status --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin status
+sudo linux-temp-admin status --user xxvcc-a1b2c3d4e5
 ```
 
-Revoke/delete (pick from the list, or name the user directly):
+Revoke/delete (pick a number from the list, or name the user):
 
 ```bash
-sudo bash temp-admin.sh revoke
-sudo bash temp-admin.sh revoke --user xxvcc-a1b2c3d4e5
+sudo linux-temp-admin revoke
+sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-Inspect account expiry and auto-delete tasks:
+Inspect expiry and auto-delete tasks:
 
 ```bash
-sudo bash temp-admin.sh expiry-status
+sudo linux-temp-admin cleanup-expired
 # Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched)
-sudo bash temp-admin.sh expiry-status --compact
+sudo linux-temp-admin cleanup-expired --compact
 ```
 
-> Deleting unregistered/foreign accounts has extra guards (anti-mistake); see [Security notes](#security-notes).
+> `cleanup-expired` **only reports** expiry/auto-delete state; it never deletes a user. Use `revoke` for that. Revoking unregistered or unknown accounts has extra guards — see [Security notes](#security-notes).
 
 ## Common usage
 
-Set the validity (hours):
+Set the lifetime in hours (1 to 8760):
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --hours 12
+sudo linux-temp-admin invite --sudo --hours 12
 ```
 
-Without sudo (create a normal account):
+No sudo (create a plain account):
 
 ```bash
-sudo bash temp-admin.sh invite --no-sudo
+sudo linux-temp-admin invite --no-sudo
 ```
 
-Set the username prefix / host / port (prefix allows lowercase letters, digits, underscore, hyphen; max 20 chars):
+Set the username prefix / host / port (the prefix allows lowercase letters, digits, underscores, and hyphens, up to 20 characters):
 
 ```bash
-sudo bash temp-admin.sh invite --prefix ops --sudo
-sudo bash temp-admin.sh invite --host 203.0.113.10 --port 22 --sudo
+sudo linux-temp-admin invite --prefix ops --sudo
+sudo linux-temp-admin invite --host 203.0.113.10 --port 22 --sudo
 ```
 
-Set account expiry only, without creating an auto-delete task:
+Set account expiry only, without an auto-delete task:
 
 ```bash
-sudo bash temp-admin.sh invite --sudo --no-auto-revoke
+sudo linux-temp-admin invite --sudo --no-auto-revoke
 ```
 
-**Automation / non-interactive** (in CI or scripts). Non-interactive mode requires `--host`; `--sudo --yes` requires repeating the username for confirmation; when stdout is not a terminal you must also explicitly allow printing the private key:
+**Automation / non-interactive** (CI or scripts). Non-interactive runs must pass `--host`; `--sudo --yes` must re-confirm the username; and when stdout is not a terminal you must explicitly allow printing the private key:
 
 ```bash
-sudo bash temp-admin.sh invite \
+sudo linux-temp-admin invite \
   --user xxvcc-a1b2c3d4e5 \
   --host 203.0.113.10 --port 22 --hours 24 \
   --sudo --install-deps --yes \
@@ -280,67 +244,71 @@ sudo bash temp-admin.sh invite \
 
 ### Supported systems
 
-- **Primary**: Debian / Ubuntu, common BT-panel Linux environments, RHEL / Rocky / AlmaLinux / Fedora
+- **Primary**: Debian / Ubuntu, common aaPanel Linux environments, RHEL / Rocky / AlmaLinux / Fedora
 - **Best effort**: Alpine, Arch Linux
 
 ### Dependencies
 
-The script detects them automatically; if missing, it can install them interactively (type `YES` or pass `--install-deps`) via `apt-get` / `dnf` / `yum` / `apk` / `pacman`. Tools used:
+The binary itself has no runtime dependencies. It only calls the system's **account-management tools**; when those are missing it can install them interactively (confirm, or pass `--install-deps`) via `apt-get` / `dnf` / `yum` / `apk` / `pacman`:
 
-- `bash`, `ssh-keygen`, `useradd` or `adduser`, `userdel` or `deluser`, `usermod`, `chage`, `flock`
-- a `date` that can compute a future date (GNU coreutils) or `python3`
-- `at` / `atq` / `atrm`: only as a fallback auto-delete when systemd is unavailable
-- `sudo`: only when granting sudo
+- `useradd` or `adduser`, `userdel` or `deluser`, `usermod`, `chage`
+- `sudo`: only needed when granting sudo
+
+`doctor` checks each of the tools above, plus the package manager, the init system, the safety of `/etc/sudoers.d`, and the detected SSH port.
+
+`at` / `atd` is the auto-delete fallback backend for hosts without systemd. It is **not part of the dependency check and is never auto-installed**: when neither backend is available, auto-delete degrades to account expiry alone and the invite bundle says to revoke manually.
 
 ### Expiry vs auto-delete
 
-Default validity is 24 hours. The script does two things at once:
+The default lifetime is 24 hours. The tool does two things at once:
 
-1. set the account expiry date with `chage -E` (date-granularity; mainly blocks future login, **does not delete the user**);
-2. write a persistent systemd `.service` + `.timer` first (`OnCalendar` as an absolute UTC time + `Persistent=true`) that calls `revoke` at the deadline to delete the user, home directory, SSH key, sudoers file, and registry entry; if systemd is unavailable or fails, try `at` (and attempt to enable `atd`); only if neither works does it fall back to account expiry only and show a manual-revoke warning in the bundle.
+1. sets the account expiry date with `chage -E` (day granularity, meant to block further logins — it **does not delete the user**);
+2. preferentially writes a persistent systemd `.service` + `.timer` (absolute UTC `OnCalendar` + `Persistent=true`, with `NoNewPrivileges` and similar light confinement on the service unit) that calls `revoke` at the deadline to delete the user, home directory, SSH key, sudoers drop-in, and registry entry. If systemd is unavailable or fails, it falls back to `at` (trying to enable `atd`). Only if neither works does it degrade to account expiry alone, and the invite bundle then says you must revoke manually.
 
-- Hour-precise deletion depends on the systemd timer or the `at` fallback; `chage` is only a date-granularity backstop.
-- In interactive mode without `--host`, the script first asks whether to auto-detect the public IP — trying local interfaces/cloud metadata first, then `https://api.ipify.org`, `https://ifconfig.me/ip`, `https://icanhazip.com`, reporting success or failure clearly. `--yes` mode never does this silently and requires an explicit `--host`. To troubleshoot, set `LINUX_TEMP_ADMIN_DEBUG_IP=1` (diagnostics never print the private key).
-- `--host` accepts only a plain domain, IPv4, or IPv6 address; do not include a port (use `--port`). The SSH command brackets IPv6 addresses automatically.
+- Hour-accurate auto-delete relies on a systemd timer or the `at` fallback; `chage` is only a day-granularity backstop.
+- The auto-delete task's `ExecStart` invokes the **installed stable command**, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first.
+- In interactive mode without `--host`, it first asks whether to auto-detect the public IP — trying cloud metadata and local interfaces first, and only then `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com` in turn, reporting success or failure either way. `--yes` mode never reaches out silently: it requires an explicit `--host`.
+- `--host` accepts a plain domain, IPv4, or IPv6 only; do not append a port (use `--port`). The SSH command in the bundle brackets IPv6 addresses automatically.
 
 ### Files written
 
 ```text
-/usr/local/sbin/linux-temp-admin                              # stable revoke command
-/var/lib/linux-temp-admin/users.tsv                           # local registry
-/etc/systemd/system/linux-temp-admin-revoke-USER.service      # with lightweight NoNewPrivileges/PrivateTmp hardening
-/etc/systemd/system/linux-temp-admin-revoke-USER.timer
-/etc/sudoers.d/linux-temp-admin-USER                          # only when passwordless sudo is enabled
+/usr/local/sbin/linux-temp-admin                             # stable revoke command
+/var/lib/linux-temp-admin/v2/registry.tsv                    # local registry (root:root 0600, dir 0700)
+/var/log/linux-temp-admin/audit.log                          # operation audit log (root:root 0600, dir 0700)
+/etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # with NoNewPrivileges and similar light confinement
+/etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer
+/etc/sudoers.d/linux-temp-admin-USER                         # only when NOPASSWD sudo is enabled
 /home/USER/.ssh/authorized_keys
 # plus a fallback auto-delete job in the at queue when systemd is unavailable
 ```
 
-To avoid a modified or downgraded copy silently overwriting the shared `/usr/local/sbin/linux-temp-admin` (which would redirect other registered users' revoke tasks), the internal auto-install path **reuses the existing command instead of overwriting it** when the installed version differs from the current script. To replace it intentionally, use `install --force` / `upgrade --force`, or set `LINUX_TEMP_ADMIN_REINSTALL=1` for the auto-revoke installation path.
-
 ## Security notes
 
-- The private key is shown only once and is not stored on the server; the account password is locked by default and no account/sudo password is printed.
-- **NOPASSWD sudo is effectively root** — grant it only to trusted parties; revoking deletes only the account itself, not any root-owned processes, cron jobs, systemd units, or SUID files it left behind.
-- Revoking deletes the home directory and SSH key; if the system delete command fails, the script stops and asks you to check manually instead of reporting a false success.
-- **Anti-mistake guard**: `revoke` only deletes users registered by the script; deleting an unregistered account **created by this tool** (its home GECOS carries the `linux-temp-admin` tag) requires `--force`, and non-interactive runs also require `--confirm-force USER`.
-- Even with `--force`, the script refuses to delete root, common system accounts, UID 0, low-UID system accounts, and any real account **not created by this tool (no tag) and not registered** — use the system's `userdel` for those.
-- If creation fails mid-way, the script tries to roll back (cancel auto-revoke, remove the sudoers/registry entries, delete the just-created user); Ctrl-C mid-invite also triggers rollback.
-- The registry, sudoers, systemd units, revoke command, and user SSH key files undergo symlink / regular-file safety checks and refuse to overwrite unsafe targets.
-- Never commit real invite bundles to GitHub, Notion, tickets, or group chats; revoke immediately after use rather than relying on expiry.
-- When stdout is not a TTY the script refuses to print the private key unless `--allow-non-tty-private-key-output` is passed.
+- The private key is shown once at creation and never stored on the server; the account password is locked by default, and no account/sudo password is ever printed.
+- **NOPASSWD sudo is essentially root.** Grant it only to trusted parties. Revoking deletes the account itself; it does not clean up processes, cron jobs, systemd units, or SUID files that account left behind as root.
+- Deleting a user also deletes the home directory and SSH key. If the system's delete command fails, the tool stops and tells you to check manually rather than pretending the revoke succeeded.
+- **Guard against accidental deletion**: `revoke` only deletes users this tool registered. Deleting an unregistered account that **this tool created** (its GECOS carries the `linux-temp-admin` marker) requires an explicit `--force`, plus `--confirm-force USER` when non-interactive.
+- Even with `--force`, it refuses to delete root, well-known system accounts, UID 0, low-UID system accounts, and **any real account that this tool did not create (no marker) and did not register** — use the system's `userdel` for those.
+- A failure partway through creation rolls back what it can (cancel auto-revoke, remove the sudoers drop-in and registry entry, delete the just-created user).
+- The registry, sudoers drop-in, systemd units, the stable command, and the user's SSH key files all go through symlink/regular-file safety checks, refusing to overwrite an unsafe target.
+- Upgrades are HTTPS-only and ed25519-signature-enforced; a verification failure aborts, so an unsigned or mis-signed binary is never installed.
+- Never commit a real invite bundle to GitHub, Notion, a ticket, or a group chat. Run `revoke` as soon as you are done — do not rely on expiry alone.
+- When stdout is not a TTY, printing the private key is refused by default; pass `--allow-non-tty-private-key-output` only when the output channel is known to be safe.
 
 ## Development & license
 
-Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately as described in [SECURITY.md](SECURITY.md). See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing, and report security issues privately per [SECURITY.md](SECURITY.md). Version history lives in [CHANGELOG.md](CHANGELOG.md).
 
-Local checks:
+Local checks (requires Go 1.25+):
 
 ```bash
-bash -n temp-admin.sh tests/unit.sh
-shellcheck -S warning temp-admin.sh tests/unit.sh
-bash tests/unit.sh
+go build ./...
+go vet -printf.funcs=printf,errorf,warnf ./...
+test -z "$(gofmt -l .)"
+go test -race ./...
 ```
 
-The repo includes a GitHub Actions workflow that runs Bash syntax checks, ShellCheck, and unit tests on push and pull request.
+The repo ships GitHub Actions workflows that run the build, vet, gofmt, and tests on every push and pull request, plus ShellCheck over `scripts/`.
 
 License: MIT, see [LICENSE](LICENSE).

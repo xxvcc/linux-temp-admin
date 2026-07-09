@@ -1,8 +1,7 @@
 // Package selfmanage installs, uninstalls, and upgrades the stable command. The
 // upgrade path downloads the new binary over HTTPS and verifies a detached
 // ed25519 signature against an embedded release public key before installing it
-// — failing closed on any verification error. This is the authenticated
-// self-upgrade the bash tool never had.
+// — failing closed on any verification error.
 package selfmanage
 
 import (

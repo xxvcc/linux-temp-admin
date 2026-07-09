@@ -4,15 +4,13 @@
 
 ## Testing
 
-Go (v2):
-
 - [ ] `go build ./... && go vet -printf.funcs=printf,errorf,warnf ./...`
 - [ ] `gofmt -l .` is empty
 - [ ] `go test -race ./...` (and `-tags integration` on a disposable host, if touched)
 
-Bash (v1.x), if changed:
+Release/install scripts, if changed:
 
-- [ ] `bash -n temp-admin.sh tests/unit.sh` · `shellcheck -S warning temp-admin.sh tests/unit.sh scripts/*.sh` · `bash tests/unit.sh`
+- [ ] `shellcheck -S warning scripts/*.sh`
 
 ## Safety Notes
 

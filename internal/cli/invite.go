@@ -276,8 +276,8 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	autoScheduled := false
 	if wantAuto {
 		// The auto-revoke task's ExecStart runs the installed stable command, so
-		// ensure a binary is present at InstallPath first (as the bash tool did),
-		// otherwise the timer would fire and fail on a non-installed run.
+		// ensure a binary is present at InstallPath first, otherwise the timer
+		// would fire and fail on a non-installed run.
 		if err := a.ensureStableInstalled(); err != nil {
 			a.warnf("%s: %v", a.P.M("无法安装稳定命令，自动删除改为仅设置到期", "cannot install the stable command; auto-delete falls back to account expiry only"), err)
 		} else if unit, err := a.Scheduler.Schedule(username, hours); err == nil {

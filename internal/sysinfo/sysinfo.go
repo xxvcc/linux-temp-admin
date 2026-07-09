@@ -1,7 +1,7 @@
 // Package sysinfo detects the host's package manager, init system, SSH port, and
-// which external tools the tool still depends on. The Go rewrite needs far fewer
-// external commands than the bash version (ssh-keygen, curl/wget, date, getent,
-// install, flock, pkill are all done natively), leaving only the account tools.
+// which external tools the tool still depends on. Key generation, downloads, date
+// arithmetic, passwd lookups, file installs, locking, and process signalling are
+// all native, leaving only the account-management tools as external commands.
 package sysinfo
 
 import (
@@ -58,7 +58,7 @@ type Dep struct {
 }
 
 // RequiredDeps returns the external account-management tools the tool needs.
-// needSudo adds sudo. Everything else the bash version required is now native.
+// needSudo adds sudo.
 func RequiredDeps(needSudo bool) []Dep {
 	deps := []Dep{
 		{Label: "useradd/adduser", Names: []string{"useradd", "adduser"}},

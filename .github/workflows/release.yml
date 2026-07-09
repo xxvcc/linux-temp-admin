@@ -24,7 +24,7 @@ jobs:
           go-version: '1.25'
           check-latest: true
 
-      - name: Derive version and gate (v2+ only; v1.x is the bash tool)
+      - name: Derive version and gate (v2+ tags only)
         id: v
         run: |
           set -Eeuo pipefail
@@ -35,7 +35,7 @@ jobs:
             echo "go_release=true" >> "$GITHUB_OUTPUT"
           else
             echo "go_release=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${GITHUB_REF_NAME} is not a v2+ tag; skipping the Go release build (v1.x is bash-only)."
+            echo "::notice::${GITHUB_REF_NAME} is not a v2+ tag; skipping the release build."
           fi
 
       - name: Build static binaries (amd64, arm64)

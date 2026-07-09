@@ -117,12 +117,12 @@ func TestUpgradeURL(t *testing.T) {
 		in   string
 		want bool
 	}{
-		{"https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/temp-admin.sh", true},
-		{"https://example.com/temp-admin.sh", true},
-		{"http://example.com/temp-admin.sh", false}, // https only
-		{"https://example.com/a b.sh", false},       // whitespace
-		{"https://example.com/a|b.sh", false},       // shell metacharacter
-		{"short", false},                            // below minimum length / not https
+		{"https://github.com/xxvcc/linux-temp-admin/releases/latest/download/linux-temp-admin-linux-amd64", true},
+		{"https://example.com/linux-temp-admin-linux-arm64", true},
+		{"http://example.com/linux-temp-admin-linux-arm64", false}, // https only
+		{"https://example.com/a b", false},                         // whitespace
+		{"https://example.com/a|b", false},                         // shell metacharacter
+		{"short", false},                                           // below minimum length / not https
 	}
 	for _, c := range cases {
 		if got := UpgradeURL(c.in); got != c.want {

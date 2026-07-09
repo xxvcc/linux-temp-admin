@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
-	"github.com/xxvcc/linux-temp-admin/internal/legacy"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -130,9 +129,6 @@ func (a *App) doctor(args []string) int {
 	} else {
 		a.warnf("%s (%v)", a.P.M("/etc/sudoers.d 不可用或不安全；NOPASSWD sudo 可能不可用。",
 			"/etc/sudoers.d unavailable or unsafe; NOPASSWD sudo may be unavailable."), err)
-	}
-	for _, f := range legacy.New().Findings() {
-		a.warnf("%s", f)
 	}
 	return rc
 }

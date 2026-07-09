@@ -2,8 +2,7 @@
 // mutating operation (account create/delete, sudo grant, install/uninstall/
 // upgrade) to a log file. Each entry is one JSON object per line and records
 // when, who (the invoking user under sudo, plus the effective uid), what, the
-// target, and the result — giving an operator-attributable trail the bash tool
-// never had.
+// target, and the result — giving an operator-attributable trail.
 //
 // The log lives in a root-owned 0700 directory and is written 0600 with
 // O_NOFOLLOW, so an unprivileged local user can neither read nor redirect it.

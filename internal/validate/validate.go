@@ -1,8 +1,7 @@
-// Package validate reproduces the bash tool's input validators (usernames,
-// prefixes, hosts, ports, hours, upgrade URLs, versions). Every value that later
-// reaches a shell/sudoers/systemd/at/awk context in the bash version is
-// constrained here first; the Go port keeps the same accept/reject behavior
-// (see validate_test.go, ported from tests/unit.sh) while avoiding shell quoting.
+// Package validate holds the input validators (usernames, prefixes, hosts,
+// ports, hours, upgrade URLs, versions). Every value that later reaches a
+// sudoers, systemd, at, or filesystem context is constrained here first, so an
+// untrusted value can never take on meaning in the context it lands in.
 package validate
 
 import (
