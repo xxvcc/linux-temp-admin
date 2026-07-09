@@ -43,7 +43,7 @@ That's it. The tool will:
 2. Print **an invite bundle** — forward it over private chat, and the recipient logs in by running the two commands inside it, **without needing to understand any of this**;
 3. Delete that user, its home directory, and its key **automatically after 24 hours** by default.
 
-> Running `sudo linux-temp-admin` with no subcommand opens an interactive menu. The UI is bilingual; see [Language](#language).
+> Running `sudo linux-temp-admin` with no subcommand opens an interactive menu. The menu is drawn on entry and whenever you press Enter, so each action's result stays on screen above the prompt instead of being scrolled away. The UI is bilingual; see [Language](#language).
 
 ## Language
 

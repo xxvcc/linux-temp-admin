@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.2 - The menu stops scrolling your results away
+
+- **The interactive menu no longer redraws after every action.** It is drawn on
+  entry, and again whenever you press Enter on an empty line. Previously each
+  action's output was immediately buried under eight lines of menu, so you had to
+  scroll back to read it — worst of all for `invite`, whose bundle carries the
+  one-time private key. Now the result is the last thing on screen, directly above
+  a one-line prompt (`请选择 [1-8]（回车显示菜单）` / `select [1-8] (Enter shows
+  the menu)`), and results are framed with blank lines that do not depend on the
+  terminal echoing your Enter, so piped and scripted runs read the same.
+- A blank line at the prompt now redraws the menu instead of reporting an invalid
+  choice.
+
 ## v2.2.1 - install tells the truth; the menu drops it
 
 - **`install` no longer claims a write it did not make.** Running `install` from

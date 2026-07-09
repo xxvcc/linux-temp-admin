@@ -156,28 +156,45 @@ var menuItems = []struct {
 	{"退出", "Exit", nil},
 }
 
+// menu drives the interactive loop. The menu is drawn on entry and only when
+// asked for again (a blank line), never automatically after an action: redrawing
+// eight lines on top of every result scrolled it out of view, and an invite
+// bundle -- which carries the one-time private key -- suffered worst.
 func (a *App) menu() int {
 	if !a.requireRoot() {
 		return 1
 	}
-	prompt := fmt.Sprintf(a.P.M("请选择 [1-%d]: ", "select [1-%d]: "), len(menuItems))
+	prompt := fmt.Sprintf(a.P.M("请选择 [1-%d]（回车显示菜单）: ", "select [1-%d] (Enter shows the menu): "), len(menuItems))
+	draw := true
 	for {
-		a.printf("\n%s", a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"))
-		for i, it := range menuItems {
-			a.printf("%2d) %s", i+1, a.P.M(it.zh, it.en))
+		if draw {
+			a.printf("\n%s", a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"))
+			for i, it := range menuItems {
+				a.printf("%2d) %s", i+1, a.P.M(it.zh, it.en))
+			}
+			draw = false
 		}
 		fmt.Fprint(a.Err, prompt)
 		choice, ok := a.readLine()
 		if !ok {
 			return 0 // EOF
 		}
+		if choice == "" { // a blank line asks for the menu back
+			draw = true
+			continue
+		}
 		n, err := strconv.Atoi(choice)
-		if err != nil || n < 1 || n > len(menuItems) { // includes a blank line
+		if err != nil || n < 1 || n > len(menuItems) {
 			a.warnf("%s", a.P.M("无效选择", "invalid choice"))
 			continue
 		}
 		if run := menuItems[n-1].run; run != nil {
+			// Frame the result with blank lines. The leading one does not rely on
+			// the terminal echoing the operator's Enter, so a piped or scripted run
+			// reads the same as an interactive one.
+			fmt.Fprintln(a.Out)
 			run(a)
+			fmt.Fprintln(a.Out)
 		} else {
 			return 0
 		}
