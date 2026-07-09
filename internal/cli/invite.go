@@ -94,6 +94,14 @@ func (a *App) invite(args []string) int {
 	grantSudo := triState(fSudo, fNoSudo)
 	autoRev := triState(fAuto, fNoAuto)
 
+	// Refuse a non-TTY stdout up front — before any prompt or host probe — so a
+	// piped run fails immediately rather than after the operator answers.
+	if !a.StdoutIsTTY() && !fAllowNonTTY {
+		a.errorf("%s", a.P.M("stdout 非 TTY，拒绝输出一次性私钥（可加 --allow-non-tty-private-key-output）",
+			"stdout is not a TTY; refusing to print the one-time private key (add --allow-non-tty-private-key-output)"))
+		return 1
+	}
+
 	host := *hostFlag
 	if host == "" {
 		if fYes {
@@ -113,14 +121,6 @@ func (a *App) invite(args []string) int {
 	}
 	if !validate.Port(port) {
 		a.errorf("%s", a.P.M(fmt.Sprintf("SSH 端口不合法：%d", port), fmt.Sprintf("invalid SSH port: %d", port)))
-		return 1
-	}
-
-	// Refuse a non-TTY stdout up front (before any interactive prompt), so a
-	// piped run fails immediately rather than after the operator answers.
-	if !a.StdoutIsTTY() && !fAllowNonTTY {
-		a.errorf("%s", a.P.M("stdout 非 TTY，拒绝输出一次性私钥（可加 --allow-non-tty-private-key-output）",
-			"stdout is not a TTY; refusing to print the one-time private key (add --allow-non-tty-private-key-output)"))
 		return 1
 	}
 
@@ -471,15 +471,36 @@ func resolveShell() string {
 	return "/bin/sh"
 }
 
+// detectOrPromptHost resolves the invite's Host. Local interfaces and cloud
+// metadata never leave this host or its link, so they are probed silently. The
+// external echo services would disclose this server's address to a third party,
+// so they stay behind an explicit yes: a root-run tool must not phone home
+// unasked. Either way the result is offered as a default the operator can
+// override, because a multi-homed box can present the wrong public IP and a
+// wrong Host silently produces an invite nobody can connect with.
 func (a *App) detectOrPromptHost() string {
-	if yesish(a.prompt(a.P.M("是否自动探测公网 IP？[y/N]: ", "Detect public IP automatically? [y/N]: "))) {
-		if ip, ok := a.Detector.LocalPublicIP(2 * time.Second); ok {
-			return ip
-		}
-		if ip, ok := a.Detector.PublicIP(5 * time.Second); ok {
-			return ip
-		}
-		a.warnf("%s", a.P.M("自动探测失败，请手动输入", "auto-detect failed; enter manually"))
+	if ip, ok := a.Detector.LocalPublicIP(2 * time.Second); ok {
+		return a.promptHost(ip)
 	}
-	return a.prompt(a.P.M("请输入服务器公网 IP/域名: ", "Enter server public IP/domain: "))
+	if yesish(a.prompt(a.P.M("本机未探测到公网 IP。是否向外部服务查询？[y/N]: ",
+		"No public IP found locally. Ask an external service? [y/N]: "))) {
+		if ip, ok := a.Detector.PublicIP(5 * time.Second); ok {
+			return a.promptHost(ip)
+		}
+		a.warnf("%s", a.P.M("外部查询失败，请手动输入", "external lookup failed; enter manually"))
+	}
+	return a.promptHost("")
+}
+
+// promptHost asks for the Host, offering detected (when non-empty) as the
+// default that a blank line accepts.
+func (a *App) promptHost(detected string) string {
+	if detected == "" {
+		return a.prompt(a.P.M("请输入服务器公网 IP/域名: ", "Enter server public IP/domain: "))
+	}
+	msg := fmt.Sprintf(a.P.M("服务器公网 IP/域名 [%s]: ", "Server public IP/domain [%s]: "), detected)
+	if h := a.prompt(msg); h != "" {
+		return h
+	}
+	return detected
 }

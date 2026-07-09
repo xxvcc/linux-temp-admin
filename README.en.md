@@ -267,7 +267,7 @@ The default lifetime is 24 hours. The tool does two things at once:
 
 - Hour-accurate auto-delete relies on a systemd timer or the `at` fallback; `chage` is only a day-granularity backstop.
 - The auto-delete task's `ExecStart` invokes the **installed stable command**, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first.
-- In interactive mode without `--host`, it first asks whether to auto-detect the public IP — trying cloud metadata and local interfaces first, and only then `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com` in turn, reporting success or failure either way. `--yes` mode never reaches out silently: it requires an explicit `--host`.
+- In interactive mode without `--host`, cloud metadata and local interfaces are probed **silently** (neither leaves this host or its link), and whatever they find becomes the default in the host prompt — press Enter to accept it, or type over it. Only when no public IP is found locally does it **ask** before querying `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`: that step discloses your server's address to a third party, so it needs an explicit yes. `--yes` mode never reaches out at all; it requires an explicit `--host`.
 - `--host` accepts a plain domain, IPv4, or IPv6 only; do not append a port (use `--port`). The SSH command in the bundle brackets IPv6 addresses automatically.
 
 ### Files written

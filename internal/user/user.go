@@ -174,6 +174,11 @@ func (m *Manager) Delete(name string) error {
 	return fmt.Errorf("no userdel/deluser available")
 }
 
+// kill is syscall.Kill, indirected so a test can observe which pids would be
+// signalled without signalling anything. A test that called the real syscall to
+// prove the uid guard holds would kill every root process if the guard broke.
+var kill = syscall.Kill
+
 // TerminateProcesses signals SIGTERM then, after a grace period, SIGKILL to every
 // process owned by uid. It no-ops for a non-positive uid (never root/all). Done
 // natively via /proc (no pkill dependency).
@@ -201,7 +206,7 @@ func signalUID(sig syscall.Signal, uid int) {
 			continue
 		}
 		if ruid == uid || euid == uid {
-			_ = syscall.Kill(pid, sig)
+			_ = kill(pid, sig)
 		}
 	}
 }

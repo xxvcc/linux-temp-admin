@@ -221,3 +221,22 @@ func TestUninstallRefusesOnRegistryReadError(t *testing.T) {
 		t.Errorf("uninstall with unreadable registry: rc=%d, want 1 (stderr: %s)", rc, errb.String())
 	}
 }
+
+// TestInviteNonTTYRefusesBeforeAnyPrompt pins the ordering: a piped run must be
+// rejected before invite asks anything or probes the network for a host, so an
+// operator never answers prompts only to be refused at the end.
+func TestInviteNonTTYRefusesBeforeAnyPrompt(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.StdoutIsTTY = func() bool { return false }
+	// No Detector and no stdin: if invite reaches host resolution it nil-derefs
+	// or blocks, which is exactly the regression this test catches.
+	if rc := a.invite(nil); rc != 1 {
+		t.Fatalf("invite on non-TTY stdout: rc=%d, want 1", rc)
+	}
+	if !strings.Contains(errb.String(), "not a TTY") {
+		t.Errorf("want the non-TTY refusal, got: %q", errb.String())
+	}
+	if strings.Contains(errb.String(), "public IP") || strings.Contains(errb.String(), "IP/domain") {
+		t.Errorf("invite prompted for a host before refusing: %q", errb.String())
+	}
+}

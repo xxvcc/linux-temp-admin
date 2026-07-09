@@ -267,7 +267,7 @@ sudo linux-temp-admin invite \
 
 - 精确到小时的自动删除依赖 systemd timer 或备用 `at` 任务；`chage` 只是按天兜底。
 - 自动删除任务的 `ExecStart` 调用的是**已安装的稳定命令**，所以选择自动删除时，工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在。
-- 交互模式不传 `--host` 时，会先问是否自动探测公网 IP——先尝试云厂商 metadata 和本地网卡，失败才依次访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`，成败都有明确提示；`--yes` 模式不会静默外联，必须显式传 `--host`。
+- 交互模式不传 `--host` 时，会**静默**探测云厂商 metadata 和本地网卡（这两者都不出本机/本链路），探到的地址作为默认值填进提示符，回车即接受、也可直接改写。只有在本机探不到公网 IP 时，才会**询问**是否访问 `https://api.ipify.org`、`https://ifconfig.me/ip`、`https://icanhazip.com`——这一步会把你的服务器地址暴露给第三方，所以必须显式同意。`--yes` 模式永远不会外联，必须显式传 `--host`。
 - `--host` 只接受普通域名、IPv4 或 IPv6；不要带端口（用 `--port` 单独指定），邀请包中的 SSH 命令会自动为 IPv6 加方括号。
 
 ### 写入的文件

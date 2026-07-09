@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
@@ -135,5 +136,25 @@ func TestDeleteFallsBackToUserdel(t *testing.T) {
 	}
 	if len(f.calls) != 2 || f.calls[0][0] != "deluser" || !reflect.DeepEqual(f.calls[1], []string{"userdel", "-r", "--", "u"}) {
 		t.Errorf("delete calls = %v", f.calls)
+	}
+}
+
+// TestTerminateProcessesNeverSignalsRootOrAll pins the guard that keeps a
+// mis-parsed or zero uid from signalling every root-owned process on the host.
+// kill is stubbed, so a regression fails the test instead of killing the runner.
+func TestTerminateProcessesNeverSignalsRootOrAll(t *testing.T) {
+	var signalled [][2]int
+	orig := kill
+	kill = func(pid int, sig syscall.Signal) error {
+		signalled = append(signalled, [2]int{pid, int(sig)})
+		return nil
+	}
+	t.Cleanup(func() { kill = orig })
+
+	for _, uid := range []int{0, -1, -1000} {
+		TerminateProcesses(uid)
+		if len(signalled) != 0 {
+			t.Fatalf("uid %d must signal nothing, signalled %v", uid, signalled)
+		}
 	}
 }
