@@ -459,7 +459,8 @@ func (a *App) ensureStableInstalled() error {
 	if err != nil {
 		return err
 	}
-	return a.Selfmanage.Install(bin, false)
+	_, err = a.Selfmanage.Install(bin, false)
+	return err
 }
 
 func resolveShell() string {

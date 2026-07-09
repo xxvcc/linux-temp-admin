@@ -136,6 +136,12 @@ func (a *App) doctor(args []string) int {
 // menuItems are the interactive menu entries in order. An entry's position is
 // both the digit shown and the action run, so a label can never drift away from
 // the command it launches. A nil run means "leave the menu".
+//
+// `install` is deliberately absent. Reaching this menu means a binary is already
+// running as root, so install either does nothing (it is the installed one, byte
+// for byte) or is a one-time bootstrap better done from the shell as
+// `sudo ./linux-temp-admin install`. Leaving it out makes `upgrade` the menu's
+// single, signature-verified update path.
 var menuItems = []struct {
 	zh, en string
 	run    func(*App) int
@@ -145,8 +151,7 @@ var menuItems = []struct {
 	{"查看用户状态", "Show user status", func(a *App) int { return a.status(nil) }},
 	{"查看账号过期/自动删除状态", "Show expiry/auto-delete status", func(a *App) int { return a.cleanupExpired(nil) }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
-	{"安装/更新当前程序为稳定命令", "Install/update current binary as stable command", func(a *App) int { return a.install(nil) }},
-	{"从 GitHub 升级稳定命令", "Upgrade stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
+	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
 	{"退出", "Exit", nil},
 }

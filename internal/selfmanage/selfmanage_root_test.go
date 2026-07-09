@@ -31,8 +31,12 @@ func rootDir(t *testing.T) string {
 func TestInstallIdempotentAndForce(t *testing.T) {
 	dir := rootDir(t)
 	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin")}
-	if err := m.Install([]byte("v1"), false); err != nil {
+	installed, err := m.Install([]byte("v1"), false)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !installed {
+		t.Error("first install must report that it wrote")
 	}
 	if fi, _ := os.Lstat(m.InstallPath); fi.Mode().Perm() != 0o755 {
 		t.Errorf("mode = %o, want 755", fi.Mode().Perm())
@@ -40,17 +44,29 @@ func TestInstallIdempotentAndForce(t *testing.T) {
 	if st := statT(t, m.InstallPath); st.Uid != 0 {
 		t.Errorf("owner uid = %d, want 0", st.Uid)
 	}
-	// identical -> no-op
-	if err := m.Install([]byte("v1"), false); err != nil {
+	// identical -> no-op, and it must say so rather than claim a write
+	before := statT(t, m.InstallPath)
+	installed, err = m.Install([]byte("v1"), false)
+	if err != nil {
 		t.Fatalf("identical install should be a no-op: %v", err)
 	}
+	if installed {
+		t.Error("identical install must report that it wrote nothing")
+	}
+	if after := statT(t, m.InstallPath); after.Ino != before.Ino {
+		t.Error("identical install replaced the file (inode changed)")
+	}
+	// identical + force -> still a no-op: the short-circuit precedes the force check
+	if installed, err := m.Install([]byte("v1"), true); err != nil || installed {
+		t.Errorf("identical install --force: installed=%v err=%v, want false,nil", installed, err)
+	}
 	// differs, no force -> refuse
-	if err := m.Install([]byte("v2"), false); err == nil {
+	if _, err := m.Install([]byte("v2"), false); err == nil {
 		t.Fatal("differing install without force should refuse")
 	}
 	// differs, force -> replace
-	if err := m.Install([]byte("v2"), true); err != nil {
-		t.Fatal(err)
+	if installed, err := m.Install([]byte("v2"), true); err != nil || !installed {
+		t.Fatalf("forced replace: installed=%v err=%v", installed, err)
 	}
 	if b, _ := os.ReadFile(m.InstallPath); string(b) != "v2" {
 		t.Errorf("content = %q, want v2", b)

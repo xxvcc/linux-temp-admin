@@ -30,9 +30,18 @@ func (a *App) install(args []string) int {
 		a.errorf("%v", err)
 		return 1
 	}
-	if err := a.Selfmanage.Install(bin, force); err != nil {
+	installed, err := a.Selfmanage.Install(bin, force)
+	if err != nil {
 		a.errorf("%v", err)
 		return 1
+	}
+	if !installed {
+		// The running binary already *is* the stable command. Saying "installed"
+		// here would claim a privileged write that never happened -- and would put
+		// a matching lie in the audit log.
+		a.info(a.P.M("已是稳定命令，无需安装："+a.InstallPath,
+			"already the stable command; nothing to install: "+a.InstallPath))
+		return 0
 	}
 	a.audit("install", "", "ok", a.InstallPath, nil)
 	a.success(a.P.M("已安装稳定命令："+a.InstallPath, "installed the stable command: "+a.InstallPath))

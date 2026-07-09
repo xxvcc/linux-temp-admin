@@ -58,29 +58,33 @@ func New(installPath string, maxBytes int64) *Manager {
 }
 
 // Install atomically writes srcBytes to InstallPath as a root-owned 0755 binary.
-// If the target exists, is byte-identical, install is a no-op; if it differs and
-// force is false, it refuses.
-func (m *Manager) Install(srcBytes []byte, force bool) error {
+// It reports whether it actually wrote: a byte-identical target is left alone and
+// returns (false, nil), mirroring Upgrade's ("", nil) for "nothing to do". If the
+// target differs and force is false, it refuses.
+func (m *Manager) Install(srcBytes []byte, force bool) (installed bool, err error) {
 	if fi, err := os.Lstat(m.InstallPath); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a symlink; refusing", m.InstallPath)
+			return false, fmt.Errorf("%s is a symlink; refusing", m.InstallPath)
 		}
 		if fi.Mode().IsRegular() {
 			cur, rerr := os.ReadFile(m.InstallPath)
 			if rerr == nil && string(cur) == string(srcBytes) {
-				return nil // already installed and byte-identical
+				return false, nil // already installed and byte-identical
 			}
 			if !force {
 				// Fail closed: never replace an existing binary without --force, even
 				// if it could not be read back for the identical-bytes comparison.
 				if rerr != nil {
-					return fmt.Errorf("%s exists but could not be read (%v); use --force to replace", m.InstallPath, rerr)
+					return false, fmt.Errorf("%s exists but could not be read (%v); use --force to replace", m.InstallPath, rerr)
 				}
-				return fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
+				return false, fmt.Errorf("%s already exists and differs; use --force to replace", m.InstallPath)
 			}
 		}
 	}
-	return fsutil.WriteRootFile(m.InstallPath, srcBytes, 0o755)
+	if err := fsutil.WriteRootFile(m.InstallPath, srcBytes, 0o755); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Uninstall removes the stable command. Unless force is set, the target must be a
@@ -125,7 +129,7 @@ func (m *Manager) Upgrade(binaryURL, sigURL, currentVersion string, force bool) 
 	if !force && !version.Greater(newVer, currentVersion) {
 		return "", nil // already up to date or newer
 	}
-	if err := m.Install(bin, true); err != nil {
+	if _, err := m.Install(bin, true); err != nil {
 		return "", err
 	}
 	return newVer, nil

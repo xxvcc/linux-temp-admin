@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.1 - install tells the truth; the menu drops it
+
+- **`install` no longer claims a write it did not make.** Running `install` from
+  the already-installed binary finds the target byte-identical and does nothing —
+  that short-circuit precedes the `--force` check — yet it printed "installed the
+  stable command" and appended a matching `install ok` line to the audit log. It
+  now reports "already the stable command; nothing to install" and audits nothing.
+  `Manager.Install` returns whether it wrote, mirroring `Upgrade`'s `("", nil)`.
+- **The interactive menu drops `install`.** Reaching the menu means a binary is
+  already running as root, so `install` there was either the no-op above or a
+  one-time bootstrap better done as `sudo ./linux-temp-admin install`. That made
+  it look like a duplicate of `upgrade`, which its old label ("Install/update the
+  current binary...") reinforced. `upgrade` is now the menu's single,
+  signature-verified update path; the prompt range follows the table, so entries
+  renumber and the menu is now `[1-8]`.
+
+  `install` remains a subcommand: it is the only way to place a binary you already
+  hold — an air-gapped host, or a self-built binary that carries no release
+  signature (`upgrade` is HTTPS-only and fails closed without one). And
+  `Manager.Install` stays what both `upgrade` and auto-revoke's
+  `ensureStableInstalled` are built on.
+
 ## v2.2.0 - Full Chinese UI; v1 removed
 
 - **Chinese is now the default UI language.** Precedence is unchanged (`--lang` >

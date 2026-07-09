@@ -81,7 +81,11 @@ sudo ./linux-temp-admin install --force # force-overwrite the installed command 
 
 `upgrade` downloads the binary and a detached signature, and installs only **after the embedded ed25519 public key verifies it** (fail-closed: a bad signature aborts the upgrade). It accepts HTTPS only (redirects must stay HTTPS), caps the download at 64 MiB, and overwrites only when the downloaded version is newer. To repair or roll back to a custom location, use `--force --url URL`. For the release and signing flow, see [docs/releasing.md](docs/releasing.md).
 
-`install` copies **the binary that is currently running**. It is therefore only meaningful when you run a copy from somewhere else — `sudo ./linux-temp-admin install`, where the leading `./` is the point. If you run the already-installed `/usr/local/sbin/linux-temp-admin`, it copies itself over itself: the bytes are identical, so it is a no-op (with or without `--force`).
+`install` and `upgrade` do different jobs. `install` **places** a binary you already have. `upgrade` **updates**: it fetches a new binary from GitHub and replaces the installed one after verifying its signature.
+
+`install` copies **the binary that is currently running**, so it is only meaningful when you run a copy from somewhere else — `sudo ./linux-temp-admin install`, where the leading `./` is the point. It neither reaches the network nor checks a signature, because it grants no new trust: you are already executing those bytes as root. That also makes it the only way to install on an air-gapped host, or to install a binary you built yourself (`upgrade` accepts HTTPS only and requires a release signature, which a self-built binary cannot have).
+
+If you run the already-installed `/usr/local/sbin/linux-temp-admin`, it finds the bytes identical, does nothing, and says so: "already the stable command; nothing to install" (with or without `--force`). That is also why the interactive menu has **no** `install` entry — seeing the menu means a binary is already running as root. The menu's only update path is the signature-verified upgrade.
 
 When a binary with **different** contents already sits at the target path, `install` refuses to overwrite it unless you pass `--force` — this stops a modified or downgraded copy from silently replacing the shared `/usr/local/sbin/linux-temp-admin` and breaking other registered users' auto-revoke tasks. Likewise, `uninstall` refuses by default while registered users still exist.
 

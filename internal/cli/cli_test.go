@@ -100,8 +100,8 @@ func TestDispatchRouting(t *testing.T) {
 }
 
 func TestMenuBlankIsInvalidAndEOFExits(t *testing.T) {
-	// blank line -> "invalid choice" and loop; then 9 exits.
-	a, _, errb := newTestApp(t, "\n9\n")
+	// blank line -> "invalid choice" and loop; then the last entry exits.
+	a, _, errb := newTestApp(t, "\n"+strconv.Itoa(len(menuItems))+"\n")
 	if rc := a.menu(); rc != 0 {
 		t.Fatalf("menu rc=%d", rc)
 	}
@@ -161,6 +161,17 @@ func TestMenuRendersEveryEntryInBothLanguages(t *testing.T) {
 			if want := tc.label(i); !strings.Contains(rendered, want) {
 				t.Errorf("%s menu missing entry %d (%q):\n%s", tc.lang, i+1, want, rendered)
 			}
+		}
+	}
+}
+
+// TestMenuOmitsInstall pins the reason install is not a menu entry: from the menu
+// the running binary is already root, so install is either a no-op or a one-time
+// bootstrap done from the shell. upgrade must be the menu's only update path.
+func TestMenuOmitsInstall(t *testing.T) {
+	for i, it := range menuItems {
+		if strings.Contains(strings.ToLower(it.en), "install") && !strings.Contains(strings.ToLower(it.en), "uninstall") {
+			t.Errorf("menuItems[%d] reintroduces install: %q", i, it.en)
 		}
 	}
 }
