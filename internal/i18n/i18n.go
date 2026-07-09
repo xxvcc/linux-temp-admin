@@ -1,5 +1,5 @@
 // Package i18n resolves the UI language and prints bilingual (zh/en) messages.
-// Language precedence is explicit flag > env var > caller locale > English, and
+// Language precedence is explicit flag > env var > caller locale > Chinese, and
 // messages are supplied inline as (zh, en) pairs at the call site rather than
 // via a keyed catalog.
 package i18n
@@ -28,14 +28,16 @@ func Parse(v string) (Lang, bool) {
 }
 
 // Resolve picks the language by precedence: flag, then env, then locale, then
-// English. Empty/invalid values are skipped.
+// Chinese. Empty/invalid values are skipped, so a server with no LANG set — the
+// common case — gets the project's primary language rather than the fallback.
+// An en* flag, env var, or locale still selects English.
 func Resolve(flag, env, locale string) Lang {
 	for _, v := range []string{flag, env, locale} {
 		if l, ok := Parse(v); ok {
 			return l
 		}
 	}
-	return EN
+	return ZH
 }
 
 // Printer selects the active language for bilingual messages.

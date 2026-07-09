@@ -38,9 +38,17 @@ func TestResolvePrecedence(t *testing.T) {
 	if got := Resolve("", "", "zh_CN.UTF-8"); got != ZH {
 		t.Errorf("locale should be used: got %q", got)
 	}
-	// default English when nothing valid
-	if got := Resolve("", "", "de_DE"); got != EN {
-		t.Errorf("default should be en: got %q", got)
+	// an English locale still selects English
+	if got := Resolve("", "", "en_US.UTF-8"); got != EN {
+		t.Errorf("en locale should select en: got %q", got)
+	}
+	// default Chinese when nothing valid: no locale at all (the common server
+	// case), and a locale in some third language.
+	if got := Resolve("", "", ""); got != ZH {
+		t.Errorf("default with no locale should be zh: got %q", got)
+	}
+	if got := Resolve("", "", "de_DE"); got != ZH {
+		t.Errorf("default should be zh: got %q", got)
 	}
 }
 

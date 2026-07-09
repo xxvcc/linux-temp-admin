@@ -47,14 +47,14 @@ That's it. The tool will:
 
 ## Language
 
-The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the system locale (`LC_ALL`, then `LANG`) > **English by default**.
+The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the system locale (`LC_ALL`, then `LANG`) > **Chinese by default** (this is a Chinese-first project).
 
-A Chinese locale (`zh_*`) selects Chinese automatically; otherwise pass `--lang zh` or set the environment variable:
+An English locale (`en_*`) selects English automatically. On a server with no `LANG` set, pass `--lang en` or set the environment variable:
 
 ```bash
-sudo linux-temp-admin --lang zh invite --sudo
+sudo linux-temp-admin --lang en invite --sudo
 # or once per shell:
-export LINUX_TEMP_ADMIN_LANG=zh
+export LINUX_TEMP_ADMIN_LANG=en
 ```
 
 ## Install, upgrade, and doctor

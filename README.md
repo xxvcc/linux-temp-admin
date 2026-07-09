@@ -47,14 +47,14 @@ sudo linux-temp-admin invite --sudo
 
 ## 语言
 
-界面语言按以下顺序确定：`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 系统 locale（`LC_ALL`，其次 `LANG`）> **默认英文**。
+界面语言按以下顺序确定：`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 系统 locale（`LC_ALL`，其次 `LANG`）> **默认中文**。
 
-中文环境（`zh_*` locale）会自动用中文；否则用 `--lang zh` 或设环境变量：
+英文环境（`en_*` locale）会自动用英文；否则用 `--lang en` 或设环境变量：
 
 ```bash
-sudo linux-temp-admin --lang zh invite --sudo
+sudo linux-temp-admin --lang en invite --sudo
 # 或在当前 shell 里设一次：
-export LINUX_TEMP_ADMIN_LANG=zh
+export LINUX_TEMP_ADMIN_LANG=en
 ```
 
 ## 安装、升级与诊断
