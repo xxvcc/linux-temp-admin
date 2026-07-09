@@ -3,6 +3,7 @@ package cli
 import (
 	"flag"
 	"fmt"
+	"strconv"
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/legacy"
@@ -136,39 +137,48 @@ func (a *App) doctor(args []string) int {
 	return rc
 }
 
+// menuItems are the interactive menu entries in order. An entry's position is
+// both the digit shown and the action run, so a label can never drift away from
+// the command it launches. A nil run means "leave the menu".
+var menuItems = []struct {
+	zh, en string
+	run    func(*App) int
+}{
+	{"创建一次性临时管理员邀请", "Create one-time temp admin invite", func(a *App) int { return a.invite(nil) }},
+	{"撤销/删除临时用户", "Revoke/delete temp user", func(a *App) int { return a.revoke(nil) }},
+	{"查看用户状态", "Show user status", func(a *App) int { return a.status(nil) }},
+	{"查看账号过期/自动删除状态", "Show expiry/auto-delete status", func(a *App) int { return a.cleanupExpired(nil) }},
+	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
+	{"安装/更新当前程序为稳定命令", "Install/update current binary as stable command", func(a *App) int { return a.install(nil) }},
+	{"从 GitHub 升级稳定命令", "Upgrade stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
+	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
+	{"退出", "Exit", nil},
+}
+
 func (a *App) menu() int {
 	if !a.requireRoot() {
 		return 1
 	}
+	prompt := fmt.Sprintf(a.P.M("请选择 [1-%d]: ", "select [1-%d]: "), len(menuItems))
 	for {
-		a.printf("\n%s\n 1) invite\n 2) revoke\n 3) status\n 4) cleanup-expired\n 5) doctor\n 6) install\n 7) upgrade\n 8) uninstall\n 9) %s",
-			a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"), a.P.M("退出", "exit"))
-		fmt.Fprint(a.Err, a.P.M("请选择 [1-9]: ", "select [1-9]: "))
+		a.printf("\n%s", a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"))
+		for i, it := range menuItems {
+			a.printf("%2d) %s", i+1, a.P.M(it.zh, it.en))
+		}
+		fmt.Fprint(a.Err, prompt)
 		choice, ok := a.readLine()
 		if !ok {
 			return 0 // EOF
 		}
-		switch choice {
-		case "1":
-			a.invite(nil)
-		case "2":
-			a.revoke(nil)
-		case "3":
-			a.status(nil)
-		case "4":
-			a.cleanupExpired(nil)
-		case "5":
-			a.doctor(nil)
-		case "6":
-			a.install(nil)
-		case "7":
-			a.upgrade(nil)
-		case "8":
-			a.uninstall(nil)
-		case "9":
-			return 0
-		default: // includes a blank line
+		n, err := strconv.Atoi(choice)
+		if err != nil || n < 1 || n > len(menuItems) { // includes a blank line
 			a.warnf("%s", a.P.M("无效选择", "invalid choice"))
+			continue
+		}
+		if run := menuItems[n-1].run; run != nil {
+			run(a)
+		} else {
+			return 0
 		}
 	}
 }

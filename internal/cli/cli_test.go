@@ -2,8 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +112,68 @@ func TestMenuBlankIsInvalidAndEOFExits(t *testing.T) {
 	a2, _, _ := newTestApp(t, "")
 	if rc := a2.menu(); rc != 0 {
 		t.Errorf("EOF menu rc=%d, want 0", rc)
+	}
+}
+
+// TestMenuItemsAreTranslated guards the regression this table was built to fix:
+// entries once carried the bare English subcommand name in both languages, so a
+// zh run printed an English menu body. Asserting zh != en catches that directly,
+// without depending on any particular wording.
+func TestMenuItemsAreTranslated(t *testing.T) {
+	for i, it := range menuItems {
+		if it.zh == "" || it.en == "" {
+			t.Errorf("menuItems[%d]: empty label (zh=%q en=%q)", i, it.zh, it.en)
+		}
+		if it.zh == it.en {
+			t.Errorf("menuItems[%d]: zh is untranslated (both %q)", i, it.zh)
+		}
+	}
+	// Only the last entry leaves the menu; every other one must dispatch.
+	for i, it := range menuItems[:len(menuItems)-1] {
+		if it.run == nil {
+			t.Errorf("menuItems[%d] (%q) has no action", i, it.en)
+		}
+	}
+	if last := menuItems[len(menuItems)-1]; last.run != nil {
+		t.Errorf("last entry %q should exit, not dispatch", last.en)
+	}
+}
+
+// TestMenuRendersEveryEntryInBothLanguages renders the menu in each language and
+// checks that every entry of the table appears, so a new entry cannot be added
+// without being localized.
+func TestMenuRendersEveryEntryInBothLanguages(t *testing.T) {
+	exit := strconv.Itoa(len(menuItems)) + "\n"
+	for _, tc := range []struct {
+		lang  i18n.Lang
+		label func(i int) string
+	}{
+		{i18n.ZH, func(i int) string { return menuItems[i].zh }},
+		{i18n.EN, func(i int) string { return menuItems[i].en }},
+	} {
+		a, out, _ := newTestApp(t, exit)
+		a.P = i18n.Printer{Lang: tc.lang}
+		if rc := a.menu(); rc != 0 {
+			t.Fatalf("%s menu rc=%d, want 0", tc.lang, rc)
+		}
+		rendered := out.String()
+		for i := range menuItems {
+			if want := tc.label(i); !strings.Contains(rendered, want) {
+				t.Errorf("%s menu missing entry %d (%q):\n%s", tc.lang, i+1, want, rendered)
+			}
+		}
+	}
+}
+
+// TestMenuChoiceOutOfRange covers the digits either side of the table.
+func TestMenuChoiceOutOfRange(t *testing.T) {
+	last := len(menuItems)
+	a, _, errb := newTestApp(t, fmt.Sprintf("0\n%d\n%d\n", last+1, last))
+	if rc := a.menu(); rc != 0 {
+		t.Fatalf("menu rc=%d", rc)
+	}
+	if n := strings.Count(errb.String(), "invalid choice"); n != 2 {
+		t.Errorf("want 2 invalid-choice warnings for 0 and %d, got %d: %q", last+1, n, errb.String())
 	}
 }
 
