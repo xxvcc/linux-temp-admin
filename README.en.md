@@ -59,7 +59,7 @@ export LINUX_TEMP_ADMIN_LANG=en
 
 ## Install, upgrade, and doctor
 
-The install script is the recommended path: it downloads the latest released binary for your architecture (amd64 / arm64), **verifies its SHA-256**, and installs it to `/usr/local/sbin/linux-temp-admin`.
+The install script is the recommended path: it downloads the latest released binary for your architecture (amd64 / arm64), **verifies its SHA-256 and a detached ed25519 signature against the release key embedded in the script**, and installs it to `/usr/local/sbin/linux-temp-admin` — failing closed on any mismatch (and, when openssl is unavailable, refusing to install unless `LTA_ALLOW_UNVERIFIED=1` is set).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh

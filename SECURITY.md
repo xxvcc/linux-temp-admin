@@ -47,4 +47,4 @@ Out of scope:
 - Revoke access immediately after use; do not rely only on expiry.
 - Grant `--sudo` only to users you trust with full root access.
 - Keep `/usr/local/sbin/linux-temp-admin` root-owned and not group/world writable.
-- v2: `upgrade` verifies an ed25519 signature against the embedded release key before installing (fails closed); the `install.sh` bootstrap verifies the published SHA-256 checksum over HTTPS. Report any way to bypass either check.
+- v2: `upgrade` verifies an ed25519 signature against the embedded release key before installing (fails closed); the `install.sh` bootstrap verifies both the published SHA-256 checksum and a detached ed25519 signature (against the release key embedded in the script) over HTTPS, failing closed unless `LTA_ALLOW_UNVERIFIED=1` is set when openssl is unavailable. Report any way to bypass either check.

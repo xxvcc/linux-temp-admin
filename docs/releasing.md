@@ -71,8 +71,11 @@ same binaries; it signs each and writes `SHA256SUMS` (covering the sigs too).
 
 ## Install / upgrade on a host
 
-- **Install** (bootstrap): downloads over HTTPS and verifies SHA-256 against the
-  published `SHA256SUMS` before installing.
+- **Install** (bootstrap): downloads over HTTPS and verifies both SHA-256 against
+  the published `SHA256SUMS` and a detached ed25519 signature against the release
+  key embedded in `install.sh`, before installing. It fails closed on any
+  mismatch; if openssl (>= 3.0) is unavailable it refuses to install unless
+  `LTA_ALLOW_UNVERIFIED=1` is set (checksum-only fallback).
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
@@ -91,7 +94,9 @@ same binaries; it signs each and writes `SHA256SUMS` (covering the sigs too).
 
 ## Trust model
 
-- **Bootstrap install**: TLS + SHA-256 checksum (both fetched over HTTPS).
+- **Bootstrap install**: TLS + SHA-256 checksum + a detached ed25519 signature
+  verified against the release key embedded in `install.sh` (fails closed; the
+  same offline key as `upgrade`). All fetched over HTTPS.
 - **Upgrades**: TLS + an ed25519 signature that only the offline private key can
   produce, verified in-process before anything is written.
 - **Release provenance**: binaries are built in CI (auditable workflow logs,

@@ -59,7 +59,7 @@ export LINUX_TEMP_ADMIN_LANG=en
 
 ## 安装、升级与诊断
 
-推荐用安装脚本：它按架构（amd64 / arm64）下载最新发布的二进制，**校验 SHA-256** 后再装到 `/usr/local/sbin/linux-temp-admin`。
+推荐用安装脚本：它按架构（amd64 / arm64）下载最新发布的二进制，**校验 SHA-256 并用脚本内嵌的发布公钥验证 ed25519 签名**后再装到 `/usr/local/sbin/linux-temp-admin`——验签失败即中止（openssl 不可用时默认拒装，除非设置 `LTA_ALLOW_UNVERIFIED=1`）。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
