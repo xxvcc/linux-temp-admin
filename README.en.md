@@ -20,9 +20,9 @@ It ships as a **single static binary**: zero runtime dependencies, glibc/musl al
 ## Contents
 
 - [Quick start (30 seconds)](#quick-start-30-seconds)
+- [What it solves](#what-it-solves)
 - [Language](#language)
 - [Install, upgrade, and doctor](#install-upgrade-and-doctor)
-- [What it solves](#what-it-solves)
 - [Full walkthrough](#full-walkthrough)
 - [Everyday commands](#everyday-commands)
 - [Common usage](#common-usage)
@@ -45,6 +45,20 @@ That's it. The tool will:
 
 > Running `sudo linux-temp-admin` with no subcommand opens an interactive menu. The menu is drawn on entry and whenever you press Enter, so each action's result stays on screen above the prompt instead of being scrolled away. The UI is bilingual; see [Language](#language).
 
+## What it solves
+
+Granting someone temporary SSH access usually goes wrong in these ways:
+
+- handing out the root password;
+- creating a temporary account and forgetting to delete it;
+- leaving a public key in `authorized_keys` that nobody cleans up;
+- losing track of which temporary accounts you have opened;
+- never taking back sudo.
+
+This tool standardizes the whole flow: **create → print invite bundle → register → inspect → revoke → auto-delete on expiry**.
+
+It does **not**: store the private key; generate or print any account/sudo password; modify the SSH server configuration; touch the firewall; or open any inbound port.
+
 ## Language
 
 The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the system locale (`LC_ALL`, then `LANG`) > **Chinese by default** (this is a Chinese-first project).
@@ -66,8 +80,6 @@ curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts
 linux-temp-admin doctor
 ```
 
-If you already have the binary, it can install itself as the stable command: `sudo ./linux-temp-admin install`.
-
 Everyday maintenance:
 
 ```bash
@@ -75,37 +87,11 @@ sudo linux-temp-admin doctor            # check dependencies, sudoers.d, package
 sudo linux-temp-admin upgrade           # download, verify the signature, and upgrade the stable command
 sudo linux-temp-admin upgrade --yes     # non-interactive confirmation
 sudo linux-temp-admin uninstall         # remove the stable command
-
-sudo ./linux-temp-admin install --force # force-overwrite the installed command with the binary in hand
+sudo ./linux-temp-admin install         # install the binary in hand as the stable command (note the leading ./)
 ```
 
-`upgrade` downloads the binary and a detached signature, and installs only **after the embedded ed25519 public key verifies it** (fail-closed: a bad signature aborts the upgrade). It accepts HTTPS only (redirects must stay HTTPS), caps the download at 64 MiB, and overwrites only when the downloaded version is newer. To repair or roll back to a custom location, use `--force --url URL`. For the release and signing flow, see [docs/releasing.md](docs/releasing.md).
-
-`install` and `upgrade` do different jobs. `install` **places** a binary you already have. `upgrade` **updates**: it fetches a new binary from GitHub and replaces the installed one after verifying its signature.
-
-`install` copies **the binary that is currently running**, so it is only meaningful when you run a copy from somewhere else — `sudo ./linux-temp-admin install`, where the leading `./` is the point. It neither reaches the network nor checks a signature, because it grants no new trust: you are already executing those bytes as root. That also makes it the only way to install on an air-gapped host, or to install a binary you built yourself (`upgrade` accepts HTTPS only and requires a release signature, which a self-built binary cannot have).
-
-If you run the already-installed `/usr/local/sbin/linux-temp-admin`, it finds the bytes identical, does nothing, and says so: "already the stable command; nothing to install" (with or without `--force`). That is also why the interactive menu has **no** `install` entry — seeing the menu means a binary is already running as root. The menu's only update path is the signature-verified upgrade.
-
-When a binary with **different** contents already sits at the target path, `install` refuses to overwrite it unless you pass `--force` — this stops a modified or downgraded copy from silently replacing the shared `/usr/local/sbin/linux-temp-admin` and breaking other registered users' auto-revoke tasks. Likewise, `uninstall` refuses by default while registered users still exist.
-
-For routine updates use `upgrade` (which verifies the signature), not `install --force`.
-
-**Operation audit log**: every privileged action (account create/delete, install/upgrade/uninstall) is appended as a JSON line to the root-owned `/var/log/linux-temp-admin/audit.log`, recording the time, actor (`SUDO_USER`), action, target, and result.
-
-## What it solves
-
-Granting someone temporary SSH access usually goes wrong in these ways:
-
-- handing out the root password;
-- creating a temporary account and forgetting to delete it;
-- leaving a public key in `authorized_keys` that nobody cleans up;
-- losing track of which temporary accounts you have opened;
-- never taking back sudo.
-
-This tool standardizes the whole flow: **create → print invite bundle → register → inspect → revoke → auto-delete on expiry**.
-
-It does **not**: store the private key; generate or print any account/sudo password; modify the SSH server configuration; touch the firewall; or open any inbound port.
+- **`upgrade`** fetches a new binary from GitHub and installs it only **after the embedded ed25519 public key verifies it** (fail-closed); HTTPS only, capped at 64 MiB, overwrites only when the version is newer. To repair or pin a custom source, use `--force --url URL` (its signature is `URL.sig`). **Use this for routine updates.**
+- **`install`** places a binary you **already have** (no network, no signature check) — for an air-gapped host or a self-built binary. It copies the binary that is *currently running*, so it is only meaningful when you run a copy from elsewhere (`sudo ./linux-temp-admin install`, where the leading `./` is the point). It refuses to overwrite a *different* binary without `--force`; `uninstall` refuses by default while registered users still exist.
 
 ## Full walkthrough
 
@@ -260,17 +246,14 @@ The binary itself has no runtime dependencies. It only calls the system's **acco
 
 `doctor` checks each of the tools above, plus the package manager, the init system, the safety of `/etc/sudoers.d`, and the detected SSH port.
 
-`at` / `atd` is the auto-delete fallback backend for hosts without systemd. It is **not part of the dependency check and is never auto-installed**: when neither backend is available, auto-delete degrades to account expiry alone and the invite bundle says to revoke manually.
+`at` / `atd` is the auto-delete fallback backend for hosts without systemd. It is **not part of the dependency check and is never auto-installed**.
 
 ### Expiry vs auto-delete
 
-The default lifetime is 24 hours. The tool does two things at once:
+The default lifetime is 24 hours. The tool both sets a day-granularity account expiry with `chage -E` (to block further logins — it **does not delete the user**) and writes an auto-delete task that actually removes the user at the deadline: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed stable command, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first.
 
-1. sets the account expiry date with `chage -E` (day granularity, meant to block further logins — it **does not delete the user**);
-2. preferentially writes a persistent systemd `.service` + `.timer` (absolute UTC `OnCalendar` + `Persistent=true`, with `NoNewPrivileges` and similar light confinement on the service unit) that calls `revoke` at the deadline to delete the user, home directory, SSH key, sudoers drop-in, and registry entry. If systemd is unavailable or fails, it falls back to `at` (trying to enable `atd`). Only if neither works does it degrade to account expiry alone, and the invite bundle then says you must revoke manually.
+Two host notes:
 
-- Hour-accurate auto-delete relies on a systemd timer or the `at` fallback; `chage` is only a day-granularity backstop.
-- The auto-delete task's `ExecStart` invokes the **installed stable command**, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first.
 - In interactive mode without `--host`, cloud metadata and local interfaces are probed **silently** (neither leaves this host or its link), and whatever they find becomes the default in the host prompt — press Enter to accept it, or type over it. Only when no public IP is found locally does it **ask** before querying `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`: that step discloses your server's address to a third party, so it needs an explicit yes. `--yes` mode never reaches out at all; it requires an explicit `--host`.
 - `--host` accepts a plain domain, IPv4, or IPv6 only; do not append a port (use `--port`). The SSH command in the bundle brackets IPv6 addresses automatically.
 
@@ -295,24 +278,13 @@ The default lifetime is 24 hours. The tool does two things at once:
 - **Guard against accidental deletion**: `revoke` only deletes users this tool registered. Deleting an unregistered account that **this tool created** (its GECOS carries the `linux-temp-admin` marker) requires an explicit `--force`, plus `--confirm-force USER` when non-interactive.
 - Even with `--force`, it refuses to delete root, well-known system accounts, UID 0, low-UID system accounts, and **any real account that this tool did not create (no marker) and did not register** — use the system's `userdel` for those.
 - A failure partway through creation rolls back what it can (cancel auto-revoke, remove the sudoers drop-in and registry entry, delete the just-created user).
-- The registry, sudoers drop-in, systemd units, the stable command, and the user's SSH key files all go through symlink/regular-file safety checks, refusing to overwrite an unsafe target.
 - Upgrades are HTTPS-only and ed25519-signature-enforced; a verification failure aborts, so an unsigned or mis-signed binary is never installed.
-- Never commit a real invite bundle to GitHub, Notion, a ticket, or a group chat. Run `revoke` as soon as you are done — do not rely on expiry alone.
+- Every privileged action (account create/delete, install/upgrade/uninstall) is appended as a JSON line to the root-owned `/var/log/linux-temp-admin/audit.log` (time, actor `SUDO_USER`, action, target, result).
 - When stdout is not a TTY, printing the private key is refused by default; pass `--allow-non-tty-private-key-output` only when the output channel is known to be safe.
 
 ## Development & license
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing, and report security issues privately per [SECURITY.md](SECURITY.md). Version history lives in [CHANGELOG.md](CHANGELOG.md).
-
-Local checks (requires Go 1.25+):
-
-```bash
-go build ./...
-go vet -printf.funcs=printf,errorf,warnf ./...
-test -z "$(gofmt -l .)"
-go test -race ./...
-```
-
-The repo ships GitHub Actions workflows that run the build, vet, gofmt, and tests on every push and pull request, plus ShellCheck over `scripts/`.
+- Contributing & local checks: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Report security issues privately per [SECURITY.md](SECURITY.md); version history in [CHANGELOG.md](CHANGELOG.md).
 
 License: MIT, see [LICENSE](LICENSE).

@@ -21,3 +21,6 @@ coverage.txt
 
 # Local tool config (not part of the repo; keep the ignore with the repo)
 .claude/
+
+# Developer/architecture notes kept local, intentionally not published
+/ARCHITECTURE.md
