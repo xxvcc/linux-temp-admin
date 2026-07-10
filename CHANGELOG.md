@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.4 - Signature-verified bootstrap install
+
+- **`install.sh` now verifies an ed25519 signature at first install.** The
+  bootstrap installer previously trusted the release with only a same-origin
+  SHA-256 checksum (trust-on-first-use). It now also verifies a detached ed25519
+  signature against the release public key embedded in the script — the same
+  offline key `upgrade` uses — failing closed on any mismatch, so a tampered or
+  maliciously re-published binary is rejected even if the release host is
+  compromised. When openssl (>= 3.0, for `pkeyutl -rawin`) is unavailable the
+  install fails closed unless `LTA_ALLOW_UNVERIFIED=1` opts into checksum-only
+  trust; the wget path probes for `--https-only` so BusyBox-only hosts still
+  install. The Go binary is unchanged from v2.2.3.
+- **Docs.** The security policy drops the removed v1 (bash) support line, and the
+  README is reorganized as a focused user manual.
+
 ## v2.2.3 - invite refuses names revoke would protect
 
 - **`invite` no longer creates an account the tool could never revoke.** A
