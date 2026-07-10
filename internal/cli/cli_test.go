@@ -237,12 +237,61 @@ func TestInviteGuardsReject(t *testing.T) {
 		{"port zero", []string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--port", "0", "--no-sudo", "--no-auto-revoke", "--yes"}},
 		{"sudo yes needs confirm", []string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--sudo", "--yes"}},
 		{"trailing arg", []string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--yes", "junk"}},
+		{"reserved user root", []string{"--user", "root", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+		{"reserved user systemd-", []string{"--user", "systemd-abc", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+		{"reserved prefix systemd", []string{"--prefix", "systemd", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
 	}
 	for _, c := range cases {
 		a, _, errb := newTestApp(t, "")
 		if rc := a.invite(c.args); rc != 1 {
 			t.Errorf("%s: rc=%d, want 1 (stderr: %s)", c.name, rc, errb.String())
 		}
+	}
+}
+
+// TestInviteRejectsReservedNames pins the fix for the create/revoke asymmetry: a
+// reserved name (explicit --user or generated from a reserved --prefix) must be
+// refused at creation with the reserved-namespace reason, before any mutation —
+// otherwise the tool could mint an account its own revoke path would never delete.
+// newTestApp leaves Users nil, so reaching creation would panic instead of pass.
+func TestInviteRejectsReservedNames(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"explicit root", []string{"--user", "root", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+		{"explicit systemd-", []string{"--user", "systemd-resolve", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+		{"generated from systemd prefix", []string{"--prefix", "systemd", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+		{"generated from systemd- subprefix", []string{"--prefix", "systemd-x", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"}},
+	}
+	for _, c := range cases {
+		a, _, errb := newTestApp(t, "")
+		if rc := a.invite(c.args); rc != 1 {
+			t.Errorf("%s: rc=%d, want 1", c.name, rc)
+		}
+		if !strings.Contains(errb.String(), "reserved") {
+			t.Errorf("%s: want a reserved-namespace refusal, got: %q", c.name, errb.String())
+		}
+	}
+}
+
+// TestInvitePrefixGuardSkippedWithExplicitUser pins the fix for a regression the
+// reserved-name guard introduced: the prefix guard must NOT fire when --user is
+// given, because the prefix is then unused for name generation. A legitimate
+// explicit username must clear both name guards and be rejected only by a later
+// guard (here an invalid host) — never by the reserved-namespace message.
+func TestInvitePrefixGuardSkippedWithExplicitUser(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	rc := a.invite([]string{"--user", "alice", "--prefix", "systemd", "--host", "bad host", "--no-sudo", "--no-auto-revoke", "--yes"})
+	if rc != 1 {
+		t.Fatalf("rc=%d, want 1 (reject on the invalid host, not create)", rc)
+	}
+	got := errb.String()
+	if strings.Contains(got, "reserved") {
+		t.Errorf("prefix guard wrongly rejected an explicit --user invite: %q", got)
+	}
+	if !strings.Contains(got, "invalid host") {
+		t.Errorf("want rejection at the host guard, got: %q", got)
 	}
 }
 

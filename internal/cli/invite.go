@@ -66,9 +66,17 @@ func (a *App) invite(args []string) int {
 		a.errorf("%s", a.P.M("用户名前缀不合法："+*prefix, "invalid username prefix: "+*prefix))
 		return 1
 	}
-
 	username := *userFlag
 	if username == "" {
+		// Only the generation path uses the prefix. A prefix in the reserved
+		// "systemd-" namespace would generate usernames the revoke path refuses to
+		// delete (user.IsReservedName), so reject it here before generating. An
+		// explicit --user does not use the prefix and is validated on its own below.
+		if user.IsReservedName(*prefix + "-") {
+			a.errorf("%s", a.P.M("用户名前缀落入受保护命名空间（如 systemd-），会创建无法撤销的账号："+*prefix,
+				"username prefix is in a reserved namespace (e.g. systemd-) and would create an unrevocable account: "+*prefix))
+			return 1
+		}
 		for attempt := 0; attempt < 20; attempt++ {
 			h, err := a.RandHex(5)
 			if err != nil {
@@ -88,6 +96,15 @@ func (a *App) invite(args []string) int {
 	}
 	if !validate.Username(username) {
 		a.errorf("%s", a.P.M("用户名不合法："+username, "invalid username: "+username))
+		return 1
+	}
+	// Refuse a reserved/system name (root, daemon, systemd-*, ...): the revoke path
+	// protects these, so creating one would leave an account the tool can never
+	// delete — manually or via the auto-revoke timer. This is the authoritative
+	// gate; it also covers an explicit --user that bypasses the prefix path above.
+	if user.IsReservedName(username) {
+		a.errorf("%s", a.P.M("用户名落入受保护/系统命名空间，拒绝创建（撤销将无法删除）："+username,
+			"username is a reserved/system name and cannot be created (revoke would refuse to delete it): "+username))
 		return 1
 	}
 

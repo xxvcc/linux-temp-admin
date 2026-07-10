@@ -87,15 +87,25 @@ var protectedNames = map[string]bool{
 	"irc": true, "gnats": true, "nobody": true, "dbus": true, "sshd": true, "polkitd": true,
 }
 
+// IsReservedName reports whether name falls in a namespace the tool must never
+// touch based on its shape alone — a well-known system account name or the
+// reserved "systemd-" prefix — independent of any /etc/passwd lookup. It is the
+// single source of truth shared by both sides: the revoke path refuses to delete
+// these, and the create path (invite) refuses to create them, so the tool can
+// never mint an account it would later be unable to revoke.
+func IsReservedName(name string) bool {
+	return protectedNames[name] || strings.HasPrefix(name, "systemd-")
+}
+
 // IsProtectedRevokeTarget reports whether deleting name must be refused. registered
-// says whether the tool's registry lists it. A UID-0 or blocklisted account is
-// always protected; a system-range UID (<1000) is protected unless it is a
-// registered, managed temp account; a real UID>=1000 account is protected unless it
+// says whether the tool's registry lists it. A reserved (system/systemd-) name or a
+// UID-0 account is always protected; a system-range UID (<1000) is protected unless it
+// is a registered, managed temp account; a real UID>=1000 account is protected unless it
 // carries the managed GECOS marker — so a real account that merely reuses the name of
 // a since-deleted temp account is never touched, even if a stale registry entry still
 // names it.
 func IsProtectedRevokeTarget(name string, registered bool) bool {
-	if protectedNames[name] || strings.HasPrefix(name, "systemd-") {
+	if IsReservedName(name) {
 		return true
 	}
 	pw, ok := Lookup(name)

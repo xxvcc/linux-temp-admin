@@ -46,6 +46,31 @@ func TestLookupAndManaged(t *testing.T) {
 	}
 }
 
+func TestIsReservedName(t *testing.T) {
+	reserved := []string{"root", "daemon", "nobody", "sshd", "systemd-network", "systemd-resolve", "systemd-", "systemd-x"}
+	for _, n := range reserved {
+		if !IsReservedName(n) {
+			t.Errorf("IsReservedName(%q) = false, want true", n)
+		}
+	}
+	// Names the create path must still allow: normal temp users, and near-misses
+	// that are NOT in the reserved shape (a bare "systemd", a "systemdd-" prefix,
+	// or a protected name merely used as a temp-username prefix).
+	allowed := []string{"xxvcc-abcdef0123", "alice", "systemd", "systemdd-x1", "root-abcdef0123"}
+	for _, n := range allowed {
+		if IsReservedName(n) {
+			t.Errorf("IsReservedName(%q) = true, want false", n)
+		}
+	}
+	// Every reserved name must also be refused by the revoke path (defense in
+	// depth: the two sides share this predicate and must never diverge).
+	for _, n := range reserved {
+		if !IsProtectedRevokeTarget(n, true) {
+			t.Errorf("reserved %q is not a protected revoke target", n)
+		}
+	}
+}
+
 func TestIsProtectedRevokeTarget(t *testing.T) {
 	setPasswd(t, samplePasswd)
 	cases := []struct {

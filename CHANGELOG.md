@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.3 - invite refuses names revoke would protect
+
+- **`invite` no longer creates an account the tool could never revoke.** A
+  username in a reserved namespace — an explicit `--user root` / `--user
+  systemd-*`, or any name generated from `--prefix systemd` — passed creation but
+  is refused by the revoke path, which protects `systemd-*` and well-known system
+  names. The account (optionally with NOPASSWD sudo) could be created but never
+  deleted: not by a manual `revoke`, nor by its own auto-revoke timer, which
+  failed silently at fire time while the invite reported success and scheduled it.
+  Creation now shares a single `IsReservedName` predicate with revoke and refuses
+  these names up front — the prefix is checked on the name-generation path (an
+  explicit `--user` leaves the prefix unused), and the final username is checked
+  authoritatively so an explicit `--user` cannot slip a reserved name through.
+
 ## v2.2.2 - The menu stops scrolling your results away
 
 - **The interactive menu no longer redraws after every action.** It is drawn on
