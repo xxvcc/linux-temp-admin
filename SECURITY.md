@@ -7,9 +7,7 @@
 | Version | Supported |
 | --- | --- |
 | 2.x (Go) | Yes |
-| 1.2.x (bash) | Yes |
-| 1.1.x | Critical fixes only |
-| < 1.1 | No |
+| < 2.0 | No |
 
 ## Reporting a Vulnerability
 
