@@ -19,8 +19,18 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
+	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
+)
+
+// The effective sshd config the fakes report. A test's verdict about sshd policy
+// must come from these fixtures, never from the sshd of whatever machine happens
+// to run the suite.
+const (
+	sshdOK       = "pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
+	sshdNoPubkey = "pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n"
 )
 
 // fakeSched satisfies schedule.System without touching real systemd/at.
@@ -56,6 +66,7 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 
 	regDir := rootDir(t, 0o700)
 	sudoDir := rootDir(t, 0o750)
+	sshdDir := rootDir(t, 0o755)
 	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
 	// A stub at InstallPath so ensureStableInstalled treats it as present.
 	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -79,6 +90,11 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		Registry: &registry.Store{
 			Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
 		},
+		SSHD: &sshdconf.Manager{
+			Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
+			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		},
+		SSHDConfig: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		Detector:   netdetect.New(),
 		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
 		Audit: &audit.Logger{
@@ -123,10 +139,17 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	}
 	inviteOut := out.String()
 	for _, want := range []string{"BEGIN LINUX TEMP ADMIN INVITE", "OPENSSH PRIVATE KEY",
-		"ssh -i ./" + username + ".key", "Sudo: yes"} {
+		"ssh -i ./" + username + ".key", "Sudo: yes",
+		// The Login line is now a verdict, not a slogan: it may only claim a key
+		// login on a host whose effective sshd config was read and said yes.
+		"Login: SSH key only (verified"} {
 		if !strings.Contains(inviteOut, want) {
 			t.Errorf("invite output missing %q", want)
 		}
+	}
+	// sshd already accepts keys here, so the tool must not have touched it.
+	if ents, _ := os.ReadDir(sshdDir); len(ents) != 0 {
+		t.Errorf("invite wrote an sshd drop-in on a host that did not need one: %v", ents)
 	}
 	if b, err := os.ReadFile(auditFile); err != nil {
 		t.Errorf("audit log after invite: %v", err)
@@ -154,5 +177,125 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		t.Errorf("audit log after revoke: %v", err)
 	} else if !strings.Contains(string(b), `"account.delete"`) {
 		t.Errorf("audit log missing account.delete:\n%s", b)
+	}
+}
+
+// TestInviteFixSSHDThenRevokeEndToEnd covers the path this whole feature exists
+// for: a host whose sshd refuses public-key logins. The invite must write a
+// per-account exception, prove it, and print a verified invite -- and revoke must
+// take the exception away again, leaving the host as it was found.
+func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	const username = "ltae2efix"
+	forceDelete := func() { _ = exec.Command("userdel", "-r", "--", username).Run() }
+	forceDelete()
+	t.Cleanup(forceDelete)
+
+	regDir := rootDir(t, 0o700)
+	sudoDir := rootDir(t, 0o750)
+	sshdDir := rootDir(t, 0o755)
+	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
+
+	// The host refuses keys until the drop-in exists: the manager's own probe is
+	// what decides, so a grant that failed to take effect would fail the invite.
+	dropIn := filepath.Join(sshdDir, "10-linux-temp-admin-"+username+".conf")
+	effective := func(string) (*sysinfo.SSHDConfig, error) {
+		if _, err := os.Lstat(dropIn); err == nil {
+			return sysinfo.ParseSSHD(sshdOK), nil
+		}
+		return sysinfo.ParseSSHD(sshdNoPubkey), nil
+	}
+	reloads := 0
+
+	var out, errb bytes.Buffer
+	app := &cli.App{
+		Out: &out, Err: &errb, In: strings.NewReader(""),
+		P:       i18n.Printer{Lang: i18n.EN},
+		Users:   user.New(),
+		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }},
+		SSHD: &sshdconf.Manager{
+			Dir: sshdDir, Validate: func() error { return nil }, Effective: effective,
+			Reload: func() error { reloads++; return nil },
+		},
+		SSHDConfig: effective,
+		Scheduler: &schedule.Scheduler{
+			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
+			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
+		},
+		Registry: &registry.Store{
+			Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+		},
+		Detector:    netdetect.New(),
+		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
+		InstallPath: installPath,
+		Now:         now,
+		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
+		StdoutIsTTY: func() bool { return true },
+		StdinIsTTY:  func() bool { return false },
+		Geteuid:     func() int { return 0 },
+	}
+
+	// Without --fix-sshd, a non-interactive invite must refuse and change nothing:
+	// a script must never quietly rewrite a remote host's sshd configuration.
+	rc := app.Dispatch([]string{"invite", "--user", username, "--host", "203.0.113.5", "--hours", "24", "--yes"})
+	if rc == 0 {
+		t.Fatal("invite should refuse on a host that rejects keys when --fix-sshd was not passed")
+	}
+	if user.Exists(username) {
+		t.Fatal("a refused invite must not create an account")
+	}
+	if ents, _ := os.ReadDir(sshdDir); len(ents) != 0 {
+		t.Fatalf("a refused invite must not touch sshd: %v", ents)
+	}
+
+	// With --fix-sshd it goes through, and the invite may claim a verified key login.
+	out.Reset()
+	errb.Reset()
+	rc = app.Dispatch([]string{"invite", "--user", username, "--host", "203.0.113.5",
+		"--hours", "24", "--fix-sshd", "--yes"})
+	if rc != 0 {
+		t.Fatalf("invite --fix-sshd rc=%d\nstderr:\n%s", rc, errb.String())
+	}
+	if _, err := os.Lstat(dropIn); err != nil {
+		t.Fatalf("sshd drop-in missing after --fix-sshd: %v", err)
+	}
+	body, err := os.ReadFile(dropIn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The exception must be scoped to this one account and lift only what was
+	// actually blocking: a global directive here would change every other login.
+	if !strings.Contains(string(body), "Match User "+username) {
+		t.Errorf("drop-in is not scoped to the account:\n%s", body)
+	}
+	if !strings.Contains(string(body), "PubkeyAuthentication yes") {
+		t.Errorf("drop-in does not lift the blocker:\n%s", body)
+	}
+	if strings.Contains(string(body), "AuthorizedKeysFile") {
+		t.Errorf("drop-in carries a directive nothing was blocking on:\n%s", body)
+	}
+	if reloads == 0 {
+		t.Error("sshd was never reloaded, so the grant could not have taken effect")
+	}
+	if !strings.Contains(out.String(), "Login: SSH key only (verified") {
+		t.Errorf("invite does not claim a verified key login:\n%s", out.String())
+	}
+
+	// --- revoke puts the host back ---
+	rc = app.Dispatch([]string{"revoke", "--user", username, "--yes"})
+	if rc != 0 {
+		t.Fatalf("revoke rc=%d\nstderr:\n%s", rc, errb.String())
+	}
+	if _, err := os.Lstat(dropIn); !os.IsNotExist(err) {
+		t.Error("revoke must remove the sshd exception it created")
+	}
+	if ents, _ := os.ReadDir(sshdDir); len(ents) != 0 {
+		t.Errorf("revoke left something behind in sshd_config.d: %v", ents)
 	}
 }

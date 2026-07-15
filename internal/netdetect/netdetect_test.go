@@ -85,3 +85,45 @@ func TestFetchRespectsTimeout(t *testing.T) {
 		t.Errorf("did not time out promptly: %v", elapsed)
 	}
 }
+
+func TestPublicIPAcceptsIPv6(t *testing.T) {
+	// A v6-only host's echo service replies with a v6 address; it must be accepted,
+	// not rejected as "not a public IPv4".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("2606:4700:4700::1111\n"))
+	}))
+	defer srv.Close()
+	d := New()
+	d.ExternalServices = []string{srv.URL}
+	ip, ok := d.PublicIP(2 * time.Second)
+	if !ok || ip != "2606:4700:4700::1111" {
+		t.Fatalf("PublicIP = %q, %v; want the v6 address", ip, ok)
+	}
+}
+
+func TestPublicIPRejectsNonPublicV6(t *testing.T) {
+	// A link-local v6 from an echo service must be rejected, not fed into the invite.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("fe80::1"))
+	}))
+	defer srv.Close()
+	d := New()
+	d.ExternalServices = []string{srv.URL}
+	if ip, ok := d.PublicIP(2 * time.Second); ok {
+		t.Errorf("PublicIP accepted a link-local v6: %q", ip)
+	}
+}
+
+func TestLocalPublicIPPrefersV4Metadata(t *testing.T) {
+	// A v4 metadata answer wins immediately, before the interface scan (which is
+	// where a v6 address would come from) is ever consulted.
+	v4 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("8.8.4.4"))
+	}))
+	defer v4.Close()
+	d := New()
+	d.MetadataServices = []string{v4.URL}
+	if ip, ok := d.LocalPublicIP(2 * time.Second); !ok || ip != "8.8.4.4" {
+		t.Fatalf("LocalPublicIP = %q, %v; want the v4 metadata address to win", ip, ok)
+	}
+}

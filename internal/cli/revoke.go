@@ -54,15 +54,16 @@ func (a *App) revoke(args []string) int {
 	}
 
 	if !user.Exists(username) {
-		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/自动删除任务："+username,
-			"user does not exist; cleaning up registry/sudoers/auto-delete task: "+username))
+		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/sshd 例外/自动删除任务："+username,
+			"user does not exist; cleaning up registry/sudoers/sshd exception/auto-delete task: "+username))
 		recordedUnit, _ := a.Registry.UnitFor(username)
 		a.Scheduler.Cancel(username, recordedUnit)
 		a.Sudoers.Remove(username)
+		a.removeSSHDException(username)
 		if err := a.Registry.Remove(username); err != nil {
 			a.warnf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
 		}
-		a.audit("account.cleanup", username, "ok", "user absent; cleaned registry/sudoers/schedule", nil)
+		a.audit("account.cleanup", username, "ok", "user absent; cleaned registry/sudoers/sshd/schedule", nil)
 		return 0
 	}
 
@@ -90,6 +91,7 @@ func (a *App) revoke(args []string) int {
 		user.TerminateProcesses(pw.UID)
 	}
 	a.Sudoers.Remove(username)
+	a.removeSSHDException(username)
 	if err := a.Users.Delete(username); err != nil {
 		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), err)
 		a.audit("account.delete", username, "fail", err.Error(), nil)
@@ -101,6 +103,29 @@ func (a *App) revoke(args []string) int {
 	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(fForce), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
 	return 0
+}
+
+// removeSSHDException deletes any per-account sshd drop-in this tool wrote for
+// username and reloads sshd. Like the sudoers drop-in beside it, the path is
+// derived from the username and the manager only ever touches its own managed
+// file, so this is called blindly: revoke never has to know whether a grant was
+// made, which means a grant can never be orphaned by a lost registry entry.
+//
+// A failure is reported but never blocks the revoke: the account itself going
+// away is what matters most, and a leftover Match block for a user that no
+// longer exists grants nobody anything.
+func (a *App) removeSSHDException(username string) {
+	if a.SSHD == nil {
+		return
+	}
+	if err := a.SSHD.Remove(username); err != nil {
+		// Remove's own error already says precisely what happened — in the common
+		// failure the file WAS deleted and only the reload was (deliberately) skipped
+		// because the host's sshd config is invalid. Do not prepend a contradicting
+		// "removal failed; delete it by hand", which would name a path that is already
+		// gone and bury the real problem.
+		a.warnf("%s: %v", a.P.M("sshd 例外", "sshd exception"), err)
+	}
 }
 
 // selectUser lists existing registered users and reads a choice or a username.

@@ -2,6 +2,10 @@
 // net/http with per-request context timeouts (no curl/wget, so no busybox -T
 // segfault or unbounded hang). It prefers cloud metadata and local interfaces,
 // falling back to external echo services.
+//
+// Both address families are detected, IPv4 first (still the more universally
+// reachable choice for whoever will SSH in) and IPv6 as the fallback that makes
+// a v6-only host work without the operator having to type its address by hand.
 package netdetect
 
 import (
@@ -18,10 +22,19 @@ import (
 
 // Detector performs public-IP detection. Fields are exported so tests can inject
 // a test server and client.
+//
+// There is deliberately no IPv6 metadata list. Unlike a public IPv4 — which is
+// frequently NAT'd and visible only through metadata — a host's global-unicast
+// IPv6 is bound directly to an interface, so the interface scan already finds it.
+// And the three clouds do not expose a v6 address at a fixed leaf: AWS and
+// Alibaba put it under network/interfaces/macs/<mac>/ipv6s, Tencent under
+// .../local-ipv6s, each reachable only after first listing the MACs. That
+// per-provider two-hop dance buys nothing the interface scan does not already
+// give us, so it is not attempted.
 type Detector struct {
 	Client           *http.Client
-	MetadataServices []string
-	ExternalServices []string
+	MetadataServices []string // cloud metadata that returns an IPv4
+	ExternalServices []string // echo services; the reply's family follows the connection
 }
 
 // New returns a Detector with the default services and a redirect-free client.
@@ -66,42 +79,62 @@ func (d *Detector) fetch(ctx context.Context, url string) (string, error) {
 	return strings.TrimSpace(s), nil
 }
 
-// LocalPublicIP tries cloud metadata then local interface addresses, returning
-// the first public IPv4 found. perReq bounds each metadata request.
+// LocalPublicIP tries the sources that never leave this host or its link — cloud
+// metadata (IPv4 only; see the Detector doc) then local interface addresses — and
+// returns the first routable public address found. perReq bounds each metadata
+// request.
+//
+// IPv4 is preferred over IPv6: a dual-stack box hands out its v4 address (the
+// more universally reachable one), and a v6-only box, whose interfaces carry no
+// public v4, still gets its global v6 instead of falling through to a manual
+// prompt.
 func (d *Detector) LocalPublicIP(perReq time.Duration) (string, bool) {
-	for _, svc := range d.MetadataServices {
-		ctx, cancel := context.WithTimeout(context.Background(), perReq)
-		ip, err := d.fetch(ctx, svc)
-		cancel()
-		if err == nil && validate.PublicIPv4(ip) {
-			return ip, true
-		}
+	if ip, ok := d.metaIP(d.MetadataServices, perReq, validate.PublicIPv4); ok {
+		return ip, true
 	}
-	if ip, ok := localInterfaceIP(); ok {
+	if ip, ok := localInterfaceIP(validate.PublicIPv4); ok {
+		return ip, true
+	}
+	if ip, ok := localInterfaceIP(validate.PublicIPv6); ok {
 		return ip, true
 	}
 	return "", false
 }
 
 // PublicIP queries external echo services, returning the first routable public
-// IPv4 they report. perReq bounds each request. It applies the same PublicIPv4
-// filter as the metadata path, so a service that echoes a private/reserved/
-// loopback address (or a bare hostname) is rejected rather than fed into the
-// invite as a bogus "public IP".
+// address they report. perReq bounds each request. It applies the same
+// public-address filters as the metadata path — for either family — so a service
+// that echoes a private/reserved/loopback address (or a bare hostname) is
+// rejected rather than fed into the invite as a bogus "public IP".
 func (d *Detector) PublicIP(perReq time.Duration) (string, bool) {
 	for _, svc := range d.ExternalServices {
 		ctx, cancel := context.WithTimeout(context.Background(), perReq)
 		ip, err := d.fetch(ctx, svc)
 		cancel()
-		if err == nil && validate.PublicIPv4(ip) {
+		if err == nil && (validate.PublicIPv4(ip) || validate.PublicIPv6(ip)) {
 			return ip, true
 		}
 	}
 	return "", false
 }
 
-// localInterfaceIP returns the first public IPv4 bound to a local interface.
-func localInterfaceIP() (string, bool) {
+// metaIP tries each metadata URL, returning the first response that passes ok.
+func (d *Detector) metaIP(urls []string, perReq time.Duration, ok func(string) bool) (string, bool) {
+	for _, svc := range urls {
+		ctx, cancel := context.WithTimeout(context.Background(), perReq)
+		ip, err := d.fetch(ctx, svc)
+		cancel()
+		if err == nil && ok(ip) {
+			return ip, true
+		}
+	}
+	return "", false
+}
+
+// localInterfaceIP returns the first locally-bound address that passes ok. When
+// ok is PublicIPv4 a v4 address is compared; for PublicIPv6 a v6 one — the
+// wrong-family addresses simply fail the filter, so one loop serves both.
+func localInterfaceIP(ok func(string) bool) (string, bool) {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return "", false
@@ -114,8 +147,18 @@ func localInterfaceIP() (string, bool) {
 		case *net.IPAddr:
 			ip = v.IP
 		}
-		if ip4 := ip.To4(); ip4 != nil && validate.PublicIPv4(ip4.String()) {
-			return ip4.String(), true
+		if ip == nil {
+			continue
+		}
+		// Compare in the address's own family: To4() gives dotted-quad for a v4
+		// address (and nil for v6), so the string handed to ok matches what its
+		// regex/parser expects.
+		s := ip.String()
+		if ip4 := ip.To4(); ip4 != nil {
+			s = ip4.String()
+		}
+		if ok(s) {
+			return s, true
 		}
 	}
 	return "", false

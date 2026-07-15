@@ -2,6 +2,193 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.5 - The invite stops promising a login it never checked
+
+- **`invite` now verifies that the account can actually log in — before it creates
+  anything.** The tool wrote the public key to `~/.ssh/authorized_keys` and printed
+  `Login: SSH key only` as a hardcoded literal, without ever asking sshd whether it
+  would accept that key. On a host with `PubkeyAuthentication no`, an
+  `AuthorizedKeysFile` pointing somewhere else, an `AllowUsers`/`AllowGroups`
+  whitelist, an `AuthenticationMethods` demanding a second factor (which the
+  tool's own `usermod -L` makes unsatisfiable), or a crypto policy without
+  `ssh-ed25519`, the invite was printed anyway — reporting success, handing over a
+  one-time private key, and locking the password, for an account with no usable way
+  in. The irony was that `sysinfo` already ran `sshd -T` and threw away every line
+  but `port`. It now reads sshd's effective configuration for the account
+  (`sshd -T -C user=<name>`, which resolves `Include`, `Match`, and distro crypto
+  policy) and refuses up front, naming the directive that blocks it. Nothing has
+  been created at that point, so a refusal leaves the host untouched. The invite's
+  `Login:` line is now a computed verdict and says `UNVERIFIED` when the config
+  could not be read, instead of asserting a login method nobody checked.
+- **`--fix-sshd` opens a door for one account, and only that account.** It writes a
+  separate drop-in (`/etc/ssh/sshd_config.d/10-linux-temp-admin-<user>.conf`)
+  holding nothing but a `Match User` block that lifts exactly the blockers found.
+  sshd's global configuration is never edited, so every other account keeps the
+  operator's baseline byte for byte — and "restoring" is deleting our own file, so
+  there is no backup to go stale and clobber a later change. The grant is
+  syntax-checked with `sshd -t`, *proved* effective with `sshd -T -C user=`, and
+  only then reloaded (`reload`, never `restart`: live sessions survive). Any failure
+  removes the file and refuses the invite. `revoke` — including the auto-revoke
+  timer — deletes the drop-in and reloads sshd. An interactive run asks first; a
+  `--yes` run refuses unless `--fix-sshd` was passed explicitly, so a script can
+  never quietly rewrite a remote host's sshd configuration. An explicit
+  `DenyUsers`/`DenyGroups` rule is never bypassed: not being on an allow list is a
+  default nobody spoke about, an explicit deny is a decision.
+- **`--password-login` is the opt-in fallback for hosts you would rather not
+  touch.** It verifies that sshd really accepts passwords (refusing otherwise),
+  issues a 24-character password from `crypto/rand` shown once, and hands it to
+  `chpasswd` on stdin so it never appears in the process table. The invite says
+  `Login: password` truthfully and warns that this is the weakest grant the tool
+  issues.
+- **A doomed invite is refused before the operator is asked anything.** The sshd
+  preflight only reads, so it now runs before the Host is resolved and before the
+  sudo and auto-delete questions — not after them. On a host whose sshd explicitly
+  denies the account (a rule the tool will never bypass), the refusal is immediate
+  and silent: no questions, and no asking an external echo service for this server's
+  public IP, which resolving the Host can otherwise do. Phoning home on behalf of an
+  invite that was always going to be refused is precisely the disclosure this tool
+  promises not to make. Values passed explicitly on the command line (`--host`,
+  `--port`) are still validated first — a bad flag is a usage error, and a malformed
+  command should never reach a question at all.
+
+- **The interactive flow no longer dead-ends a menu-driven operator on a
+  locked-down host.** When a key login cannot be made to work — an unfixable deny, or
+  the operator declines the per-account sshd exception — and sshd would accept a
+  password, the interactive run now offers one (defaulting to No, behind the same
+  "weakest grant this tool issues" warning). Previously the only route to a working
+  invite there was `--password-login`, a flag the menu cannot reach, so a menu-only
+  operator was stranded.
+
+- **The interactive flow asks for the account lifetime.** A menu-driven run never
+  touches `--hours`, so it was always fixed at 24h; it now prompts `Lifetime in hours
+  [24]` when the flag was not given. The prompt is gated on a real TTY — an
+  unbounded non-terminal stdin of invalid lines would otherwise spin the re-ask loop
+  forever — so a piped run keeps the default rather than hanging.
+
+- **Missing dependencies are named in the confirmation summary and installed only
+  after YES.** The read-only dependency check moved ahead of the summary, which now
+  lists the packages it would install; the install itself still waits until after the
+  confirmation. The consent is the single YES rather than a separate install prompt.
+
+- **The confirmation prompt now states the login method — and its price.** The sshd
+  preflight running early also means the summary can carry a `login=` line naming the
+  method and, when sshd has to be touched, the exact drop-in file that will appear on
+  the host:
+
+  ```text
+  即将创建一次性临时账号：
+    user=xxvcc-a1b2c3 host=203.0.113.10 port=22 hours=24 sudo=yes auto-delete=yes
+    login=ssh 密钥；将为该账号写入 sshd 例外（全局策略不变）：/etc/ssh/sshd_config.d/10-linux-temp-admin-xxvcc-a1b2c3.conf
+  确认创建请输入 YES:
+  ```
+
+  Previously the operator typed YES and was only then asked whether sshd could be
+  modified — agreeing to the account before seeing what it would cost the host. And
+  when the post-creation re-check against the account's real groups finds that sshd
+  accepts the login as it is, the promised exception is not written and the invite
+  says so, rather than quietly skipping a file the summary had named.
+
+- **No path in a root-run tool may panic, and none may hang.** The sshd probe is
+  reached through a guard that reports an unwired collaborator instead of
+  dereferencing it, and the `<InstallPath> version` probe — which executes a binary
+  at an operator-controlled path, as root, after the account already exists — is
+  bounded by a timeout. A binary that never returned would otherwise leave the invite
+  suspended with the account created and nothing printed.
+
+- **Host detection now finds IPv6, not only IPv4.** Detection was v4-only: the
+  local-interface scan skipped anything `To4()` returned nil for, and the
+  external-echo filter rejected every address with a colon — so on a v6-only host
+  detection always came up empty and the operator had to type the address by hand.
+  Two of the three legs now try IPv6 as well: the interface scan accepts a
+  global-unicast v6 (via a new `validate.PublicIPv6` gate that excludes loopback,
+  link-local, unique-local `fc00::/7`, and the `2001:db8::/32` documentation range),
+  and the external echo services accept a v6 reply. IPv4 is still preferred on a
+  dual-stack box as the more universally reachable choice, and a detected v6 flows
+  through the same `[addr]` bracketing the invite already applied to a hand-entered
+  one.
+
+  Cloud metadata is deliberately *not* consulted for IPv6: unlike a public IPv4
+  (often NAT'd and visible only through metadata), a global v6 sits on the interface
+  itself, so the interface scan already covers it — and the three clouds expose no v6
+  at a fixed leaf (AWS/Alibaba under `network/interfaces/macs/<mac>/ipv6s`, Tencent
+  under `.../local-ipv6s`, each needing a per-provider two-hop lookup that buys
+  nothing here).
+
+- **`doctor` reports whether sshd would accept a key login** for a freshly created
+  temporary account, so the answer is available before an invite is needed, and
+  names any sshd exception that outlived its account. `cleanup-expired --compact`
+  removes those orphans.
+
+  Safety properties worth stating, because they are what make the sshd write
+  defensible at all:
+
+  - **Every reload is gated on `sshd -t` — on the way out as well as in.** A reload
+    re-execs sshd against whatever is on disk. If an operator left a typo in
+    sshd_config this afternoon and never reloaded, the running daemon is still
+    happily serving its old in-memory config; an ungated reload fired at 3am by the
+    auto-revoke timer would be the thing that finally takes SSH off the machine. A
+    missed reload is recoverable; a dead sshd on a remote box is not.
+  - **The SIGHUP fallback confirms the pid is really sshd** before signalling it.
+    SIGHUP's default action is to terminate, pid files go stale, and pids are
+    recycled — so signalling a number on faith is not a no-op that might miss, it is
+    a root-privileged kill aimed at whatever inherited it.
+  - **"Nothing to reload" is not reported as success.** If no init system took the
+    reload and no live sshd could be signalled, the drop-in stays (a socket-activated
+    sshd reads it on the next connection) but the invite says UNVERIFIED rather than
+    claiming a running daemon adopted a file it never saw.
+  - **A narrowed crypto policy is preserved.** Lifting a `PubkeyAcceptedAlgorithms`
+    restriction re-states the operator's effective list and appends `ssh-ed25519`,
+    rather than writing `+ssh-ed25519` — OpenSSH's `+` appends to its *compiled-in
+    default* set, so on precisely the FIPS/crypto-policy hosts where this can fire it
+    would have handed the account sshd's entire default algorithm list. The directive
+    is written back under the name that host's own sshd used for it (it was renamed
+    in 8.5).
+  - **An address-qualified `AllowUsers user@host` rule yields no verdict, not a pass.**
+    The tool cannot know which IP the invitee will connect from, so it reports the
+    login as UNVERIFIED instead of claiming a proof — and does not "fix" it either,
+    since writing `AllowUsers <account>` would quietly cancel the operator's network
+    restriction. Deny rules fail closed for the same reason, in the other direction.
+  - **The login is re-checked against the account's real groups** once it exists.
+    The preflight has to predict them (it runs before the account does), and
+    `useradd` only gives an account a group of its own name where `USERGROUPS_ENAB`
+    is on — so a host that drops new accounts into a shared group plus a
+    `DenyGroups users` rule would otherwise have been stamped "verified" on a login
+    sshd refuses.
+  - **The auto-revoke timer is kept able to clean up after this invite.** It executes
+    whatever binary sits at `InstallPath`, and an older one would delete the account
+    and its registry row while leaving the sshd exception behind forever — so an
+    older installed binary is now upgraded to this one.
+  - **`--fix-sshd` is not defeated by a network-scoped `AllowUsers`.** An
+    address-qualified rule such as `AllowUsers *@10.0.0.0/8` ("SSH only from the VPN")
+    cannot be evaluated without knowing the invitee's address, so it is treated as a
+    reason to print UNVERIFIED — never as a blocker to "repair" (which would silently
+    cancel the network restriction) and never as something that fails the drop-in's
+    proof-of-effect (the drop-in still makes the key work; that is what the proof
+    checks). A bare `AllowUsers <account>` alongside it still counts as an
+    unconditional pass.
+  - **An address- or host-scoped `Match` block downgrades the invite to UNVERIFIED.**
+    `sshd -T -C user=X` cannot evaluate `Match Address`/`Match Host` — the invitee's
+    source address is unknown — so a host that, say, denies the account from the
+    public internet would otherwise read as "verified" from a no-address probe. The
+    tool now detects the presence of such a block (in the main config and the drop-in
+    directory) and says UNVERIFIED rather than overclaiming. A block hidden in a
+    deeply nested Include this scan does not reach falls back to the prior behaviour;
+    it is never made worse.
+  - **A revoke that cannot safely reload no longer tells the operator to hand-delete a
+    file that is already gone.** When `Remove()` deletes the exception but skips the
+    reload because the host's sshd config is invalid, the message now states exactly
+    that, instead of a "removal failed; delete it by hand" that named a vanished path
+    and buried the real problem.
+
+  Two residual trade-offs, stated rather than hidden: an init-system `reload` command
+  that exits 0 is trusted as success even though a SysV `service` script could in
+  principle no-op on a host whose sshd is not running (a socket-activated sshd reads
+  the new config on the next connection regardless, so this is not a false promise for
+  that case); and when the binary already installed at `InstallPath` is an OLDER
+  version, an `invite --auto-revoke` upgrades it in place (printing an INFO line) so
+  the timer can clean up — which replaces a deliberately-placed older wrapper at that
+  tool-owned path.
+
 ## v2.2.4 - Signature-verified bootstrap install
 
 - **`install.sh` now verifies an ed25519 signature at first install.** The

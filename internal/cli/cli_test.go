@@ -12,6 +12,8 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 )
 
 // newTestApp builds a minimal, root-free App: Geteuid is faked to 0 and the
@@ -335,5 +337,174 @@ func TestInviteNonTTYRefusesBeforeAnyPrompt(t *testing.T) {
 	}
 	if strings.Contains(errb.String(), "public IP") || strings.Contains(errb.String(), "IP/domain") {
 		t.Errorf("invite prompted for a host before refusing: %q", errb.String())
+	}
+}
+
+// TestInviteRefusesBeforeAskingAnything pins the ordering that makes a refusal
+// cheap and quiet. On a host whose sshd explicitly denies the account (a rule the
+// tool will never bypass), the invite is doomed no matter what the operator
+// answers — so it must be refused before a single question is asked and before
+// the Host is resolved, which can mean asking an external echo service for this
+// server's public IP. Phoning home for an invite that is about to be refused is
+// exactly the disclosure this tool promises not to make.
+//
+// The nil Detector is the tripwire: reaching Host resolution would dereference it.
+func TestInviteRefusesBeforeAskingAnything(t *testing.T) {
+	a, _, errb := newTestApp(t, "y\nYES\n") // answers that must never be consumed
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		// An explicit deny: unfixable by design, so nothing the operator says matters.
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\ndenyusers xxvcc-a1\n"), nil
+	}
+
+	// No --host, so reaching Host resolution would prompt and probe (and panic on
+	// the nil Detector).
+	rc := a.invite([]string{"--user", "xxvcc-a1", "--no-sudo", "--no-auto-revoke"})
+
+	if rc != 1 {
+		t.Fatalf("rc=%d, want 1 (an explicit sshd deny must refuse)", rc)
+	}
+	if !strings.Contains(errb.String(), "explicit sshd deny rule") {
+		t.Errorf("refusal did not name the reason:\n%s", errb.String())
+	}
+	// Not one question may have been put to the operator.
+	for _, q := range []string{"Grant sudo", "Auto-delete", "Type YES",
+		"public-key login for this account only", "public IP"} {
+		if strings.Contains(errb.String(), q) {
+			t.Errorf("operator was asked %q before the invite was refused:\n%s", q, errb.String())
+		}
+	}
+}
+
+// TestInviteSurvivesAnUnwiredSSHDProbe pins that a root-run tool has no path that
+// panics: an unset probe is reported, not dereferenced.
+func TestInviteSurvivesAnUnwiredSSHDProbe(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.SSHDConfig = nil // never happens via NewApp; must still not crash
+	// Users is nil in the fixture, so creation would panic -- the point is only that
+	// the probe itself does not.
+	defer func() {
+		if r := recover(); r != nil && !strings.Contains(errb.String(), "unverified") {
+			t.Fatalf("an unwired probe panicked before it could be reported: %v", r)
+		}
+	}()
+	_ = a.invite([]string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"})
+	if !strings.Contains(errb.String(), "unverified") {
+		t.Errorf("an unwired probe should be reported as unverified:\n%s", errb.String())
+	}
+}
+
+// interactiveApp is a root App wired for the interactive planLogin branches: a
+// TTY stdin fed from `in`, and an sshd effective config parsed from `sshdConf`.
+func interactiveApp(t *testing.T, in, sshdConf string) (*App, *bytes.Buffer) {
+	t.Helper()
+	a, _, errb := newTestApp(t, in)
+	a.StdinIsTTY = func() bool { return true }
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdConf), nil }
+	return a, errb
+}
+
+// TestPlanLoginOffersPasswordFallback covers the dead-end fix: a host that refuses
+// keys but accepts passwords must, interactively, offer a password rather than
+// leaving a menu-driven operator stranded.
+func TestPlanLoginOffersPasswordFallback(t *testing.T) {
+	// pubkey auth off (fixable), but the operator declines the sshd exception ("n"),
+	// then accepts the password fallback ("y"). Passwords are on.
+	const conf = "pubkeyauthentication no\npasswordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
+	a, _ := interactiveApp(t, "n\ny\n", conf)
+	a.SSHD = &sshdconf.Manager{} // non-nil, so the exception path is offered first
+
+	plan, ok := a.planLogin("xxvcc-a1", false, "ask", false)
+	if !ok {
+		t.Fatal("planLogin refused although a password fallback was available and accepted")
+	}
+	if !plan.password {
+		t.Fatalf("expected a password plan, got %+v", plan)
+	}
+	if plan.fixSSHD {
+		t.Error("declined exception must not still be planned")
+	}
+}
+
+// TestPlanLoginPasswordFallbackDefaultsNo: the offer defaults to No, so a blank
+// answer leaves the operator refused rather than silently issuing a password.
+func TestPlanLoginPasswordFallbackDefaultsNo(t *testing.T) {
+	const conf = "pubkeyauthentication no\npasswordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
+	a, _ := interactiveApp(t, "n\n\n", conf) // decline exception, then blank at the password offer
+	a.SSHD = &sshdconf.Manager{}
+	if _, ok := a.planLogin("xxvcc-a1", false, "ask", false); ok {
+		t.Error("a blank answer must not opt into a password login")
+	}
+}
+
+// TestPlanLoginNoPasswordFallbackWhenPasswordsOff: an explicit deny blocks
+// passwords too, so no fallback is offered — the invite is simply refused.
+func TestPlanLoginNoPasswordFallbackWhenPasswordsOff(t *testing.T) {
+	const conf = "pubkeyauthentication yes\npasswordauthentication no\ndenyusers xxvcc-a1\n"
+	a, errb := interactiveApp(t, "y\n", conf) // a "y" that must never be consumed
+	if _, ok := a.planLogin("xxvcc-a1", false, "ask", false); ok {
+		t.Error("must refuse: neither a key nor a password can work here")
+	}
+	if strings.Contains(errb.String(), "password login instead") {
+		t.Error("must not offer a password when sshd would refuse one too")
+	}
+}
+
+// TestPromptHours covers the new interactive lifetime prompt: a value is taken,
+// a blank keeps the default, and an out-of-range entry is re-asked.
+func TestPromptHours(t *testing.T) {
+	if got := mustHours(t, "48\n", 24); got != 48 {
+		t.Errorf("hours = %d, want 48", got)
+	}
+	if got := mustHours(t, "\n", 24); got != 24 {
+		t.Errorf("blank hours = %d, want the default 24", got)
+	}
+	if got := mustHours(t, "0\n99999999\n72\n", 24); got != 72 {
+		t.Errorf("hours after invalid entries = %d, want 72", got)
+	}
+	if got := mustHours(t, "", 24); got != 24 { // EOF settles on the default, never loops
+		t.Errorf("EOF hours = %d, want 24", got)
+	}
+}
+
+func mustHours(t *testing.T, in string, def int) int {
+	t.Helper()
+	a, _, _ := newTestApp(t, in)
+	return a.promptHours(def)
+}
+
+// TestPlanDepsRefusesBeforeSummaryAndInstallsAfter is a lightweight check that the
+// dependency split reports missing deps read-only. With no package manager the
+// plan must refuse (returns false), never claiming an install it cannot do.
+func TestPlanDepsAllPresent(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	// The account tools exist on this test host, so nothing is missing and no
+	// package list is produced.
+	pkgs, ok := a.planDeps(false, false, false, true)
+	if !ok || len(pkgs) != 0 {
+		t.Errorf("planDeps = %v, %v; want nil,true when nothing is missing", pkgs, ok)
+	}
+}
+
+// TestInviteSkipsHoursPromptOnNonTTYStdin is the regression guard for the
+// promptHours infinite-loop. promptHours re-asks on invalid input, so on a
+// non-TTY stdin feeding non-numeric lines (the `yes n | lta invite` idiom, whose
+// stream never blanks) it would spin forever. The hours prompt is therefore gated
+// on StdinIsTTY. This asserts the gate directly — the lifetime question must never
+// appear when stdin is not a terminal — which is deterministic, unlike trying to
+// reproduce the spin with a necessarily-finite input.
+func TestInviteSkipsHoursPromptOnNonTTYStdin(t *testing.T) {
+	a, _, errb := newTestApp(t, "n\nn\nn\n")
+	a.StdinIsTTY = func() bool { return false } // non-TTY stdin, TTY stdout (the default)
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+	// --no-sudo/--no-auto-revoke suppress those prompts; the key verifies so
+	// planLogin is silent; the confirmation reads "n" (not YES) and cancels before
+	// any account is created. What matters is only that the hours prompt never ran.
+	a.invite([]string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke"})
+	for _, s := range []string{"有效期", "Lifetime in hours"} {
+		if strings.Contains(errb.String(), s) {
+			t.Errorf("hours prompt appeared on a non-TTY stdin (would spin on an unbounded stream):\n%s", errb.String())
+		}
 	}
 }

@@ -100,6 +100,7 @@ type fakeRunner struct {
 	available map[string]bool
 	failOn    map[string]bool
 	calls     [][]string
+	stdin     []string // what each RunInput call was fed
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
@@ -109,6 +110,11 @@ func (f *fakeRunner) Run(name string, args ...string) error {
 	}
 	return nil
 }
+func (f *fakeRunner) RunInput(stdin string, name string, args ...string) error {
+	f.stdin = append(f.stdin, stdin)
+	return f.Run(name, args...)
+}
+
 func (f *fakeRunner) Look(name string) bool { return f.available[name] }
 
 var errForced = &forcedErr{}

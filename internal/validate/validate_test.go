@@ -94,6 +94,31 @@ func TestPublicIPv4(t *testing.T) {
 	}
 }
 
+func TestPublicIPv6(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"2400:cb00:2049:1::a29f:1804", true}, // routable global unicast
+		{"2606:4700:4700::1111", true},        // Cloudflare resolver, global unicast
+		{"::1", false},                        // loopback
+		{"::", false},                         // unspecified
+		{"fe80::1", false},                    // link-local
+		{"fc00::1", false},                    // unique-local fc00::/7
+		{"fd12:3456::1", false},               // unique-local
+		{"ff02::1", false},                    // multicast
+		{"2001:db8::1", false},                // documentation 2001:db8::/32
+		{"8.8.8.8", false},                    // an IPv4 is PublicIPv4's job, not this one
+		{"::ffff:8.8.8.8", false},             // IPv4-mapped resolves to v4, rejected here
+		{"not-an-ip", false},
+	}
+	for _, c := range cases {
+		if got := PublicIPv6(c.in); got != c.want {
+			t.Errorf("PublicIPv6(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestInstalledVersion(t *testing.T) {
 	cases := []struct {
 		in   string

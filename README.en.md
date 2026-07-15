@@ -121,10 +121,11 @@ Port: 22
 User: xxvcc-a1b2c3d4e5
 Expires: 2026-07-09 01:00:00 CST
 Sudo: yes
-Login: SSH key only
+Login: SSH key only (verified against the effective sshd config)
 Password login: locked
 Auto revoke: yes
 Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
+Sshd exception: none
 
 SSH login command:
 ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
@@ -148,6 +149,8 @@ Security notes: the private key is shown only once and not stored on the server;
 ```
 
 > The bundle's field names and command blocks stay in English and keep a fixed format so it can be forwarded verbatim; only the caption lines are localized.
+
+The `Login:` line is **a verdict, not a slogan**. Before anything is created, the tool reads `sshd -T -C user=<new account>` — sshd's effective configuration, with `Include`, `Match`, and the distro's crypto policy already resolved — and only claims a key login if that account really could log in. If the config cannot be read, the line says `UNVERIFIED` instead of guessing.
 
 ### 4. Forward the bundle to your collaborator over private chat
 
@@ -230,6 +233,48 @@ sudo linux-temp-admin invite \
   --allow-non-tty-private-key-output
 ```
 
+### When the server does not accept public-key logins
+
+Some servers have key logins switched off (`PubkeyAuthentication no`), or redirect `authorized_keys` to a central path, or run an `AllowUsers` whitelist, or demand a second factor. On such a host sshd never reads the key written to `~/.ssh/authorized_keys`, and no invite — however pretty — can log in.
+
+**The tool now finds this out before it creates anything, and refuses** (the account does not exist yet, so nothing is left behind), naming the directive that blocks it. You have two ways forward.
+
+**1. Open a door for this one account** (recommended):
+
+```bash
+sudo linux-temp-admin invite --sudo --fix-sshd
+```
+
+It writes a drop-in of its own, containing nothing but a `Match User` block:
+
+```text
+# /etc/ssh/sshd_config.d/10-linux-temp-admin-xxvcc-a1b2c3d4e5.conf
+Match User xxvcc-a1b2c3d4e5
+    PubkeyAuthentication yes
+```
+
+- **The global policy is not edited at all.** Every other account keeps your baseline, byte for byte.
+- The file is syntax-checked with `sshd -t`, then **proved effective** with `sshd -T -C user=<account>`, and only then is sshd asked to `reload` (**reload, never restart**: live sessions survive). If any step fails, the file is removed, sshd is not reloaded, and the invite is refused.
+- `revoke` (including the auto-delete timer) **deletes that file and reloads sshd**. "Restoring" is deleting our own file — there is no backup to keep, so the tool can never clobber a change you made to sshd in the meantime.
+
+An interactive run asks first. A `--yes` run never asks and never modifies sshd implicitly: it refuses unless `--fix-sshd` said so out loud, because a script must not quietly rewrite a remote host's sshd configuration while nobody is watching.
+
+**2. Fall back to a password** (leaves sshd alone):
+
+```bash
+sudo linux-temp-admin invite --sudo --password-login
+```
+
+It first verifies that sshd really does accept passwords (and refuses otherwise), then issues a 24-character random password, shown once. **This is the weakest grant the tool issues**: the password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear. Prefer `--fix-sshd`.
+
+**What the tool will never do**: edit sshd's global configuration, or bypass an explicit `DenyUsers`/`DenyGroups` rule. Not being on an allow list is a default you never spoke about; an explicit deny is a decision you made.
+
+To find out where your server stands before you need an invite:
+
+```bash
+sudo linux-temp-admin doctor
+```
+
 ## Reference
 
 ### Supported systems
@@ -273,6 +318,9 @@ Two host notes:
 ## Security notes
 
 - The private key is shown once at creation and never stored on the server; the account password is locked by default, and no account/sudo password is ever printed.
+- The invite's `Login:` line is **a verified conclusion**: before creating anything, the tool reads `sshd -T -C user=<new account>` to confirm the account really can log in, and says `UNVERIFIED` when it cannot read the config. It never asserts a login method it did not check.
+- **sshd's global configuration is never edited.** `--fix-sshd` writes a separate drop-in holding a single `Match User` block (no other account's policy changes by one byte); it is syntax-checked with `sshd -t`, proved effective with `sshd -T`, reloaded (never restarted), removed on any failure, and deleted by `revoke`. **An explicit `DenyUsers`/`DenyGroups` rule is never bypassed.**
+- `--password-login` is the weakest grant available (brute-forceable from anywhere, delivered in the clear). It is opt-in only, and refuses unless sshd is verified to accept passwords.
 - **NOPASSWD sudo is essentially root.** Grant it only to trusted parties. Revoking deletes the account itself; it does not clean up processes, cron jobs, systemd units, or SUID files that account left behind as root.
 - Deleting a user also deletes the home directory and SSH key. If the system's delete command fails, the tool stops and tells you to check manually rather than pretending the revoke succeeded.
 - **Guard against accidental deletion**: `revoke` only deletes users this tool registered. Deleting an unregistered account that **this tool created** (its GECOS carries the `linux-temp-admin` marker) requires an explicit `--force`, plus `--confirm-force USER` when non-interactive.

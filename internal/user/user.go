@@ -58,6 +58,47 @@ func Lookup(name string) (Passwd, bool) {
 // Exists reports whether name is a local account.
 func Exists(name string) bool { _, ok := Lookup(name); return ok }
 
+// groupPath is the group database; overridable in tests.
+var groupPath = "/etc/group"
+
+// Groups returns pw's group names: its primary group, plus every group that
+// lists it as a member. This is exactly the set sshd evaluates AllowGroups and
+// DenyGroups against, so an invite can tell whether a whitelist would admit the
+// account it is about to create.
+func Groups(pw Passwd) []string {
+	f, err := os.Open(groupPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var primary string
+	var extra []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// name:passwd:gid:member,member,...
+		parts := strings.Split(sc.Text(), ":")
+		if len(parts) < 4 {
+			continue
+		}
+		if gid, err := strconv.Atoi(parts[2]); err == nil && gid == pw.GID {
+			primary = parts[0]
+			continue
+		}
+		for _, m := range strings.Split(parts[3], ",") {
+			if m == pw.Name {
+				extra = append(extra, parts[0])
+				break
+			}
+		}
+	}
+	// The primary group comes first: it is the one a grant names when it has to
+	// satisfy an AllowGroups whitelist.
+	if primary == "" {
+		return extra
+	}
+	return append([]string{primary}, extra...)
+}
+
 // IsManaged reports whether name's GECOS carries the exact managed tag this tool
 // sets — an exact match on the GECOS full-name subfield, not a bare substring, so
 // a self-set partial GECOS cannot pose as managed.
@@ -131,6 +172,10 @@ func IsProtectedRevokeTarget(name string, registered bool) bool {
 // Runner executes account-management commands; injectable for tests.
 type Runner interface {
 	Run(name string, args ...string) error
+	// RunInput is Run with data on the command's stdin. It exists so a secret
+	// (a password) is handed to chpasswd through a pipe and never as an argv
+	// element, which every process on the host can read out of /proc.
+	RunInput(stdin string, name string, args ...string) error
 	Look(name string) bool
 }
 
@@ -139,6 +184,17 @@ type execRunner struct{}
 func (execRunner) Run(name string, args ...string) error {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
+		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (execRunner) RunInput(stdin string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// The error text must never carry stdin back out: it holds the password.
 		return fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -167,6 +223,21 @@ func (m *Manager) Create(name, shell string) error {
 
 // LockPassword disables password login for name.
 func (m *Manager) LockPassword(name string) error { return m.Runner.Run("usermod", "-L", name) }
+
+// SetPassword sets name's login password, for the --password-login invite on a
+// host whose sshd will not take a key. The password goes to chpasswd on stdin,
+// never in argv, so it cannot be read out of the process table.
+func (m *Manager) SetPassword(name, password string) error {
+	if !m.Runner.Look("chpasswd") {
+		return fmt.Errorf("chpasswd not available")
+	}
+	if strings.ContainsAny(password, ":\n") {
+		// chpasswd's line format is user:password — a colon or newline would split
+		// the record and set a different password than the one we printed.
+		return fmt.Errorf("refusing a password containing ':' or a newline")
+	}
+	return m.Runner.RunInput(name+":"+password+"\n", "chpasswd")
+}
 
 // SetExpiry sets the account expiry date (YYYY-MM-DD) via chage.
 func (m *Manager) SetExpiry(name, date string) error { return m.Runner.Run("chage", "-E", date, name) }

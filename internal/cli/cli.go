@@ -23,7 +23,9 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
+	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"golang.org/x/term"
 )
@@ -39,18 +41,24 @@ type App struct {
 
 	Users      *user.Manager
 	Sudoers    *sudoers.Manager
+	SSHD       *sshdconf.Manager
 	Scheduler  *schedule.Scheduler
 	Registry   *registry.Store
 	Detector   *netdetect.Detector
 	Selfmanage *selfmanage.Manager
 	Audit      *audit.Logger
 
-	InstallPath string
-	Now         func() time.Time
-	RandHex     func(nBytes int) (string, error)
-	StdoutIsTTY func() bool
-	StdinIsTTY  func() bool
-	Geteuid     func() int
+	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
+	// test's verdict comes from a fixture, not from the test host's own sshd.
+	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
+
+	InstallPath  string
+	Now          func() time.Time
+	RandHex      func(nBytes int) (string, error)
+	RandPassword func(nChars int) (string, error)
+	StdoutIsTTY  func() bool
+	StdinIsTTY   func() bool
+	Geteuid      func() int
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -58,23 +66,26 @@ type App struct {
 // NewApp builds an App with real collaborators and the resolved language.
 func NewApp(lang i18n.Lang) *App {
 	return &App{
-		Out:         os.Stdout,
-		Err:         os.Stderr,
-		In:          os.Stdin,
-		P:           i18n.Printer{Lang: lang},
-		Users:       user.New(),
-		Sudoers:     sudoers.New(),
-		Scheduler:   schedule.New(),
-		Registry:    registry.Default(),
-		Detector:    netdetect.New(),
-		Selfmanage:  selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
-		Audit:       audit.Default(),
-		InstallPath: config.InstallPath,
-		Now:         time.Now,
-		RandHex:     randHex,
-		StdoutIsTTY: func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
-		StdinIsTTY:  func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
-		Geteuid:     os.Geteuid,
+		Out:          os.Stdout,
+		Err:          os.Stderr,
+		In:           os.Stdin,
+		P:            i18n.Printer{Lang: lang},
+		Users:        user.New(),
+		Sudoers:      sudoers.New(),
+		SSHD:         sshdconf.New(),
+		Scheduler:    schedule.New(),
+		Registry:     registry.Default(),
+		Detector:     netdetect.New(),
+		Selfmanage:   selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
+		Audit:        audit.Default(),
+		SSHDConfig:   sysinfo.SSHDEffective,
+		InstallPath:  config.InstallPath,
+		Now:          time.Now,
+		RandHex:      randHex,
+		RandPassword: randPassword,
+		StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
+		StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
+		Geteuid:      os.Geteuid,
 	}
 }
 
@@ -84,6 +95,34 @@ func randHex(nBytes int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// passwordAlphabet is deliberately alphanumeric: the password travels through a
+// chpasswd line, an SSH prompt, and a chat message, and a character that any one
+// of those three would mangle costs far more than the ~6 bits of entropy it adds.
+// At 24 characters this is ~142 bits, which no online guessing attack reaches.
+const passwordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// passwordLen is the length of a --password-login password.
+const passwordLen = 24
+
+// randPassword returns a uniformly random password. Rejection sampling keeps the
+// distribution flat: taking a raw byte modulo 62 would quietly favour the first
+// few letters of the alphabet.
+func randPassword(nChars int) (string, error) {
+	out := make([]byte, 0, nChars)
+	buf := make([]byte, 1)
+	const limit = 256 - (256 % len(passwordAlphabet)) // 248: the unbiased range
+	for len(out) < nChars {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		if int(buf[0]) >= limit {
+			continue
+		}
+		out = append(out, passwordAlphabet[int(buf[0])%len(passwordAlphabet)])
+	}
+	return string(out), nil
 }
 
 // Run is the process entry point: it resolves the language, then dispatches.

@@ -121,10 +121,11 @@ Port: 22
 User: xxvcc-a1b2c3d4e5
 Expires: 2026-07-09 01:00:00 CST
 Sudo: yes
-Login: SSH key only
+Login: SSH key only (verified against the effective sshd config)
 Password login: locked
 Auto revoke: yes
 Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
+Sshd exception: none
 
 SSH 登录命令:
 ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
@@ -148,6 +149,8 @@ Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥
 ```
 
 > 邀请包里的字段名和命令块保持英文/固定格式，方便原样复制转发；中文只出现在说明行上。
+
+`Login:` 那行是**检查结果，不是口号**：创建任何东西之前，工具会读一遍 `sshd -T -C user=<新账号>`（sshd 的有效配置，已展开 `Include`、`Match` 和发行版加密策略），确认这个账号真的能用公钥登录，才敢这么写。读不到就如实标 `UNVERIFIED`。
 
 ### 4. 把这份邀请包私聊发给协作者
 
@@ -230,6 +233,48 @@ sudo linux-temp-admin invite \
   --allow-non-tty-private-key-output
 ```
 
+### 服务器不接受公钥登录时
+
+有些服务器把公钥登录关掉了（`PubkeyAuthentication no`），或者把 `authorized_keys` 改到了集中路径、开了 `AllowUsers` 白名单、要求多因素认证。这时候写进 `~/.ssh/authorized_keys` 的公钥 sshd 根本不看，邀请再漂亮也登不进去。
+
+**工具会在创建任何东西之前发现这一点并拒绝**（此时账号还没建，零残留），并告诉你到底卡在哪一条。你有两个选择：
+
+**① 只为这一个账号开一条口子**（推荐）：
+
+```bash
+sudo linux-temp-admin invite --sudo --fix-sshd
+```
+
+它会写一个独立的 drop-in，内容只有一个 `Match User` 块：
+
+```text
+# /etc/ssh/sshd_config.d/10-linux-temp-admin-xxvcc-a1b2c3d4e5.conf
+Match User xxvcc-a1b2c3d4e5
+    PubkeyAuthentication yes
+```
+
+- **全局策略一个字节都不动**：其他所有账号的登录策略原封不动，该关的还是关着。
+- 写入后先 `sshd -t` 校验语法，再用 `sshd -T -C user=<账号>` **证明确实生效**，最后才 `reload`（**reload 不是 restart**，现有会话不受影响）。任何一步不过，就删掉文件、不 reload、中止创建。
+- `revoke`（含到期自动删除）会**删掉这个文件并 reload sshd**。所谓"还原"就是删掉我们自己写的文件——不需要备份，因此**不可能覆盖你后来对 sshd 做的任何改动**。
+
+交互式运行会先问你一句；`--yes` 非交互模式下**不会**弹问，必须显式写 `--fix-sshd`——脚本不该在无人值守时悄悄改远程机器的 sshd。
+
+**② 改用密码登录**（不碰 sshd）：
+
+```bash
+sudo linux-temp-admin invite --sudo --password-login
+```
+
+先验证 sshd 真的接受密码登录（否则拒绝），然后生成一个 24 位随机密码，只打印一次。**这是本工具最弱的一种授权**：密码在账号整个生命周期里都能被全网爆破，而且必须明文交付。能用 `--fix-sshd` 就别用它。
+
+**工具不会为你做的事**：它**永远不会**修改 sshd 的全局配置，也**永远不会**绕过 `DenyUsers` / `DenyGroups` 这类显式拒绝规则——"不在白名单里"是你没表过态的默认值，而"明确拒绝"是你的决定。
+
+想提前知道自己的服务器行不行，直接跑：
+
+```bash
+sudo linux-temp-admin doctor
+```
+
 ## 参考
 
 ### 支持的系统
@@ -266,6 +311,7 @@ sudo linux-temp-admin invite \
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # 含 NoNewPrivileges 等轻量限制
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER                         # 仅在启用免密 sudo 时
+/etc/ssh/sshd_config.d/10-linux-temp-admin-USER.conf         # 仅在 --fix-sshd 时；只含一个 Match User 块，revoke 时删除
 /home/USER/.ssh/authorized_keys
 # 以及在 systemd 不可用时，at 队列中的备用自动删除任务
 ```
@@ -273,6 +319,9 @@ sudo linux-temp-admin invite \
 ## 安全说明
 
 - 私钥只在创建时显示一次，服务器不保存；账号密码默认锁定，不输出任何账号/Sudo 密码。
+- 邀请里的 `Login:` 是**验证过的结论**：创建前会读 `sshd -T -C user=<新账号>` 确认这个账号真能登进去，读不到就标 `UNVERIFIED`，绝不凭空断言。
+- **绝不修改 sshd 全局配置**。`--fix-sshd` 只写一个独立的、仅含 `Match User` 块的 drop-in（其他账号的策略一个字节不动），写入前 `sshd -t` 校验、写入后 `sshd -T` 证明生效、只 `reload` 不 `restart`，任一步失败即删除文件并中止；`revoke` 会删掉它。**绝不绕过 `DenyUsers`/`DenyGroups` 这类显式拒绝规则。**
+- `--password-login` 是最弱的授权方式（密码可被全网爆破、必须明文交付），只在显式要求时启用，且会先验证 sshd 确实接受密码登录。
 - **NOPASSWD sudo 基本等同 root**，只给可信对象；撤销只删除该账号本身，不会清理它以 root 身份留下的进程、cron、systemd 单元或 SUID 文件。
 - 删除用户会一并删除家目录和 SSH key；如果系统删除命令失败，工具会停下并提示手动检查，不会假装撤销成功。
 - **防误删**：`revoke` 默认只删除本工具登记过的用户；删除未登记但**本工具创建**（GECOS 带 `linux-temp-admin` 标记）的账号需显式 `--force`，非交互还需 `--confirm-force USER`。

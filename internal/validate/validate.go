@@ -136,6 +136,31 @@ func PublicIPv4(ip string) bool {
 	return true
 }
 
+// PublicIPv6 reports whether ip is a routable global-unicast IPv6 address — the
+// IPv6 counterpart of PublicIPv4, used only to filter auto-detection candidates.
+// It leans on net's classifiers (which already exclude loopback ::1, the
+// unspecified ::, link-local fe80::/10, and every multicast form) and adds the
+// two they do not cover for our purpose: unique-local fc00::/7 (IsPrivate) and
+// the documentation range 2001:db8::/32, which is global-unicast-shaped but not
+// routable. An IPv4 or IPv4-mapped address is rejected here; PublicIPv4 owns it.
+func PublicIPv6(ip string) bool {
+	if !strings.Contains(ip, ":") {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
+		return false
+	}
+	if !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+		return false
+	}
+	// 2001:db8::/32 — RFC 3849 documentation prefix.
+	if parsed[0] == 0x20 && parsed[1] == 0x01 && parsed[2] == 0x0d && parsed[3] == 0xb8 {
+		return false
+	}
+	return true
+}
+
 // Port reports whether p is a usable TCP port (1..65535).
 func Port(p int) bool { return p >= 1 && p <= 65535 }
 

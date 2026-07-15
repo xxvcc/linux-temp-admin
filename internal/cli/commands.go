@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -87,6 +88,26 @@ func (a *App) cleanupExpired(args []string) int {
 		a.printf("  %-22s exists=%v expires=%s auto=%v", r.User, exists, r.Expires, r.AutoRevoke)
 	}
 	if compact {
+		// Sweep the sshd exceptions BEFORE the registry rows: compacting drops the
+		// rows that name these accounts, and an exception nobody can name any more is
+		// an exception nobody will ever find.
+		if a.SSHD != nil {
+			orphans, err := a.SSHD.Orphans(user.Exists)
+			if err != nil {
+				a.warnf("%v", err)
+			}
+			for _, u := range orphans {
+				if err := a.SSHD.Remove(u); err != nil {
+					// Remove's own error states what happened (in the usual case the file
+					// was deleted and only the reload was skipped), so use a neutral prefix
+					// that does not assert the removal failed.
+					a.warnf("%s: %v", a.P.M("清理孤儿 sshd 例外时", "while cleaning up the orphaned sshd exception"), err)
+					continue
+				}
+				a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
+					"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
+			}
+		}
 		removed, err := a.Registry.Compact(user.Exists)
 		if err != nil {
 			a.warnf("%v", err)
@@ -124,6 +145,53 @@ func (a *App) doctor(args []string) int {
 	a.info(a.P.M("包管理器：", "package manager: ") + orNone(sysinfo.PackageManager()))
 	a.info(a.P.M("init 系统：", "init system: ") + sysinfo.InitSystem())
 	a.info(fmt.Sprintf(a.P.M("探测到 SSH 端口：%d", "detected SSH port: %d"), sysinfo.SSHPort()))
+	// Probe with a name shaped like a fresh invite account: brand new, on no
+	// whitelist, and in no group but its own. That is what an invite actually hits,
+	// and reporting on it here is the only way an operator can learn that key logins
+	// are off *before* they hand out an invite.
+	//
+	// The probe name is passed to SSHDConfig, not just to the check: `sshd -T` alone
+	// cannot see `Match User` blocks, so asking the global view a per-user question
+	// would let doctor contradict the invite it is meant to predict.
+	probe := config.DefaultPrefix + "-doctor"
+	if cfg, err := a.sshdConfig(probe); err != nil {
+		a.warnf("%s (%v)", a.P.M("无法读取 sshd 有效配置；invite 无法验证公钥登录是否真的可用。",
+			"cannot read the effective sshd config; invite cannot verify that a key login would work."), err)
+	} else {
+		rep := a.checkKeyLogin(cfg, probe, []string{probe})
+		for _, w := range rep.Warnings {
+			a.warnf("%s", w)
+		}
+		if rep.OK() {
+			a.success(a.P.M("sshd 接受公钥登录。", "sshd accepts public-key logins."))
+		} else {
+			a.warnf("%s", a.P.M("sshd 不会接受新建临时账号的公钥登录：",
+				"sshd would not accept a public-key login for a freshly created temporary account:"))
+			a.reportBlockers(rep)
+			if rep.Fixable() {
+				a.warnf("%s", a.P.M("可用 `invite --fix-sshd` 只为该账号开启（不改动全局策略）。",
+					"`invite --fix-sshd` can enable it for that one account, leaving the global policy untouched."))
+			}
+			rc = 1
+		}
+		for _, u := range rep.Unverifiable {
+			a.warnf("%s", u)
+		}
+	}
+	// An sshd exception that outlived its account is a standing loosening of the
+	// host's policy, and it re-arms the moment the username is reused. Nothing else
+	// looks for these, so doctor must.
+	if a.SSHD != nil {
+		if orphans, err := a.SSHD.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+			for _, u := range orphans {
+				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号已不存在）：",
+					"orphaned sshd exception (its account no longer exists): "), a.SSHD.FilePath(u))
+			}
+			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
+				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
 	if err := fsutil.RootSafeDir("/etc/sudoers.d"); err == nil {
 		a.success(a.P.M("/etc/sudoers.d 看起来安全。", "/etc/sudoers.d looks safe."))
 	} else {

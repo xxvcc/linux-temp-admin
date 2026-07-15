@@ -148,21 +148,12 @@ func SSHPort() int {
 }
 
 func sshPortFromSshdT() (int, bool) {
-	if !has("sshd") {
-		return 0, false
-	}
-	out, err := exec.Command("sshd", "-T").Output()
+	cfg, err := SSHDEffective("")
 	if err != nil {
 		return 0, false
 	}
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
-			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
-				return p, true
-			}
-		}
+	if p, err := strconv.Atoi(cfg.First("port")); err == nil && p >= 1 && p <= 65535 {
+		return p, true
 	}
 	return 0, false
 }
