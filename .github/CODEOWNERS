@@ -1,0 +1,13 @@
+# Default owner for everything in the repo.
+*                                   @xxvcc
+
+# Security-critical paths — the trust boundary of a root-run, self-upgrading tool.
+# Changes here warrant extra scrutiny.
+/internal/selfmanage/               @xxvcc
+/internal/sshdconf/                 @xxvcc
+/internal/sudoers/                  @xxvcc
+/internal/sshkey/                   @xxvcc
+/internal/fsutil/                   @xxvcc
+/scripts/                           @xxvcc
+/.github/workflows/                 @xxvcc
+/internal/selfmanage/release_pubkey.hex @xxvcc

@@ -11,10 +11,11 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.25'
+          check-latest: true
       - name: Vet
         # -printf.funcs also checks our concatenating log helpers (printf/errorf/warnf)
         run: go vet -printf.funcs=printf,errorf,warnf ./...
@@ -30,10 +31,11 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.25'
+          check-latest: true
       - name: Integration tests (root)
         run: sudo -E env "PATH=$PATH" go test -race -tags integration ./...
 
@@ -43,13 +45,31 @@ jobs:
       matrix:
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.25'
+          check-latest: true
       - name: Static build ${{ matrix.goarch }}
         env:
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
         run: go build -tags osusergo,netgo -ldflags '-s -w' -o /dev/null ./cmd/linux-temp-admin
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25'
+          check-latest: true
+      - name: Govulncheck
+        # Fails the build on any vulnerability the code actually calls. A finding is
+        # cleared by building with a patched Go/dep (check-latest above pulls the newest
+        # 1.25.x, which carries the stdlib security backports) or by an explicit,
+        # documented suppression.
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

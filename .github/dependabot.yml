@@ -1,0 +1,27 @@
+# Keep the supply chain patched. GitHub Actions are pinned to commit SHAs in the
+# workflows; dependabot bumps those SHAs (and the version comment) when a new
+# release lands, and opens PRs for Go module updates. Security fixes to the Go
+# standard library ride in via the toolchain (setup-go check-latest), not here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      go-modules:
+        patterns:
+          - "*"
