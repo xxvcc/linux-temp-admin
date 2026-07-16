@@ -88,9 +88,9 @@ func (a *App) cleanupExpired(args []string) int {
 		a.printf("  %-22s exists=%v expires=%s auto=%v", r.User, exists, r.Expires, r.AutoRevoke)
 	}
 	if compact {
-		// Sweep the sshd exceptions BEFORE the registry rows: compacting drops the
-		// rows that name these accounts, and an exception nobody can name any more is
-		// an exception nobody will ever find.
+		// Sweep the live grants BEFORE the registry rows: compacting drops the rows
+		// that name these accounts, and a grant nobody can name any more is a grant
+		// nobody will ever find.
 		if a.SSHD != nil {
 			orphans, err := a.SSHD.Orphans(user.Exists)
 			if err != nil {
@@ -106,6 +106,19 @@ func (a *App) cleanupExpired(args []string) int {
 				}
 				a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
 					"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
+			}
+		}
+		// An orphaned NOPASSWD drop-in is the worse of the two: it re-arms full root
+		// the moment its username is reused.
+		if a.Sudoers != nil {
+			orphans, err := a.Sudoers.Orphans(user.Exists)
+			if err != nil {
+				a.warnf("%v", err)
+			}
+			for _, u := range orphans {
+				a.Sudoers.Remove(u)
+				a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
+					"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
 			}
 		}
 		removed, err := a.Registry.Compact(user.Exists)
@@ -198,6 +211,21 @@ func (a *App) doctor(args []string) int {
 		a.warnf("%s (%v)", a.P.M("/etc/sudoers.d 不可用或不安全；NOPASSWD sudo 可能不可用。",
 			"/etc/sudoers.d unavailable or unsafe; NOPASSWD sudo may be unavailable."), err)
 	}
+	// An orphaned NOPASSWD drop-in is the most dangerous leftover the tool can
+	// produce — it re-arms full root the moment its username is reused — and the
+	// directory being "safe" says nothing about what is in it. Report them the same
+	// way the sshd exceptions are reported.
+	if a.Sudoers != nil {
+		if orphans, err := a.Sudoers.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+			for _, u := range orphans {
+				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号已不存在，NOPASSWD:ALL 仍在）：",
+					"orphaned sudo grant (its account is gone; NOPASSWD:ALL still on disk): "), a.Sudoers.FilePath(u))
+			}
+			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
+				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
 	return rc
 }
 
@@ -254,6 +282,14 @@ func (a *App) menu() int {
 		n, err := strconv.Atoi(choice)
 		if err != nil || n < 1 || n > len(menuItems) {
 			a.warnf("%s", a.P.M("无效选择", "invalid choice"))
+			// Re-prompting only makes sense at a terminal. readLine returns ok=false
+			// solely at EOF, so a non-TTY stream of invalid lines (`yes x | ...`) would
+			// spin this loop forever, pinning a root process and flooding stderr. A
+			// non-interactive run gets one complaint and exits, like every other prompt
+			// in the tool.
+			if !a.StdinIsTTY() {
+				return 1
+			}
 			continue
 		}
 		if run := menuItems[n-1].run; run != nil {

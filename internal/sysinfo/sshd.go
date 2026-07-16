@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strings"
 )
@@ -458,7 +457,7 @@ func matchesAllow(patterns, names []string) (allowed bool, unsure []string) {
 }
 
 // userHalf reports whether any name matches the user half of an sshd pattern
-// (sshd patterns allow * and ?; an entry may carry a user@host suffix).
+// (an entry may carry a user@host suffix, whose host half is not ours to judge).
 func userHalf(pattern string, names []string) bool {
 	if i := strings.Index(pattern, "@"); i >= 0 {
 		pattern = pattern[:i]
@@ -467,11 +466,47 @@ func userHalf(pattern string, names []string) bool {
 		if n == "" {
 			continue
 		}
-		if ok, err := path.Match(pattern, n); err == nil && ok {
+		if matchSSHDPattern(pattern, n) {
 			return true
 		}
 	}
 	return false
+}
+
+// matchSSHDPattern reports whether s matches an OpenSSH pattern, per sshd's own
+// match.c: only '*' (any run, including empty) and '?' (exactly one character)
+// are special — every other byte, notably '[' and ']', is literal.
+//
+// This deliberately does NOT use path.Match, whose bracket character classes
+// sshd does not implement. The divergence is not cosmetic: for a config carrying
+// AllowUsers admin-[0-9], path.Match says the account admin-5 is admitted while
+// sshd would compare against the literal name "admin-[0-9]" and refuse it — the
+// tool would print a verified invite for a login that cannot work.
+func matchSSHDPattern(pattern, s string) bool {
+	// Iterative backtracking: linear in the common case, and immune to the
+	// exponential blowup a naive recursion hits on patterns full of '*'.
+	var star, mark int = -1, 0
+	i, j := 0, 0
+	for i < len(s) {
+		switch {
+		case j < len(pattern) && (pattern[j] == '?' || pattern[j] == s[i]):
+			i++
+			j++
+		case j < len(pattern) && pattern[j] == '*':
+			star, mark = j, i // remember the '*' and where it started consuming
+			j++
+		case star >= 0:
+			j = star + 1 // backtrack: let the last '*' swallow one more byte
+			mark++
+			i = mark
+		default:
+			return false
+		}
+	}
+	for j < len(pattern) && pattern[j] == '*' {
+		j++
+	}
+	return j == len(pattern)
 }
 
 func splitCommas(vals []string) []string {

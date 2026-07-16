@@ -138,14 +138,34 @@ func IsReservedName(name string) bool {
 	return protectedNames[name] || strings.HasPrefix(name, "systemd-")
 }
 
-// IsProtectedRevokeTarget reports whether deleting name must be refused. registered
-// says whether the tool's registry lists it. A reserved (system/systemd-) name or a
-// UID-0 account is always protected; a system-range UID (<1000) is protected unless it
-// is a registered, managed temp account; a real UID>=1000 account is protected unless it
-// carries the managed GECOS marker — so a real account that merely reuses the name of
-// a since-deleted temp account is never touched, even if a stale registry entry still
-// names it.
-func IsProtectedRevokeTarget(name string, registered bool) bool {
+// IsProtectedRevokeTarget reports whether deleting name must be refused.
+// registered says whether the tool's registry lists it, and recordedUID is the
+// UID the registry recorded when it created the account (0 = not recorded, i.e.
+// a row from a build before that field existed).
+//
+// A reserved (system/systemd-) name or a UID-0 account is always protected; a
+// system-range UID (<1000) is protected unless it is a registered, managed temp
+// account; a real UID>=1000 account is protected unless it can be proven to be
+// one the tool made — so a real account that merely reuses the name of a
+// since-deleted temp account is never touched, even if a stale registry entry
+// still names it.
+//
+// "Proven to be ours" has two independent witnesses, and either suffices:
+//
+//   - The recorded UID still matches the account's current UID. This is the
+//     stronger witness: it was fixed at creation, before the invitee had any
+//     access, and it cannot be forged by the account itself the way GECOS can
+//     (an invitee with the granted NOPASSWD sudo — or plain chfn where
+//     CHFN_RESTRICT permits — can erase the marker and, without this, make its
+//     own account permanently unrevocable). It stays reuse-proof because a
+//     recreated account under the same name draws a fresh UID.
+//   - The managed GECOS marker. Still honoured, because rows written before the
+//     UID was recorded carry no UID, and those accounts must remain revocable.
+//
+// An account that escalates itself to UID 0 stays protected: never auto-delete a
+// root account. The caller is expected to report that tamper rather than retry —
+// see UIDTampered.
+func IsProtectedRevokeTarget(name string, registered bool, recordedUID int) bool {
 	if IsReservedName(name) {
 		return true
 	}
@@ -157,6 +177,11 @@ func IsProtectedRevokeTarget(name string, registered bool) bool {
 	if pw.UID == 0 {
 		return true
 	}
+	// The registry recorded this exact UID for this exact name at creation: this
+	// account is provably the one the tool made, whatever its GECOS says now.
+	if registered && recordedUID > 0 && pw.UID == recordedUID {
+		return false
+	}
 	managed := hasManagedGECOS(pw.GECOS)
 	if pw.UID < 1000 {
 		return !(registered && managed)
@@ -167,6 +192,23 @@ func IsProtectedRevokeTarget(name string, registered bool) bool {
 	// managed GECOS marker, by contrast, is per-account and reuse-proof, so it — not
 	// `registered` — is what makes a real-UID account safe to delete.
 	return !managed
+}
+
+// UIDTampered reports whether name's current UID differs from the one the
+// registry recorded at creation — the signature of an account that rewrote its
+// own /etc/passwd entry (most dangerously to UID 0, which makes it permanently
+// root and permanently protected). It is advisory: the caller reports it so the
+// operator knows automatic revocation cannot proceed and why. Returns false when
+// nothing was recorded (an older row) or the account is gone.
+func UIDTampered(name string, recordedUID int) (current int, tampered bool) {
+	if recordedUID <= 0 {
+		return 0, false
+	}
+	pw, ok := Lookup(name)
+	if !ok {
+		return 0, false
+	}
+	return pw.UID, pw.UID != recordedUID
 }
 
 // Runner executes account-management commands; injectable for tests.
@@ -242,7 +284,40 @@ func (m *Manager) SetPassword(name, password string) error {
 // SetExpiry sets the account expiry date (YYYY-MM-DD) via chage.
 func (m *Manager) SetExpiry(name, date string) error { return m.Runner.Run("chage", "-E", date, name) }
 
+// expiredDate is a date safely in the past; chage -E it to make an account
+// expired as of now. A literal date is used rather than "0" because chage's
+// numeric form is days-since-epoch and reads ambiguously next to -E -1 ("never").
+const expiredDate = "1970-01-01"
+
+// DisableLogin shuts the account's door before revoke starts taking it apart:
+// it expires the account (chage), which sshd and PAM both refuse regardless of
+// how the invitee authenticates, and locks the password for good measure.
+//
+// This must happen BEFORE processes are killed and the account is deleted.
+// Without it the account stays reachable throughout the revoke, so an invitee
+// reconnecting in a loop can land a session in the window between the kill and
+// the delete — which used to be enough to make userdel fail and leave the
+// account alive. Expiry is the effective gate for a key-based account: locking
+// the password alone would not stop a public-key login.
+//
+// Both steps are best-effort in the sense that the caller continues to the
+// delete either way, but their errors are returned so the caller can say the
+// door could not be shut.
+func (m *Manager) DisableLogin(name string) error {
+	if err := m.SetExpiry(name, expiredDate); err != nil {
+		return err
+	}
+	return m.LockPassword(name)
+}
+
 // Delete removes the account and its home directory.
+//
+// userdel gets -f. Without it, shadow's userdel exits 8 ("user currently logged
+// in") whenever a session exists — so an invitee who simply reconnects in a loop
+// could make every revoke fail. The caller disables the login before reaching
+// here, which closes that race at the source; -f closes what is left of it, and
+// makes the delete succeed against a stale utmp entry too. Deleting an account
+// out from under a live session is exactly what a revoke is asking for.
 func (m *Manager) Delete(name string) error {
 	if m.Runner.Look("deluser") {
 		if err := m.Runner.Run("deluser", "--remove-home", name); err == nil {
@@ -250,7 +325,7 @@ func (m *Manager) Delete(name string) error {
 		}
 	}
 	if m.Runner.Look("userdel") {
-		return m.Runner.Run("userdel", "-r", "--", name)
+		return m.Runner.Run("userdel", "-r", "-f", "--", name)
 	}
 	return fmt.Errorf("no userdel/deluser available")
 }
@@ -260,23 +335,42 @@ func (m *Manager) Delete(name string) error {
 // prove the uid guard holds would kill every root process if the guard broke.
 var kill = syscall.Kill
 
+// terminateSweeps bounds the SIGKILL retry loop. A handful of passes clears any
+// realistic fork loop; the bound keeps a process that cannot be killed at all (an
+// uninterruptible-sleep task) from spinning here forever while holding up revoke.
+const terminateSweeps = 5
+
 // TerminateProcesses signals SIGTERM then, after a grace period, SIGKILL to every
 // process owned by uid. It no-ops for a non-positive uid (never root/all). Done
 // natively via /proc (no pkill dependency).
+//
+// The SIGKILL pass repeats until a scan finds nothing left (or the bound is hit),
+// because one snapshot-then-signal pass loses to a process that is actively
+// forking: a child created after the scan is never in the list, and would survive
+// the revoke as an orphan owned by a uid that is about to be recycled. Re-scanning
+// after each kill closes that window — each pass strictly shrinks the survivors,
+// since a killed parent cannot fork again.
 func TerminateProcesses(uid int) {
 	if uid < 1 {
 		return
 	}
 	signalUID(syscall.SIGTERM, uid)
 	time.Sleep(2 * time.Second)
-	signalUID(syscall.SIGKILL, uid)
+	for i := 0; i < terminateSweeps; i++ {
+		if n := signalUID(syscall.SIGKILL, uid); n == 0 {
+			return
+		}
+	}
 }
 
-func signalUID(sig syscall.Signal, uid int) {
+// signalUID sends sig to every process owned by uid and returns how many it
+// signalled, so a caller can tell an empty sweep from a productive one.
+func signalUID(sig syscall.Signal, uid int) int {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return
+		return 0
 	}
+	signalled := 0
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
@@ -287,9 +381,12 @@ func signalUID(sig syscall.Signal, uid int) {
 			continue
 		}
 		if ruid == uid || euid == uid {
-			_ = kill(pid, sig)
+			if kill(pid, sig) == nil {
+				signalled++
+			}
 		}
 	}
+	return signalled
 }
 
 // procUIDs returns the real and effective UID from /proc/<pid>/status.

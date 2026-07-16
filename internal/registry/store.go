@@ -171,6 +171,24 @@ func (s *Store) Contains(user string) (bool, error) {
 // List returns all records.
 func (s *Store) List() ([]Record, error) { return s.readAll() }
 
+// Lookup returns user's record. found is false when the account has no entry.
+// Callers that need more than one field of a record (revoke needs the recorded
+// UID, the auto-revoke unit, and registration all at once) should use this
+// rather than several single-field lookups, so every field they act on comes
+// from one consistent read of the file.
+func (s *Store) Lookup(user string) (rec Record, found bool, err error) {
+	recs, err := s.readAll()
+	if err != nil {
+		return Record{}, false, err
+	}
+	for _, r := range recs {
+		if r.User == user {
+			return r, true, nil
+		}
+	}
+	return Record{}, false, nil
+}
+
 // UnitFor returns the recorded auto-revoke unit for user (empty if none/absent).
 func (s *Store) UnitFor(user string) (string, error) {
 	recs, err := s.readAll()

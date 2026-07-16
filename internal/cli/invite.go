@@ -844,17 +844,30 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		}
 	}
 
+	// Whoever revokes this account later runs the binary at InstallPath — the
+	// auto-revoke timer's ExecStart, and the revoke command printed in the invite.
+	// If a grant was written that an older binary does not know how to remove (the
+	// sshd exception), that binary would delete the account and leave the grant
+	// behind forever. So refresh the installed command whenever this invite created
+	// something that needs cleaning up, not only when a timer is being scheduled.
+	if wantAuto || sshdDropIn != "" {
+		if err := a.ensureStableInstalled(); err != nil {
+			a.warnf("%s: %v", a.P.M("无法安装/更新稳定命令；撤销时请使用与本次相同版本的二进制",
+				"cannot install/refresh the stable command; revoke with a binary at least as new as this one"), err)
+		}
+	}
+
 	// Clear any stale schedule left by a reused username before scheduling.
 	staleUnit, _ := a.Registry.UnitFor(username)
 	a.Scheduler.Cancel(username, staleUnit)
 	autoUnit := ""
 	autoScheduled := false
 	if wantAuto {
-		// The auto-revoke task's ExecStart runs the installed stable command, so
-		// ensure a binary is present at InstallPath first, otherwise the timer
-		// would fire and fail on a non-installed run.
-		if err := a.ensureStableInstalled(); err != nil {
-			a.warnf("%s: %v", a.P.M("无法安装稳定命令，自动删除改为仅设置到期", "cannot install the stable command; auto-delete falls back to account expiry only"), err)
+		// The auto-revoke task's ExecStart runs the installed stable command, so a
+		// binary must be present at InstallPath (ensured just above), otherwise the
+		// timer would fire and fail on a non-installed run.
+		if _, err := os.Stat(a.InstallPath); err != nil {
+			a.warnf("%s: %v", a.P.M("稳定命令不可用，自动删除改为仅设置到期", "the stable command is unavailable; auto-delete falls back to account expiry only"), err)
 		} else if unit, err := a.Scheduler.Schedule(username, hours); err == nil {
 			autoUnit = unit
 			autoScheduled = true
@@ -878,6 +891,11 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		Fingerprint: fingerprint,
 		AutoRevoke:  autoScheduled,
 		AutoUnit:    autoUnit,
+		// Pin the UID as it is right now, before the invitee has ever had access.
+		// This is revoke's immutable proof that the passwd entry it is looking at is
+		// the account created here — the GECOS marker beside it can be rewritten by
+		// the account itself, this cannot be rewritten retroactively.
+		UID: pw.UID,
 	}
 	registered := false
 	if err := a.Registry.Record(rec); err != nil {

@@ -32,7 +32,9 @@ func New() *Manager {
 	return &Manager{Dir: "/etc/sudoers.d", Validate: visudoValidate, Verify: verifyNopasswd}
 }
 
-func (m *Manager) filePath(user string) string {
+// FilePath is the drop-in path for user. Exported so a diagnostic can name the
+// exact file it is reporting.
+func (m *Manager) FilePath(user string) string {
 	return filepath.Join(m.Dir, filePrefix+user)
 }
 
@@ -71,7 +73,7 @@ func (m *Manager) Grant(user string) error {
 			return fmt.Errorf("sudoers validation failed: %w", werr)
 		}
 	}
-	path := m.filePath(user)
+	path := m.FilePath(user)
 	if err := fsutil.WriteRootFile(path, content, 0o440); err != nil {
 		return err
 	}
@@ -93,10 +95,36 @@ func (m *Manager) Grant(user string) error {
 // Remove deletes the drop-in for user (best-effort). It only ever removes a file
 // under Dir carrying the managed prefix.
 func (m *Manager) Remove(user string) {
-	path := m.filePath(user)
+	path := m.FilePath(user)
 	if strings.HasPrefix(filepath.Base(path), filePrefix) {
 		_ = os.Remove(path)
 	}
+}
+
+// Orphans returns the accounts whose managed drop-in is still on disk although
+// the account itself is gone. exists reports whether an account is still present.
+//
+// An orphaned NOPASSWD:ALL file is the most dangerous leftover this tool can
+// produce: it grants nothing while its username is unused, then re-arms full
+// root the instant that name is reused. Grants outlive their account only when
+// something went wrong — an account deleted out of band, or a revoke that could
+// not finish — so nothing else will notice them. This is what lets `doctor`
+// report them and `cleanup-expired --compact` remove them.
+func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*"))
+	if err != nil {
+		return nil, err
+	}
+	var orphans []string
+	for _, path := range matches {
+		user := strings.TrimPrefix(filepath.Base(path), filePrefix)
+		// validate.Username keeps a hand-made file with a strange name from being
+		// reported (and later removed) as if this tool had written it.
+		if user != "" && validate.Username(user) && !exists(user) {
+			orphans = append(orphans, user)
+		}
+	}
+	return orphans, nil
 }
 
 // visudoValidate syntax-checks a sudoers file. If visudo is unavailable the
