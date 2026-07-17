@@ -10,7 +10,9 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
+	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
+	"github.com/xxvcc/linux-temp-admin/internal/table"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
@@ -60,16 +62,42 @@ func (a *App) status(args []string) int {
 	}
 	if len(recs) == 0 {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
+		return 0
+	}
+	a.printf("%s", a.usersTable(recs).String())
+	return 0
+}
+
+// usersTable renders the registered accounts. It is the single view of that list:
+// `cleanup-expired` used to print its own strictly-poorer version of the same
+// rows (user/exists/expires/auto — every one of them a column here under a
+// different name), which was two renderings of one truth waiting to disagree.
+//
+// The auto-revoke unit is deliberately not a column. It is 40-odd characters,
+// mechanically derived from the username, and would double the table's width to
+// tell the reader something they already know; `status --user <name>` still
+// prints it for the one account being examined.
+func (a *App) usersTable(recs []registry.Record) *table.Table {
+	t := table.New(
+		a.P.M("用户", "USER"),
+		a.P.M("状态", "STATE"),
+		a.P.M("SUDO", "SUDO"),
+		a.P.M("自动删除", "AUTO-DELETE"),
+		a.P.M("到期", "EXPIRES"),
+		a.P.M("主机", "HOST"),
+		a.P.M("端口", "PORT"),
+	)
+	yn := func(b bool) string {
+		return a.P.M(map[bool]string{true: "是", false: "否"}[b], map[bool]string{true: "yes", false: "no"}[b])
 	}
 	for _, r := range recs {
 		state := a.P.M("缺失", "missing")
 		if user.Exists(r.User) {
 			state = a.P.M("在册", "active")
 		}
-		a.printf("  %-22s status=%-7s sudo=%v auto=%v expires=%s host=%s port=%d unit=%s",
-			r.User, state, r.Sudo, r.AutoRevoke, r.Expires, r.Host, r.Port, orNone(r.AutoUnit))
+		t.Row(r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port))
 	}
-	return 0
+	return t
 }
 
 func (a *App) cleanupExpired(args []string) int {
@@ -83,12 +111,14 @@ func (a *App) cleanupExpired(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
-	a.warnf("%s", a.P.M("此命令只查看到期/自动删除状态，不主动删除用户。",
-		"This only shows expiry/auto-delete status; it does not delete users."))
+	a.warnf("%s", a.P.M("此命令不删除用户；账号请用 revoke，状态请用 status。",
+		"This never deletes a user: revoke deletes accounts, status shows them."))
+	// The account list is status's job — this used to print its own poorer copy of
+	// it. Show it here too, but through the one renderer, so the two can never
+	// drift apart.
 	recs, _ := a.Registry.List()
-	for _, r := range recs {
-		exists := user.Exists(r.User)
-		a.printf("  %-22s exists=%v expires=%s auto=%v", r.User, exists, r.Expires, r.AutoRevoke)
+	if len(recs) > 0 {
+		a.printf("%s", a.usersTable(recs).String())
 	}
 	if compact {
 		// Sweep the live grants BEFORE the registry rows: compacting drops the rows
@@ -247,8 +277,14 @@ var menuItems = []struct {
 }{
 	{"创建一次性临时管理员邀请", "Create one-time temp admin invite", func(a *App) int { return a.invite(nil) }},
 	{"撤销/删除临时用户", "Revoke/delete temp user", func(a *App) int { return a.revoke(nil) }},
-	{"查看用户状态", "Show user status", func(a *App) int { return a.status(nil) }},
-	{"查看账号过期/自动删除状态", "Show expiry/auto-delete status", func(a *App) int { return a.cleanupExpired(nil) }},
+	{"查看临时用户", "List temporary users", func(a *App) int { return a.status(nil) }},
+	// The old entry here showed expiry/auto-delete state — every column of which
+	// the entry above already shows. What it uniquely does is clean up, so that is
+	// what it now offers; the name used to promise a deletion it explicitly refused
+	// to perform.
+	{"清理失效登记与孤儿授权", "Clean up stale registry rows and orphaned grants", func(a *App) int {
+		return a.cleanupExpired([]string{"--compact"})
+	}},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
