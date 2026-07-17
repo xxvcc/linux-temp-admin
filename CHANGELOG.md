@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- **The language is Chinese by default, whatever the server's locale says, and the
+  tool asks you once instead of guessing.** The host locale (`LANG`/`LC_ALL`) used
+  to sit above the default in the precedence chain, so a plain
+  `LANG=en_US.UTF-8` server — the overwhelming majority — silently overrode this
+  project's own primary language, and an operator who wanted Chinese had to
+  discover `--lang`. What language a box was installed in says little about the
+  language of the person holding the invite, so the locale is no longer consulted
+  at all.
+
+  Instead, the first interactive run asks:
+
+  ```text
+  Language / 语言:
+    1) 中文 (默认)
+    2) English
+  选择 / select [1-2]:
+  ```
+
+  The answer is remembered in `/var/lib/linux-temp-admin/v2/prefs` (root:root
+  0600) and never asked again. A new interactive-menu entry, labelled
+  bilingually as "切换语言 / Switch language" so it is findable even by someone
+  who picked the language they cannot read, changes it later.
+
+  Precedence is now `--lang` > `LINUX_TEMP_ADMIN_LANG` > the remembered choice >
+  the question > Chinese. The question is skipped wherever asking would be wrong —
+  no terminal (a script, CI, the cron-fired auto-revoke) or a `--yes` run that
+  said not to prompt — and those fall back to the remembered choice or Chinese.
+
+  Note the consequence: a non-interactive run on an English server now prints
+  Chinese unless `--lang`/`LINUX_TEMP_ADMIN_LANG` says otherwise. That is the
+  intended trade for not letting the box's locale outrank the operator.
+
 ## v2.2.6 - Revoke actually revokes
 
 A three-round adversarial security audit of the whole tool. The cryptographic

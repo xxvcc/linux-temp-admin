@@ -31,6 +31,11 @@ const (
 	RegistryFile = RegistryDir + "/registry.tsv"
 	// RegistryLockFile is the flock file for registry mutations.
 	RegistryLockFile = RegistryDir + "/registry.lock"
+	// PrefsFile holds the operator's remembered UI choices (currently just the
+	// language). It shares the tool's state directory rather than /etc: it is a
+	// convenience the tool wrote for itself, not configuration an operator is
+	// expected to hand-edit or ship in a config-management repo.
+	PrefsFile = RegistryDir + "/prefs"
 	// RegistrySchema is written as the registry header's version marker.
 	RegistrySchema = 2
 

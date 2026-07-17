@@ -61,15 +61,27 @@ sudo linux-temp-admin invite --sudo
 
 ## 语言
 
-界面语言按以下顺序确定：`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 系统 locale（`LC_ALL`，其次 `LANG`）> **默认中文**。
+**默认中文，与服务器的 locale 无关。** 第一次在终端里运行时，工具会先问一次语言，记住之后就不再问：
 
-英文环境（`en_*` locale）会自动用英文；否则用 `--lang en` 或设环境变量：
+```text
+Language / 语言:
+  1) 中文 (默认)
+  2) English
+选择 / select [1-2]:
+```
+
+选择保存在 `/var/lib/linux-temp-admin/v2/prefs`。想改随时进交互菜单选「切换语言 / Switch language」（这一项的标签是双语的，选错语言也找得到）。
+
+优先级：`--lang zh|en` > 环境变量 `LINUX_TEMP_ADMIN_LANG` > 记住的选择 > 首次交互时的提问 > **中文**。
+
+**系统 locale（`LANG`/`LC_ALL`）不再参与判断**——服务器装的是什么语言，跟拿着邀请的人说什么语言没多大关系。所以一台 `LANG=en_US.UTF-8` 的机器也默认中文，除非你选了英文。
 
 ```bash
-sudo linux-temp-admin --lang en invite --sudo
-# 或在当前 shell 里设一次：
-export LINUX_TEMP_ADMIN_LANG=en
+sudo linux-temp-admin --lang en invite --sudo     # 只影响这一次
+sudo -E linux-temp-admin invite --sudo            # 配合 LINUX_TEMP_ADMIN_LANG=en；注意 -E，sudo 默认会清掉环境变量
 ```
+
+非交互运行（脚本、CI、到期自动撤销的定时器）问不了，所以用记住的选择，没有就用中文；`--lang`/环境变量始终可覆盖。
 
 ## 安装、升级与诊断
 
@@ -307,6 +319,7 @@ sudo linux-temp-admin doctor
 ```text
 /usr/local/sbin/linux-temp-admin                             # 稳定撤销命令
 /var/lib/linux-temp-admin/v2/registry.tsv                    # 本地登记表（root:root 0600，目录 0700）
+/var/lib/linux-temp-admin/v2/prefs                           # 记住的界面语言（root:root 0600）
 /var/log/linux-temp-admin/audit.log                          # 操作审计日志（root:root 0600，目录 0700）
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # 含 NoNewPrivileges 等轻量限制
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer

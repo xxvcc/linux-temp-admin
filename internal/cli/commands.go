@@ -4,9 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -247,9 +250,38 @@ var menuItems = []struct {
 	{"查看用户状态", "Show user status", func(a *App) int { return a.status(nil) }},
 	{"查看账号过期/自动删除状态", "Show expiry/auto-delete status", func(a *App) int { return a.cleanupExpired(nil) }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
+	{"切换语言 / Switch language", "Switch language / 切换语言", func(a *App) int { return a.switchLang() }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
 	{"退出", "Exit", nil},
+}
+
+// switchLang re-asks the language and remembers the answer, so the one-time
+// question at first run is not a one-way door. Its own label is bilingual: an
+// operator who picked the wrong language must be able to find this entry in a
+// menu they cannot read.
+func (a *App) switchLang() int {
+	a.printf("\nLanguage / 语言:\n  1) 中文\n  2) English")
+	choice := a.prompt("选择 / select [1-2]: ")
+	var lang i18n.Lang
+	switch strings.TrimSpace(choice) {
+	case "1":
+		lang = i18n.ZH
+	case "2":
+		lang = i18n.EN
+	default:
+		a.warnf("%s", a.P.M("无效选择，语言未改变", "invalid choice; language unchanged"))
+		return 1
+	}
+	// Apply to this session first: the confirmation below should already read in the
+	// language just chosen, whether or not it can be persisted.
+	a.P = i18n.Printer{Lang: lang}
+	if err := prefs.SetLang(string(lang)); err != nil {
+		a.warnf("%s: %v", a.P.M("已切换，但未能记住（下次仍会用旧设置）", "switched, but could not be remembered (the next run will use the old setting)"), err)
+		return 1
+	}
+	a.success(a.P.M("语言已切换为中文，并已记住。", "language switched to English and remembered."))
+	return 0
 }
 
 // menu drives the interactive loop. The menu is drawn on entry and only when
