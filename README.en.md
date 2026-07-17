@@ -61,15 +61,27 @@ It does **not**: store the private key; generate or print any account/sudo passw
 
 ## Language
 
-The UI language is resolved in this order: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the system locale (`LC_ALL`, then `LANG`) > **Chinese by default** (this is a Chinese-first project).
+**Chinese by default, whatever the server's locale says.** The first time you run it at a terminal it asks once, then remembers:
 
-An English locale (`en_*`) selects English automatically. On a server with no `LANG` set, pass `--lang en` or set the environment variable:
+```text
+Language / 语言:
+  1) 中文 (默认)
+  2) English
+选择 / select [1-2]:
+```
+
+The choice is saved in `/var/lib/linux-temp-admin/v2/prefs`. Change it any time from the interactive menu under "Switch language / 切换语言" (that entry is labelled in both languages, so it is findable even if you picked the one you cannot read).
+
+Precedence: `--lang zh|en` > the `LINUX_TEMP_ADMIN_LANG` environment variable > the remembered choice > the question on first interactive use > **Chinese**.
+
+**The system locale (`LANG`/`LC_ALL`) is deliberately not consulted.** What language a server was installed in says little about the language of the person holding the invite. So a box with `LANG=en_US.UTF-8` still defaults to Chinese until you choose English.
 
 ```bash
-sudo linux-temp-admin --lang en invite --sudo
-# or once per shell:
-export LINUX_TEMP_ADMIN_LANG=en
+sudo linux-temp-admin --lang en invite --sudo     # this run only
+sudo -E linux-temp-admin invite --sudo            # with LINUX_TEMP_ADMIN_LANG=en; note -E, sudo scrubs the environment by default
 ```
+
+A non-interactive run (a script, CI, the auto-revoke timer) has nobody to ask, so it uses the remembered choice or falls back to Chinese; `--lang` and the environment variable always override.
 
 ## Install, upgrade, and doctor
 
@@ -307,6 +319,7 @@ Two host notes:
 ```text
 /usr/local/sbin/linux-temp-admin                             # stable revoke command
 /var/lib/linux-temp-admin/v2/registry.tsv                    # local registry (root:root 0600, dir 0700)
+/var/lib/linux-temp-admin/v2/prefs                           # the remembered UI language (root:root 0600)
 /var/log/linux-temp-admin/audit.log                          # operation audit log (root:root 0600, dir 0700)
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # with NoNewPrivileges and similar light confinement
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer

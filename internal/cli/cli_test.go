@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
@@ -530,5 +531,54 @@ func TestMenuDoesNotSpinOnNonTTYInvalidInput(t *testing.T) {
 	}
 	if strings.Count(errb.String(), "invalid choice") > 1 {
 		t.Errorf("a non-interactive run should complain once, not loop:\n%s", errb.String())
+	}
+}
+
+// TestResolveLangPrecedence pins the language rules: --lang beats the env
+// override, which beats the remembered preference, and the host's locale is not
+// consulted at all — a server with LANG=en_US must not override the tool's own
+// default, which is what used to force operators to discover --lang.
+func TestResolveLangPrecedence(t *testing.T) {
+	// Point the prefs file at a temp path so the test cannot read or write the
+	// real one.
+	dir := t.TempDir()
+	old := prefs.File
+	prefs.File = filepath.Join(dir, "prefs")
+	t.Cleanup(func() { prefs.File = old })
+
+	// An English locale must be ignored entirely.
+	t.Setenv("LANG", "en_US.UTF-8")
+	t.Setenv("LC_ALL", "en_US.UTF-8")
+
+	// Nothing set anywhere, nothing remembered, and no TTY to ask at -> Chinese.
+	if got := resolveLang("", "", nil); got != i18n.ZH {
+		t.Errorf("no flag/env/pref on an en_US host = %q, want zh (locale must not win)", got)
+	}
+	// The remembered preference is used when there is no flag or env.
+	if err := prefs.SetLang("en"); err != nil {
+		t.Skipf("cannot write prefs here: %v", err)
+	}
+	if got := resolveLang("", "", nil); got != i18n.EN {
+		t.Errorf("remembered preference = %q, want en", got)
+	}
+	// The env override beats the remembered preference...
+	if got := resolveLang("", "zh", nil); got != i18n.ZH {
+		t.Errorf("env over pref = %q, want zh", got)
+	}
+	// ...and an explicit flag beats everything.
+	if got := resolveLang("zh", "en", nil); got != i18n.ZH {
+		t.Errorf("flag over env = %q, want zh", got)
+	}
+}
+
+// TestAskLangSkipsUnattendedRuns: a --yes run said "do not ask me anything", and
+// a non-TTY run has nobody to ask. Neither may be stopped by the question.
+func TestAskLangSkipsUnattendedRuns(t *testing.T) {
+	// stdin here is not a terminal, which alone is enough to skip.
+	if _, ok := askLang(nil); ok {
+		t.Error("askLang must not prompt without a terminal")
+	}
+	if _, ok := askLang([]string{"invite", "--yes"}); ok {
+		t.Error("askLang must not prompt during a --yes run")
 	}
 }

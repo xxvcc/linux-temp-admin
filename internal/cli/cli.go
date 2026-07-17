@@ -20,6 +20,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
+	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
@@ -125,6 +126,10 @@ func randPassword(nChars int) (string, error) {
 	return string(out), nil
 }
 
+// EnvLang overrides the language for one run without changing what is
+// remembered. sudo scrubs the environment by default, so it needs `sudo -E`.
+const EnvLang = "LINUX_TEMP_ADMIN_LANG"
+
 // Run is the process entry point: it resolves the language, then dispatches.
 func Run(args []string) int {
 	syscall.Umask(0o077)
@@ -133,16 +138,60 @@ func Run(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	resolved := i18n.Resolve(lang, os.Getenv("LINUX_TEMP_ADMIN_LANG"), callerLocale())
-	app := NewApp(resolved)
+	app := NewApp(resolveLang(lang, os.Getenv(EnvLang), rest))
 	return app.Dispatch(rest)
 }
 
-func callerLocale() string {
-	if v := os.Getenv("LC_ALL"); v != "" {
-		return v
+// resolveLang picks the UI language: an explicit --lang, then the env override,
+// then what the operator chose last time, then — on a terminal that has never
+// been asked — the question itself, and finally Chinese.
+//
+// The host's locale is deliberately NOT consulted. It used to be, which meant a
+// server with LANG=en_US.UTF-8 silently overrode the project's own default and
+// the operator had to discover --lang to get Chinese back. The language of the
+// box says little about the language of the person holding the invite, so the
+// tool asks that person once and remembers the answer instead of guessing from
+// the environment.
+func resolveLang(flag, env string, rest []string) i18n.Lang {
+	for _, v := range []string{flag, env, prefs.Lang()} {
+		if l, ok := i18n.Parse(v); ok {
+			return l
+		}
 	}
-	return os.Getenv("LANG")
+	if l, ok := askLang(rest); ok {
+		return l
+	}
+	return i18n.ZH
+}
+
+// askLang puts the language question to an operator who has never answered it,
+// and remembers the answer. It returns ok=false whenever asking would be wrong:
+// no terminal to ask at (a script, a cron-fired auto-revoke), or a run that
+// explicitly asked not to be prompted. Those get the default, and stay silent.
+func askLang(rest []string) (i18n.Lang, bool) {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		return "", false
+	}
+	for _, a := range rest {
+		if a == "--yes" || a == "-y" { // an unattended run must not be stopped by a question
+			return "", false
+		}
+	}
+	fmt.Fprint(os.Stderr, "\nLanguage / 语言:\n  1) 中文 (默认)\n  2) English\n选择 / select [1-2]: ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" { // EOF: take the default rather than hang
+		return "", false
+	}
+	lang := i18n.ZH
+	if strings.TrimSpace(line) == "2" {
+		lang = i18n.EN
+	}
+	// Remembering is a convenience: if it cannot be saved the run still proceeds in
+	// the chosen language, it will just ask again next time.
+	if err := prefs.SetLang(string(lang)); err != nil {
+		fmt.Fprintf(os.Stderr, "（未能记住语言选择 / could not remember the language choice: %v）\n", err)
+	}
+	return lang, true
 }
 
 // extractLang pulls --lang/--lang=VAL from anywhere in args (an explicit flag
