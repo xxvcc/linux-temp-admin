@@ -30,19 +30,39 @@ All notable changes to this project are documented here.
 
 - **v2.4.0 argued the opposite of this, and was wrong on the facts.** It kept
   `revoke` a separate entry because "making delete a mode inside a viewer is a
-  footgun" — but revoke does not act on a keystroke: it makes you type the account's
-  full name, and a mistyped one is refused. A number that opens a confirmation is
-  not a misclick. It also treated cleanup as a different subject from the list,
-  when what `--compact` prunes is *precisely* the rows the table marks 缺失 — a
-  registry row whose account is gone. Two tests now pin that equivalence from both
-  sides: cleanup takes every missing row, and spares every row whose account
-  exists.
+  footgun" — but deleting a real account does not happen on a keystroke: revoke
+  makes you type the account's full name, and a mistyped one is refused. A number
+  that opens a confirmation is not a misclick. It also treated cleanup as a
+  different subject from the list, when what `--compact` prunes is *precisely* the
+  rows the table marks 缺失 — a registry row whose account is gone. Two tests now
+  pin that equivalence from both sides: cleanup takes every missing row, and
+  spares every row whose account exists.
+
+- **What a number does depends on the row, and the difference is stated rather
+  than smoothed over.** A 在册 row is a real account: revoke deletes it, behind the
+  full-name confirmation. A 缺失 row has no account left to lose — only a registry
+  row and any grant it left behind — so picking it sweeps those with no prompt,
+  exactly as `c` sweeps every missing row without asking. Demanding a name for one
+  of them and not for all of them would be ceremony, not safety. An earlier draft
+  of this entry claimed the confirmation covered every row; a review caught that,
+  and the behaviour is now pinned by its own test instead of being folklore.
 
 - The renumbering is the cost, and it lands on operators who just learned v2.4.0's
   numbers: the menu goes from 9 entries to 7, and everything below 2 shifts up.
   Nothing scriptable moved — `status`, `revoke`, `cleanup-expired --compact` are
   unchanged as subcommands, and the menu has never been an interface a script can
   drive.
+
+- **The gates this rests on are now actually tested.** The full-name confirmation
+  — the whole safety argument above — was executed by no test in this repo: delete
+  the block from `revoke` and the entire suite, `e2e` included, still passed. It is
+  reachable only with a real account (a fake registry row takes revoke's
+  "already gone" branch first), so the new tests create one, and one of them
+  reproduces that mutation as a failure. The same went for the table's numbering:
+  the old test asserted `recs[n-1]` and never read the screen, so inverting the
+  rendered `#` column alone left every test green while the display told the
+  operator to type the number of a different account. The new test reads the number
+  off the rendered table and feeds it back in.
 
 - `doctor` keeps its own orphan check. Orphaned grants are found by globbing
   `/etc/sudoers.d` and `/etc/ssh/sshd_config.d`, not by reading the registry, so a

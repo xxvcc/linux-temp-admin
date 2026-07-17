@@ -179,16 +179,24 @@ func (a *App) removeSSHDException(username string) {
 //
 // An unrecognized answer is returned verbatim for validate.Username to reject: a
 // picker must not be the thing that decides what a legal username is.
+//
+// An empty registry still prompts. It says so and then asks anyway, because a
+// registry with no rows is exactly the state `revoke --force` exists to dig out
+// of — a tool-made account whose row was lost still has to be nameable, and the
+// only way to name it here is to type it. (manageUsers takes the opposite branch
+// on an empty list, but for a reason that does not apply here: it is reached from
+// the menu, where a prompt nobody can answer would eat the next menu choice.)
 func (a *App) selectUser() string {
 	recs, err := a.Registry.List()
 	if err != nil {
 		a.warnf("%v", err)
 	}
 	if len(recs) == 0 {
-		a.warnf("%s", a.P.M("没有已登记的临时用户。", "no registered temporary users."))
-		return ""
+		a.warnf("%s", a.P.M("没有已登记的临时用户；如需删除未登记账号，请输入完整用户名（配合 --force）。",
+			"no registered temporary users; to delete an unregistered account, type its full username (with --force)."))
+	} else {
+		a.printf("%s", a.usersTable(recs, true).String())
 	}
-	a.printf("%s", a.usersTable(recs, true).String())
 	choice := strings.TrimSpace(a.prompt(a.P.M("请输入编号或用户名: ", "enter a number or a username: ")))
 	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(recs) {
 		return recs[n-1].User

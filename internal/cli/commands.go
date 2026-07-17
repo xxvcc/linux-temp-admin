@@ -123,9 +123,24 @@ func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
 // "missing": a registry row whose account is gone is exactly what --compact
 // prunes, so it was never a separate object, only a separate menu item.
 //
-// Looking is the default: a bare Enter leaves. Revoking still has to get past
-// typing the account's full name, which is where that decision belongs — not in
-// whether the list happens to be on screen.
+// Looking is the default: a bare Enter leaves.
+//
+// What a number does depends on the row's state, and the difference is worth
+// stating exactly rather than summarising as "a number revokes":
+//
+//   - 在册/active — a real account. revoke deletes it, and that has to get past
+//     typing the account's full name, which is where that decision belongs and
+//     not in whether the list happens to be on screen.
+//   - 缺失/missing — the account is already gone; only a registry row and any
+//     grant it left behind remain. revoke sweeps those, with no prompt: there is
+//     no account to lose, and `c` on this same screen sweeps every such row
+//     without asking, so demanding a name for one of them and not for all of
+//     them would be ceremony, not safety.
+//
+// The pickers deliberately list missing rows (revoke's picker used to filter them
+// out). Being unpickable never made them safer — the same cleanup was always one
+// typed name away — it only meant the one command that tidies them could not
+// offer them.
 func (a *App) manageUsers() int {
 	recs, err := a.Registry.List()
 	if err != nil {
@@ -362,10 +377,14 @@ var menuItems = []struct {
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
-	// Appended rather than slotted in beside the other settings-ish entries, so no
-	// existing digit changes meaning. Inserting it earlier pushed Exit from 8 to 9,
-	// which turned an old hand's reflexive "8" into "uninstall the stable command".
-	// Here the only shifted key is Exit, and a stale "8" lands on this — harmless.
+	// Kept next to last, in front of Exit. When this entry was added it was appended
+	// for a stronger reason — that appending changed no existing digit's meaning,
+	// where slotting it in earlier would have pushed Exit from 8 to 9 and turned an
+	// old hand's reflexive "8" into "uninstall the stable command". That property is
+	// gone: merging the three account entries into one renumbered everything below
+	// 2 anyway, which is the cost the v2.5.0 CHANGELOG entry owns rather than hides.
+	// The habit it teaches survives its own arithmetic — a digit's meaning is the
+	// interface, so moving one is a real cost to weigh, not a free tidy-up.
 	{"切换语言 / Switch language", "Switch language / 切换语言", func(a *App) int { return a.switchLang() }},
 	{"退出", "Exit", nil},
 }

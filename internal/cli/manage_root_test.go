@@ -5,12 +5,14 @@ package cli
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
+	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
 
 // fakeSys satisfies schedule.System without touching systemd or at.
@@ -182,5 +184,165 @@ func TestManageUsersCleanupRequiresRoot(t *testing.T) {
 	}
 	if got := regUsers(t, a); len(got) != 1 {
 		t.Errorf("a non-root cleanup must change nothing; rows now %v", got)
+	}
+}
+
+// parseNumberedTable reads back the rendered table: it returns the "#" cell and
+// the user cell of each body row, in the order printed. It deliberately parses
+// the real output rather than trusting the model that produced it — the point is
+// to compare what the operator SEES against what selection DOES.
+func parseNumberedTable(t *testing.T, out string) (nums []string, users []string) {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "│") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(line, "│"), "│")
+		if len(cells) < 2 {
+			continue
+		}
+		n, u := strings.TrimSpace(cells[0]), strings.TrimSpace(cells[1])
+		if n == "#" || n == "" { // header, or a row with no number column
+			continue
+		}
+		nums = append(nums, n)
+		users = append(users, u)
+	}
+	return nums, users
+}
+
+// TestManageUsersDisplayedNumberIsTheOneThatActs pins the half of the invariant
+// that the mapping test cannot reach. "A row number must map to exactly the row
+// displayed" is two claims: that selection resolves recs[n-1], and that the "#"
+// the operator reads is that same n. A test that only inspects the registry
+// afterwards pins the first and lets the second rot: invert the rendered "#"
+// column alone and every other test here still passes, while the screen now tells
+// the operator to type the number of a different account.
+//
+// So this one reads the number off the rendered table and feeds that back in.
+func TestManageUsersDisplayedNumberIsTheOneThatActs(t *testing.T) {
+	// Render first, with an input that changes nothing, and see what is on screen.
+	view, out, _ := newManageApp(t, "\n", "ltarender-a1", "ltarender-b2", "ltarender-c3")
+	if rc := view.manageUsers(); rc != 0 {
+		t.Fatalf("view rc=%d", rc)
+	}
+	nums, users := parseNumberedTable(t, out.String())
+	if len(nums) != 3 {
+		t.Fatalf("want 3 numbered rows, parsed %d from:\n%s", len(nums), out.String())
+	}
+	// Whatever the screen labels a row, typing that label must act on that row's
+	// account — checked for every row, so no single lucky alignment passes.
+	for i := range nums {
+		a, _, _ := newManageApp(t, nums[i]+"\n", "ltarender-a1", "ltarender-b2", "ltarender-c3")
+		if rc := a.manageUsers(); rc != 0 {
+			t.Fatalf("row %q: rc=%d", nums[i], rc)
+		}
+		got := regUsers(t, a)
+		for _, g := range got {
+			if g == users[i] {
+				t.Errorf("screen labels %q as row %q, but typing %q left it registered (rows now %v)",
+					users[i], nums[i], nums[i], got)
+			}
+		}
+		if len(got) != 2 {
+			t.Errorf("row %q should have taken exactly one account; rows now %v", nums[i], got)
+		}
+	}
+}
+
+// newRealAccount creates an actual local account and registers it with its REAL
+// uid, returning that uid. The confirmation gate is only reachable when the
+// account exists — revoke returns from its "user is gone, clean up" branch first
+// otherwise — so a fake row cannot reach it, which is exactly why the gate went
+// untested. The uid must be the real one or IsProtectedRevokeTarget refuses the
+// account as UID-tampered before the confirmation gets to be what is under test.
+func newRealAccount(t *testing.T, a *App, name string) int {
+	t.Helper()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd %s: %v: %s", name, err, out)
+	}
+	pw, ok := user.Lookup(name)
+	if !ok {
+		t.Fatalf("%s was not created", name)
+	}
+	if err := a.Registry.Record(registry.Record{
+		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
+		Host: "203.0.113.5", Port: 22, UID: pw.UID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return pw.UID
+}
+
+// TestManageUsersRevokeRefusesWithoutTheFullName pins the merge's entire safety
+// argument, which until now no test in this repo executed: picking a row does not
+// delete it — revoke makes you type the account's full name, and a mistyped one
+// is refused. Delete the confirmation block from revoke and every other test
+// still passes; this one fails, because the account is really there to lose.
+func TestManageUsersRevokeRefusesWithoutTheFullName(t *testing.T) {
+	const name = "ltaconfirm1"
+	a, _, errb := newManageApp(t, "1\nltaconfirm-typo\n")
+	a.Users = user.New()
+	newRealAccount(t, a, name)
+
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("a refused confirmation is a cancel, not an error: rc=%d", rc)
+	}
+	if !user.Exists(name) {
+		t.Fatal("THE ACCOUNT WAS DELETED without the operator typing its name")
+	}
+	if got := regUsers(t, a); len(got) != 1 || got[0] != name {
+		t.Errorf("a cancelled revoke must leave the registry alone; rows now %v", got)
+	}
+	if !strings.Contains(errb.String(), "confirmation mismatch") {
+		t.Errorf("want the cancel to say why; stderr: %q", errb.String())
+	}
+}
+
+// TestManageUsersRevokeDeletesOnceTheFullNameIsTyped is the other half: the gate
+// must open for the operator who actually names the account, or "the number is
+// how you revoke" would be a lie in the safe direction.
+func TestManageUsersRevokeDeletesOnceTheFullNameIsTyped(t *testing.T) {
+	const name = "ltaconfirm2"
+	a, _, _ := newManageApp(t, "1\n"+name+"\n")
+	a.Users = user.New()
+	newRealAccount(t, a, name)
+
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("rc=%d, want 0", rc)
+	}
+	if user.Exists(name) {
+		t.Error("the account survived a confirmed revoke")
+	}
+	if got := regUsers(t, a); len(got) != 0 {
+		t.Errorf("the registry row should be gone; rows now %v", got)
+	}
+}
+
+// TestManageUsersMissingRowIsSweptWithoutAPrompt pins the deliberate asymmetry a
+// review caught the docs overstating. Picking a 缺失 row does NOT ask for the
+// full name: revoke's "the account is gone, clean up after it" branch runs before
+// the confirmation. That is intended — there is no account to lose, and "c" on
+// this same screen sweeps every missing row without asking either — but it makes
+// "a number opens a confirmation" false for exactly these rows, so it is pinned
+// here rather than left as folklore.
+//
+// The input carries a second line that would be the confirmation. Nothing must
+// consume it: if a prompt ever appears here, "no-such-user" is not a legal
+// username and the test fails on the changed exit code rather than passing
+// quietly.
+func TestManageUsersMissingRowIsSweptWithoutAPrompt(t *testing.T) {
+	a, _, errb := newManageApp(t, "1\nno-such-user\n", "ltamissing-a1")
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("rc=%d, want 0", rc)
+	}
+	if got := regUsers(t, a); len(got) != 0 {
+		t.Errorf("the missing row should have been swept; rows now %v", got)
+	}
+	if strings.Contains(errb.String(), "to confirm deletion") {
+		t.Errorf("a missing row has no account to lose and must not demand a name: %q", errb.String())
 	}
 }
