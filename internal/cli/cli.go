@@ -53,7 +53,14 @@ type App struct {
 	// test's verdict comes from a fixture, not from the test host's own sshd.
 	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
 
-	InstallPath  string
+	InstallPath string
+	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
+	// they are fields for the same reason InstallPath is: a test that ran the
+	// teardown against the constants would delete the real ones. CI runs the
+	// integration suite as root, so that is not a hypothetical — it would happen on
+	// every push, to the runner and to whatever box a developer ran it on.
+	StateDir     string
+	AuditLogDir  string
 	Now          func() time.Time
 	RandHex      func(nBytes int) (string, error)
 	RandPassword func(nChars int) (string, error)
@@ -81,6 +88,8 @@ func NewApp(lang i18n.Lang) *App {
 		Audit:        audit.Default(),
 		SSHDConfig:   sysinfo.SSHDEffective,
 		InstallPath:  config.InstallPath,
+		StateDir:     config.StateDir,
+		AuditLogDir:  config.AuditLogDir,
 		Now:          time.Now,
 		RandHex:      randHex,
 		RandPassword: randPassword,

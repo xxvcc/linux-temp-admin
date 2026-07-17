@@ -48,46 +48,6 @@ func (a *App) install(args []string) int {
 	return 0
 }
 
-func (a *App) uninstall(args []string) int {
-	if !a.requireRoot() {
-		return 1
-	}
-	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
-	fs.SetOutput(a.Err)
-	var force, yes bool
-	fs.BoolVar(&force, "force", false, "")
-	fs.BoolVar(&yes, "yes", false, "")
-	fs.BoolVar(&yes, "y", false, "")
-	if !a.parseFlags(fs, args) {
-		return 1
-	}
-	if !force {
-		recs, err := a.Registry.List()
-		if err != nil {
-			a.errorf("%s: %v", a.P.M("无法读取注册表，拒绝卸载（可用 --force）", "cannot read the registry; refusing to uninstall (use --force)"), err)
-			return 1
-		}
-		if len(recs) > 0 {
-			a.errorf("%s", a.P.M("仍有登记用户，拒绝卸载稳定命令；请先 revoke/cleanup，或用 --force。",
-				"registered users still exist; refusing to uninstall — revoke/cleanup first, or use --force."))
-			return 1
-		}
-	}
-	if !yes {
-		if a.prompt(a.P.M("确认删除 "+a.InstallPath+" 请输入 YES: ", "type YES to remove "+a.InstallPath+": ")) != "YES" {
-			a.warnf("%s", a.P.M("已取消", "cancelled"))
-			return 0
-		}
-	}
-	if err := a.Selfmanage.Uninstall(force); err != nil {
-		a.errorf("%v", err)
-		return 1
-	}
-	a.audit("uninstall", "", "ok", a.InstallPath, nil)
-	a.success(a.P.M("已卸载稳定命令", "uninstalled the stable command"))
-	return 0
-}
-
 func (a *App) upgrade(args []string) int {
 	if !a.requireRoot() {
 		return 1

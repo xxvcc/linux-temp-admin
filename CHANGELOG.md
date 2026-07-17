@@ -2,48 +2,110 @@
 
 All notable changes to this project are documented here.
 
-## v2.5.1 - The recorded UID decides in both directions
+## v2.6.0 - Uninstall means uninstall
 
-- **An account whose UID contradicts the one recorded at creation is no longer
-  deleted.** The registry pins a `(name, uid)` pair when it makes an account, and
-  the code calls that pair its "only immutable proof" precisely because the GECOS
-  marker beside it can be rewritten by the account itself. When the proof
-  *matched*, it was honoured. When it *contradicted*, the check fell through and
-  asked the forgeable marker instead — so an account carrying a UID this tool never
-  issued was still deleted, on the say-so of the weaker witness.
+- **`uninstall` removes what this tool put on the host, instead of one file.** It
+  deleted `/usr/local/sbin/linux-temp-admin` and left the accounts, their sudo
+  grants, their sshd exceptions, their auto-delete tasks, the registry, the
+  language preference and v1's leftovers exactly where they were. The menu entry
+  had to be called 「卸载稳定命令」 — "uninstall the stable command" — because the
+  opaque object was the only honest part of the label. It is now just 「卸载」.
 
-  A contradicting UID is not a missing witness; it is a disproof. Whatever the
-  account is now, it is provably not the one created under that name — a
-  hand-recreated account that reused the name, or one that rewrote its own passwd
-  entry. The recorded UID is now decisive both ways, and only a row that recorded
-  no UID at all (rows written before the UID was recorded) still falls back to the
-  marker, because those accounts must stay revocable.
+  It takes an inventory first, shows it, and asks once:
 
-- **This had teeth past deleting the wrong account.** `revoke` aims its SIGKILL
-  sweep at the UID standing in passwd, so an account whose UID no longer matched
-  had that sweep pointed wherever its UID now pointed — at a real user's processes
-  where the two collide. The protection gate runs before that sweep, so refusing is
-  what keeps it aimed at an account the tool can prove it created. Note the reach
-  here is not privilege escalation: changing a UID needs `usermod`, i.e. root, so a
-  `--no-sudo` invitee cannot do it and a `--sudo` one is root-equivalent already.
-  It is a tool that could be made to point its own gun somewhere it never should.
+  ```text
+  [信息] 卸载将移除：
+  ┌────────────┬────────────────────────┬─────────────────────┐
+  │ 账号       │ 状态                   │ 依据                │
+  ├────────────┼────────────────────────┼─────────────────────┤
+  │ ltademo-a1 │ 在册（连同家目录删除） │ registry sudo-grant │
+  └────────────┴────────────────────────┴─────────────────────┘
+    状态目录： /var/lib/linux-temp-admin
+    已安装的命令： /usr/local/sbin/linux-temp-admin
+  确认卸载请输入 YES:
+  ```
 
-- **`UIDTampered`'s report can now actually fire.** It exists to tell the operator
-  "created as %d, now %d — inspect this by hand", and it lived inside the branch
-  something else had already refused: on the one path where the tamper *was* the
-  whole story, it never spoke. A refused account still loses its sudo grant and its
-  sshd exception first, as it always has — that ordering is deliberate — so it is
-  defanged and left for inspection rather than deleted on a false identification.
+- **`uninstall --force` was a trap and is now not one.** The auto-delete unit
+  hardcodes `ExecStart=/usr/local/sbin/linux-temp-admin revoke --user X --yes`, and
+  `--force` skipped the "registered users still exist" refusal — so it deleted the
+  binary out from under every timer on the box. Those timers then fired against a
+  missing path forever: the accounts never expired, and a NOPASSWD-sudo account was
+  left with nothing coming for it. `--force` no longer bypasses the accounts; it
+  keeps only its original meaning (remove a target that is not a safe root-owned
+  regular file).
 
-- The test table already stated this rule ("recorded uid does NOT match -> not the
-  account we made -> protected") but only ever exercised it on accounts whose
-  marker was absent anyway, so the one case that decides it — marker intact, UID
-  contradicting — went untested and returned "deletable". Both halves are pinned
-  now, and both fail against v2.5.0.
+- **The invariant: the binary is never removed while a managed account survives.**
+  Leaving a sudo-capable account behind while deleting the only thing that manages
+  it is worse than not uninstalling at all. If any account cannot be removed, the
+  binary and the state directory stay, the account is named, and the uninstall
+  stops. Survival is decided by asking the system (`user.Exists`) rather than by
+  revoke's exit code, which answers 0 for a deletion, for cleaning up an account
+  that was already gone, AND for a confirmation the operator declined.
 
-  Patch, not minor: this is a defect fix. The CLI contract is unchanged; the one
-  behaviour that changes is a refusal replacing a deletion the tool could not
-  justify.
+- **The inventory is a union of witnesses, and the registry is the weakest one.**
+  Every way a file goes wrong — hand-edited, truncated, restored from an old
+  backup — makes accounts *vanish* from it rather than announce themselves, and an
+  inventory that under-reports is exactly how a teardown strands what it never saw.
+  So an account named by its sudo grant, its sshd exception, its auto-delete unit
+  or v1's registry is torn down too. A witness that cannot be READ refuses the
+  whole uninstall rather than proceeding half-blind.
+
+  The managed GECOS marker is deliberately **not** a witness, and that is a
+  security property, not an omission: it is the one signal an account can write to
+  itself, so `usermod -c 'linux-temp-admin temporary admin' realadmin` would
+  otherwise enlist a real administrator's account — and their home directory — into
+  a teardown.
+
+- **v1's leftovers are read before they are deleted.** `/var/lib/linux-temp-admin/users.tsv`
+  is not litter: it is v1's account registry. v1's units carry no `-v2-` infix, so
+  the v2 glob walks straight past them, and v1's install path was byte-identical to
+  v2's — a v1 timer on an upgraded host invokes *this* binary. Deleting that
+  registry while globbing only the v2 prefix would have reproduced this release's
+  own footgun for v1 accounts, and shredded the only record naming them.
+  `schedule` gained the `Orphans`/`UnitUsers` sweep that `sudoers` and `sshdconf`
+  always had, and it globs both prefixes.
+
+- **The audit log survives an uninstall by default.** It records who opened and
+  closed root-capable accounts; erasing it on the way out is what covering your
+  tracks looks like. `--purge-audit` removes it, and the teardown's own record is
+  written *before* the purge, so "purge" cannot mean "leave exactly one line".
+
+- **`uninstall` refuses when run from the account it would delete.** A temp admin
+  has sudo and can run it; deleting its own account mid-teardown reaps the sudo
+  front-end relaying the signals and leaves the box half dismantled with nobody
+  able to log in and finish. This is an interlock for the honest operator and not a
+  security boundary — `sudo su -` drops `SUDO_USER`, the only identity signal this
+  tool has — and the code says so rather than implying a guarantee it cannot keep.
+
+- **`sudoers.Remove` reports failure, and every caller listens.** It returned
+  nothing, so failing to delete a file that hands out passwordless root the instant
+  its username exists was silent. `revoke` strips that grant *first*, deliberately,
+  so an account surviving a refused revoke cannot survive holding root — and the
+  error saying it had survived was discarded. `cleanup-expired` was worse: it
+  printed "removed an orphaned sudo grant" whichever way the removal went.
+
+- **A recorded UID now decides in both directions** (this was to be v2.5.1; it
+  ships here). The registry pins a `(name, uid)` pair at creation and the code calls
+  it the tool's only immutable proof, precisely because the GECOS marker beside it
+  can be rewritten by the account itself. A matching UID was honoured; a
+  contradicting one fell through and asked the marker instead, so an account
+  carrying a UID this tool never issued was deleted anyway, on the say-so of the
+  weaker witness. A contradiction is not a missing witness but a disproof.
+
+  It reached past deleting the wrong account: `revoke` aims its SIGKILL sweep at the
+  UID standing in passwd, so an account whose UID no longer matched had that sweep
+  pointed wherever the UID now pointed — at a real user's processes where the two
+  collide, fired unattended by the 3am timer. Not an escalation (changing a UID
+  needs `usermod`, so a `--no-sudo` invitee cannot and a `--sudo` one is
+  root-equivalent already), but a tool that could be aimed somewhere it never
+  should. `UIDTampered`'s report — which lived inside the branch something else had
+  already refused, so on the one path where the tamper was the whole story it never
+  spoke — now fires. Only rows that recorded no UID still fall back to the marker,
+  because those predate the UID being recorded.
+
+  Minor, not patch: `uninstall` does substantially more than it did, `--force` and
+  the menu's fifth entry change meaning, and `--remove-users`/`--purge-audit` are
+  new. `invite`, `revoke`, `status` and `cleanup-expired` are untouched.
 
 ## v2.5.0 - The temp users are one screen
 

@@ -98,12 +98,12 @@ Everyday maintenance:
 sudo linux-temp-admin doctor            # check dependencies, sudoers.d, package manager, init system, SSH port
 sudo linux-temp-admin upgrade           # download, verify the signature, and upgrade the stable command
 sudo linux-temp-admin upgrade --yes     # non-interactive confirmation
-sudo linux-temp-admin uninstall         # remove the stable command
+sudo linux-temp-admin uninstall         # uninstall: accounts, grants, auto-delete tasks, state, command
 sudo ./linux-temp-admin install         # install the binary in hand as the stable command (note the leading ./)
 ```
 
 - **`upgrade`** fetches a new binary from GitHub and installs it only **after the embedded ed25519 public key verifies it** (fail-closed); HTTPS only, capped at 64 MiB, overwrites only when the version is newer. To repair or pin a custom source, use `--force --url URL` (its signature is `URL.sig`). **Use this for routine updates.**
-- **`install`** places a binary you **already have** (no network, no signature check) — for an air-gapped host or a self-built binary. It copies the binary that is *currently running*, so it is only meaningful when you run a copy from elsewhere (`sudo ./linux-temp-admin install`, where the leading `./` is the point). It refuses to overwrite a *different* binary without `--force`; `uninstall` refuses by default while registered users still exist.
+- **`install`** places a binary you **already have** (no network, no signature check) — for an air-gapped host or a self-built binary. It copies the binary that is *currently running*, so it is only meaningful when you run a copy from elsewhere (`sudo ./linux-temp-admin install`, where the leading `./` is the point). It refuses to overwrite a *different* binary without `--force`.
 
 ## Full walkthrough
 
@@ -202,6 +202,19 @@ Clean up stale registry rows and orphaned grants:
 ```bash
 sudo linux-temp-admin cleanup-expired --compact
 ```
+
+**`uninstall`** removes everything this tool put on the host: the temporary accounts (with their home directories), their sudo grants and sshd exceptions, their auto-delete tasks, the state directory (v1's leftovers included), and — last — the command itself.
+
+```bash
+sudo linux-temp-admin uninstall                      # interactive: shows an inventory, then asks for YES
+sudo linux-temp-admin uninstall --yes --remove-users # non-interactive: --remove-users is required when accounts exist
+sudo linux-temp-admin uninstall --yes --purge-audit  # remove the audit log too
+```
+
+- **The audit log is kept by default** at `/var/log/linux-temp-admin/audit.log`. It records who opened and closed root-capable accounts; erasing it on the way out is what covering your tracks looks like. `--purge-audit` removes it.
+- **If any account cannot be removed, neither the command nor the state directory is**, and the uninstall stops and names it. Leaving a sudo-capable account behind while deleting the only thing that manages it is worse than not uninstalling: its auto-delete task invokes that very command.
+- **Uninstalling the command and keeping the accounts is not an option.** `--force` no longer bypasses this; it keeps only its original meaning (remove a target that is not a safe root-owned regular file).
+- **Running it from a temporary account is refused** — the teardown would reap that account's own session partway through and leave the box half dismantled. Run it as root or another administrator.
 
 `--compact` removes registry entries naming accounts that no longer exist, and the **sudo grants and sshd exceptions those accounts left behind** (an orphaned grant is the dangerous one — it re-arms the moment its username is reused). This is the command `doctor` points you at when it finds one.
 
