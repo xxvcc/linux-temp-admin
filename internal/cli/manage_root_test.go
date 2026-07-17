@@ -346,3 +346,50 @@ func TestManageUsersMissingRowIsSweptWithoutAPrompt(t *testing.T) {
 		t.Errorf("a missing row has no account to lose and must not demand a name: %q", errb.String())
 	}
 }
+
+// TestRevokeRefusesAndReportsAUIDTamperedAccount is the CLI-level half of the
+// user package's protection fix. An account whose current UID contradicts the one
+// the registry pinned at creation is not the account this tool made, and revoke
+// must refuse it rather than delete it — and, critically, must refuse BEFORE
+// TerminateProcesses, which aims a SIGKILL sweep at the UID standing in passwd.
+// A contradicting UID is by definition one the tool never issued, so that sweep
+// would have been pointed at whatever the account's UID now collides with.
+//
+// It also pins that the refusal is not silent: UIDTampered's report only ever ran
+// inside the branch something else had already refused, so on the one path where
+// it was the whole story it never spoke.
+func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
+	const name = "ltatamper1"
+	a, _, errb := newManageApp(t, "")
+	a.Users = user.New()
+
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	pw, ok := user.Lookup(name)
+	if !ok {
+		t.Fatal("account not created")
+	}
+	// The row pins a UID this account does not have: the shape of an account that
+	// rewrote its own passwd entry, and of a name whose account was recreated.
+	// The GECOS marker is intact, which is exactly the case that used to pass.
+	if err := a.Registry.Record(registry.Record{
+		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
+		Host: "203.0.113.5", Port: 22, UID: pw.UID + 4242,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.revoke([]string{"--user", name, "--yes"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 (refused)", rc)
+	}
+	if !user.Exists(name) {
+		t.Error("THE ACCOUNT WAS DELETED even though its UID proves it is not the one the tool made")
+	}
+	if !strings.Contains(errb.String(), "UID") {
+		t.Errorf("the refusal must name the tamper, or the operator cannot act on it: %q", errb.String())
+	}
+}

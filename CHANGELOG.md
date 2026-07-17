@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## v2.5.1 - The recorded UID decides in both directions
+
+- **An account whose UID contradicts the one recorded at creation is no longer
+  deleted.** The registry pins a `(name, uid)` pair when it makes an account, and
+  the code calls that pair its "only immutable proof" precisely because the GECOS
+  marker beside it can be rewritten by the account itself. When the proof
+  *matched*, it was honoured. When it *contradicted*, the check fell through and
+  asked the forgeable marker instead — so an account carrying a UID this tool never
+  issued was still deleted, on the say-so of the weaker witness.
+
+  A contradicting UID is not a missing witness; it is a disproof. Whatever the
+  account is now, it is provably not the one created under that name — a
+  hand-recreated account that reused the name, or one that rewrote its own passwd
+  entry. The recorded UID is now decisive both ways, and only a row that recorded
+  no UID at all (rows written before the UID was recorded) still falls back to the
+  marker, because those accounts must stay revocable.
+
+- **This had teeth past deleting the wrong account.** `revoke` aims its SIGKILL
+  sweep at the UID standing in passwd, so an account whose UID no longer matched
+  had that sweep pointed wherever its UID now pointed — at a real user's processes
+  where the two collide. The protection gate runs before that sweep, so refusing is
+  what keeps it aimed at an account the tool can prove it created. Note the reach
+  here is not privilege escalation: changing a UID needs `usermod`, i.e. root, so a
+  `--no-sudo` invitee cannot do it and a `--sudo` one is root-equivalent already.
+  It is a tool that could be made to point its own gun somewhere it never should.
+
+- **`UIDTampered`'s report can now actually fire.** It exists to tell the operator
+  "created as %d, now %d — inspect this by hand", and it lived inside the branch
+  something else had already refused: on the one path where the tamper *was* the
+  whole story, it never spoke. A refused account still loses its sudo grant and its
+  sshd exception first, as it always has — that ordering is deliberate — so it is
+  defanged and left for inspection rather than deleted on a false identification.
+
+- The test table already stated this rule ("recorded uid does NOT match -> not the
+  account we made -> protected") but only ever exercised it on accounts whose
+  marker was absent anyway, so the one case that decides it — marker intact, UID
+  contradicting — went untested and returned "deletable". Both halves are pinned
+  now, and both fail against v2.5.0.
+
+  Patch, not minor: this is a defect fix. The CLI contract is unchanged; the one
+  behaviour that changes is a refusal replacing a deletion the tool could not
+  justify.
+
 ## v2.5.0 - The temp users are one screen
 
 - **Menu items 2, 3 and 4 are one entry: 「管理临时用户（查看 / 撤销 / 清理）」.**
