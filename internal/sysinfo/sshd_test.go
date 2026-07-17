@@ -335,3 +335,56 @@ func TestHasAddressScopedMatch(t *testing.T) {
 		t.Error("a plain `Match User` block is not address-scoped and must not be flagged")
 	}
 }
+
+// TestMatchSSHDPattern pins the matcher against OpenSSH's match.c semantics:
+// only '*' and '?' are special, everything else is literal.
+func TestMatchSSHDPattern(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"xxvcc-a1", "xxvcc-a1", true},
+		{"xxvcc-a1", "xxvcc-a2", false},
+		{"*", "anything", true},
+		{"*", "", true},
+		{"xxvcc-*", "xxvcc-a1b2c3", true},
+		{"xxvcc-*", "other-a1", false},
+		{"*-admin", "temp-admin", true},
+		{"a?c", "abc", true},
+		{"a?c", "ac", false},
+		{"a?c", "abbc", false},
+		{"*a*b*", "xxayybzz", true},
+		{"*a*b*", "xxbyyazz", false},
+		// THE regression: sshd treats brackets literally; path.Match would expand
+		// them into a character class and call this a match, which is how the tool
+		// printed "verified" for a login sshd refuses.
+		{"admin-[0-9]", "admin-5", false},
+		{"admin-[0-9]", "admin-[0-9]", true},
+		// Other path.Match metacharacters that sshd does not honour, either.
+		{`a\*b`, `a\*b`, true},
+		{`a\*b`, "aXb", false},
+		{"a[bc]d", "abd", false},
+		{"a[bc]d", "a[bc]d", true},
+		// Trailing stars collapse; a pattern of only stars matches everything.
+		{"**", "abc", true},
+		{"abc*", "abc", true},
+	}
+	for _, c := range cases {
+		if got := matchSSHDPattern(c.pattern, c.s); got != c.want {
+			t.Errorf("matchSSHDPattern(%q, %q) = %v, want %v", c.pattern, c.s, got, c.want)
+		}
+	}
+}
+
+// TestBracketAllowUsersIsNotAFalseVerify is the end-to-end shape of the same bug:
+// an AllowUsers whose brackets sshd reads literally must NOT admit the account.
+func TestBracketAllowUsersIsNotAFalseVerify(t *testing.T) {
+	rep := CheckKeyLogin(ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\nallowusers xxvcc-[0-9]*\n"),
+		"xxvcc-a1b2c3", []string{"xxvcc-a1b2c3"})
+	if rep.OK() {
+		t.Error("a literal-bracket AllowUsers must not read as admitting this account")
+	}
+	if !rep.Has(BlockAllowUsers) {
+		t.Errorf("expected the whitelist to block; blockers=%v", rep.Blockers)
+	}
+}

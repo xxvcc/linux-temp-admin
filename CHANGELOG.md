@@ -2,6 +2,64 @@
 
 All notable changes to this project are documented here.
 
+## v2.2.6 - Revoke actually revokes
+
+A three-round adversarial security audit of the whole tool. The cryptographic
+supply chain (signature-verified upgrade/install), the symlink/TOCTOU-hardened
+write layer, the never-delete-a-real-account guarantee, and secret handling all
+held up. Everything it did find was in the revoke path, and this release fixes it.
+
+- **An invitee could make its own account permanently unrevocable.** The
+  protection gate decided from `/etc/passwd` fields the account itself can rewrite:
+  erase the managed GECOS marker (with the granted sudo, or plain `chfn` where
+  `CHFN_RESTRICT` permits) and the tool concluded "not mine" and refused to delete
+  it — forever. Worse, an invitee with NOPASSWD sudo could `usermod -o -u 0` itself
+  into a permanently-root, permanently-protected account. And because the gate ran
+  *before* the cleanup, the refusal left the NOPASSWD sudoers drop-in, the sshd
+  `Match` exception, and the auto-revoke timer live with nothing left to remove
+  them.
+
+  The registry now records each account's UID at creation — fixed before the
+  invitee ever had access, and unlike GECOS it cannot be rewritten retroactively —
+  and that (name, uid) pair is what proves an account is the tool's. It stays
+  reuse-proof, because a recreated account under the same name draws a fresh UID.
+  A registry row written before this field still parses (the field is appended;
+  the parser's minimum stays at nine), so accounts already on deployed hosts remain
+  revocable, and a row written now still parses under an older build. The privilege
+  grants are now stripped *before* the gate can refuse, so an account that survives
+  never survives still holding sudo and an sshd exception. An account that rewrote
+  its own UID is reported as tampered rather than silently refused.
+
+- **A reconnect loop defeated revoke — and revoke destroyed its own fallback
+  first.** The account stayed SSH-reachable throughout: nothing locked it, so a
+  login landing in the window between the kill and the delete made `userdel` (which
+  lacked `-f`) exit 8, and revoke returned failure *after* having already cancelled
+  the auto-revoke timer. No sudo needed — a plain reconnect loop left the account
+  alive indefinitely with nothing coming for it. Revoke now shuts the door first
+  (`chage -E` to a past date, which is what stops a *key* login — locking the
+  password alone would not — plus `usermod -L`), deletes with `-f`, and cancels the
+  auto-revoke task only once the account is provably gone: a failed delete leaves
+  the fallback armed to retry.
+
+- **Orphaned NOPASSWD sudo grants were invisible.** `sshdconf` could enumerate its
+  orphans; `sudoers` could not, so `cleanup-expired --compact` pruned the registry
+  row and the sshd file while leaving `/etc/sudoers.d/linux-temp-admin-<user>` on
+  disk — re-arming full root the moment that username was reused — and `doctor`
+  only checked that the *directory* looked safe, never what was in it. Both now
+  enumerate, report, and remove sudo orphans the same way they already did for sshd.
+
+- Hardening from the same audit: `TerminateProcesses` re-scans after each SIGKILL
+  (bounded) instead of one snapshot, so an actively-forking process cannot outlive
+  the sweep; an invite that writes an sshd exception refreshes the installed
+  command even without `--auto-revoke`, so an older binary cannot revoke the account
+  and orphan the exception; sshd Allow/Deny patterns are matched with sshd's own
+  semantics (only `*` and `?` are special — Go's `path.Match` honours `[...]`
+  classes that sshd treats literally, which could print "verified" for a login sshd
+  refuses); the silent metadata probe no longer queries a DNS-named endpoint, which
+  broke the "never leaves this host or its link" promise and let a DNS spoofer seed
+  the invite's Host; and the interactive menu no longer spins on a non-TTY stream of
+  invalid input.
+
 ## v2.2.5 - The invite stops promising a login it never checked
 
 - **`invite` now verifies that the account can actually log in — before it creates

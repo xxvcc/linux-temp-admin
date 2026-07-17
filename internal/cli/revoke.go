@@ -2,6 +2,7 @@ package cli
 
 import (
 	"flag"
+	"fmt"
 	"strconv"
 
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -37,7 +38,10 @@ func (a *App) revoke(args []string) int {
 		return 1
 	}
 
-	registered, err := a.Registry.Contains(username)
+	// One read gives every fact this path acts on — registration, the recorded
+	// creation UID (the immutable proof the account is ours), and the auto-revoke
+	// unit — so they cannot disagree with each other.
+	rec, registered, err := a.Registry.Lookup(username)
 	if err != nil {
 		a.warnf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
 	}
@@ -56,8 +60,8 @@ func (a *App) revoke(args []string) int {
 	if !user.Exists(username) {
 		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/sshd 例外/自动删除任务："+username,
 			"user does not exist; cleaning up registry/sudoers/sshd exception/auto-delete task: "+username))
-		recordedUnit, _ := a.Registry.UnitFor(username)
-		a.Scheduler.Cancel(username, recordedUnit)
+		// Nothing to delete, so the auto-revoke fallback has no job left to do.
+		a.Scheduler.Cancel(username, rec.AutoUnit)
 		a.Sudoers.Remove(username)
 		a.removeSSHDException(username)
 		if err := a.Registry.Remove(username); err != nil {
@@ -79,24 +83,57 @@ func (a *App) revoke(args []string) int {
 		}
 	}
 
-	if user.IsProtectedRevokeTarget(username, registered) {
+	// Strip the privilege grants FIRST — before the protection gate can refuse and
+	// before anything else can fail. Both only ever touch this tool's own
+	// name-scoped files, so doing it for a target that turns out to be protected is
+	// safe (for a real account those files do not exist; if one does, it is an
+	// orphan and removing it is exactly right). Ordering matters: when the gate
+	// below refuses — which an invitee with sudo can force by rewriting its own
+	// passwd entry — the account may survive, but it must not survive still holding
+	// NOPASSWD sudo and an sshd exception.
+	a.Sudoers.Remove(username)
+	a.removeSSHDException(username)
+
+	if user.IsProtectedRevokeTarget(username, registered, rec.UID) {
 		a.errorf("%s", a.P.M("拒绝删除受保护或系统用户："+username,
 			"refusing to delete a protected or system user: "+username))
+		// Name the tamper if that is why: an account that rewrote its own UID (most
+		// dangerously to 0) is now protected by the very check meant to shield real
+		// accounts, and the operator has to clean it up by hand.
+		if cur, tampered := user.UIDTampered(username, rec.UID); tampered {
+			a.errorf("%s", a.P.M(
+				fmt.Sprintf("该账号的 UID 已被改动：创建时为 %d，现在是 %d。它已不再是本工具创建的那个账号，请手动核查后处理。", rec.UID, cur),
+				fmt.Sprintf("this account's UID was changed: it was created as %d and is now %d. It is no longer the account this tool made; inspect and remove it by hand.", rec.UID, cur)))
+		}
+		a.warnf("%s", a.P.M("已移除该账号的 sudo 授权与 sshd 例外；自动删除任务保留，以便到期重试。",
+			"its sudo grant and sshd exception were removed; the auto-delete task is left armed so it retries at expiry."))
+		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
 		return 1
 	}
 
-	recordedUnit, _ := a.Registry.UnitFor(username)
-	a.Scheduler.Cancel(username, recordedUnit)
+	// Shut the door before taking the account apart. Until this lands the account
+	// is still SSH-reachable, and a reconnect landing between the kill and the
+	// delete is exactly what used to make the delete fail.
+	if err := a.Users.DisableLogin(username); err != nil {
+		a.warnf("%s: %v", a.P.M("禁用登录失败，仍继续删除", "could not disable the login; continuing to delete anyway"), err)
+	}
 	if pw, ok := user.Lookup(username); ok {
 		user.TerminateProcesses(pw.UID)
 	}
-	a.Sudoers.Remove(username)
-	a.removeSSHDException(username)
 	if err := a.Users.Delete(username); err != nil {
 		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), err)
+		// The auto-revoke task is deliberately still armed: it is the fallback that
+		// retries this deletion, and tearing it down on the way to a failure would
+		// leave the account with nothing coming for it. The login is already
+		// disabled, so the account cannot be used in the meantime.
+		a.warnf("%s", a.P.M("登录已禁用，自动删除任务保留以便重试；请手动核查。",
+			"the login is disabled and the auto-delete task is left armed to retry; please check by hand."))
 		a.audit("account.delete", username, "fail", err.Error(), nil)
 		return 1
 	}
+
+	// Only now that the account is provably gone is the fallback safe to remove.
+	a.Scheduler.Cancel(username, rec.AutoUnit)
 	if err := a.Registry.Remove(username); err != nil {
 		a.warnf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
 	}

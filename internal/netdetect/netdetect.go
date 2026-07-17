@@ -44,8 +44,13 @@ func New() *Detector {
 			// Never auto-follow redirects for a metadata/echo probe.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
+		// Link-local literals only. A DNS-named endpoint (Tencent publishes
+		// metadata.tencentyun.com for this) would emit a resolver query, which breaks
+		// the promise that these probes never leave the host or its link — and hands
+		// anyone who can answer that query the ability to seed the Host the invite
+		// hands out. 169.254.169.254 is Tencent's documented address for the same
+		// service, so nothing is lost by naming it numerically.
 		MetadataServices: []string{
-			"http://metadata.tencentyun.com/latest/meta-data/public-ipv4",
 			"http://169.254.169.254/latest/meta-data/public-ipv4",
 			"http://100.100.100.200/latest/meta-data/eipv4",
 		},

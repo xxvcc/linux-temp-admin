@@ -215,10 +215,14 @@ func TestMenuOmitsInstall(t *testing.T) {
 	}
 }
 
-// TestMenuChoiceOutOfRange covers the digits either side of the table.
+// TestMenuChoiceOutOfRange covers the digits either side of the table. It runs
+// as a TTY because re-prompting after an invalid choice is deliberately
+// terminal-only: a non-TTY run exits instead, so an unbounded stream of garbage
+// cannot spin the loop (see TestMenuDoesNotSpinOnNonTTYInvalidInput).
 func TestMenuChoiceOutOfRange(t *testing.T) {
 	last := len(menuItems)
 	a, _, errb := newTestApp(t, fmt.Sprintf("0\n%d\n%d\n", last+1, last))
+	a.StdinIsTTY = func() bool { return true }
 	if rc := a.menu(); rc != 0 {
 		t.Fatalf("menu rc=%d", rc)
 	}
@@ -506,5 +510,25 @@ func TestInviteSkipsHoursPromptOnNonTTYStdin(t *testing.T) {
 		if strings.Contains(errb.String(), s) {
 			t.Errorf("hours prompt appeared on a non-TTY stdin (would spin on an unbounded stream):\n%s", errb.String())
 		}
+	}
+}
+
+// TestMenuDoesNotSpinOnNonTTYInvalidInput pins the L5 fix: menu() re-prompts on
+// an invalid choice, and readLine only reports EOF, so an unbounded non-TTY
+// stream of invalid lines used to pin a root process at 100% CPU. A
+// non-interactive run must get one complaint and exit.
+func TestMenuDoesNotSpinOnNonTTYInvalidInput(t *testing.T) {
+	a, _, errb := newTestApp(t, "x\nx\nx\nx\n")
+	a.StdinIsTTY = func() bool { return false }
+	done := make(chan int, 1)
+	go func() { done <- a.menu() }()
+	select {
+	case <-done:
+		// exited — good
+	case <-time.After(5 * time.Second):
+		t.Fatal("menu() spun on a non-TTY stream of invalid input")
+	}
+	if strings.Count(errb.String(), "invalid choice") > 1 {
+		t.Errorf("a non-interactive run should complain once, not loop:\n%s", errb.String())
 	}
 }

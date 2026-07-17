@@ -27,6 +27,8 @@ svc:x:200:200::/var/lib/svc:/usr/sbin/nologin
 human:x:1000:1000:A Human:/home/human:/bin/bash
 tmp1000:x:1001:1001:` + config.ManagedGECOS + `,,,:/home/tmp1000:/bin/bash
 tmp500:x:500:500:` + config.ManagedGECOS + `:/home/tmp500:/bin/bash
+wiped:x:1002:1002:not the marker any more:/home/wiped:/bin/bash
+escalated:x:0:0:` + config.ManagedGECOS + `:/home/escalated:/bin/bash
 `
 
 func TestLookupAndManaged(t *testing.T) {
@@ -65,7 +67,7 @@ func TestIsReservedName(t *testing.T) {
 	// Every reserved name must also be refused by the revoke path (defense in
 	// depth: the two sides share this predicate and must never diverge).
 	for _, n := range reserved {
-		if !IsProtectedRevokeTarget(n, true) {
+		if !IsProtectedRevokeTarget(n, true, 0) {
 			t.Errorf("reserved %q is not a protected revoke target", n)
 		}
 	}
@@ -74,24 +76,44 @@ func TestIsReservedName(t *testing.T) {
 func TestIsProtectedRevokeTarget(t *testing.T) {
 	setPasswd(t, samplePasswd)
 	cases := []struct {
-		name       string
-		registered bool
-		want       bool
+		name        string
+		registered  bool
+		recordedUID int // 0 = an older registry row that recorded no UID
+		want        bool
 	}{
-		{"root", false, true},            // uid 0 / blocklist
-		{"daemon", false, true},          // blocklist (not in passwd)
-		{"systemd-network", false, true}, // systemd- prefix
-		{"svc", false, true},             // system uid, unregistered
-		{"svc", true, true},              // system uid, registered but not managed
-		{"tmp500", false, true},          // managed system uid but unregistered
-		{"tmp500", true, false},          // managed + registered system uid -> deletable
-		{"human", false, true},           // real uid, unregistered human
-		{"human", true, true},            // real uid, registered but NOT managed -> protected (stale entry / name reuse)
-		{"tmp1000", false, false},        // managed real uid -> deletable even unregistered
+		{"root", false, 0, true},            // uid 0 / blocklist
+		{"daemon", false, 0, true},          // blocklist (not in passwd)
+		{"systemd-network", false, 0, true}, // systemd- prefix
+		{"svc", false, 0, true},             // system uid, unregistered
+		{"svc", true, 0, true},              // system uid, registered but not managed
+		{"tmp500", false, 0, true},          // managed system uid but unregistered
+		{"tmp500", true, 0, false},          // managed + registered system uid -> deletable
+		{"human", false, 0, true},           // real uid, unregistered human
+		{"human", true, 0, true},            // real uid, registered but NOT managed -> protected (stale entry / name reuse)
+		{"tmp1000", false, 0, false},        // managed real uid -> deletable even unregistered
+
+		// The recorded UID is the immutable witness. An account that erased its own
+		// GECOS marker used to become permanently unrevocable; now the UID recorded at
+		// creation still proves it is ours.
+		{"wiped", true, 1002, false}, // marker erased BUT recorded uid matches -> still deletable
+		{"wiped", true, 0, true},     // same account, legacy row with no recorded uid -> old GECOS rule -> protected
+		{"wiped", false, 1002, true}, // unregistered: a recorded uid we never wrote proves nothing
+		{"wiped", true, 9999, true},  // recorded uid does NOT match -> not the account we made -> protected
+
+		// A recorded UID must never make a REAL account deletable: the pair only
+		// matches for an account this tool actually created.
+		{"human", true, 1000, false}, // registry says we created uid 1000 under this name -> ours
+		{"human", true, 1234, true},  // recorded uid disagrees with passwd -> real account stays protected
+
+		// Escalating to uid 0 stays protected — never auto-delete a root account —
+		// even though it is registered, managed, and its name is ours.
+		{"escalated", true, 1003, true},
+		{"escalated", true, 0, true},
 	}
 	for _, c := range cases {
-		if got := IsProtectedRevokeTarget(c.name, c.registered); got != c.want {
-			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v) = %v, want %v", c.name, c.registered, got, c.want)
+		if got := IsProtectedRevokeTarget(c.name, c.registered, c.recordedUID); got != c.want {
+			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d) = %v, want %v",
+				c.name, c.registered, c.recordedUID, got, c.want)
 		}
 	}
 }
@@ -160,13 +182,37 @@ func TestLockExpiryArgv(t *testing.T) {
 
 func TestDeleteFallsBackToUserdel(t *testing.T) {
 	// deluser present but fails -> userdel is tried.
+	//
+	// The -f is load-bearing, not decoration: without it shadow's userdel exits 8
+	// whenever a session exists, so an invitee reconnecting in a loop could make
+	// every revoke fail and keep the account alive.
 	f := &fakeRunner{available: map[string]bool{"deluser": true, "userdel": true}, failOn: map[string]bool{"deluser": true}}
 	m := &Manager{Runner: f}
 	if err := m.Delete("u"); err != nil {
 		t.Fatal(err)
 	}
-	if len(f.calls) != 2 || f.calls[0][0] != "deluser" || !reflect.DeepEqual(f.calls[1], []string{"userdel", "-r", "--", "u"}) {
+	if len(f.calls) != 2 || f.calls[0][0] != "deluser" || !reflect.DeepEqual(f.calls[1], []string{"userdel", "-r", "-f", "--", "u"}) {
 		t.Errorf("delete calls = %v", f.calls)
+	}
+}
+
+// TestDisableLoginExpiresBeforeLocking pins the H2 fix: revoke must shut the
+// account's door before it starts taking it apart. Expiry is what actually stops
+// a KEY login (locking the password alone would not), so it must be issued.
+func TestDisableLoginExpiresBeforeLocking(t *testing.T) {
+	f := &fakeRunner{available: map[string]bool{"chage": true, "usermod": true}}
+	m := &Manager{Runner: f}
+	if err := m.DisableLogin("u"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("DisableLogin calls = %v, want chage then usermod", f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"chage", "-E", "1970-01-01", "u"}) {
+		t.Errorf("first call = %v, want the account expired to a past date", f.calls[0])
+	}
+	if !reflect.DeepEqual(f.calls[1], []string{"usermod", "-L", "u"}) {
+		t.Errorf("second call = %v, want the password locked", f.calls[1])
 	}
 }
 
