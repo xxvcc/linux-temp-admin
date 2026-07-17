@@ -2,6 +2,58 @@
 
 All notable changes to this project are documented here.
 
+## v2.4.0 - One list, one table
+
+- **The registered temp users are shown as a table**, and the two commands that
+  printed that list now share one renderer. `cleanup-expired` used to print its
+  own strictly-poorer copy — `user`, `exists`, `expires`, `auto`, every one of
+  them already a column of `status` under a different name (its `exists` is
+  status's `active`/`missing`). Two views of the same rows, free to drift apart.
+
+  ```text
+  ┌──────────────┬──────┬──────┬──────────┬──────────────────────┬─────────────┬──────┐
+  │ 用户         │ 状态 │ SUDO │ 自动删除 │ 到期                 │ 主机        │ 端口 │
+  ├──────────────┼──────┼──────┼──────────┼──────────────────────┼─────────────┼──────┤
+  │ xxvcc-a1b2c3 │ 在册 │ 是   │ 是       │ 2026-07-18 17:00 CST │ 203.0.113.5 │ 22   │
+  └──────────────┴──────┴──────┴──────────┴──────────────────────┴─────────────┴──────┘
+  ```
+
+  The auto-revoke unit is deliberately not a column: 40-odd characters,
+  mechanically derived from the username, and it would double the table's width to
+  restate what the reader already knows. `status --user <name>` still prints it.
+
+- **The menu's two entries become one view and one action.** "查看用户状态" and
+  "查看账号过期/自动删除状态" showed the same rows; the second now does the thing
+  only it can do:
+
+  | | before | after |
+  |---|---|---|
+  | 3 | 查看用户状态 | **查看临时用户** — the table |
+  | 4 | 查看账号过期/自动删除状态 | **清理失效登记与孤儿授权** — `--compact` |
+
+  Item 4 is `doctor`'s remediation partner, which is what doctor already tells
+  operators to run when it finds an orphaned grant. The old name promised a
+  deletion the command opened by disclaiming ("this only shows expiry status; it
+  does not delete users"); the banner now says what it is rather than what it is
+  not. **`cleanup-expired` and `--compact` still work as subcommands — no script
+  breaks.** `revoke` stays its own entry: making "delete" a mode inside a viewer is
+  the footgun the language entry was moved to avoid.
+
+- New `internal/table`, ~60 lines, **no new dependency** (the module graph stays
+  `x/crypto`, `x/term`, `x/sys`). `fmt` cannot align this: `%-8s` pads by rune
+  count while a terminal draws CJK two columns wide, so a Chinese cell overruns its
+  column — untidy in key=value output, but it visibly breaks a box-drawn table's
+  vertical rules. `table.Width` measures display columns, and a test pins every
+  rendered line to exactly its top border's width with mixed zh/en rows. The width
+  function covers the CJK ranges only, which is provably enough here (the cells are
+  this tool's own zh/en labels plus fields `validate` constrains to ASCII); that
+  scope is documented at `Width`, pointing at `x/text/width` for anyone who later
+  feeds it arbitrary text.
+
+  Minor, not patch: `status`'s output format changed and menu item 4 now *acts*
+  where it used to *look*. Upgrading should not spring either of those on someone
+  who asked for a patch.
+
 ## v2.3.0 - You pick the language, not the server
 
 - **The language is Chinese by default, whatever the server's locale says, and the

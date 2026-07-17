@@ -197,15 +197,15 @@ sudo linux-temp-admin revoke
 sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-查看账号过期与自动删除任务：
+清理失效登记与孤儿授权：
 
 ```bash
-sudo linux-temp-admin cleanup-expired
-# 加 --compact 顺带清理登记表里指向已不存在用户的失效条目（只改登记表，不动任何账号）
 sudo linux-temp-admin cleanup-expired --compact
 ```
 
-> `cleanup-expired` **只查看**到期/自动删除状态，不会主动删除任何用户；删除请用 `revoke`。撤销未登记/陌生账号有额外限制（防误删），见[安全说明](#安全说明)。
+`--compact` 会清掉：登记表里指向已不存在账号的失效条目，以及那些账号遗留的 **sudo 授权和 sshd 例外**（孤儿授权最危险——用户名一旦被复用就会重新生效）。`doctor` 发现孤儿时提示的就是这条命令。
+
+> `cleanup-expired` **从不删除账号**：删账号用 `revoke`，看列表用 `status`。撤销未登记/陌生账号有额外限制（防误删），见[安全说明](#安全说明)。
 
 ## 常见用法
 

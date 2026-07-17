@@ -197,15 +197,15 @@ sudo linux-temp-admin revoke
 sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-Inspect expiry and auto-delete tasks:
+Clean up stale registry rows and orphaned grants:
 
 ```bash
-sudo linux-temp-admin cleanup-expired
-# Add --compact to also prune registry entries pointing to users that no longer exist (registry only, no account is touched)
 sudo linux-temp-admin cleanup-expired --compact
 ```
 
-> `cleanup-expired` **only reports** expiry/auto-delete state; it never deletes a user. Use `revoke` for that. Revoking unregistered or unknown accounts has extra guards — see [Security notes](#security-notes).
+`--compact` removes registry entries naming accounts that no longer exist, and the **sudo grants and sshd exceptions those accounts left behind** (an orphaned grant is the dangerous one — it re-arms the moment its username is reused). This is the command `doctor` points you at when it finds one.
+
+> `cleanup-expired` **never deletes an account**: use `revoke` for that, and `status` to see the list. Revoking unregistered or unknown accounts has extra guards — see [Security notes](#security-notes).
 
 ## Common usage
 
