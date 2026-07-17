@@ -4,6 +4,7 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -86,7 +87,7 @@ func TestTeardownNeverReadsTheRealPaths(t *testing.T) {
 			t.Fatalf("a test App is pointed at the real %s", real)
 		}
 	}
-	plan := a.teardownPlan(false)
+	plan := a.teardownPlan(false, false)
 	if plan.stateDir != a.StateDir {
 		t.Errorf("plan.stateDir = %q, want the injected %q", plan.stateDir, a.StateDir)
 	}
@@ -116,7 +117,7 @@ func TestInventoryUnionsEveryWitness(t *testing.T) {
 	mustWrite(t, filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile)),
 		"ltainv-v1row\t2020-01-01\tsomething\n\n#comment\n")
 
-	plan := a.teardownPlan(false)
+	plan := a.teardownPlan(false, false)
 	got := map[string]bool{}
 	for _, acc := range plan.accounts {
 		got[acc.name] = true
@@ -137,15 +138,31 @@ func TestInventoryUnionsEveryWitness(t *testing.T) {
 // teardown. root is the stand-in here for "an account this tool did not create";
 // nothing deletes it, the inventory is a read.
 func TestInventoryIgnoresTheGECOSMarker(t *testing.T) {
+	const name = "ltagecos1"
 	a, _, _ := uninstallApp(t, "")
-	plan := a.teardownPlan(false)
-	for _, acc := range plan.accounts {
-		if acc.name == "root" {
-			t.Fatal("the inventory enlisted an account no tool-owned file names")
-		}
+	a.Users = user.New()
+
+	// A REAL account carrying the managed marker and nothing else — no registry
+	// row, no sudo grant, no unit. This is what `usermod -c 'linux-temp-admin
+	// temporary admin' realadmin` produces, and the whole point is that the marker
+	// must not be enough to enlist it. An empty inventory would pass this test
+	// whether or not the marker were trusted, so the account has to exist for the
+	// assertion to mean anything.
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
 	}
-	if len(plan.accounts) != 0 {
-		t.Errorf("nothing names an account here; got %v", plan.names())
+	if !user.IsManaged(name) {
+		t.Fatalf("%s should carry the managed marker; the fixture is wrong", name)
+	}
+
+	plan := a.teardownPlan(false, false)
+	for _, acc := range plan.accounts {
+		if acc.name == name {
+			t.Fatal("the GECOS marker enlisted an account no tool-owned FILE names — a real admin could be deleted by writing that marker to their own account")
+		}
 	}
 }
 
@@ -300,5 +317,66 @@ func TestUninstallRefusesFromTheAccountItWouldDelete(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), name) {
 		t.Errorf("the refusal must name the account; got %q", errb.String())
+	}
+}
+
+// TestUninstallRemovesAWitnessOnlyAccount is the case the whole "union of
+// witnesses" idea exists for, and the one revoke's own guard turns away. An
+// account can be real and live yet have no registry row — the row was lost, or it
+// is a v1 account, or only its sudo grant still names it. teardown must delete it.
+//
+// Bare `revoke --user X --yes` REFUSES an unregistered account ("use --force"),
+// so a teardown that reuses revoke without --force strands exactly the account
+// the inventory worked hardest to find, and the uninstall can then never complete
+// (the survivor blocks the binary, correctly, forever).
+func TestUninstallRemovesAWitnessOnlyAccount(t *testing.T) {
+	const name = "ltawitness1"
+	a, _, _ := uninstallApp(t, "")
+	a.Users = user.New()
+
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	// No registry row. The account exists only because a sudo grant names it — the
+	// witness an account cannot drop without dropping the root it is keeping.
+	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 0 {
+		t.Fatalf("rc=%d, want 0: a witness-only account must be removable, not a permanent blocker", rc)
+	}
+	if user.Exists(name) {
+		t.Error("the witness-only account survived the uninstall")
+	}
+	if _, err := os.Stat(a.Sudoers.FilePath(name)); !os.IsNotExist(err) {
+		t.Error("its NOPASSWD grant survived")
+	}
+	if _, err := os.Stat(a.InstallPath); !os.IsNotExist(err) {
+		t.Error("the binary should have been removed once every account was gone")
+	}
+}
+
+// TestUninstallRefusesWhenV1RegistryIsUnreadable pins the fix for the one witness
+// that had no error channel. A v1 registry that exists but cannot be read must
+// refuse the uninstall, exactly as an unreadable v2 registry does — it is the
+// only record of a v1 account made without a sudo grant, so collapsing "can't
+// read it" into "no v1 accounts" is how such an account gets stranded.
+func TestUninstallRefusesWhenV1RegistryIsUnreadable(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	// A directory where the file is expected: os.Open succeeds, the read fails.
+	v1 := filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile))
+	if err := os.MkdirAll(v1, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if rc := a.uninstall([]string{"--yes"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 when the v1 registry cannot be read", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Error("the binary was removed despite an unreadable v1 registry")
+	}
+	if !strings.Contains(errb.String(), "refusing to uninstall") {
+		t.Errorf("want a refusal; got %q", errb.String())
 	}
 }

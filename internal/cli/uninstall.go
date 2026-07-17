@@ -81,7 +81,7 @@ func (p teardownPlan) names() []string {
 }
 
 // teardownPlan gathers every account any witness names, plus the footprint.
-func (a *App) teardownPlan(purgeAudit bool) teardownPlan {
+func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	found := map[string][]witness{}
 	add := func(name string, w witness) {
 		if name == "" || !validate.Username(name) {
@@ -103,8 +103,12 @@ func (a *App) teardownPlan(purgeAudit bool) teardownPlan {
 			add(r.User, witnessRegistry)
 		}
 	}
-	for _, u := range a.v1RegistryUsers() {
-		add(u, witnessV1)
+	if users, err := a.v1RegistryUsers(); err != nil {
+		inventoryErr = fmt.Errorf("%s: %w", a.P.M("读取 v1 注册表失败", "reading the v1 registry failed"), err)
+	} else {
+		for _, u := range users {
+			add(u, witnessV1)
+		}
 	}
 	if a.Sudoers != nil {
 		if users, err := a.Sudoers.All(); err != nil {
@@ -151,7 +155,7 @@ func (a *App) teardownPlan(purgeAudit bool) teardownPlan {
 		sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
 		plan.accounts = append(plan.accounts, teardownAccount{name: n, exists: user.Exists(n), witnesses: ws})
 	}
-	plan.binaryBlocker = a.binaryBlocker()
+	plan.binaryBlocker = a.binaryBlocker(force)
 	plan.inventoryErr = inventoryErr
 	return plan
 }
@@ -162,13 +166,19 @@ func (a *App) teardownPlan(purgeAudit bool) teardownPlan {
 // and the state is gone, with nothing left to do but hand the operator --force.
 // A symlinked install path is ordinary on a host with a versioned or Nix-style
 // layout, and it is refused (fsutil.RootSafeFile), so this is not a rare corner.
-func (a *App) binaryBlocker() string {
+func (a *App) binaryBlocker(force bool) string {
 	fi, err := os.Lstat(a.InstallPath)
 	if os.IsNotExist(err) {
 		return "" // nothing to remove is not a blocker
 	}
 	if err != nil {
 		return err.Error()
+	}
+	// --force is exactly what makes an unsafe path removable (Selfmanage.Uninstall
+	// skips the RootSafeFile check under force), so with it set there is no blocker
+	// to report — saying "needs --force" while --force is present is just wrong.
+	if force {
+		return ""
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		return a.P.M("是符号链接（需 --force）", "is a symlink (needs --force)")
@@ -189,12 +199,23 @@ func (a *App) binaryBlocker() string {
 // with a v1 account still live and it strands exactly as a v2 one would.
 //
 // The format is v1's: tab-separated, username first (its own removal pass keyed
-// on `awk -F '\t' '$1 != u'`). Anything unparseable is skipped rather than
-// guessed at; the filesystem witnesses are what make that safe.
-func (a *App) v1RegistryUsers() []string {
+// on `awk -F '\t' '$1 != u'`). A line that does not parse to a valid username is
+// skipped; the filesystem witnesses are what make that safe.
+//
+// It distinguishes absent from unreadable, and the caller treats the two
+// differently. Absent is the normal case — nothing was upgraded from v1 — and
+// returns no error. But a file that EXISTS and cannot be read (a permission
+// error, a mid-read I/O failure) must not collapse into "no v1 accounts": that is
+// the exact silent under-report the inventory's fatal-error gate exists to catch,
+// and this is the one witness the code itself calls the only record of an account
+// v1 made without a sudo grant. So a present-but-unreadable registry is an error.
+func (a *App) v1RegistryUsers() ([]string, error) {
 	f, err := os.Open(filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile)))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil // absent is the normal case: nothing was ever upgraded from v1
+		return nil, err
 	}
 	defer f.Close()
 	var users []string
@@ -209,7 +230,12 @@ func (a *App) v1RegistryUsers() []string {
 			users = append(users, name)
 		}
 	}
-	return users
+	if err := sc.Err(); err != nil {
+		// A partial read already yielded some names; returning them AND the error
+		// would let the caller act on an inventory it was just told is incomplete.
+		return nil, err
+	}
+	return users, nil
 }
 
 // printTeardownPlan shows what is about to happen while it can still be stopped.
@@ -280,7 +306,7 @@ func (a *App) uninstall(args []string) int {
 		return 1
 	}
 
-	plan := a.teardownPlan(purgeAudit)
+	plan := a.teardownPlan(purgeAudit, force)
 
 	// A witness that could not be read is fatal, not advisory. Every way of failing
 	// to read one makes accounts vanish from the inventory rather than announce
@@ -349,8 +375,21 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// --yes, because the operator already confirmed this whole teardown once
 	// against the printed plan; asking again per account would be N prompts for a
 	// decision already made, on a shared stdin.
+	//
+	// --force, and this is load-bearing rather than incidental: the inventory is a
+	// union of witnesses precisely to catch an account with NO registry row — one
+	// whose row was lost, a v1 account, one named only by its sudo grant. Bare
+	// revoke REFUSES an unregistered account ("use --force"), so without this the
+	// teardown would turn away exactly the account the inventory worked hardest to
+	// find, and then — correctly — refuse to remove the binary while that account
+	// survived, so the uninstall could never complete. --confirm-force is the token
+	// bare revoke also demands for an unregistered --force --yes; here the operator
+	// confirmed the whole named plan once, which is the same assurance per account.
+	// revoke's protections (protected targets, the UID proof) are UNaffected by
+	// --force and still refuse a real non-managed account — that is what the
+	// survivor check below is for.
 	for _, acc := range plan.accounts {
-		a.revoke([]string{"--user", acc.name, "--yes"})
+		a.revoke([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name})
 	}
 
 	// Ground truth, not the return code. revoke answers 0 for a deletion, for a

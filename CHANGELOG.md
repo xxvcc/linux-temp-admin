@@ -105,7 +105,10 @@ All notable changes to this project are documented here.
 
   Minor, not patch: `uninstall` does substantially more than it did, `--force` and
   the menu's fifth entry change meaning, and `--remove-users`/`--purge-audit` are
-  new. `invite`, `revoke`, `status` and `cleanup-expired` are untouched.
+  new. The other subcommands' CONTRACT is unchanged — same flags, same exit codes,
+  same on-disk formats. `revoke` and `cleanup-expired` gained one internal change
+  described above (a sudo-grant removal that used to fail silently now speaks), but
+  nothing an `invite`/`revoke`/`status`/`cleanup-expired` caller invokes differently.
 
 ## v2.5.0 - The temp users are one screen
 
