@@ -250,9 +250,13 @@ var menuItems = []struct {
 	{"查看用户状态", "Show user status", func(a *App) int { return a.status(nil) }},
 	{"查看账号过期/自动删除状态", "Show expiry/auto-delete status", func(a *App) int { return a.cleanupExpired(nil) }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
-	{"切换语言 / Switch language", "Switch language / 切换语言", func(a *App) int { return a.switchLang() }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
+	// Appended rather than slotted in beside the other settings-ish entries, so no
+	// existing digit changes meaning. Inserting it earlier pushed Exit from 8 to 9,
+	// which turned an old hand's reflexive "8" into "uninstall the stable command".
+	// Here the only shifted key is Exit, and a stale "8" lands on this — harmless.
+	{"切换语言 / Switch language", "Switch language / 切换语言", func(a *App) int { return a.switchLang() }},
 	{"退出", "Exit", nil},
 }
 

@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## v2.3.0 - You pick the language, not the server
 
 - **The language is Chinese by default, whatever the server's locale says, and the
   tool asks you once instead of guessing.** The host locale (`LANG`/`LC_ALL`) used
@@ -25,7 +25,10 @@ All notable changes to this project are documented here.
   The answer is remembered in `/var/lib/linux-temp-admin/v2/prefs` (root:root
   0600) and never asked again. A new interactive-menu entry, labelled
   bilingually as "切换语言 / Switch language" so it is findable even by someone
-  who picked the language they cannot read, changes it later.
+  who picked the language they cannot read, changes it later. It is appended
+  rather than slotted in beside the other settings-ish entries: every existing
+  digit keeps its meaning, and the only shifted key — Exit, 8 to 9 — now lands on
+  the harmless language switcher instead of "uninstall the stable command".
 
   Precedence is now `--lang` > `LINUX_TEMP_ADMIN_LANG` > the remembered choice >
   the question > Chinese. The question is skipped wherever asking would be wrong —
@@ -35,6 +38,10 @@ All notable changes to this project are documented here.
   Note the consequence: a non-interactive run on an English server now prints
   Chinese unless `--lang`/`LINUX_TEMP_ADMIN_LANG` says otherwise. That is the
   intended trade for not letting the box's locale outrank the operator.
+
+  This is a minor release, not a patch, deliberately: `upgrade` from 2.2.x brings
+  a changed default, a question that was never asked before, and one more menu
+  entry. A patch number would have promised none of that was in the box.
 
 ## v2.2.6 - Revoke actually revokes
 
