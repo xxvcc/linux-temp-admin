@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -165,21 +166,40 @@ func (a *App) removeSSHDException(username string) {
 	}
 }
 
-// selectUser lists existing registered users and reads a choice or a username.
+// selectUser shows the registered accounts and reads a row number or a username.
+// It is the `revoke` command's own picker, reached when no --user was given; the
+// menu comes in through manageUsers, which has already chosen.
+//
+// It shows the same table, numbered the same way, because it used to print a bare
+// list of names: you picked what to delete without seeing which account was about
+// to expire anyway, which carried sudo, or which was already gone. Rows whose
+// account is missing are listed too — revoke is what cleans up their registry
+// entry and any grant they left behind, so leaving them unpickable only meant
+// they could not be named.
+//
+// An unrecognized answer is returned verbatim for validate.Username to reject: a
+// picker must not be the thing that decides what a legal username is.
+//
+// An empty registry still prompts. It says so and then asks anyway, because a
+// registry with no rows is exactly the state `revoke --force` exists to dig out
+// of — a tool-made account whose row was lost still has to be nameable, and the
+// only way to name it here is to type it. (manageUsers takes the opposite branch
+// on an empty list, but for a reason that does not apply here: it is reached from
+// the menu, where a prompt nobody can answer would eat the next menu choice.)
 func (a *App) selectUser() string {
-	recs, _ := a.Registry.List()
-	var existing []string
-	for _, r := range recs {
-		if user.Exists(r.User) {
-			existing = append(existing, r.User)
-		}
+	recs, err := a.Registry.List()
+	if err != nil {
+		a.warnf("%v", err)
 	}
-	for i, u := range existing {
-		a.warnf("%2d) %s", i+1, u)
+	if len(recs) == 0 {
+		a.warnf("%s", a.P.M("没有已登记的临时用户；如需删除未登记账号，请输入完整用户名（配合 --force）。",
+			"no registered temporary users; to delete an unregistered account, type its full username (with --force)."))
+	} else {
+		a.printf("%s", a.usersTable(recs, true).String())
 	}
-	choice := a.prompt(a.P.M("请选择编号或输入用户名: ", "select a number or enter a username: "))
-	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(existing) {
-		return existing[n-1]
+	choice := strings.TrimSpace(a.prompt(a.P.M("请输入编号或用户名: ", "enter a number or a username: ")))
+	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(recs) {
+		return recs[n-1].User
 	}
 	return choice
 }
