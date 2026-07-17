@@ -128,25 +128,26 @@ func TestMenuBlankRedrawsAndEOFExits(t *testing.T) {
 // the last thing on screen above the prompt.
 func TestMenuDoesNotRedrawAfterAction(t *testing.T) {
 	exit := strconv.Itoa(len(menuItems))
-	// "3" is status: it prints, and prints nothing that looks like the menu.
-	a, out, _ := newTestApp(t, "3\n"+exit+"\n")
+	// "2" manages the temporary users: with an empty registry it prints the list,
+	// prints nothing that looks like the menu, and returns without prompting.
+	a, out, _ := newTestApp(t, "2\n"+exit+"\n")
 	if rc := a.menu(); rc != 0 {
 		t.Fatalf("menu rc=%d", rc)
 	}
 	rendered := out.String()
 	if !strings.Contains(rendered, "Registered temporary users") {
-		t.Fatalf("choice 3 did not run status: %q", rendered)
+		t.Fatalf("choice 2 did not list the users: %q", rendered)
 	}
 	if n := strings.Count(rendered, menuTitleEN); n != 1 {
 		t.Errorf("menu redrawn after an action: title drawn %d times, want 1:\n%s", n, rendered)
 	}
 	// The result must come after the menu, with nothing of the menu after it.
 	if strings.Index(rendered, "Registered temporary users") < strings.Index(rendered, menuTitleEN) {
-		t.Error("status output should follow the menu, not precede it")
+		t.Error("the action's output should follow the menu, not precede it")
 	}
 
 	// An explicit blank line still brings the menu back.
-	a2, out2, _ := newTestApp(t, "3\n\n"+exit+"\n")
+	a2, out2, _ := newTestApp(t, "2\n\n"+exit+"\n")
 	if rc := a2.menu(); rc != 0 {
 		t.Fatalf("menu rc=%d", rc)
 	}

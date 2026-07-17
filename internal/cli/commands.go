@@ -64,7 +64,7 @@ func (a *App) status(args []string) int {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
 		return 0
 	}
-	a.printf("%s", a.usersTable(recs).String())
+	a.printf("%s", a.usersTable(recs, false).String())
 	return 0
 }
 
@@ -73,12 +73,17 @@ func (a *App) status(args []string) int {
 // rows (user/exists/expires/auto — every one of them a column here under a
 // different name), which was two renderings of one truth waiting to disagree.
 //
+// numbered adds a leading # column, so the same table can also be the thing an
+// operator picks a row from. Choosing what to delete used to mean reading a bare
+// list of names, with no way to see which account was about to expire, which
+// carried sudo, or which was already gone.
+//
 // The auto-revoke unit is deliberately not a column. It is 40-odd characters,
 // mechanically derived from the username, and would double the table's width to
 // tell the reader something they already know; `status --user <name>` still
 // prints it for the one account being examined.
-func (a *App) usersTable(recs []registry.Record) *table.Table {
-	t := table.New(
+func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
+	headers := []string{
 		a.P.M("用户", "USER"),
 		a.P.M("状态", "STATE"),
 		a.P.M("SUDO", "SUDO"),
@@ -86,18 +91,79 @@ func (a *App) usersTable(recs []registry.Record) *table.Table {
 		a.P.M("到期", "EXPIRES"),
 		a.P.M("主机", "HOST"),
 		a.P.M("端口", "PORT"),
-	)
+	}
+	if numbered {
+		headers = append([]string{"#"}, headers...)
+	}
+	t := table.New(headers...)
 	yn := func(b bool) string {
 		return a.P.M(map[bool]string{true: "是", false: "否"}[b], map[bool]string{true: "yes", false: "no"}[b])
 	}
-	for _, r := range recs {
+	for i, r := range recs {
 		state := a.P.M("缺失", "missing")
 		if user.Exists(r.User) {
 			state = a.P.M("在册", "active")
 		}
-		t.Row(r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port))
+		cells := []string{r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port)}
+		if numbered {
+			cells = append([]string{strconv.Itoa(i + 1)}, cells...)
+		}
+		t.Row(cells...)
 	}
 	return t
+}
+
+// manageUsers is the menu's one screen for the temporary accounts: it shows the
+// table and offers the two things anyone does with it.
+//
+// The three menu entries this replaces were three views of one list. Revoke
+// opened with a bare list of names — you chose what to delete without seeing
+// which account was expiring or carried sudo. The list itself was the entry
+// beside it. And the cleanup entry acted on precisely the rows this table marks
+// "missing": a registry row whose account is gone is exactly what --compact
+// prunes, so it was never a separate object, only a separate menu item.
+//
+// Looking is the default: a bare Enter leaves. Revoking still has to get past
+// typing the account's full name, which is where that decision belongs — not in
+// whether the list happens to be on screen.
+func (a *App) manageUsers() int {
+	recs, err := a.Registry.List()
+	if err != nil {
+		a.warnf("%v", err)
+	}
+	a.info(a.P.M("已登记的临时用户：", "Registered temporary users:"))
+	if len(recs) == 0 {
+		a.printf("  %s", a.P.M("（无）", "(none)"))
+		return 0
+	}
+	a.printf("%s", a.usersTable(recs, true).String())
+
+	choice := strings.TrimSpace(a.prompt(a.P.M(
+		"输入编号或用户名撤销 · c 清理失效登记与孤儿授权 · 回车返回: ",
+		"a number or username revokes it · c cleans up stale rows and orphaned grants · Enter returns: ")))
+	switch {
+	case choice == "":
+		return 0
+	case strings.EqualFold(choice, "c"):
+		// compact() is the bare sweep, so the root gate the cleanup-expired
+		// subcommand opens with has to be repeated here rather than inherited.
+		if !a.requireRoot() {
+			return 1
+		}
+		a.compact()
+		return 0
+	}
+	// A row number is shorthand for its username; anything else is taken as a name
+	// and validated downstream, exactly as `revoke --user` would.
+	name := choice
+	if n, err := strconv.Atoi(choice); err == nil {
+		if n < 1 || n > len(recs) {
+			a.warnf("%s", a.P.M("无效编号", "no such row"))
+			return 1
+		}
+		name = recs[n-1].User
+	}
+	return a.revoke([]string{"--user", name})
 }
 
 func (a *App) cleanupExpired(args []string) int {
@@ -118,51 +184,63 @@ func (a *App) cleanupExpired(args []string) int {
 	// drift apart.
 	recs, _ := a.Registry.List()
 	if len(recs) > 0 {
-		a.printf("%s", a.usersTable(recs).String())
+		a.printf("%s", a.usersTable(recs, false).String())
 	}
 	if compact {
-		// Sweep the live grants BEFORE the registry rows: compacting drops the rows
-		// that name these accounts, and a grant nobody can name any more is a grant
-		// nobody will ever find.
-		if a.SSHD != nil {
-			orphans, err := a.SSHD.Orphans(user.Exists)
-			if err != nil {
-				a.warnf("%v", err)
-			}
-			for _, u := range orphans {
-				if err := a.SSHD.Remove(u); err != nil {
-					// Remove's own error states what happened (in the usual case the file
-					// was deleted and only the reload was skipped), so use a neutral prefix
-					// that does not assert the removal failed.
-					a.warnf("%s: %v", a.P.M("清理孤儿 sshd 例外时", "while cleaning up the orphaned sshd exception"), err)
-					continue
-				}
-				a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
-					"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
-			}
-		}
-		// An orphaned NOPASSWD drop-in is the worse of the two: it re-arms full root
-		// the moment its username is reused.
-		if a.Sudoers != nil {
-			orphans, err := a.Sudoers.Orphans(user.Exists)
-			if err != nil {
-				a.warnf("%v", err)
-			}
-			for _, u := range orphans {
-				a.Sudoers.Remove(u)
-				a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
-					"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
-			}
-		}
-		removed, err := a.Registry.Compact(user.Exists)
-		if err != nil {
-			a.warnf("%v", err)
-		} else {
-			a.info(fmt.Sprintf(a.P.M("已压实注册表：移除 %d 条指向已不存在用户的记录。",
-				"Compacted the registry: removed %d entries for users that no longer exist."), removed))
-		}
+		a.compact()
 	}
 	return 0
+}
+
+// compact is the sweep itself, with none of the framing the cleanup-expired
+// subcommand wraps it in. It is split out for the manage screen, which has just
+// drawn the table and is where revoke already lives: re-printing the list under a
+// banner that sends the reader off to `revoke` and `status` would repeat what is
+// already on screen and point away from where they are.
+//
+// The subcommand's root gate does NOT come with it. Every caller has to keep its
+// own — this function sweeps.
+func (a *App) compact() {
+	// Sweep the live grants BEFORE the registry rows: compacting drops the rows
+	// that name these accounts, and a grant nobody can name any more is a grant
+	// nobody will ever find.
+	if a.SSHD != nil {
+		orphans, err := a.SSHD.Orphans(user.Exists)
+		if err != nil {
+			a.warnf("%v", err)
+		}
+		for _, u := range orphans {
+			if err := a.SSHD.Remove(u); err != nil {
+				// Remove's own error states what happened (in the usual case the file
+				// was deleted and only the reload was skipped), so use a neutral prefix
+				// that does not assert the removal failed.
+				a.warnf("%s: %v", a.P.M("清理孤儿 sshd 例外时", "while cleaning up the orphaned sshd exception"), err)
+				continue
+			}
+			a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
+				"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
+		}
+	}
+	// An orphaned NOPASSWD drop-in is the worse of the two: it re-arms full root
+	// the moment its username is reused.
+	if a.Sudoers != nil {
+		orphans, err := a.Sudoers.Orphans(user.Exists)
+		if err != nil {
+			a.warnf("%v", err)
+		}
+		for _, u := range orphans {
+			a.Sudoers.Remove(u)
+			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
+				"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
+		}
+	}
+	removed, err := a.Registry.Compact(user.Exists)
+	if err != nil {
+		a.warnf("%v", err)
+	} else {
+		a.info(fmt.Sprintf(a.P.M("已压实注册表：移除 %d 条指向已不存在用户的记录。",
+			"Compacted the registry: removed %d entries for users that no longer exist."), removed))
+	}
 }
 
 func (a *App) doctor(args []string) int {
@@ -276,15 +354,11 @@ var menuItems = []struct {
 	run    func(*App) int
 }{
 	{"创建一次性临时管理员邀请", "Create one-time temp admin invite", func(a *App) int { return a.invite(nil) }},
-	{"撤销/删除临时用户", "Revoke/delete temp user", func(a *App) int { return a.revoke(nil) }},
-	{"查看临时用户", "List temporary users", func(a *App) int { return a.status(nil) }},
-	// The old entry here showed expiry/auto-delete state — every column of which
-	// the entry above already shows. What it uniquely does is clean up, so that is
-	// what it now offers; the name used to promise a deletion it explicitly refused
-	// to perform.
-	{"清理失效登记与孤儿授权", "Clean up stale registry rows and orphaned grants", func(a *App) int {
-		return a.cleanupExpired([]string{"--compact"})
-	}},
+	// One entry for the temporary accounts, because there was only ever one list.
+	// It replaced three: revoke (which opened with a bare list of names to choose
+	// from), the list itself, and a cleanup whose target — a registry row whose
+	// account is gone — is a row of this very table, marked "missing".
+	{"管理临时用户（查看 / 撤销 / 清理）", "Temporary users (list / revoke / clean up)", func(a *App) int { return a.manageUsers() }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
 	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},

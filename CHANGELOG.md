@@ -2,6 +2,56 @@
 
 All notable changes to this project are documented here.
 
+## v2.5.0 - The temp users are one screen
+
+- **Menu items 2, 3 and 4 are one entry: 「管理临时用户（查看 / 撤销 / 清理）」.**
+  They were three ways into one list. Revoke opened by printing a bare column of
+  names to pick from; the list itself was the entry beside it; and cleanup acted
+  on rows of that same list. Now the table is the screen, and the two things
+  anyone does with it are answers to one prompt:
+
+  ```text
+  [信息] 已登记的临时用户：
+  ┌───┬──────────────┬──────┬──────┬──────────┬──────────────────────┬─────────────┬──────┐
+  │ # │ 用户         │ 状态 │ SUDO │ 自动删除 │ 到期                 │ 主机        │ 端口 │
+  ├───┼──────────────┼──────┼──────┼──────────┼──────────────────────┼─────────────┼──────┤
+  │ 1 │ xxvcc-a1b2c3 │ 在册 │ 是   │ 是       │ 2026-07-18 17:00 CST │ 203.0.113.5 │ 22   │
+  │ 2 │ xxvcc-d4e5f6 │ 缺失 │ 是   │ 是       │ 2026-07-16 09:00 CST │ 203.0.113.5 │ 22   │
+  └───┴──────────────┴──────┴──────┴──────────┴──────────────────────┴─────────────┴──────┘
+  输入编号或用户名撤销 · c 清理失效登记与孤儿授权 · 回车返回:
+  ```
+
+  Looking is the default — a bare Enter leaves, having changed nothing.
+
+- **`revoke` picks from the table too**, instead of a bare list of names. Choosing
+  what to delete used to mean reading names with none of the facts next to them:
+  which account was expiring within the hour anyway, which carried sudo, which was
+  already gone. Same rows, same numbering, in both places.
+
+- **v2.4.0 argued the opposite of this, and was wrong on the facts.** It kept
+  `revoke` a separate entry because "making delete a mode inside a viewer is a
+  footgun" — but revoke does not act on a keystroke: it makes you type the account's
+  full name, and a mistyped one is refused. A number that opens a confirmation is
+  not a misclick. It also treated cleanup as a different subject from the list,
+  when what `--compact` prunes is *precisely* the rows the table marks 缺失 — a
+  registry row whose account is gone. Two tests now pin that equivalence from both
+  sides: cleanup takes every missing row, and spares every row whose account
+  exists.
+
+- The renumbering is the cost, and it lands on operators who just learned v2.4.0's
+  numbers: the menu goes from 9 entries to 7, and everything below 2 shifts up.
+  Nothing scriptable moved — `status`, `revoke`, `cleanup-expired --compact` are
+  unchanged as subcommands, and the menu has never been an interface a script can
+  drive.
+
+- `doctor` keeps its own orphan check. Orphaned grants are found by globbing
+  `/etc/sudoers.d` and `/etc/ssh/sshd_config.d`, not by reading the registry, so a
+  grant whose registry row is gone appears in doctor but in no table — which is
+  exactly the case doctor exists to catch.
+
+  Minor, not patch: the menu's entries changed meaning and position. That should
+  not arrive as a patch.
+
 ## v2.4.0 - One list, one table
 
 - **The registered temp users are shown as a table**, and the two commands that
