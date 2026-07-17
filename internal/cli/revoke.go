@@ -63,7 +63,7 @@ func (a *App) revoke(args []string) int {
 			"user does not exist; cleaning up registry/sudoers/sshd exception/auto-delete task: "+username))
 		// Nothing to delete, so the auto-revoke fallback has no job left to do.
 		a.Scheduler.Cancel(username, rec.AutoUnit)
-		a.Sudoers.Remove(username)
+		a.removeSudoGrant(username)
 		a.removeSSHDException(username)
 		if err := a.Registry.Remove(username); err != nil {
 			a.warnf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
@@ -92,7 +92,7 @@ func (a *App) revoke(args []string) int {
 	// below refuses — which an invitee with sudo can force by rewriting its own
 	// passwd entry — the account may survive, but it must not survive still holding
 	// NOPASSWD sudo and an sshd exception.
-	a.Sudoers.Remove(username)
+	a.removeSudoGrant(username)
 	a.removeSSHDException(username)
 
 	if user.IsProtectedRevokeTarget(username, registered, rec.UID) {
@@ -141,6 +141,24 @@ func (a *App) revoke(args []string) int {
 	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(fForce), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
 	return 0
+}
+
+// removeSudoGrant deletes any NOPASSWD drop-in this tool wrote for username. Like
+// removeSSHDException beside it, the path is derived from the username and the
+// manager only ever touches its own managed file, so it is called blindly.
+//
+// A failure is reported and never silent, because of what surviving means here:
+// the drop-in grants passwordless root the moment its username exists. Everything
+// else in a revoke can fail and leave the host no worse than it was found; this
+// one failing leaves a live grant behind, and it used to do so without a word.
+func (a *App) removeSudoGrant(username string) {
+	if a.Sudoers == nil {
+		return
+	}
+	if err := a.Sudoers.Remove(username); err != nil {
+		a.errorf("%s: %v", a.P.M("无法移除 sudo 授权（该账号可能仍有免密 root，请手动删除该文件）",
+			"could not remove the sudo grant (this account may still hold passwordless root; delete the file by hand)"), err)
+	}
 }
 
 // removeSSHDException deletes any per-account sshd drop-in this tool wrote for

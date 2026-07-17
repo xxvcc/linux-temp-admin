@@ -244,7 +244,14 @@ func (a *App) compact() {
 			a.warnf("%v", err)
 		}
 		for _, u := range orphans {
-			a.Sudoers.Remove(u)
+			// Announce the removal only once it happened: this used to print "removed"
+			// whatever the outcome, which is the worst possible lie about a file that
+			// hands out passwordless root.
+			if err := a.Sudoers.Remove(u); err != nil {
+				a.errorf("%s: %v", a.P.M("无法移除孤儿 sudo 授权（该文件仍会在用户名被复用时立即生效，请手动删除）",
+					"could not remove an orphaned sudo grant (it re-arms the instant its username is reused; delete it by hand)"), err)
+				continue
+			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
 				"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
 		}

@@ -34,8 +34,13 @@ type Scheduler struct {
 	SystemdDir  string
 	InstallPath string
 	UnitPrefix  string
-	Now         func() time.Time
-	Sys         System
+	// LegacyUnitPrefixes are older namespaces whose units this Scheduler must still
+	// be able to FIND (see UnitUsers) though it never writes them. It is a field
+	// rather than a constant so a test can point the whole namespace at a temp dir
+	// without picking up the real one.
+	LegacyUnitPrefixes []string
+	Now                func() time.Time
+	Sys                System
 	// UnderUnit reports whether the current process is executing inside the given
 	// systemd service (i.e. the firing auto-revoke run for that unit); when true,
 	// Cancel leaves that .service file in place rather than deleting the file it is
@@ -49,9 +54,13 @@ func New() *Scheduler {
 		SystemdDir:  config.SystemdDir,
 		InstallPath: config.InstallPath,
 		UnitPrefix:  config.AutoRevokeUnitPrefix,
-		Now:         time.Now,
-		Sys:         realSystem{},
-		UnderUnit:   runningUnderFiringUnit,
+		// v1's units are still findable, never written. v1 installed to the same path
+		// this binary occupies, so its timers invoke THIS code and its accounts strand
+		// exactly like v2's would.
+		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
+		Now:                time.Now,
+		Sys:                realSystem{},
+		UnderUnit:          runningUnderFiringUnit,
 	}
 }
 
