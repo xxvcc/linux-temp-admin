@@ -177,10 +177,23 @@ func IsProtectedRevokeTarget(name string, registered bool, recordedUID int) bool
 	if pw.UID == 0 {
 		return true
 	}
-	// The registry recorded this exact UID for this exact name at creation: this
-	// account is provably the one the tool made, whatever its GECOS says now.
-	if registered && recordedUID > 0 && pw.UID == recordedUID {
-		return false
+	// A UID recorded at creation decides this on its own, in BOTH directions.
+	//
+	// It matching proves the account is the one the tool made, whatever its GECOS
+	// says now. It DISAGREEING is not a missing witness but a contradicting one:
+	// whatever this account is today, it is provably not the one created under this
+	// name, and a disproof must not be overruled by the marker the account itself
+	// can write. Letting it be overruled had teeth beyond deleting the wrong
+	// account: revoke aims its SIGKILL sweep at the UID standing in passwd
+	// (revoke.go), so an account carrying a UID the tool never issued had that sweep
+	// pointed wherever its UID now pointed — at a real user's processes if the two
+	// collide. The caller reports the tamper; see UIDTampered.
+	//
+	// Only a row that recorded no UID at all falls through to the marker, because
+	// those rows predate the UID being recorded and their accounts must stay
+	// revocable.
+	if registered && recordedUID > 0 {
+		return pw.UID != recordedUID
 	}
 	managed := hasManagedGECOS(pw.GECOS)
 	if pw.UID < 1000 {

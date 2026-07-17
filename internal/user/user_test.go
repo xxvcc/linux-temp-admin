@@ -105,6 +105,14 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"human", true, 1000, false}, // registry says we created uid 1000 under this name -> ours
 		{"human", true, 1234, true},  // recorded uid disagrees with passwd -> real account stays protected
 
+		// A recorded UID that disagrees is not a MISSING witness but a CONTRADICTING
+		// one, and the marker must not overrule it. The two rows above only ever
+		// exercised that rule on accounts whose marker was absent anyway, so the case
+		// that decides it — marker intact, recorded UID contradicting — went untested
+		// and returned "deletable". revoke then aimed its SIGKILL sweep at the UID in
+		// passwd, i.e. at whatever UID the account had been given.
+		{"tmp1000", true, 9999, true}, // marker intact BUT recorded uid contradicts -> protected
+
 		// Escalating to uid 0 stays protected — never auto-delete a root account —
 		// even though it is registered, managed, and its name is ours.
 		{"escalated", true, 1003, true},
