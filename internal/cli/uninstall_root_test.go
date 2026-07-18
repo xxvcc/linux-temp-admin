@@ -614,3 +614,28 @@ func TestDoctorShowsVersions(t *testing.T) {
 }
 
 func buildinfoVersion() string { return buildinfo.Version }
+
+// TestUninstallCompletesWithAStaleV1RegistryRow is the regression the re-inventory
+// introduced. A v1-upgraded host has /var/lib/linux-temp-admin/users.tsv naming an
+// account whose system account is long gone — a leftover row. teardownPlan lists
+// it (witnessV1), and the post-revoke re-inventory listed it again and blocked on
+// len(residual.accounts)>0 forever: the v1 row is never pruned by revoke, and
+// removeStateDir (which would delete users.tsv) runs AFTER the gate. A bare
+// registry row for a non-existent account carries no privilege — no grant, no
+// exception, no unit, no process — so it must not block the binary.
+func TestUninstallCompletesWithAStaleV1RegistryRow(t *testing.T) {
+	a, _, _ := uninstallApp(t, "")
+	// A v1 users.tsv row for an account that does not exist. Nothing else names it.
+	mustWrite(t, filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile)),
+		"ltav1ghost\t2020-01-01\tsomething\n")
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 0 {
+		t.Fatalf("rc=%d, want 0: a stale v1 registry row must not block the uninstall", rc)
+	}
+	if _, err := os.Lstat(a.InstallPath); !os.IsNotExist(err) {
+		t.Error("the binary should have been removed")
+	}
+	if _, err := os.Lstat(a.StateDir); !os.IsNotExist(err) {
+		t.Error("the state dir (with the stale v1 row) should have been removed")
+	}
+}

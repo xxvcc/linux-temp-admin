@@ -40,6 +40,20 @@ const (
 	witnessUnit     witness = "auto-delete-task"
 )
 
+// hasArtifactWitness reports whether the account is named by a filesystem
+// artifact that carries privilege — a sudo grant, an sshd exception, or an
+// auto-delete unit — as opposed to only a registry row. A row is a record; an
+// artifact is a live loosening of policy. The residual-block after teardown keys
+// on this so a stale row never blocks, but a surviving grant always does.
+func hasArtifactWitness(acc teardownAccount) bool {
+	for _, w := range acc.witnesses {
+		if w == witnessSudoers || w == witnessSSHD || w == witnessUnit {
+			return true
+		}
+	}
+	return false
+}
+
 // teardownAccount is one account the uninstall has to get rid of, and why it
 // thinks so.
 type teardownAccount struct {
@@ -428,7 +442,21 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 		a.audit("uninstall", "", "fail", "re-inventory error: "+residual.inventoryErr.Error(), nil)
 		return 1
 	}
-	if len(residual.accounts) > 0 {
+	// Block only on residue that carries privilege: a live account, or a leftover
+	// grant / exception / unit. A residual entry named ONLY by a registry row whose
+	// account no longer exists carries none — it is a stale row (a v1 users.tsv
+	// leftover is the common one; revoke prunes v2 rows but never touches v1's), and
+	// removeStateDir just below deletes it. Blocking on it would false-block the
+	// uninstall forever on any v1-upgraded host, which is strictly worse than the
+	// user.Exists-only check this re-inventory replaced.
+	var blocking []teardownAccount
+	for _, acc := range residual.accounts {
+		if acc.exists || hasArtifactWitness(acc) {
+			blocking = append(blocking, acc)
+		}
+	}
+	if len(blocking) > 0 {
+		residual.accounts = blocking
 		a.errorf("%s", a.P.M(
 			"以下项未能清除（账号、sudo 授权、sshd 例外或自动删除任务仍在）：",
 			"these could not be cleared (an account, a sudo grant, an sshd exception, or an auto-delete task remains):"))

@@ -185,3 +185,48 @@ func TestAutoRevokeForceStillProtectsARealAccount(t *testing.T) {
 		t.Error("SECURITY: --force auto-revoke deleted a real account it did not create")
 	}
 }
+
+// TestInviteExistingLiveAccountDoesNotStripItsGrant is the regression the
+// pre-clear introduced. invite's explicit --user path has no existence guard, so
+// re-inviting a name that is a currently-LIVE managed account used to be a
+// harmless no-op (Create failed first, nothing touched). The unconditional
+// pre-clear made it strip the live account's sudo grant and sshd exception (and
+// reload sshd, locking out the invitee) BEFORE Create fails — destroying a live
+// account's privilege on an operator typo. The pre-clear must only run for a name
+// whose account is actually gone (the reuse case it targets).
+func TestInviteExistingLiveAccountDoesNotStripItsGrant(t *testing.T) {
+	a, sudoMgr, sshdMgr, _ := inviteApp(t)
+	const name = "xxvcc-live01"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	// A live managed account with a real sudo grant and sshd exception on disk.
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	grant := sudoMgr.FilePath(name)
+	mustWriteInvite(t, grant, name+" ALL=(ALL) NOPASSWD:ALL\n")
+	sshEx := sshdMgr.FilePath(name)
+	mustWriteInvite(t, sshEx, "Match User "+name+"\n\tPubkeyAuthentication yes\n")
+
+	// Re-invite the live name. Create will fail (account exists) — the point is that
+	// nothing on disk is touched on the way to that failure.
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "24", "--no-sudo", "--no-fix-sshd", "--no-auto-revoke", "--yes"})
+	if rc == 0 {
+		t.Fatalf("invite of an existing account should have failed")
+	}
+	if _, err := os.Stat(grant); err != nil {
+		t.Error("REGRESSION: re-inviting a live account stripped its NOPASSWD sudo grant")
+	}
+	if _, err := os.Stat(sshEx); err != nil {
+		t.Error("REGRESSION: re-inviting a live account stripped its sshd exception")
+	}
+}
+
+func mustWriteInvite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o440); err != nil {
+		t.Fatal(err)
+	}
+}
