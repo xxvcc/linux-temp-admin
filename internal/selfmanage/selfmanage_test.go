@@ -127,3 +127,29 @@ func TestNewClientRedirectToPrivateIsRefused(t *testing.T) {
 		t.Error("a redirect to a private/loopback address must be refused")
 	}
 }
+
+// TestCheckDialAddr exercises the dial-time policy the Control hook enforces —
+// including the DENY branch, which the redirect integration test cannot reach
+// (its loopback target is refused earlier by the name check). This is the
+// rebinding-proof enforcement point, so its deny path must be pinned directly.
+func TestCheckDialAddr(t *testing.T) {
+	cases := []struct {
+		addr         string
+		allowPrivate bool
+		wantErr      bool
+	}{
+		{"93.184.216.34:443", false, false}, // public, redirect phase -> allowed
+		{"93.184.216.34:443", true, false},  // public, initial -> allowed
+		{"127.0.0.1:443", true, false},      // private but initial mirror -> allowed
+		{"127.0.0.1:443", false, true},      // private AFTER redirect -> DENIED (the fix)
+		{"10.0.0.5:443", false, true},       // RFC1918 after redirect -> denied
+		{"169.254.169.254:80", false, true}, // link-local metadata after redirect -> denied
+		{"[::1]:443", false, true},          // ipv6 loopback after redirect -> denied
+	}
+	for _, c := range cases {
+		err := checkDialAddr(c.addr, c.allowPrivate)
+		if (err != nil) != c.wantErr {
+			t.Errorf("checkDialAddr(%q, allowPrivate=%v) err=%v, wantErr=%v", c.addr, c.allowPrivate, err, c.wantErr)
+		}
+	}
+}

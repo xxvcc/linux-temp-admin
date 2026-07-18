@@ -55,15 +55,7 @@ func New(installPath string, maxBytes int64) *Manager {
 	// deliberate internal mirror still works; the first redirect clears it.
 	dialer := &net.Dialer{
 		Control: func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if ip == nil || isPublicIP(ip) || m.allowPrivateDial {
-				return nil
-			}
-			return fmt.Errorf("refusing to dial non-public address after redirect: %s", address)
+			return checkDialAddr(address, m.allowPrivateDial)
 		},
 	}
 	m.Client = &http.Client{
@@ -269,6 +261,25 @@ func refusePrivateRedirect(host string) error {
 
 // isPublicIP reports whether ip is a routable public address — not loopback,
 // private (RFC1918/ULA), link-local, CGNAT (RFC6598), multicast, or unspecified.
+// checkDialAddr is the dial-time policy the Control hook enforces on the address
+// ACTUALLY being connected to (host:port, resolved). It is the rebinding-proof
+// point: a name that passed a separate lookup but resolves to a private IP at
+// connect time is refused here. A private address is allowed only while
+// allowPrivate holds — true for the operator's initial URL (a deliberate internal
+// mirror), cleared on the first redirect. It is a free function so the deny branch
+// is directly testable, not reachable only through a live DNS-rebinding server.
+func checkDialAddr(address string, allowPrivate bool) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || isPublicIP(ip) || allowPrivate {
+		return nil
+	}
+	return fmt.Errorf("refusing to dial non-public address after redirect: %s", address)
+}
+
 func isPublicIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {

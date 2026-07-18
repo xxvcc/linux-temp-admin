@@ -757,12 +757,19 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// lower down for the same reason, but a sudo drop-in is more urgent: it is
 	// name-keyed, so the instant useradd creates the account the leftover
 	// /etc/sudoers.d file grants it passwordless root — while this invite records
-	// sudo=no. The grant this invite actually wants is (re)written below; the sshd
-	// exception likewise. Both removers only ever touch this tool's own
-	// managed-prefixed file, so calling them blindly is safe (revoke relies on the
-	// same property), and clearing then re-granting is idempotent.
-	a.removeSudoGrant(username)
-	a.removeSSHDException(username)
+	// sudo=no. The grant this invite actually wants is (re)written below.
+	//
+	// ONLY when the account does not already exist. The case this guards is a
+	// reused name whose account is GONE but whose grant lingers; there, useradd
+	// will mint a fresh account and the stale file must not carry over. If the name
+	// is a currently-LIVE account, useradd is about to fail and this invite touches
+	// nothing — stripping a live account's grant (and reloading sshd out from under
+	// its invitee) on the way to that failure is a regression. The generated-name
+	// path is already existence-checked; an explicit --user is not, so guard here.
+	if !user.Exists(username) {
+		a.removeSudoGrant(username)
+		a.removeSSHDException(username)
+	}
 
 	if err := a.Users.Create(username, resolveShell()); err != nil {
 		a.errorf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
