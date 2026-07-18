@@ -380,7 +380,7 @@ func (a *App) doctor(args []string) int {
 		if v == buildinfo.Version {
 			a.success(fmt.Sprintf(a.P.M("已安装命令版本：%s", "installed command version: %s"), v))
 		} else {
-			a.warnf(fmt.Sprintf(a.P.M("已安装命令版本 %s 与运行中的 %s 不一致（自动删除任务执行的是已安装的那份，可用 upgrade 或 install 对齐）",
+			a.warnf("%s", fmt.Sprintf(a.P.M("已安装命令版本 %s 与运行中的 %s 不一致（自动删除任务执行的是已安装的那份，可用 upgrade 或 install 对齐）",
 				"installed command version %s differs from the running %s (the auto-delete task runs the installed one; align with upgrade or install)"), v, buildinfo.Version))
 		}
 	}
