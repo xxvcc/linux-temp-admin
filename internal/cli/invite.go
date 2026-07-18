@@ -205,12 +205,15 @@ func (a *App) invite(args []string) int {
 	}
 
 	if grantSudo == "ask" {
+		// This tool exists to create admin accounts, so an interactive invite grants
+		// sudo by default without asking — the pre-create summary still shows
+		// "Sudo: yes" and can be declined, and `--no-sudo` makes a plain account. A
+		// non-interactive run (--yes) is left as a plain account unless --sudo is
+		// passed explicitly, which keeps the --confirm-sudo gate and scripts intact.
 		if fYes {
 			grantSudo = "no"
-		} else if yesish(a.prompt(a.P.M("是否授予 sudo 管理员权限？[y/N]: ", "Grant sudo admin privileges? [y/N]: "))) {
-			grantSudo = "yes"
 		} else {
-			grantSudo = "no"
+			grantSudo = "yes"
 		}
 	}
 	if autoRev == "ask" {
@@ -226,14 +229,21 @@ func (a *App) invite(args []string) int {
 		}
 	}
 
-	// A menu-driven operator never touches --hours, so offer the lifetime here when
-	// it was not set on the command line; a blank answer keeps the default. The TTY
-	// gate matters: promptHours re-asks on invalid input, and an unbounded non-TTY
-	// stdin stream (e.g. `yes n | lta invite`) never reaches EOF, so without it the
-	// root tool would spin forever on the pipe. A non-interactive run keeps the
-	// default, exactly as the other interactive-only prompts do.
-	if !hoursSet && !fYes && a.StdinIsTTY() {
+	// The lifetime only means something when the account will auto-delete; without
+	// it the account is permanent (no expiry, no deletion), so there is nothing to
+	// ask. A menu-driven operator never touches --hours, so offer it here when
+	// auto-delete is on and it was not set on the command line. The TTY gate
+	// matters: promptHours re-asks on invalid input, and an unbounded non-TTY stdin
+	// stream (e.g. `yes n | lta invite`) never reaches EOF, so without it the root
+	// tool would spin forever on the pipe.
+	if autoRev == "yes" && !hoursSet && !fYes && a.StdinIsTTY() {
 		hours = a.promptHours(hours)
+	}
+	// --hours with --no-auto-revoke asks for a lifetime the permanent account will
+	// not have; say so rather than silently ignoring the flag.
+	if autoRev == "no" && hoursSet {
+		a.warnf("%s", a.P.M("未选择自动删除，账号将永久有效，--hours 被忽略。",
+			"auto-delete is off, so the account is permanent and --hours is ignored."))
 	}
 
 	// Work out what would have to be installed BEFORE the summary, so the summary
@@ -245,9 +255,15 @@ func (a *App) invite(args []string) int {
 	}
 
 	if !fYes {
-		a.printf("\n%s\n  user=%s host=%s port=%d hours=%d sudo=%s auto-delete=%s\n  login=%s\n",
+		// A permanent account (auto-delete off) has no lifetime, so the summary shows
+		// its expiry as "permanent" instead of an hours figure that would not apply.
+		lifetime := fmt.Sprintf(a.P.M("有效期=%d小时", "expires-in=%dh"), hours)
+		if autoRev != "yes" {
+			lifetime = a.P.M("永久", "permanent")
+		}
+		a.printf("\n%s\n  user=%s host=%s port=%d %s sudo=%s auto-delete=%s\n  login=%s\n",
 			a.P.M("即将创建一次性临时账号：", "About to create a one-time temporary account:"),
-			username, host, port, hours, grantSudo, autoRev, a.loginSummary(plan, username))
+			username, host, port, lifetime, grantSudo, autoRev, a.loginSummary(plan, username))
 		if len(depPkgs) > 0 {
 			a.printf("  %s%s", a.P.M("确认后将安装依赖：", "dependencies to install on confirm: "), strings.Join(depPkgs, " "))
 		}
@@ -844,8 +860,18 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		}
 	}
 
-	if err := a.Users.SetExpiry(username, expiry.Date(a.Now(), hours)); err != nil {
-		return failf("%s: %v", a.P.M("设置到期失败", "set expiry failed"), err)
+	// Expiry is set only when the account will auto-delete. Without auto-delete the
+	// account is permanent — no chage expiry, no deletion — which is what "not
+	// auto-deleting" now means; the old behaviour (login expires via chage but the
+	// account is never deleted) was neither temporary nor permanent, and surprised
+	// operators who read "no auto-delete" as "keep it".
+	permanent := !wantAuto
+	expiresDisplay := a.P.M("永久（不会过期，也不会自动删除）", "never (does not expire or auto-delete)")
+	if !permanent {
+		if err := a.Users.SetExpiry(username, expiry.Date(a.Now(), hours)); err != nil {
+			return failf("%s: %v", a.P.M("设置到期失败", "set expiry failed"), err)
+		}
+		expiresDisplay = expiry.DisplayLocal(a.Now(), hours)
 	}
 
 	sudoGranted := false
@@ -903,7 +929,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	rec := registry.Record{
 		User:        username,
 		Created:     a.Now().Format("2006-01-02 15:04:05 MST"),
-		Expires:     expiry.DisplayLocal(a.Now(), hours),
+		Expires:     expiresDisplay,
 		Sudo:        sudoGranted,
 		Host:        host,
 		Port:        port,
@@ -953,6 +979,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	a.printInvite(inviteBundle{
 		user: username, host: host, port: port, hours: hours,
 		sudo: sudoGranted, auto: autoScheduled, autoUnit: autoUnit,
+		permanent: permanent, expires: expiresDisplay,
 		registered: registered, kp: kp, password: password,
 		sshdDropIn: sshdDropIn, verified: plan.verified, unverified: plan.unverified,
 	})
@@ -991,6 +1018,8 @@ type inviteBundle struct {
 	user, host  string
 	port, hours int
 	sudo, auto  bool
+	permanent   bool
+	expires     string
 	autoUnit    string
 	registered  bool
 	kp          *sshkey.KeyPair // nil for a password invite
@@ -1031,21 +1060,11 @@ func (b inviteBundle) loginLine() string {
 }
 
 func (a *App) printInvite(b inviteBundle) {
-	sshHost := b.host
-	if isIPv6(b.host) {
-		sshHost = "[" + b.host + "]"
-	}
 	yesno := func(v bool) string {
 		if v {
 			return "yes"
 		}
 		return "no"
-	}
-	// An unregistered account (registry write failed) can only be revoked with
-	// --force, so print that in the copy-paste revoke command.
-	revokeSuffix := ""
-	if !b.registered {
-		revokeSuffix = " --force"
 	}
 	passwordLine := "locked"
 	if b.byPassword() {
@@ -1065,43 +1084,25 @@ Auto revoke: %s
 Auto revoke unit: %s
 Sshd exception: %s
 `,
-		b.host, b.port, b.user, expiry.DisplayLocal(a.Now(), b.hours), yesno(b.sudo),
+		b.host, b.port, b.user, b.expires, yesno(b.sudo),
 		b.loginLine(), passwordLine, yesno(b.auto), orNone(b.autoUnit), orNone(b.sshdDropIn))
 
+	// The credential only. The SSH login command that used to sit here was dropped:
+	// the header carries the Host, Port, and User to build it from, and the noise
+	// was not worth it for a recipient who runs ssh.
 	if b.byPassword() {
-		fmt.Fprintf(a.Out, `
-%s
-ssh -p %d %s@%s
-
-%s
-%s
-`,
-			a.P.M("SSH 登录命令:", "SSH login command:"), b.port, b.user, sshHost,
+		fmt.Fprintf(a.Out, "\n%s\n%s\n",
 			a.P.M("登录密码（只显示这一次）:", "Login password (shown only once):"), b.password)
 	} else {
 		fmt.Fprintf(a.Out, `
-%s
-ssh -i ./%s.key -p %d %s@%s
-
 %s
 cat > './%s.key' <<'EOF_KEY'
 %sEOF_KEY
 chmod 600 './%s.key'
 `,
-			a.P.M("SSH 登录命令:", "SSH login command:"), b.user, b.port, b.user, sshHost,
 			a.P.M("保存私钥命令:", "Save private key command:"), b.user, string(b.kp.PrivatePEM), b.user)
 	}
 
-	fmt.Fprintf(a.Out, `
-%s
-sudo %s revoke --user %s%s
-`, a.P.M("撤销命令:", "Revoke command:"), a.InstallPath, b.user, revokeSuffix)
-
-	if b.sudo {
-		fmt.Fprint(a.Out, "\n"+a.P.M(
-			"Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥有的持久化；撤销只删除此账号本身。",
-			"Sudo note: NOPASSWD sudo is enabled (equivalent to full root); it may leave root-owned persistence. Revoking only deletes this account itself.")+"\n")
-	}
 	if b.sshdDropIn != "" {
 		fmt.Fprint(a.Out, "\n"+a.P.M(
 			"Sshd 提示: 已为该账号单独写入一个 sshd 例外（仅 Match User 块，全局策略未改动）；撤销时会删除该文件并 reload sshd。",
@@ -1112,7 +1113,11 @@ sudo %s revoke --user %s%s
 			"密码提示: 密码登录可被全网爆破，且必须以明文交付；这是本工具最弱的一种授权方式，用完请立即撤销。",
 			"Password note: a password login is brute-forceable from anywhere and must be delivered in the clear. This is the weakest grant this tool issues; revoke as soon as you are done.")+"\n")
 	}
-	if !b.auto {
+	if b.permanent {
+		fmt.Fprint(a.Out, "\n"+a.P.M(
+			"永久账号提示: 未选择自动删除，此账号不会过期、不会被自动删除；用完请手动撤销（revoke）。",
+			"Permanent-account note: auto-delete was not chosen, so this account does not expire and is not auto-deleted. Revoke it by hand when done.")+"\n")
+	} else if !b.auto {
 		fmt.Fprint(a.Out, "\n"+a.P.M(
 			"自动删除提示: 未创建自动删除任务；账号到期只阻止登录，不删除用户，请按需手动撤销。",
 			"Auto-delete note: no auto-delete task was created; expiry only blocks login and does not delete the user. Revoke manually when needed.")+"\n")
@@ -1244,8 +1249,15 @@ func resolveShell() string {
 // override, because a multi-homed box can present the wrong public IP and a
 // wrong Host silently produces an invite nobody can connect with.
 func (a *App) detectOrPromptHost() string {
+	// A locally-detected public IP is authoritative — it comes from cloud metadata
+	// or a routable address on one of this host's own interfaces — so take it
+	// without a prompt. `--host` overrides it when the operator wants a domain or a
+	// specific address; the summary below prints the Host, so a wrong guess is
+	// still visible before anything is created.
 	if ip, ok := a.Detector.LocalPublicIP(2 * time.Second); ok {
-		return a.promptHost(ip)
+		a.info(fmt.Sprintf(a.P.M("使用探测到的公网 IP：%s（如需域名或其他地址请用 --host）",
+			"using the detected public IP: %s (use --host for a domain or a different address)"), ip))
+		return ip
 	}
 	if yesish(a.prompt(a.P.M("本机未探测到公网 IP。是否向外部服务查询？[y/N]: ",
 		"No public IP found locally. Ask an external service? [y/N]: "))) {

@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented here.
 
+## v2.7.0 - A shorter invite flow, and "no auto-delete" means permanent
+
+- **The interactive invite asks less.** The public IP, when detected locally
+  (cloud metadata or a routable interface address — authoritative), is used
+  without a prompt (`--host` still overrides for a domain or another address, and
+  the summary prints the Host so a wrong guess is visible). The sudo question is
+  gone: this tool creates admin accounts, so an interactive invite grants sudo by
+  default — the pre-create summary still shows `Sudo: yes` and can be declined, and
+  `--no-sudo` still makes a plain account. And the lifetime is asked only when
+  auto-delete is on.
+
+- **"No auto-delete" now means permanent, not "login expires anyway".** Previously
+  a `--no-auto-revoke` account still got a `chage` login-expiry after `--hours`, so
+  it was neither temporary nor permanent — it stopped working but was never
+  removed, surprising operators who read "no auto-delete" as "keep it". Now
+  auto-delete off sets no expiry at all: the account is genuinely permanent, the
+  bundle says so, and there is no lifetime to ask for. `--hours` with
+  `--no-auto-revoke` is ignored, with a warning.
+
+  This is a real behavior change to that flag combination — hence the minor bump —
+  but it matches what "not auto-deleting" reads as, and a temporary account is
+  still the default (auto-delete defaults to yes).
+
+- **The invite bundle is trimmed.** The SSH login command, the revoke command, and
+  the standalone Sudo note were removed. The bundle keeps the header (Host / Port /
+  User / Expires / Sudo / Login / … — everything needed to build the connection),
+  the save-private-key command, and the security reminder. A permanent account
+  shows `Expires: never` and a note that it must be revoked by hand.
+
 ## v2.6.2 - The manage screen shows the orphans doctor sees
 
 - **「管理临时用户」now lists orphaned leftovers with no registry row**, below the

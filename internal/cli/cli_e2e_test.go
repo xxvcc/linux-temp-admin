@@ -139,12 +139,20 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	}
 	inviteOut := out.String()
 	for _, want := range []string{"BEGIN LINUX TEMP ADMIN INVITE", "OPENSSH PRIVATE KEY",
-		"ssh -i ./" + username + ".key", "Sudo: yes",
+		// The save-key command is kept; the SSH login command was removed from the
+		// bundle, so assert the key delivery, not a login line.
+		"cat > './" + username + ".key'", "Sudo: yes",
 		// The Login line is now a verdict, not a slogan: it may only claim a key
 		// login on a host whose effective sshd config was read and said yes.
 		"Login: SSH key only (verified"} {
 		if !strings.Contains(inviteOut, want) {
 			t.Errorf("invite output missing %q", want)
+		}
+	}
+	// The removed sections must be gone.
+	for _, gone := range []string{"ssh -i ./", "Revoke command:", "revoke --user", "Sudo note:"} {
+		if strings.Contains(inviteOut, gone) {
+			t.Errorf("invite output should no longer contain %q", gone)
 		}
 	}
 	// sshd already accepts keys here, so the tool must not have touched it.

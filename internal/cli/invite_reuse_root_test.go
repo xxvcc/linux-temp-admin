@@ -230,3 +230,82 @@ func mustWriteInvite(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// TestInvitePermanentWhenNoAutoRevoke pins the new "no auto-delete = permanent"
+// semantics: no chage expiry is set (SetExpiry not called), no auto-delete task,
+// and the bundle says permanent. Previously even a --no-auto-revoke account got a
+// chage login-expiry; now it is genuinely permanent.
+func TestInvitePermanentWhenNoAutoRevoke(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	out := a.Out.(*bytes.Buffer)
+	const name = "xxvcc-perm01"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--no-sudo", "--no-auto-revoke", "--yes", "--allow-non-tty-private-key-output"})
+	if rc != 0 {
+		t.Fatalf("invite rc=%d: %s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	// No chage expiry: the shadow expiry field must be empty (never set).
+	if line := passwdExpiryField(t, name); line != "" {
+		t.Errorf("a permanent account must have no chage expiry; shadow expire field = %q", line)
+	}
+	if !strings.Contains(out.String(), "never") && !strings.Contains(out.String(), "永久") {
+		t.Errorf("bundle should show a permanent expiry: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Permanent-account note") {
+		t.Errorf("bundle should carry the permanent-account note: %q", out.String())
+	}
+}
+
+// passwdExpiryField returns the account-expiry field (field 8) from /etc/shadow
+// for name — empty when no expiry was ever set.
+func passwdExpiryField(t *testing.T, name string) string {
+	t.Helper()
+	out, err := exec.Command("chage", "-l", name).CombinedOutput()
+	if err != nil {
+		t.Fatalf("chage -l: %v: %s", err, out)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(strings.ToLower(line), "account expires") {
+			_, v, _ := strings.Cut(line, ":")
+			v = strings.TrimSpace(v)
+			if v == "never" {
+				return ""
+			}
+			return v
+		}
+	}
+	return ""
+}
+
+// TestInviteInteractiveDefaultsSudoOn: the interactive flow (a TTY, no --yes)
+// grants sudo without asking. A --no-sudo still makes a plain account, but the
+// bare interactive path is admin-by-default.
+func TestInviteInteractiveDefaultsSudoOn(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	out := a.Out.(*bytes.Buffer)
+	a.StdinIsTTY = func() bool { return true }
+	// Interactive answers: sudo is NOT asked now; auto-delete [Y/n] -> n (so no
+	// hours prompt either); then the confirmation YES.
+	a.In = strings.NewReader("n\nYES\n")
+	const name = "xxvcc-defsudo1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--allow-non-tty-private-key-output"})
+	if rc != 0 {
+		t.Fatalf("invite rc=%d: %s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !strings.Contains(out.String(), "Sudo: yes") {
+		t.Errorf("interactive invite should default to sudo on: %q", out.String())
+	}
+	// It must NOT have asked the sudo question.
+	if strings.Contains(a.Err.(*bytes.Buffer).String(), "Grant sudo") {
+		t.Errorf("interactive invite should not ask about sudo anymore")
+	}
+}
