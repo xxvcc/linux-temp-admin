@@ -119,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts
 sudo linux-temp-admin invite --sudo
 ```
 
-交互模式会先让你确认信息（用户名、Host、有效期、是否 sudo、是否到期自动删），确认后输出邀请包。
+交互模式很短：探测到公网 IP 就直接用（`--host` 可改域名/其他地址）、默认授予 sudo（这是个建管理员的工具，`--no-sudo` 可建普通账号）、问是否到期自动删除；**选了自动删除才问有效期**。最后列出摘要让你确认，再输出邀请包。
 
 ### 3. 你会拿到这样一份邀请包（已脱敏）
 
@@ -139,9 +139,6 @@ Auto revoke: yes
 Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
 Sshd exception: none
 
-SSH 登录命令:
-ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
-
 保存私钥命令:
 cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
@@ -149,11 +146,6 @@ cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 './xxvcc-a1b2c3d4e5.key'
-
-撤销命令:
-sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
-
-Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥有的持久化；撤销只删除此账号本身。
 
 安全提醒: 私钥只显示这一次、服务器不保存；仅通过可信私聊发送；用完立即撤销。
 
@@ -169,7 +161,8 @@ Sudo 提示: 已启用 NOPASSWD sudo，等同完整 root，可能留下 root 拥
 对方拿到后只需两步，**无需安装任何东西、也不用懂这个工具**：
 
 - 复制「保存私钥命令」那一段，在自己电脑上粘贴运行 → 得到私钥文件；
-- 复制「SSH 登录命令」运行 → 登录成功。
+- 用头部的 Host / Port / User 拼出登录命令即可，例如：
+  `ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10`。
 
 > ⚠️ 邀请包含一次性私钥，**只通过可信私聊发送**，不要发群里、工单或公开页面。
 
@@ -241,7 +234,7 @@ sudo linux-temp-admin invite --prefix ops --sudo
 sudo linux-temp-admin invite --host 203.0.113.10 --port 22 --sudo
 ```
 
-只设账号过期、不创建自动删除任务：
+不自动删除——创建**永久账号**（不设到期、不删除，需手动 `revoke`）：
 
 ```bash
 sudo linux-temp-admin invite --sudo --no-auto-revoke
@@ -320,7 +313,9 @@ sudo linux-temp-admin doctor
 
 ### 关于"过期"和"自动删除"
 
-默认有效期 24 小时。工具同时做两件事：用 `chage -E` 按天设置账号过期（阻止后续登录，**不删用户**），并写一个到点真正删除用户的自动删除任务——优先 systemd timer，`at` 兜底，两者都不可用才降级为"只设账号过期"并在邀请包里提示手动撤销。自动删除任务调用的是已安装的命令，因此选择自动删除时工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在（即便到期时登记表已丢失，该任务仍会验明账号身份后删除并撤回授权）。
+默认有效期 24 小时,且**默认开启自动删除**。开启自动删除时,工具做两件事:用 `chage -E` 按天设置账号过期(到期阻止登录),并写一个到点**真正删除用户**的自动删除任务——优先 systemd timer,`at` 兜底,两者都不可用才降级为"只设账号过期"并在邀请包里提示手动撤销。自动删除任务调用的是已安装的命令,因此工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在(即便到期时登记表已丢失,该任务仍会验明账号身份后删除并撤回授权)。
+
+**不开启自动删除 = 永久账号**:不设任何到期、也不会被删除,只能手动 `revoke`。此时 `--hours` 被忽略。
 
 关于 Host 的两点用户须知：
 
