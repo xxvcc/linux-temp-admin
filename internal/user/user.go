@@ -7,7 +7,7 @@
 package user
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,14 +34,17 @@ type Passwd struct {
 
 // Lookup returns the passwd entry for name (local accounts only; no NSS).
 func Lookup(name string) (Passwd, bool) {
-	f, err := os.Open(passwdPath)
+	// os.ReadFile, not a bufio.Scanner: a scanner ignores a mid-file read error and
+	// stops early, which would make an account later in the file look absent — and
+	// Lookup backs user.Exists, which the teardown trusts as ground truth. ReadFile
+	// either returns the whole file or an error; a read error reads as "absent",
+	// the same as a missing file, but a partial read can never masquerade as EOF.
+	data, err := os.ReadFile(passwdPath)
 	if err != nil {
 		return Passwd{}, false
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		parts := strings.Split(sc.Text(), ":")
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Split(line, ":")
 		if len(parts) < 7 || parts[0] != name {
 			continue
 		}
@@ -66,17 +69,18 @@ var groupPath = "/etc/group"
 // DenyGroups against, so an invite can tell whether a whitelist would admit the
 // account it is about to create.
 func Groups(pw Passwd) []string {
-	f, err := os.Open(groupPath)
+	// Whole-file read for the same reason as Lookup: a truncated scan would
+	// under-report group membership, and that feeds the AllowGroups/DenyGroups
+	// preview an invite decides a login on.
+	data, err := os.ReadFile(groupPath)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 	var primary string
 	var extra []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
+	for _, line := range strings.Split(string(data), "\n") {
 		// name:passwd:gid:member,member,...
-		parts := strings.Split(sc.Text(), ":")
+		parts := strings.Split(line, ":")
 		if len(parts) < 4 {
 			continue
 		}
@@ -316,11 +320,15 @@ const expiredDate = "1970-01-01"
 // Both steps are best-effort in the sense that the caller continues to the
 // delete either way, but their errors are returned so the caller can say the
 // door could not be shut.
+//
+// Both steps are ATTEMPTED even if the first fails. They guard different auth
+// vectors — expiry stops a key login, the lock stops a password login — so
+// returning on the expiry error would skip the password lock, dropping a
+// mitigation that might still have succeeded (chage missing does not imply
+// usermod missing). The errors are joined so the caller sees every door that
+// could not be shut, not just the first.
 func (m *Manager) DisableLogin(name string) error {
-	if err := m.SetExpiry(name, expiredDate); err != nil {
-		return err
-	}
-	return m.LockPassword(name)
+	return errors.Join(m.SetExpiry(name, expiredDate), m.LockPassword(name))
 }
 
 // Delete removes the account and its home directory.
@@ -332,13 +340,21 @@ func (m *Manager) DisableLogin(name string) error {
 // makes the delete succeed against a stale utmp entry too. Deleting an account
 // out from under a live session is exactly what a revoke is asking for.
 func (m *Manager) Delete(name string) error {
+	var delErr error
 	if m.Runner.Look("deluser") {
-		if err := m.Runner.Run("deluser", "--remove-home", name); err == nil {
+		if delErr = m.Runner.Run("deluser", "--remove-home", name); delErr == nil {
 			return nil
 		}
 	}
 	if m.Runner.Look("userdel") {
 		return m.Runner.Run("userdel", "-r", "-f", "--", name)
+	}
+	// deluser ran and failed but there is no userdel to fall back to: return the
+	// REAL deluser error, not a generic "no tool available". On BusyBox (deluser,
+	// no userdel) the true cause — a live session, say — was being hidden behind a
+	// false "the tool is missing" that sent the operator debugging the wrong thing.
+	if delErr != nil {
+		return fmt.Errorf("deluser: %w", delErr)
 	}
 	return fmt.Errorf("no userdel/deluser available")
 }
@@ -404,14 +420,13 @@ func signalUID(sig syscall.Signal, uid int) int {
 
 // procUIDs returns the real and effective UID from /proc/<pid>/status.
 func procUIDs(pid int) (ruid, euid int, ok bool) {
-	f, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
+	// Whole-file read: a scanner that errored before the Uid: line would drop this
+	// pid from the SIGKILL sweep silently. /proc/<pid>/status is tiny.
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		return 0, 0, false
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
+	for _, line := range strings.Split(string(data), "\n") {
 		if !strings.HasPrefix(line, "Uid:") {
 			continue
 		}

@@ -37,7 +37,7 @@ For changes that touch account creation, revoke, sudoers, systemd timers, or `at
 - Keep the tool dependency-light and portable across Debian/Ubuntu, RHEL-compatible systems, Alpine (musl/BusyBox), and Arch where practical. It depends only on the Go stdlib plus `golang.org/x/sys`, `golang.org/x/crypto`, and `golang.org/x/term`.
 - Validate all user-controlled values before using them in paths, shell commands, systemd units, sudoers, or registry records. In Go, never build a shell command string — use `os/exec` with an argv slice.
 - Prefer root-owned temporary files plus atomic rename for managed root files; set owner/mode on the file descriptor and never follow a symlink at the target.
-- Do not silently overwrite an existing stable command if doing so could break another registered user's auto-revoke task.
+- Do not silently overwrite an existing installed command if doing so could break another registered user's auto-revoke task.
 - Keep non-interactive automation explicit: dangerous actions need `--yes` plus a specific confirmation value when relevant.
 - Update both Chinese and English README files when user-facing behavior changes.
 - Add or update tests for validation, parsing, quoting, and safety boundary changes.

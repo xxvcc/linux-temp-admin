@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
@@ -207,6 +212,71 @@ func (a *App) cleanupExpired(args []string) int {
 	return 0
 }
 
+// accountIsOursAndLive reports whether name is a temporary account this tool
+// currently manages — it exists AND is either marked managed (the GECOS marker)
+// or vouched for by a registry row that recorded its exact UID.
+//
+// It is the predicate the orphan sweeps use instead of a bare user.Exists,
+// because a grant/exception/unit outlives its account in TWO ways, not one: the
+// account is gone, OR a different, unmanaged account has since taken the name. In
+// the second case a bare user.Exists reports the name as present and the sweeps
+// treat the leftover as live — while the name-keyed sudoers drop-in hands OUR
+// passwordless root to an account we never granted it to, invisible to doctor and
+// cleanup. Requiring the account to be provably ours closes that: a name taken
+// over by something that is not ours makes the leftover an orphan again.
+//
+// It never mistakes a live managed account for an orphan: a normal temp account
+// carries the marker, and one whose marker was erased is still vouched for by its
+// recorded UID.
+func (a *App) accountIsOursAndLive(name string) bool {
+	if !user.Exists(name) {
+		return false
+	}
+	if user.IsManaged(name) {
+		return true
+	}
+	if a.Registry != nil {
+		if rec, found, _ := a.Registry.Lookup(name); found && rec.UID > 0 {
+			if pw, ok := user.Lookup(name); ok && pw.UID == rec.UID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// installedCommandVersion best-effort reads the version of the binary at
+// InstallPath — the one the auto-revoke timer runs, which can differ from this
+// process. It returns (version, "ok") when it read one, and ("", state) where
+// state is "absent" (nothing installed), "unreadable" (present but the version
+// could not be obtained), or "" (nothing to check, e.g. no InstallPath set).
+//
+// It execs the installed binary, so it refuses to run anything at an unsafe path
+// (RootSafeFile) — never exec a symlink or a non-root-owned file — and bounds the
+// call with a timeout so a wedged binary cannot hang the report.
+func (a *App) installedCommandVersion() (string, string) {
+	if a.InstallPath == "" {
+		return "", ""
+	}
+	if _, err := os.Lstat(a.InstallPath); err != nil {
+		return "", "absent"
+	}
+	if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+		return "", "unreadable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, a.InstallPath, "version").Output()
+	if err != nil {
+		return "", "unreadable"
+	}
+	v := strings.TrimSpace(string(out))
+	if !validate.InstalledVersion(v) {
+		return "", "unreadable"
+	}
+	return v, "ok"
+}
+
 // compact is the sweep itself, with none of the framing the cleanup-expired
 // subcommand wraps it in. It is split out for the manage screen, which has just
 // drawn the table and is where revoke already lives: re-printing the list under a
@@ -220,7 +290,7 @@ func (a *App) compact() {
 	// that name these accounts, and a grant nobody can name any more is a grant
 	// nobody will ever find.
 	if a.SSHD != nil {
-		orphans, err := a.SSHD.Orphans(user.Exists)
+		orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
 		}
@@ -234,12 +304,13 @@ func (a *App) compact() {
 			}
 			a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
 				"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
+			a.audit("sshd.cleanup", u, "ok", "orphaned sshd exception removed", nil)
 		}
 	}
 	// An orphaned NOPASSWD drop-in is the worse of the two: it re-arms full root
 	// the moment its username is reused.
 	if a.Sudoers != nil {
-		orphans, err := a.Sudoers.Orphans(user.Exists)
+		orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
 		}
@@ -254,6 +325,23 @@ func (a *App) compact() {
 			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
 				"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
+			a.audit("grant.cleanup", u, "ok", "orphaned sudo drop-in removed", nil)
+		}
+	}
+	// An orphaned auto-revoke unit is the third leftover, and until now the only one
+	// with no sweep: its ExecStart runs the installed binary, so a unit whose
+	// account is gone fires forever and fails forever (and against a REMOVED binary
+	// after an uninstall). Scheduler.Orphans mirrors the two sweeps above, and
+	// globs the v1 prefix too.
+	if a.Scheduler != nil {
+		orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive)
+		if err != nil {
+			a.warnf("%v", err)
+		}
+		for _, u := range orphans {
+			a.Scheduler.Cancel(u, "")
+			a.info(a.P.M("已移除孤儿自动删除任务："+u, "removed an orphaned auto-delete task: "+u))
+			a.audit("schedule.cleanup", u, "ok", "orphaned auto-revoke unit removed", nil)
 		}
 	}
 	removed, err := a.Registry.Compact(user.Exists)
@@ -262,6 +350,9 @@ func (a *App) compact() {
 	} else {
 		a.info(fmt.Sprintf(a.P.M("已压实注册表：移除 %d 条指向已不存在用户的记录。",
 			"Compacted the registry: removed %d entries for users that no longer exist."), removed))
+		if removed > 0 {
+			a.audit("registry.compact", "", "ok", fmt.Sprintf("removed %d stale rows", removed), nil)
+		}
 	}
 }
 
@@ -273,6 +364,26 @@ func (a *App) doctor(args []string) int {
 	}
 	rc := 0
 	a.info(a.P.M("linux-temp-admin 诊断报告", "linux-temp-admin doctor report"))
+	a.info(fmt.Sprintf(a.P.M("运行版本：%s", "running version: %s"), buildinfo.Version))
+	// The version that matters most is not this process's but the one installed at
+	// InstallPath: the auto-revoke timer's ExecStart runs THAT binary, so a stale or
+	// missing installed copy is a real diagnostic concern. Surface it, and flag a
+	// mismatch — this whole tool just spent a release closing installed-vs-running
+	// divergences.
+	switch v, state := a.installedCommandVersion(); state {
+	case "absent":
+		a.warnf("%s", a.P.M("已安装命令：未安装（自动删除任务需要它）",
+			"installed command: not installed (the auto-delete task needs it)"))
+	case "unreadable":
+		a.warnf("%s%s", a.P.M("无法读取已安装命令的版本：", "could not read the installed command's version: "), a.InstallPath)
+	case "ok":
+		if v == buildinfo.Version {
+			a.success(fmt.Sprintf(a.P.M("已安装命令版本：%s", "installed command version: %s"), v))
+		} else {
+			a.warnf("%s", fmt.Sprintf(a.P.M("已安装命令版本 %s 与运行中的 %s 不一致（自动删除任务执行的是已安装的那份，可用 upgrade 或 install 对齐）",
+				"installed command version %s differs from the running %s (the auto-delete task runs the installed one; align with upgrade or install)"), v, buildinfo.Version))
+		}
+	}
 	if a.Geteuid() == 0 {
 		a.success(a.P.M("当前以 root 运行。", "running as root."))
 	} else {
@@ -328,7 +439,7 @@ func (a *App) doctor(args []string) int {
 	// host's policy, and it re-arms the moment the username is reused. Nothing else
 	// looks for these, so doctor must.
 	if a.SSHD != nil {
-		if orphans, err := a.SSHD.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+		if orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号已不存在）：",
 					"orphaned sshd exception (its account no longer exists): "), a.SSHD.FilePath(u))
@@ -349,13 +460,58 @@ func (a *App) doctor(args []string) int {
 	// directory being "safe" says nothing about what is in it. Report them the same
 	// way the sshd exceptions are reported.
 	if a.Sudoers != nil {
-		if orphans, err := a.Sudoers.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+		if orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号已不存在，NOPASSWD:ALL 仍在）：",
 					"orphaned sudo grant (its account is gone; NOPASSWD:ALL still on disk): "), a.Sudoers.FilePath(u))
 			}
 			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
 				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
+	// The auto-revoke unit is the third leftover to report. Its account being gone
+	// means it fires against a name nothing will recreate — or, after an uninstall,
+	// against a binary that no longer exists — so it belongs in the same health list
+	// the two grants are in.
+	if a.Scheduler != nil {
+		if orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
+			for _, u := range orphans {
+				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号已不存在）：",
+					"orphaned auto-delete task (its account no longer exists): "), u)
+			}
+			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
+				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
+	// The other direction: a registered account that asked to be auto-deleted, still
+	// exists, and has NO task on disk to do it. chage -E still blocks its login at
+	// the expiry date, so this is not a live-access hole — but the deletion the
+	// operator asked for will never happen (the timer was removed out of band, or
+	// Schedule failed at invite and only expiry-locking was set). Surface it so the
+	// account does not linger disabled-but-undeleted forever; revoke finishes it.
+	if a.Scheduler != nil && a.Registry != nil {
+		haveUnit := map[string]bool{}
+		if units, err := a.Scheduler.UnitUsers(); err == nil {
+			for _, u := range units {
+				haveUnit[u] = true
+			}
+		}
+		recs, _ := a.Registry.List()
+		var stranded []string
+		for _, r := range recs {
+			if r.AutoRevoke && user.Exists(r.User) && !haveUnit[r.User] && !strings.HasPrefix(r.AutoUnit, "at:") {
+				stranded = append(stranded, r.User)
+			}
+		}
+		if len(stranded) > 0 {
+			for _, u := range stranded {
+				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无对应任务（登录仍会在到期日被 chage 阻止）：",
+					"account set to auto-delete but has no task left to do it (chage still blocks its login at expiry): "), u)
+			}
+			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
+				"remove them with `revoke --user <name>` once expired."))
 			rc = 1
 		}
 	}
@@ -382,7 +538,13 @@ var menuItems = []struct {
 	// account is gone — is a row of this very table, marked "missing".
 	{"管理临时用户（查看 / 撤销 / 清理）", "Temporary users (list / revoke / clean up)", func(a *App) int { return a.manageUsers() }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
-	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
+	// Just 升级, like 卸载 below: the old label spelled out "verify-signed, from
+	// GitHub, the stable command" — the whole mechanism — where the entry only needs
+	// to name the act. The command itself still shows "will download, verify, and
+	// upgrade from <url>" and asks for YES before touching anything, so the
+	// signature-verified part is stated where it matters, at the point of action,
+	// not carried as ballast in a menu line.
+	{"升级", "Upgrade", func(a *App) int { return a.upgrade(nil) }},
 	// It says 卸载 with nothing qualifying it because it finally earns the word: it
 	// removes the accounts, their grants, their auto-delete tasks, the state and the
 	// command. The old label had to say "the stable command" — an opaque phrase for

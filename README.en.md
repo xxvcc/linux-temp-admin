@@ -96,10 +96,10 @@ Everyday maintenance:
 
 ```bash
 sudo linux-temp-admin doctor            # check dependencies, sudoers.d, package manager, init system, SSH port
-sudo linux-temp-admin upgrade           # download, verify the signature, and upgrade the stable command
+sudo linux-temp-admin upgrade           # verify the signature and upgrade the installed command from GitHub
 sudo linux-temp-admin upgrade --yes     # non-interactive confirmation
 sudo linux-temp-admin uninstall         # uninstall: accounts, grants, auto-delete tasks, state, command
-sudo ./linux-temp-admin install         # install the binary in hand as the stable command (note the leading ./)
+sudo ./linux-temp-admin install         # put the binary in hand into place (note the leading ./)
 ```
 
 - **`upgrade`** fetches a new binary from GitHub and installs it only **after the embedded ed25519 public key verifies it** (fail-closed); HTTPS only, capped at 64 MiB, overwrites only when the version is newer. To repair or pin a custom source, use `--force --url URL` (its signature is `URL.sig`). **Use this for routine updates.**
@@ -216,7 +216,7 @@ sudo linux-temp-admin uninstall --yes --purge-audit  # remove the audit log too
 - **Uninstalling the command and keeping the accounts is not an option.** `--force` no longer bypasses this; it keeps only its original meaning (remove a target that is not a safe root-owned regular file).
 - **Running it from a temporary account is refused** — the teardown would reap that account's own session partway through and leave the box half dismantled. Run it as root or another administrator.
 
-`--compact` removes registry entries naming accounts that no longer exist, and the **sudo grants and sshd exceptions those accounts left behind** (an orphaned grant is the dangerous one — it re-arms the moment its username is reused). This is the command `doctor` points you at when it finds one.
+`--compact` removes registry entries naming accounts that no longer exist, and the **sudo grants, sshd exceptions, and auto-delete tasks those accounts left behind** (an orphaned grant is the dangerous one — it re-arms the moment its username is reused). It decides "orphan" by whether the name is a live account this tool still manages, so a leftover grant whose name a real account reused is caught too. This is the command `doctor` points you at when it finds one.
 
 > `cleanup-expired` **never deletes an account**: use `revoke` for that, and `status` to see the list. Revoking unregistered or unknown accounts has extra guards — see [Security notes](#security-notes).
 
@@ -314,13 +314,13 @@ The binary itself has no runtime dependencies. It only calls the system's **acco
 - `useradd` or `adduser`, `userdel` or `deluser`, `usermod`, `chage`
 - `sudo`: only needed when granting sudo
 
-`doctor` checks each of the tools above, plus the package manager, the init system, the safety of `/etc/sudoers.d`, and the detected SSH port.
+`doctor` shows **the running version and the installed command's version** (flagging a mismatch — the auto-delete task runs the installed one), checks each of the tools above, plus the package manager, the init system, the safety of `/etc/sudoers.d`, and the detected SSH port, and **rehearses whether a freshly created temporary account could log in by public key** (pointing you at `invite --fix-sshd` when sshd would refuse). It also reports **orphaned sudo grants, sshd exceptions, and auto-delete tasks** (their account gone but the artifact left behind), and accounts set to auto-delete with no task left to do it — pointing you at `cleanup-expired --compact` or `revoke`.
 
 `at` / `atd` is the auto-delete fallback backend for hosts without systemd. It is **not part of the dependency check and is never auto-installed**.
 
 ### Expiry vs auto-delete
 
-The default lifetime is 24 hours. The tool both sets a day-granularity account expiry with `chage -E` (to block further logins — it **does not delete the user**) and writes an auto-delete task that actually removes the user at the deadline: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed stable command, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first.
+The default lifetime is 24 hours. The tool both sets a day-granularity account expiry with `chage -E` (to block further logins — it **does not delete the user**) and writes an auto-delete task that actually removes the user at the deadline: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed command, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first (and even if the registry row is gone by expiry, the task still proves the account is one this tool made before deleting it and stripping its grants).
 
 Two host notes:
 

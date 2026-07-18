@@ -326,6 +326,22 @@ func (a *App) uninstall(args []string) int {
 
 	a.printTeardownPlan(plan)
 
+	// If the binary itself cannot be removed, refuse NOW — before a single account
+	// or grant is torn down. binaryBlocker is force-aware (empty under --force), so
+	// a non-empty value means the path is unsafe AND the operator did not opt in.
+	// The whole point of computing it during the inventory is that the alternative —
+	// discovering it in the last step, after every account and the state dir are
+	// already gone — leaves the operator with a half-uninstalled host and only
+	// --force to finish, which is the footgun this design removes. Not a gate until
+	// now: it was printed as a warning and nothing acted on it.
+	if plan.binaryBlocker != "" {
+		a.errorf("%s：%s（%s）", a.P.M("拒绝卸载：无法移除已安装的命令", "refusing to uninstall: the installed command cannot be removed"),
+			plan.binaryPath, plan.binaryBlocker)
+		a.warnf("%s", a.P.M("先处理该路径（或用 --force 明确接受），再重试——否则卸载会删光账号与状态却卡在最后一步。",
+			"resolve that path (or pass --force to accept it explicitly) and retry — otherwise the uninstall would remove every account and all state, then stop at the last step."))
+		return 1
+	}
+
 	// Refuse before anything is touched, not partway through.
 	if who := callerAccount(); who != "" {
 		for _, acc := range plan.accounts {
@@ -392,58 +408,86 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 		a.revoke([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name})
 	}
 
-	// Ground truth, not the return code. revoke answers 0 for a deletion, for a
-	// cleanup of an account that was already gone, AND for a refusal the operator
-	// declined — so its rc cannot carry this weight. Ask the system instead.
-	var survivors []string
-	for _, acc := range plan.accounts {
-		if user.Exists(acc.name) {
-			survivors = append(survivors, acc.name)
-		}
+	// Re-inventory from scratch, do not trust the plan or revoke's rc. Two things
+	// the point-in-time plan and a user.Exists check both miss:
+	//   - an artifact revoke could not remove — a NOPASSWD grant wedged with
+	//     chattr +i, an EPERM, a path swapped for a non-empty dir. The account is
+	//     gone, so user.Exists reports no survivor, but the passwordless-root file
+	//     re-arms the instant the name is reused. sudoers.Remove returns its error
+	//     precisely so this cannot be called done; the fresh Sudoers.All witness is
+	//     what observes it.
+	//   - an account created by a concurrent invite between the plan and now, whose
+	//     auto-revoke task points at the binary we are about to remove.
+	// A witness that names ANYTHING — an account, a grant, an exception, a unit —
+	// blocks the binary, exactly as a surviving account does. An unreadable witness
+	// blocks too: we cannot prove nothing is left.
+	residual := a.teardownPlan(purgeAudit, force)
+	if residual.inventoryErr != nil {
+		a.errorf("%s: %v", a.P.M("无法确认账号与授权已全部清除，卸载中止（命令与状态已保留）",
+			"cannot confirm every account and grant is gone; the uninstall stopped (command and state kept)"), residual.inventoryErr)
+		a.audit("uninstall", "", "fail", "re-inventory error: "+residual.inventoryErr.Error(), nil)
+		return 1
 	}
-
-	if len(survivors) > 0 {
+	if len(residual.accounts) > 0 {
 		a.errorf("%s", a.P.M(
-			"以下账号未能删除："+strings.Join(survivors, " "),
-			"these accounts could not be removed: "+strings.Join(survivors, " ")))
+			"以下项未能清除（账号、sudo 授权、sshd 例外或自动删除任务仍在）：",
+			"these could not be cleared (an account, a sudo grant, an sshd exception, or an auto-delete task remains):"))
+		for _, acc := range residual.accounts {
+			ws := make([]string, 0, len(acc.witnesses))
+			for _, w := range acc.witnesses {
+				ws = append(ws, string(w))
+			}
+			a.printf("  %s (%s)", acc.name, strings.Join(ws, " "))
+		}
 		a.errorf("%s", a.P.M(
-			"已保留已安装的命令和状态目录，卸载中止。留着一个带 sudo 的账号却删掉唯一能管理它的命令，比不卸载更糟：它的自动删除任务执行的就是这个命令。请先手动处理上述账号，再重试。",
-			"the installed command and the state directory were kept, and the uninstall stopped. Leaving a sudo-capable account behind while deleting the only thing that manages it is worse than not uninstalling: its auto-delete task invokes this very command. Deal with those accounts by hand and retry."))
-		a.audit("uninstall", "", "fail", "survivors: "+strings.Join(survivors, " "), nil)
+			"已保留已安装的命令和状态目录，卸载中止。留着一个带 sudo 的授权却删掉唯一能清理它的命令，比不卸载更糟。请先手动处理，再重试。",
+			"the installed command and the state directory were kept, and the uninstall stopped. Leaving a sudo grant behind while deleting the only thing that can clean it up is worse than not uninstalling. Deal with these by hand and retry."))
+		a.audit("uninstall", "", "fail", "residual: "+strings.Join(residual.names(), " "), nil)
 		return 1
 	}
 
-	// The record of the teardown is written BEFORE the log can be purged, or the
-	// purge would recreate the file it just deleted and "purge" would quietly mean
-	// "leave exactly one line behind".
-	a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{
-		"accounts": fmt.Sprint(len(plan.accounts)),
-		"purged":   ynStr(purgeAudit),
-	})
-
+	// Nothing is left, so removal is safe. Purge the audit log only AFTER a final
+	// record of the teardown — the record precedes the purge, or "purge" would
+	// recreate the file it deleted and quietly mean "leave exactly one line".
 	if purgeAudit {
+		a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "yes"})
 		if err := os.RemoveAll(a.AuditLogDir); err != nil {
 			a.warnf("%s: %v", a.P.M("删除审计日志失败", "removing the audit log failed"), err)
 		} else {
 			a.info(a.P.M("已删除审计日志："+a.AuditLogDir, "removed the audit log: "+a.AuditLogDir))
 		}
-		// Nothing may audit after this point; a.Audit would recreate the directory.
-		a.Audit = nil
+		a.Audit = nil // nothing may audit after this: a.Audit would recreate the dir
 	}
 
+	stateGone := true
 	if err := a.removeStateDir(force); err != nil {
+		stateGone = false
 		a.warnf("%s: %v", a.P.M("删除状态目录失败（账号已全部移除，命令仍将卸载）",
 			"removing the state directory failed (every account is gone, so the command is still uninstalled)"), err)
 	} else {
 		a.info(a.P.M("已删除状态目录："+a.StateDir, "removed the state directory: "+a.StateDir))
 	}
 
+	// The binary is the last thing removed and the first that can still fail here
+	// (a symlinked path without --force). The "ok" audit is written only once it is
+	// actually gone, so the log never records success for a teardown that failed at
+	// its defining step.
 	if err := a.Selfmanage.Uninstall(force); err != nil {
 		a.errorf("%v", err)
+		a.audit("uninstall", "", "fail", "binary removal failed: "+err.Error(), nil)
 		return 1
 	}
-	a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
-		"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
+	if !purgeAudit {
+		a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "no"})
+	}
+
+	if stateGone {
+		a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
+			"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
+	} else {
+		a.success(a.P.M("已卸载命令，账号与授权已清除；但状态目录未能删除（见上），请手动清理 "+a.StateDir,
+			"uninstalled the command; accounts and grants are gone, but the state directory could not be removed (see above) — remove "+a.StateDir+" by hand."))
+	}
 	return 0
 }
 

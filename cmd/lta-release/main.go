@@ -67,7 +67,16 @@ func keygen(privOut string) {
 	if dir := filepath.Dir(privOut); dir != "." {
 		check(os.MkdirAll(dir, 0o700))
 	}
-	check(os.WriteFile(privOut, []byte(hex.EncodeToString(priv)+"\n"), 0o600))
+	// Open and fchmod explicitly rather than os.WriteFile(0600): WriteFile's perm
+	// applies only when it CREATES the file, so writing a fresh signing key over a
+	// pre-existing group/world-readable path (a prior touch under umask 022) would
+	// leave the private key at the looser mode. Tightening the open fd closes that.
+	f, err := os.OpenFile(privOut, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	check(err)
+	check(f.Chmod(0o600))
+	_, werr := f.WriteString(hex.EncodeToString(priv) + "\n")
+	check(werr)
+	check(f.Close())
 	fmt.Fprintf(os.Stderr, "private key written to %s (keep offline)\n", privOut)
 	fmt.Fprintln(os.Stderr, "paste this public key into internal/selfmanage/release_pubkey.hex:")
 	fmt.Println(hex.EncodeToString(pub))

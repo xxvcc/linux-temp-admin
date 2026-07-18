@@ -96,10 +96,10 @@ linux-temp-admin doctor
 
 ```bash
 sudo linux-temp-admin doctor            # 检查依赖、sudoers.d、包管理器、init 系统、SSH 端口
-sudo linux-temp-admin upgrade           # 从 GitHub 下载并验签后升级稳定命令
+sudo linux-temp-admin upgrade           # 从 GitHub 验签升级已安装的命令
 sudo linux-temp-admin upgrade --yes     # 非交互确认
 sudo linux-temp-admin uninstall         # 卸载：账号、授权、自动删除任务、状态与命令
-sudo ./linux-temp-admin install         # 把手头这个二进制装成稳定命令（注意前面的 ./）
+sudo ./linux-temp-admin install         # 把手头这个二进制装到位（注意前面的 ./）
 ```
 
 - **升级 `upgrade`**：从 GitHub 取回新二进制，用内嵌 ed25519 公钥验签通过才安装（fail-closed，验签不过就中止）；只接受 HTTPS、下载上限 64 MiB、仅版本更新时才覆盖。需要修复或指定自定义来源时用 `--force --url URL`（其签名为 `URL.sig`）。**日常更新用它。**
@@ -216,7 +216,7 @@ sudo linux-temp-admin uninstall --yes --purge-audit  # 连审计日志一起删
 - **不能只删命令、留下账号**。`--force` 不再绕过这一点（它现在只保留原意：目标不是安全的 root 属主普通文件时仍强删）。
 - **从临时账号自己运行卸载会被拒绝**——它会在删到自己时把自己的会话一起收走，留下拆到一半的机器。请用 root 或别的管理员身份运行。
 
-`--compact` 会清掉：登记表里指向已不存在账号的失效条目，以及那些账号遗留的 **sudo 授权和 sshd 例外**（孤儿授权最危险——用户名一旦被复用就会重新生效）。`doctor` 发现孤儿时提示的就是这条命令。
+`--compact` 会清掉：登记表里指向已不存在账号的失效条目，以及那些账号遗留的 **sudo 授权、sshd 例外和自动删除任务**（孤儿授权最危险——用户名一旦被复用就会重新生效）。它按「是否本工具当前托管的活账号」判定孤儿，所以一个被真实账号复用了名字的残留授权也会被发现。`doctor` 发现孤儿时提示的就是这条命令。
 
 > `cleanup-expired` **从不删除账号**：删账号用 `revoke`，看列表用 `status`。撤销未登记/陌生账号有额外限制（防误删），见[安全说明](#安全说明)。
 
@@ -314,13 +314,13 @@ sudo linux-temp-admin doctor
 - `useradd` 或 `adduser`、`userdel` 或 `deluser`、`usermod`、`chage`
 - `sudo`：仅在选择授予 sudo 时需要
 
-`doctor` 会逐项检查上面这些工具，外加包管理器、init 系统、`/etc/sudoers.d` 的安全性和探测到的 SSH 端口。
+`doctor` 会显示**运行中的版本与已安装命令的版本**（两者不一致会提示——自动删除任务执行的是已安装的那份），逐项检查上面这些工具，外加包管理器、init 系统、`/etc/sudoers.d` 的安全性、探测到的 SSH 端口，并**预演一个新建临时账号能否通过公钥登录**（sshd 会拒绝时给出 `invite --fix-sshd` 提示）。它还会报告**孤儿的 sudo 授权、sshd 例外和自动删除任务**（账号已不存在却残留），以及设置了自动删除却已无对应任务的账号——都指向 `cleanup-expired --compact` 或 `revoke` 处理。
 
 `at` / `atd` 是 systemd 不可用时自动删除的备用后端，**不在依赖检查里，也不会被自动安装**。
 
 ### 关于"过期"和"自动删除"
 
-默认有效期 24 小时。工具同时做两件事：用 `chage -E` 按天设置账号过期（阻止后续登录，**不删用户**），并写一个到点真正删除用户的自动删除任务——优先 systemd timer，`at` 兜底，两者都不可用才降级为"只设账号过期"并在邀请包里提示手动撤销。自动删除任务调用的是已安装的稳定命令，因此选择自动删除时工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在。
+默认有效期 24 小时。工具同时做两件事：用 `chage -E` 按天设置账号过期（阻止后续登录，**不删用户**），并写一个到点真正删除用户的自动删除任务——优先 systemd timer，`at` 兜底，两者都不可用才降级为"只设账号过期"并在邀请包里提示手动撤销。自动删除任务调用的是已安装的命令，因此选择自动删除时工具会先确保 `/usr/local/sbin/linux-temp-admin` 存在（即便到期时登记表已丢失，该任务仍会验明账号身份后删除并撤回授权）。
 
 关于 Host 的两点用户须知：
 

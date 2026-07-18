@@ -126,9 +126,18 @@ func TestInstalledVersion(t *testing.T) {
 	}{
 		{"1.2.3", true},
 		{"1.2.3-rc1", true},
+		{"1.2.3-rc.1", true}, // dotted suffix after a real separator is fine
+		{"1.2.3+build.5", true},
+		{"1.2.3~pre", true},
 		{"not-a-version", false},
-		{"1.2", false},    // 2 components: version_gt cannot parse
-		{"1.2.3.4", true}, // 3 components + ".4" suffix (comparator treats it the same)
+		{"1.2", false}, // 2 components: version_gt cannot parse
+		// EXACTLY three numeric components. A trailing ".4" is NOT a suffix — the
+		// suffix must be led by one of - _ + ~, never '.', or version.Greater
+		// mis-orders the 4-part string as a prerelease of the 3-part one and the
+		// upgrade gate silently declines a genuinely newer release.
+		{"1.2.3.4", false},
+		{"10.20.30.40", false},
+		{"2.6.0.1", false},
 	}
 	for _, c := range cases {
 		if got := InstalledVersion(c.in); got != c.want {
