@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -249,6 +250,26 @@ func (m *Manager) Remove(user string) error {
 // binary that did not know about these files, or an account deleted out of
 // band), and an orphan is a standing loosening of sshd policy that re-arms the
 // moment the username is reused — so something has to be able to find them.
+// All returns every account this tool has an sshd exception for, whether or not
+// the account still exists. Orphans answers "which exceptions outlived their
+// account", which is the wrong question for a teardown: an exception whose
+// account is alive is precisely what has to go.
+func (m *Manager) All() ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*.conf"))
+	if err != nil {
+		return nil, err
+	}
+	var users []string
+	for _, path := range matches {
+		user := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), filePrefix), ".conf")
+		if user != "" && validate.Username(user) {
+			users = append(users, user)
+		}
+	}
+	sort.Strings(users)
+	return users, nil
+}
+
 func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
 	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*.conf"))
 	if err != nil {

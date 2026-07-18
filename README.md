@@ -98,12 +98,12 @@ linux-temp-admin doctor
 sudo linux-temp-admin doctor            # 检查依赖、sudoers.d、包管理器、init 系统、SSH 端口
 sudo linux-temp-admin upgrade           # 从 GitHub 下载并验签后升级稳定命令
 sudo linux-temp-admin upgrade --yes     # 非交互确认
-sudo linux-temp-admin uninstall         # 卸载稳定命令
+sudo linux-temp-admin uninstall         # 卸载：账号、授权、自动删除任务、状态与命令
 sudo ./linux-temp-admin install         # 把手头这个二进制装成稳定命令（注意前面的 ./）
 ```
 
 - **升级 `upgrade`**：从 GitHub 取回新二进制，用内嵌 ed25519 公钥验签通过才安装（fail-closed，验签不过就中止）；只接受 HTTPS、下载上限 64 MiB、仅版本更新时才覆盖。需要修复或指定自定义来源时用 `--force --url URL`（其签名为 `URL.sig`）。**日常更新用它。**
-- **安装 `install`**：把你**手头已有**的二进制放到位（不联网、不验签），用于离线机器或自建二进制。目标已存在且内容不同时需显式 `--force`；仍有登记用户时 `uninstall` 默认拒绝。它复制的是当前正在运行的那个二进制，所以只在你运行别处副本时才有意义（如 `sudo ./linux-temp-admin install`，前面的 `./` 是关键）。
+- **安装 `install`**：把你**手头已有**的二进制放到位（不联网、不验签），用于离线机器或自建二进制。目标已存在且内容不同时需显式 `--force`。它复制的是当前正在运行的那个二进制，所以只在你运行别处副本时才有意义（如 `sudo ./linux-temp-admin install`，前面的 `./` 是关键）。
 
 ## 完整流程
 
@@ -202,6 +202,19 @@ sudo linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```bash
 sudo linux-temp-admin cleanup-expired --compact
 ```
+
+**卸载 `uninstall`**：移除本工具在这台机器上留下的一切——临时账号（连同家目录）、它们的 sudo 授权与 sshd 例外、自动删除任务、状态目录（含 v1 遗留），最后才是命令本身。
+
+```bash
+sudo linux-temp-admin uninstall                      # 交互：先列清单，再输 YES
+sudo linux-temp-admin uninstall --yes --remove-users # 非交互：有账号时必须显式加 --remove-users
+sudo linux-temp-admin uninstall --yes --purge-audit  # 连审计日志一起删
+```
+
+- **审计日志默认保留**在 `/var/log/linux-temp-admin/audit.log`。它记录的是谁开过、谁删过 root 级账号；卸载顺手抹掉这份记录，正是入侵者会做的事。要删得显式 `--purge-audit`。
+- **只要有一个账号删不掉，命令和状态目录都不会被删**，卸载中止并点名那个账号。留着一个带 sudo 的账号、却删掉唯一能管理它的命令，比不卸载更糟：它的自动删除任务执行的就是这个命令。
+- **不能只删命令、留下账号**。`--force` 不再绕过这一点（它现在只保留原意：目标不是安全的 root 属主普通文件时仍强删）。
+- **从临时账号自己运行卸载会被拒绝**——它会在删到自己时把自己的会话一起收走，留下拆到一半的机器。请用 root 或别的管理员身份运行。
 
 `--compact` 会清掉：登记表里指向已不存在账号的失效条目，以及那些账号遗留的 **sudo 授权和 sshd 例外**（孤儿授权最危险——用户名一旦被复用就会重新生效）。`doctor` 发现孤儿时提示的就是这条命令。
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
@@ -94,11 +95,50 @@ func (m *Manager) Grant(user string) error {
 
 // Remove deletes the drop-in for user (best-effort). It only ever removes a file
 // under Dir carrying the managed prefix.
-func (m *Manager) Remove(user string) {
+// Remove deletes the managed drop-in for user, if any. A file that is already
+// absent is success — the caller wants the grant gone, and it is.
+//
+// It reports failure because a caller may need to know: an uninstall removes the
+// binary only once nothing root-capable is left behind it, and a NOPASSWD:ALL
+// file that could not be deleted is exactly that. Silently discarding the error
+// let the removal fail and the teardown call it done.
+func (m *Manager) Remove(user string) error {
 	path := m.FilePath(user)
-	if strings.HasPrefix(filepath.Base(path), filePrefix) {
-		_ = os.Remove(path)
+	if !strings.HasPrefix(filepath.Base(path), filePrefix) {
+		// Not ours to touch. Nothing was granted under this name by this tool, so
+		// there is nothing to remove and no failure to report.
+		return nil
 	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove sudo grant %s: %w", path, err)
+	}
+	return nil
+}
+
+// All returns every account this tool has a sudo drop-in for, whether or not the
+// account still exists.
+//
+// Orphans answers a different question — "which grants outlived their account" —
+// and an uninstall must not ask that one: a grant whose account is very much
+// alive is the most important thing on the host to remove, and it is exactly what
+// Orphans filters out. This is also the teardown's sturdiest witness. An account
+// can be hidden from the registry by editing a file, but not from this: the grant
+// IS the passwordless root, so hiding an account means keeping the file that
+// names it.
+func (m *Manager) All() ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*"))
+	if err != nil {
+		return nil, err
+	}
+	var users []string
+	for _, path := range matches {
+		user := strings.TrimPrefix(filepath.Base(path), filePrefix)
+		if user != "" && validate.Username(user) {
+			users = append(users, user)
+		}
+	}
+	sort.Strings(users)
+	return users, nil
 }
 
 // Orphans returns the accounts whose managed drop-in is still on disk although

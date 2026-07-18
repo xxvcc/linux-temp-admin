@@ -244,7 +244,14 @@ func (a *App) compact() {
 			a.warnf("%v", err)
 		}
 		for _, u := range orphans {
-			a.Sudoers.Remove(u)
+			// Announce the removal only once it happened: this used to print "removed"
+			// whatever the outcome, which is the worst possible lie about a file that
+			// hands out passwordless root.
+			if err := a.Sudoers.Remove(u); err != nil {
+				a.errorf("%s: %v", a.P.M("无法移除孤儿 sudo 授权（该文件仍会在用户名被复用时立即生效，请手动删除）",
+					"could not remove an orphaned sudo grant (it re-arms the instant its username is reused; delete it by hand)"), err)
+				continue
+			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
 				"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
 		}
@@ -376,7 +383,12 @@ var menuItems = []struct {
 	{"管理临时用户（查看 / 撤销 / 清理）", "Temporary users (list / revoke / clean up)", func(a *App) int { return a.manageUsers() }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
 	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
-	{"卸载稳定命令", "Uninstall stable command", func(a *App) int { return a.uninstall(nil) }},
+	// It says 卸载 with nothing qualifying it because it finally earns the word: it
+	// removes the accounts, their grants, their auto-delete tasks, the state and the
+	// command. The old label had to say "the stable command" — an opaque phrase for
+	// "the copy at the install path" — precisely because the object was the only
+	// honest part: uninstall deleted one file and left everything else on the host.
+	{"卸载", "Uninstall", func(a *App) int { return a.uninstall(nil) }},
 	// Kept next to last, in front of Exit. When this entry was added it was appended
 	// for a stronger reason — that appending changed no existing digit's meaning,
 	// where slotting it in earlier would have pushed Exit from 8 to 9 and turned an

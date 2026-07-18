@@ -179,3 +179,45 @@ func TestParseAtJobID(t *testing.T) {
 		}
 	}
 }
+
+// TestCancelRemovesLegacyUnitsToo pins the fix for a v1 timer surviving an
+// uninstall. v1's units carry no "-v2-" infix and v1's install path was identical
+// to v2's, so a v1 timer left enabled fires this binary; if Cancel disables only
+// the v2 name, an uninstall that removes the binary strands it — a timer that
+// fails forever, the exact footgun the uninstall exists to close.
+func TestCancelRemovesLegacyUnitsToo(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := &Scheduler{
+		SystemdDir: dir, InstallPath: "/usr/local/sbin/linux-temp-admin",
+		UnitPrefix: "linux-temp-admin-v2-revoke-", LegacyUnitPrefixes: []string{"linux-temp-admin-revoke-"},
+		Now: func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }, Sys: sys,
+	}
+	v1timer := filepath.Join(dir, "linux-temp-admin-revoke-oldu.timer")
+	v1svc := filepath.Join(dir, "linux-temp-admin-revoke-oldu.service")
+	for _, p := range []string{v1timer, v1svc} {
+		if err := os.WriteFile(p, []byte("[Unit]\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.Cancel("oldu", "")
+
+	for _, p := range []string{v1timer, v1svc} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s survived Cancel", filepath.Base(p))
+		}
+	}
+	// It must also have been disabled by its v1 name, not just unlinked, or a
+	// timers.target.wants symlink lingers.
+	var disabled bool
+	for _, call := range sys.calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "disable") && strings.Contains(joined, "linux-temp-admin-revoke-oldu.timer") {
+			disabled = true
+		}
+	}
+	if !disabled {
+		t.Errorf("the v1 timer was never disabled; systemctl calls: %v", sys.calls)
+	}
+}

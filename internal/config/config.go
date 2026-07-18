@@ -24,9 +24,34 @@ const (
 
 	// --- owned paths and namespaces ---
 
+	// StateDir is everything this tool owns under /var/lib: the v2 registry in its
+	// "/v2" leaf, and the v1-era files beside it. It is the unit of removal for an
+	// uninstall, which is why it is named separately from RegistryDir.
+	StateDir = "/var/lib/" + ManagedTag
 	// RegistryDir is the registry directory. The "/v2" leaf is baked into deployed
 	// hosts' on-disk state; changing it would strand their registries.
-	RegistryDir = "/var/lib/linux-temp-admin/v2"
+	RegistryDir = StateDir + "/v2"
+
+	// --- v1-era artifacts ---
+	//
+	// v1 was the shell implementation (temp-admin.sh). v2 does not read or write
+	// any of this and never has; it is named here only so an uninstall can find it,
+	// because on an upgraded host these are not litter — V1RegistryFile is v1's
+	// account registry, the only record naming the accounts v1 created.
+	//
+	// This matters more than it looks: v1's INSTALL_PATH was byte-identical to v2's
+	// (/usr/local/sbin/linux-temp-admin), so a v1 auto-revoke timer still on disk
+	// invokes THIS binary — with an argv v2 parses perfectly. Remove the binary and
+	// a v1 account is stranded exactly as a v2 one would be.
+
+	// V1RegistryFile is v1's account registry.
+	V1RegistryFile = StateDir + "/users.tsv"
+	// V1RegistryLockFile is v1's registry lock.
+	V1RegistryLockFile = StateDir + "/users.lock"
+	// V1AutoRevokeUnitPrefix namespaced v1's generated units. It has no "-v2-"
+	// infix, so AutoRevokeUnitPrefix does NOT match it and a sweep that globs only
+	// the v2 prefix walks straight past every v1 unit on the host.
+	V1AutoRevokeUnitPrefix = ManagedTag + "-revoke-"
 	// RegistryFile is the registry file.
 	RegistryFile = RegistryDir + "/registry.tsv"
 	// RegistryLockFile is the flock file for registry mutations.

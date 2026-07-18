@@ -34,8 +34,13 @@ type Scheduler struct {
 	SystemdDir  string
 	InstallPath string
 	UnitPrefix  string
-	Now         func() time.Time
-	Sys         System
+	// LegacyUnitPrefixes are older namespaces whose units this Scheduler must still
+	// be able to FIND (see UnitUsers) though it never writes them. It is a field
+	// rather than a constant so a test can point the whole namespace at a temp dir
+	// without picking up the real one.
+	LegacyUnitPrefixes []string
+	Now                func() time.Time
+	Sys                System
 	// UnderUnit reports whether the current process is executing inside the given
 	// systemd service (i.e. the firing auto-revoke run for that unit); when true,
 	// Cancel leaves that .service file in place rather than deleting the file it is
@@ -49,9 +54,13 @@ func New() *Scheduler {
 		SystemdDir:  config.SystemdDir,
 		InstallPath: config.InstallPath,
 		UnitPrefix:  config.AutoRevokeUnitPrefix,
-		Now:         time.Now,
-		Sys:         realSystem{},
-		UnderUnit:   runningUnderFiringUnit,
+		// v1's units are still findable, never written. v1 installed to the same path
+		// this binary occupies, so its timers invoke THIS code and its accounts strand
+		// exactly like v2's would.
+		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
+		Now:                time.Now,
+		Sys:                realSystem{},
+		UnderUnit:          runningUnderFiringUnit,
 	}
 }
 
@@ -177,21 +186,33 @@ func (s *Scheduler) Cancel(user, recordedUnit string) {
 	}
 	s.Sys.RemoveAtJobsFor(s.RevokeCommand(user))
 
-	unit := s.UnitName(user)
-	if strings.ContainsAny(unit, "/ ") {
-		return
-	}
-	if s.Sys.HasSystemctl() {
-		_ = s.Sys.Systemctl("disable", "--now", unit+".timer")
-		_ = s.Sys.Systemctl("reset-failed", unit+".timer", unit+".service")
-	}
-	timerPath := filepath.Join(s.SystemdDir, unit+".timer")
-	removeIfNotSymlink(timerPath)
-	if s.UnderUnit == nil || !s.UnderUnit(unit) {
-		removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".service"))
-		if s.Sys.HasSystemctl() {
-			_ = s.Sys.Systemctl("daemon-reload")
+	// Cancel every unit namespace that could name this account, not only the one
+	// this build writes. A v1 unit carries no "-v2-" infix and v1's install path
+	// was identical to v2's, so a v1 timer left enabled fires THIS binary — and if
+	// an uninstall then removes the binary, that timer fails forever. Disabling by
+	// the v2 name alone would leave it armed. There is normally at most one unit per
+	// account, so the extra names are no-ops on a pure-v2 host.
+	reloadNeeded := false
+	for _, prefix := range s.unitPrefixes() {
+		unit := prefix + user
+		if strings.ContainsAny(unit, "/ ") {
+			continue
 		}
+		if s.Sys.HasSystemctl() {
+			_ = s.Sys.Systemctl("disable", "--now", unit+".timer")
+			_ = s.Sys.Systemctl("reset-failed", unit+".timer", unit+".service")
+		}
+		removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".timer"))
+		// Never delete the .service this very run is executing from (a firing v2
+		// auto-revoke); a manual revoke, even from another systemd scope, does clean
+		// it. The firing unit is always the v2 one, so this only guards that name.
+		if s.UnderUnit == nil || !s.UnderUnit(unit) {
+			removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".service"))
+			reloadNeeded = true
+		}
+	}
+	if reloadNeeded && s.Sys.HasSystemctl() {
+		_ = s.Sys.Systemctl("daemon-reload")
 	}
 }
 

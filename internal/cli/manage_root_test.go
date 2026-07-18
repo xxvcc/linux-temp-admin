@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -391,5 +392,38 @@ func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "UID") {
 		t.Errorf("the refusal must name the tamper, or the operator cannot act on it: %q", errb.String())
+	}
+}
+
+// TestRevokeShoutsWhenTheSudoGrantSurvives pins what used to be the quietest
+// failure in the tool. revoke strips the sudo drop-in FIRST, deliberately, so an
+// account that survives a refused revoke cannot survive holding passwordless
+// root — and the removal's error was discarded, so when it did survive, nothing
+// said so.
+//
+// Making a real os.Remove fail AS ROOT is the trick here: a read-only directory
+// does not do it (root bypasses the permission check and the test would skip,
+// asserting nothing — in CI, which runs this suite as root, always). A non-empty
+// directory at the grant's path fails for everyone, root included, and it fails
+// inside the real os.Remove rather than a mock, so the test still bites if the
+// reporting path is rewritten.
+func TestRevokeShoutsWhenTheSudoGrantSurvives(t *testing.T) {
+	a, _, errb := newManageApp(t, "", "ltasudogrant-a1")
+	grant := a.Sudoers.FilePath("ltasudogrant-a1")
+	if err := os.MkdirAll(filepath.Join(grant, "wedge"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	a.revoke([]string{"--user", "ltasudogrant-a1", "--yes"})
+
+	if _, err := os.Stat(grant); err != nil {
+		t.Fatalf("the wedge should have survived; the test proves nothing: %v", err)
+	}
+	// Match the distinctive phrase, not "sudo": revoke's absent-account branch says
+	// "cleaning up registry/sudoers/sshd exception/..." on this very path, so a
+	// substring that loose passes with the reporting deleted (it did — this test was
+	// vacuous until the mutation caught it).
+	if !strings.Contains(errb.String(), "passwordless root") {
+		t.Errorf("a surviving NOPASSWD grant must be reported, not discarded; stderr: %q", errb.String())
 	}
 }
