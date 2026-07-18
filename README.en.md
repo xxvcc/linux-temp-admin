@@ -119,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts
 sudo linux-temp-admin invite --sudo
 ```
 
-Interactive mode asks you to confirm the details (username, host, lifetime, sudo, auto-delete) before printing the bundle.
+Interactive mode is short: a locally-detected public IP is used without asking (`--host` overrides for a domain or another address); sudo is granted by default (this is an admin tool — `--no-sudo` makes a plain account); it asks whether to auto-delete on expiry, and **only asks the lifetime when auto-delete is on**. It then shows a summary to confirm before printing the bundle.
 
 ### 3. You get an invite bundle like this (redacted)
 
@@ -139,9 +139,6 @@ Auto revoke: yes
 Auto revoke unit: linux-temp-admin-v2-revoke-xxvcc-a1b2c3d4e5
 Sshd exception: none
 
-SSH login command:
-ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
-
 Save private key command:
 cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----BEGIN OPENSSH PRIVATE KEY-----
@@ -149,11 +146,6 @@ cat > './xxvcc-a1b2c3d4e5.key' <<'EOF_KEY'
 -----END OPENSSH PRIVATE KEY-----
 EOF_KEY
 chmod 600 './xxvcc-a1b2c3d4e5.key'
-
-Revoke command:
-sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
-
-Sudo note: NOPASSWD sudo is enabled (equivalent to full root); it may leave root-owned persistence. Revoking only deletes this account itself.
 
 Security notes: the private key is shown only once and not stored on the server; send only via trusted private chat; revoke immediately after use.
 
@@ -169,7 +161,8 @@ The `Login:` line is **a verdict, not a slogan**. Before anything is created, th
 They only need two steps, **without installing anything or understanding this tool**:
 
 - copy the "Save private key command" block, paste and run it locally → they get the key file;
-- copy the "SSH login command" and run it → they are in.
+- build the login command from the header's Host / Port / User, e.g.
+  `ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10`.
 
 > ⚠️ The bundle contains a one-time private key. **Send it only over trusted private chat** — never in a group, a ticket, or a public page.
 
@@ -241,7 +234,7 @@ sudo linux-temp-admin invite --prefix ops --sudo
 sudo linux-temp-admin invite --host 203.0.113.10 --port 22 --sudo
 ```
 
-Set account expiry only, without an auto-delete task:
+Create a permanent account (no expiry, no auto-delete — revoke by hand):
 
 ```bash
 sudo linux-temp-admin invite --sudo --no-auto-revoke
@@ -320,7 +313,9 @@ The binary itself has no runtime dependencies. It only calls the system's **acco
 
 ### Expiry vs auto-delete
 
-The default lifetime is 24 hours. The tool both sets a day-granularity account expiry with `chage -E` (to block further logins — it **does not delete the user**) and writes an auto-delete task that actually removes the user at the deadline: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed command, so choosing auto-delete makes the tool ensure `/usr/local/sbin/linux-temp-admin` exists first (and even if the registry row is gone by expiry, the task still proves the account is one this tool made before deleting it and stripping its grants).
+The default lifetime is 24 hours, and **auto-delete is on by default**. With auto-delete on, the tool both sets a day-granularity account expiry with `chage -E` (to block further logins at the deadline) and writes an auto-delete task that actually removes the user then: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed command, so the tool ensures `/usr/local/sbin/linux-temp-admin` exists first (and even if the registry row is gone by expiry, the task still proves the account is one this tool made before deleting it and stripping its grants).
+
+**Auto-delete off = a permanent account**: no expiry is set and it is never deleted — revoke it by hand. `--hours` is ignored in that case.
 
 Two host notes:
 
