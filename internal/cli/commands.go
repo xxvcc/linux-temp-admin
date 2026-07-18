@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -151,12 +152,36 @@ func (a *App) manageUsers() int {
 	if err != nil {
 		a.warnf("%v", err)
 	}
+	orphans := a.orphanArtifacts(recs)
+
 	a.info(a.P.M("已登记的临时用户：", "Registered temporary users:"))
 	if len(recs) == 0 {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
+	} else {
+		a.printf("%s", a.usersTable(recs, true).String())
+	}
+
+	// Orphans have no registry row, so the table above cannot show them — this is
+	// where `doctor` and this screen used to disagree: doctor globs the filesystem
+	// and sees a leftover grant/exception/unit; the table reads only the registry.
+	// Surface them here, on the very screen whose `c` sweeps them, so the cleanup is
+	// discoverable instead of something you only learn about from doctor.
+	if len(orphans) > 0 {
+		a.warnf("%s", a.P.M("另有无登记行的孤儿残留（账号已不存在；按 c 清理）：",
+			"orphaned leftovers with no registry row (their account is gone; press c to clean):"))
+		for _, o := range orphans {
+			a.printf("  %s (%s)", o.name, strings.Join(o.kinds, " "))
+		}
+	}
+
+	// Only truly empty — no rows AND no orphans — is a dead end. When orphans exist
+	// with an empty registry (a host where every account expired, leaving fired
+	// auto-revoke .service files behind), the old early return said "(none)" and
+	// walked away without ever offering `c`, so the leftovers could not be cleaned
+	// from here at all.
+	if len(recs) == 0 && len(orphans) == 0 {
 		return 0
 	}
-	a.printf("%s", a.usersTable(recs, true).String())
 
 	choice := strings.TrimSpace(a.prompt(a.P.M(
 		"输入编号或用户名撤销 · c 清理失效登记与孤儿授权 · 回车返回: ",
@@ -275,6 +300,58 @@ func (a *App) installedCommandVersion() (string, string) {
 		return "", "unreadable"
 	}
 	return v, "ok"
+}
+
+// orphanArtifact is a leftover the tool wrote for a name with no registry row —
+// a sudo grant, an sshd exception, or an auto-delete unit whose account is gone.
+type orphanArtifact struct {
+	name  string
+	kinds []string
+}
+
+// orphanArtifacts returns the leftovers `c`/compact would sweep that the registry
+// table cannot show: managed grants/exceptions/units whose account is not a live
+// account of ours AND whose name has no registry row (rows are already in the
+// table, marked 缺失). It is the same union of sweeps compact() acts on and doctor
+// reports, so the three views agree.
+func (a *App) orphanArtifacts(recs []registry.Record) []orphanArtifact {
+	inRegistry := make(map[string]bool, len(recs))
+	for _, r := range recs {
+		inRegistry[r.User] = true
+	}
+	kinds := map[string][]string{}
+	addKind := func(users []string, label string) {
+		for _, u := range users {
+			if !inRegistry[u] {
+				kinds[u] = append(kinds[u], label)
+			}
+		}
+	}
+	if a.Sudoers != nil {
+		if o, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err == nil {
+			addKind(o, a.P.M("sudo 授权", "sudo grant"))
+		}
+	}
+	if a.SSHD != nil {
+		if o, err := a.SSHD.Orphans(a.accountIsOursAndLive); err == nil {
+			addKind(o, a.P.M("sshd 例外", "sshd exception"))
+		}
+	}
+	if a.Scheduler != nil {
+		if o, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err == nil {
+			addKind(o, a.P.M("自动删除任务", "auto-delete task"))
+		}
+	}
+	names := make([]string, 0, len(kinds))
+	for n := range kinds {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]orphanArtifact, 0, len(names))
+	for _, n := range names {
+		out = append(out, orphanArtifact{name: n, kinds: kinds[n]})
+	}
+	return out
 }
 
 // compact is the sweep itself, with none of the framing the cleanup-expired

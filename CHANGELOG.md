@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## v2.6.2 - The manage screen shows the orphans doctor sees
+
+- **「管理临时用户」now lists orphaned leftovers with no registry row**, below the
+  table. The table reads the registry; `doctor` globs the filesystem — so an
+  orphaned sudo grant / sshd exception / auto-delete unit whose account is gone
+  and whose row is gone showed up in `doctor` but was invisible on the very screen
+  whose `c` sweeps it. (A common source: a fired auto-revoke leaves its `.service`
+  behind — the running unit cannot delete the file it is executing from — so every
+  expired account can leave one.) The three views — table, `doctor`, and `c` — now
+  agree, keyed on the same "a live account we manage" predicate.
+
+- **An empty registry no longer hides the cleanup.** When every account had
+  expired but orphans remained, the screen printed "(none)" and returned before
+  ever offering `c`, so the leftovers could not be cleaned from there at all. It
+  now shows them and prompts; only a truly empty host (no rows, no orphans) is a
+  dead end.
+
+  Patch: additive interactive output and a fixed dead-end; the CLI contract is
+  unchanged.
+
 ## v2.6.1 - What a three-round audit of the whole program found
 
 A line-by-line audit of all 7142 lines (three rounds — correctness, cross-module

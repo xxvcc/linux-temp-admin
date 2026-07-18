@@ -427,3 +427,50 @@ func TestRevokeShoutsWhenTheSudoGrantSurvives(t *testing.T) {
 		t.Errorf("a surviving NOPASSWD grant must be reported, not discarded; stderr: %q", errb.String())
 	}
 }
+
+func mustWriteManage(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o440); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManageUsersShowsOrphansWithNoRegistryRow(t *testing.T) {
+	a, out, errb := newManageApp(t, "\n", "ltamanage-live")
+	mustWriteManage(t, a.Sudoers.FilePath("ltaorphan-x"), "ltaorphan-x ALL=(ALL) NOPASSWD:ALL\n")
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !strings.Contains(out.String(), "ltaorphan-x") {
+		t.Errorf("orphan not surfaced: %q // errb=%q", out.String(), errb.String())
+	}
+}
+
+func TestManageUsersEmptyRegistryStillOffersCleanupForOrphans(t *testing.T) {
+	a, out, errb := newManageApp(t, "\n")
+	mustWriteManage(t, a.Sudoers.FilePath("ltaorphan-y"), "ltaorphan-y ALL=(ALL) NOPASSWD:ALL\n")
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !strings.Contains(out.String(), "ltaorphan-y") {
+		t.Errorf("orphan not surfaced: %q", out.String())
+	}
+	if !strings.Contains(errb.String(), "Enter returns") {
+		t.Errorf("no prompt: %q", errb.String())
+	}
+}
+
+// TestManageUsersTrulyEmptyStillReturns: no rows AND no orphans is the one case
+// that prints "(none)" and leaves without a prompt — the guard's other direction.
+func TestManageUsersTrulyEmptyStillReturns(t *testing.T) {
+	a, out, errb := newManageApp(t, "")
+	if rc := a.manageUsers(); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !strings.Contains(out.String(), "(none)") {
+		t.Errorf("want (none): %q", out.String())
+	}
+	if strings.Contains(errb.String(), "Enter returns") {
+		t.Errorf("must not prompt when truly empty: %q", errb.String())
+	}
+}
