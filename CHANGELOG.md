@@ -79,6 +79,13 @@ the unprivileged-invitee surface all held.
   this release spent its length closing installed-vs-running divergences. It is
   additive output only; `doctor`'s exit code is unchanged.
 
+- **The menu's upgrade entry is now just 「升级」 / "Upgrade".** It read "从 GitHub
+  验签升级稳定命令" / "Verify and upgrade the stable command from GitHub" — the whole
+  mechanism spelled into the label, the same "stable command" phrasing 卸载 already
+  shed. The command still prints "will download, verify, and upgrade from <url>"
+  and asks for YES before touching anything, so the signature-verified part is
+  stated at the point of action, not carried as ballast in the menu line.
+
 ## v2.6.0 - Uninstall means uninstall
 
 - **`uninstall` removes what this tool put on the host, instead of one file.** It

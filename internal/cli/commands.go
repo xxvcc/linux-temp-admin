@@ -538,7 +538,13 @@ var menuItems = []struct {
 	// account is gone — is a row of this very table, marked "missing".
 	{"管理临时用户（查看 / 撤销 / 清理）", "Temporary users (list / revoke / clean up)", func(a *App) int { return a.manageUsers() }},
 	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
-	{"从 GitHub 验签升级稳定命令", "Verify and upgrade the stable command from GitHub", func(a *App) int { return a.upgrade(nil) }},
+	// Just 升级, like 卸载 below: the old label spelled out "verify-signed, from
+	// GitHub, the stable command" — the whole mechanism — where the entry only needs
+	// to name the act. The command itself still shows "will download, verify, and
+	// upgrade from <url>" and asks for YES before touching anything, so the
+	// signature-verified part is stated where it matters, at the point of action,
+	// not carried as ballast in a menu line.
+	{"升级", "Upgrade", func(a *App) int { return a.upgrade(nil) }},
 	// It says 卸载 with nothing qualifying it because it finally earns the word: it
 	// removes the accounts, their grants, their auto-delete tasks, the state and the
 	// command. The old label had to say "the stable command" — an opaque phrase for
