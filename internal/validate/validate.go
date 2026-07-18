@@ -23,7 +23,7 @@ var (
 	// DNS label: alnum at both edges, hyphen allowed inside
 	dnsLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 	// exactly three numeric components + optional [._+~-]-led suffix
-	installedVersionRe = regexp.MustCompile(`^[0-9]+([.][0-9]+){2}([._+~-][A-Za-z0-9._+~-]+)?$`)
+	installedVersionRe = regexp.MustCompile(`^[0-9]+([.][0-9]+){2}([-_+~][A-Za-z0-9._+~-]+)?$`)
 )
 
 // Username reports whether s is a valid temporary username.
@@ -185,6 +185,10 @@ func UpgradeURL(u string) bool {
 }
 
 // InstalledVersion reports whether v is a comparable version string: exactly
-// three numeric components with an optional suffix (matches the version
-// comparator, so a 2- or 4-part string can't slip through).
+// three numeric components with an optional suffix, where the suffix must be led
+// by one of - _ + ~ (never '.'). That leading-separator rule is load-bearing: if
+// '.' could lead the suffix, "1.2.3.4" would match as "1.2.3" plus suffix ".4",
+// and version.Greater would then rank that 4-part string BELOW the 3-part 1.2.3
+// (a suffix reads as a prerelease), so the upgrade gate would silently decline a
+// genuinely newer release. So a 2- or 4-part string cannot slip through.
 func InstalledVersion(v string) bool { return installedVersionRe.MatchString(v) }

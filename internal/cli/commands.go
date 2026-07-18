@@ -207,6 +207,39 @@ func (a *App) cleanupExpired(args []string) int {
 	return 0
 }
 
+// accountIsOursAndLive reports whether name is a temporary account this tool
+// currently manages — it exists AND is either marked managed (the GECOS marker)
+// or vouched for by a registry row that recorded its exact UID.
+//
+// It is the predicate the orphan sweeps use instead of a bare user.Exists,
+// because a grant/exception/unit outlives its account in TWO ways, not one: the
+// account is gone, OR a different, unmanaged account has since taken the name. In
+// the second case a bare user.Exists reports the name as present and the sweeps
+// treat the leftover as live — while the name-keyed sudoers drop-in hands OUR
+// passwordless root to an account we never granted it to, invisible to doctor and
+// cleanup. Requiring the account to be provably ours closes that: a name taken
+// over by something that is not ours makes the leftover an orphan again.
+//
+// It never mistakes a live managed account for an orphan: a normal temp account
+// carries the marker, and one whose marker was erased is still vouched for by its
+// recorded UID.
+func (a *App) accountIsOursAndLive(name string) bool {
+	if !user.Exists(name) {
+		return false
+	}
+	if user.IsManaged(name) {
+		return true
+	}
+	if a.Registry != nil {
+		if rec, found, _ := a.Registry.Lookup(name); found && rec.UID > 0 {
+			if pw, ok := user.Lookup(name); ok && pw.UID == rec.UID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // compact is the sweep itself, with none of the framing the cleanup-expired
 // subcommand wraps it in. It is split out for the manage screen, which has just
 // drawn the table and is where revoke already lives: re-printing the list under a
@@ -220,7 +253,7 @@ func (a *App) compact() {
 	// that name these accounts, and a grant nobody can name any more is a grant
 	// nobody will ever find.
 	if a.SSHD != nil {
-		orphans, err := a.SSHD.Orphans(user.Exists)
+		orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
 		}
@@ -234,12 +267,13 @@ func (a *App) compact() {
 			}
 			a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
 				"removed an orphaned sshd exception: "+a.SSHD.FilePath(u)))
+			a.audit("sshd.cleanup", u, "ok", "orphaned sshd exception removed", nil)
 		}
 	}
 	// An orphaned NOPASSWD drop-in is the worse of the two: it re-arms full root
 	// the moment its username is reused.
 	if a.Sudoers != nil {
-		orphans, err := a.Sudoers.Orphans(user.Exists)
+		orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
 		}
@@ -254,6 +288,23 @@ func (a *App) compact() {
 			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
 				"removed an orphaned sudo grant: "+a.Sudoers.FilePath(u)))
+			a.audit("grant.cleanup", u, "ok", "orphaned sudo drop-in removed", nil)
+		}
+	}
+	// An orphaned auto-revoke unit is the third leftover, and until now the only one
+	// with no sweep: its ExecStart runs the installed binary, so a unit whose
+	// account is gone fires forever and fails forever (and against a REMOVED binary
+	// after an uninstall). Scheduler.Orphans mirrors the two sweeps above, and
+	// globs the v1 prefix too.
+	if a.Scheduler != nil {
+		orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive)
+		if err != nil {
+			a.warnf("%v", err)
+		}
+		for _, u := range orphans {
+			a.Scheduler.Cancel(u, "")
+			a.info(a.P.M("已移除孤儿自动删除任务："+u, "removed an orphaned auto-delete task: "+u))
+			a.audit("schedule.cleanup", u, "ok", "orphaned auto-revoke unit removed", nil)
 		}
 	}
 	removed, err := a.Registry.Compact(user.Exists)
@@ -262,6 +313,9 @@ func (a *App) compact() {
 	} else {
 		a.info(fmt.Sprintf(a.P.M("已压实注册表：移除 %d 条指向已不存在用户的记录。",
 			"Compacted the registry: removed %d entries for users that no longer exist."), removed))
+		if removed > 0 {
+			a.audit("registry.compact", "", "ok", fmt.Sprintf("removed %d stale rows", removed), nil)
+		}
 	}
 }
 
@@ -328,7 +382,7 @@ func (a *App) doctor(args []string) int {
 	// host's policy, and it re-arms the moment the username is reused. Nothing else
 	// looks for these, so doctor must.
 	if a.SSHD != nil {
-		if orphans, err := a.SSHD.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+		if orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号已不存在）：",
 					"orphaned sshd exception (its account no longer exists): "), a.SSHD.FilePath(u))
@@ -349,13 +403,58 @@ func (a *App) doctor(args []string) int {
 	// directory being "safe" says nothing about what is in it. Report them the same
 	// way the sshd exceptions are reported.
 	if a.Sudoers != nil {
-		if orphans, err := a.Sudoers.Orphans(user.Exists); err == nil && len(orphans) > 0 {
+		if orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号已不存在，NOPASSWD:ALL 仍在）：",
 					"orphaned sudo grant (its account is gone; NOPASSWD:ALL still on disk): "), a.Sudoers.FilePath(u))
 			}
 			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
 				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
+	// The auto-revoke unit is the third leftover to report. Its account being gone
+	// means it fires against a name nothing will recreate — or, after an uninstall,
+	// against a binary that no longer exists — so it belongs in the same health list
+	// the two grants are in.
+	if a.Scheduler != nil {
+		if orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
+			for _, u := range orphans {
+				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号已不存在）：",
+					"orphaned auto-delete task (its account no longer exists): "), u)
+			}
+			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
+				"remove them with `cleanup-expired --compact`."))
+			rc = 1
+		}
+	}
+	// The other direction: a registered account that asked to be auto-deleted, still
+	// exists, and has NO task on disk to do it. chage -E still blocks its login at
+	// the expiry date, so this is not a live-access hole — but the deletion the
+	// operator asked for will never happen (the timer was removed out of band, or
+	// Schedule failed at invite and only expiry-locking was set). Surface it so the
+	// account does not linger disabled-but-undeleted forever; revoke finishes it.
+	if a.Scheduler != nil && a.Registry != nil {
+		haveUnit := map[string]bool{}
+		if units, err := a.Scheduler.UnitUsers(); err == nil {
+			for _, u := range units {
+				haveUnit[u] = true
+			}
+		}
+		recs, _ := a.Registry.List()
+		var stranded []string
+		for _, r := range recs {
+			if r.AutoRevoke && user.Exists(r.User) && !haveUnit[r.User] && !strings.HasPrefix(r.AutoUnit, "at:") {
+				stranded = append(stranded, r.User)
+			}
+		}
+		if len(stranded) > 0 {
+			for _, u := range stranded {
+				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无对应任务（登录仍会在到期日被 chage 阻止）：",
+					"account set to auto-delete but has no task left to do it (chage still blocks its login at expiry): "), u)
+			}
+			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
+				"remove them with `revoke --user <name>` once expired."))
 			rc = 1
 		}
 	}

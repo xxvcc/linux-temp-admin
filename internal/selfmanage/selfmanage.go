@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
@@ -27,34 +28,61 @@ type Manager struct {
 	PublicKey   ed25519.PublicKey // release signing key; nil => signed upgrades disabled
 	Client      *http.Client
 	MaxBytes    int64
+
+	// allowPrivateDial gates whether the dialer may connect to a private/reserved
+	// IP. It is true only for the initial, operator-supplied URL of the current
+	// download (a deliberate internal mirror is legitimate); the first redirect
+	// clears it, so a redirect target is checked against the address ACTUALLY
+	// dialed — closing the DNS-rebinding gap where the redirect's name passed a
+	// separate lookup but resolved to a private IP at connect time. Set per
+	// download; a Manager runs its fetches sequentially.
+	allowPrivateDial bool
 }
 
 // New returns a Manager with the embedded release public key and an HTTPS client
 // that refuses to follow a redirect to a non-https scheme.
 func New(installPath string, maxBytes int64) *Manager {
-	return &Manager{
+	m := &Manager{
 		InstallPath: installPath,
 		PublicKey:   embeddedPublicKey(),
 		MaxBytes:    maxBytes,
-		Client: &http.Client{
-			Timeout: 60 * time.Second, // bound the whole fetch; a stalled server can't hang upgrade
-			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-				// A redirect target is chosen by the (possibly hostile) release
-				// server, so it must stay https and must not point at a private/
-				// reserved address — otherwise a compromised host could pivot the
-				// root-run fetch into an SSRF against link-local cloud metadata or an
-				// internal service. The initial, operator-supplied URL is not subject
-				// to this check, so a deliberate internal mirror still works.
-				if req.URL.Scheme != "https" {
-					return fmt.Errorf("refusing redirect to non-https: %s", req.URL)
-				}
-				if err := refusePrivateRedirect(req.URL.Hostname()); err != nil {
-					return err
-				}
+	}
+	// The Control hook runs with the address ACTUALLY being dialed — the resolved
+	// IP:port, after Go's own resolution — so it is the authoritative, rebinding-
+	// proof enforcement point: a name that passed a separate lookup but resolves to
+	// a private IP at connect time is still refused here. Private IPs are allowed
+	// only while allowPrivateDial holds, i.e. for the operator's initial URL, so a
+	// deliberate internal mirror still works; the first redirect clears it.
+	dialer := &net.Dialer{
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || isPublicIP(ip) || m.allowPrivateDial {
 				return nil
-			},
+			}
+			return fmt.Errorf("refusing to dial non-public address after redirect: %s", address)
 		},
 	}
+	m.Client = &http.Client{
+		Timeout:   60 * time.Second, // bound the whole fetch; a stalled server can't hang upgrade
+		Transport: &http.Transport{DialContext: dialer.DialContext, ForceAttemptHTTP2: true},
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			// A redirect target is chosen by the (possibly hostile) release server, so
+			// it must stay https, and from here on a private address is refused: the
+			// operator only vouched for the initial URL, not for wherever it bounces.
+			m.allowPrivateDial = false
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("refusing redirect to non-https: %s", req.URL)
+			}
+			// The name-based check stays as a friendly, early rejection; the Control
+			// hook above is what actually holds under DNS rebinding.
+			return refusePrivateRedirect(req.URL.Hostname())
+		},
+	}
+	return m
 }
 
 // Install atomically writes srcBytes to InstallPath as a root-owned 0755 binary.
@@ -143,6 +171,9 @@ func (m *Manager) download(url string, max int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The operator vouched for this initial URL, so a private/reserved address is
+	// allowed for it (a deliberate internal mirror); the first redirect clears this.
+	m.allowPrivateDial = true
 	resp, err := m.Client.Do(req)
 	if err != nil {
 		return nil, err

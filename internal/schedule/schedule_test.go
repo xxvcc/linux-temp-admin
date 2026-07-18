@@ -50,7 +50,7 @@ func TestOnCalendarAndNames(t *testing.T) {
 	if got := s.UnitName("xxvcc-a1"); got != "linux-temp-admin-v2-revoke-xxvcc-a1" {
 		t.Errorf("UnitName = %q", got)
 	}
-	if got := s.RevokeCommand("xxvcc-a1"); got != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes" {
+	if got := s.RevokeCommand("xxvcc-a1"); got != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes --force --confirm-force xxvcc-a1" {
 		t.Errorf("RevokeCommand = %q", got)
 	}
 }
@@ -83,8 +83,13 @@ func TestScheduleFallsBackToAt(t *testing.T) {
 	if unit != "at:42" {
 		t.Errorf("unit = %q, want at:42", unit)
 	}
-	if sys.atCommand != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes" || sys.atHours != 6 {
+	if sys.atCommand != s.RevokeCommand("xxvcc-a1") || sys.atHours != 6 {
 		t.Errorf("ScheduleAt got %q, %d", sys.atCommand, sys.atHours)
+	}
+	// The queued command carries --force --confirm-force so a lost registry row at
+	// expiry cannot make the unattended revoke refuse the account.
+	if !strings.Contains(sys.atCommand, "--force --confirm-force xxvcc-a1") {
+		t.Errorf("at command lacks the force tokens: %q", sys.atCommand)
 	}
 }
 
@@ -108,8 +113,14 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 
 	s.Cancel("xxvcc-a1", "")
 
-	if len(sys.removedFor) != 1 || sys.removedFor[0] != s.RevokeCommand("xxvcc-a1") {
+	// The sweep matches on the stable "--yes" prefix, so it still finds an at job
+	// queued by an OLDER version whose body has no --force tokens.
+	needle := sys.removedFor[0]
+	if len(sys.removedFor) != 1 || needle != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes" {
 		t.Errorf("RemoveAtJobsFor = %v", sys.removedFor)
+	}
+	if strings.Contains(needle, "--force") {
+		t.Errorf("at-sweep needle must not include --force (old jobs lack it): %q", needle)
 	}
 	if _, err := os.Lstat(svc); !os.IsNotExist(err) {
 		t.Error("service file should be removed")

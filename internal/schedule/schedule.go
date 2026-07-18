@@ -82,8 +82,28 @@ func runningUnderFiringUnit(unit string) bool {
 // usernames are already safe as a plain unit name).
 func (s *Scheduler) UnitName(user string) string { return s.UnitPrefix + user }
 
-// RevokeCommand is the command the auto-revoke task runs.
+// RevokeCommand is the command the auto-revoke task runs at expiry.
+//
+// It carries --force --confirm-force <user> because the auto-revoke fires
+// UNATTENDED, and the registry row it would otherwise need may be gone by then:
+// the whole uninstall-witness design is premised on rows vanishing (hand-edit,
+// backup restore, corruption). Without --force, a lost row makes revoke refuse an
+// "unregistered" account before it even strips the grants — stranding a
+// NOPASSWD-sudo account with no retry, since a fired one-shot timer does not run
+// again. With --force the account is still safe: revoke's protection gate
+// (IsProtectedRevokeTarget) deletes only what the recorded UID or the managed
+// GECOS proves this tool made, and protects every real account regardless of
+// --force. confirm-force is the username, fixed at creation, which is exactly the
+// token revoke demands for a forced unregistered delete.
 func (s *Scheduler) RevokeCommand(user string) string {
+	return fmt.Sprintf("%s revoke --user %s --yes --force --confirm-force %s", s.InstallPath, user, user)
+}
+
+// revokeAtNeedle is the stable substring used to FIND this account's queued at
+// job, as opposed to the full command used to queue it. It must match jobs queued
+// by any version of this tool, so it stops at "--yes" — the part every past and
+// present RevokeCommand shares — and does not include the newer --force tokens.
+func (s *Scheduler) revokeAtNeedle(user string) string {
 	return fmt.Sprintf("%s revoke --user %s --yes", s.InstallPath, user)
 }
 
@@ -102,8 +122,8 @@ Type=oneshot
 NoNewPrivileges=yes
 PrivateTmp=yes
 User=root
-ExecStart=%s revoke --user %s --yes
-`, user, s.InstallPath, user)
+ExecStart=%s
+`, user, s.RevokeCommand(user))
 }
 
 func timerContent(unit, onCalendar string) string {
@@ -123,13 +143,27 @@ WantedBy=timers.target
 
 // Schedule creates the auto-revoke task and returns its recorded identifier
 // ("<unit>" for systemd or "at:<id>" for the fallback).
+//
+// When systemd is present but scheduling on it fails, the real cause (a read-only
+// /etc/systemd/system, a daemon-reload failure) is kept and, if the at fallback
+// then also fails, reported alongside it. Discarding the systemd error made a
+// systemd host that could not write a unit report the fallback's misleading "no
+// systemctl or at available", sending the operator to debug a missing tool that
+// was in fact present.
 func (s *Scheduler) Schedule(user string, hours int) (string, error) {
+	var systemdErr error
 	if s.Sys.HasSystemctl() {
-		if unit, err := s.scheduleSystemd(user, hours); err == nil {
+		unit, err := s.scheduleSystemd(user, hours)
+		if err == nil {
 			return unit, nil
 		}
+		systemdErr = err
 	}
-	return s.scheduleAt(user, hours)
+	unit, atErr := s.scheduleAt(user, hours)
+	if atErr != nil && systemdErr != nil {
+		return "", fmt.Errorf("systemd: %w; at fallback: %v", systemdErr, atErr)
+	}
+	return unit, atErr
 }
 
 func (s *Scheduler) scheduleSystemd(user string, hours int) (string, error) {
@@ -184,7 +218,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) {
 	if strings.HasPrefix(recordedUnit, "at:") {
 		s.Sys.AtrmJob(strings.TrimPrefix(recordedUnit, "at:"))
 	}
-	s.Sys.RemoveAtJobsFor(s.RevokeCommand(user))
+	s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user))
 
 	// Cancel every unit namespace that could name this account, not only the one
 	// this build writes. A v1 unit carries no "-v2-" infix and v1's install path

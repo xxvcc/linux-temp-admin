@@ -752,6 +752,18 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		return 1
 	}
 
+	// Clear any grant a reused username left behind BEFORE the account exists, so a
+	// fresh account can never inherit it. The stale auto-revoke unit is cleared
+	// lower down for the same reason, but a sudo drop-in is more urgent: it is
+	// name-keyed, so the instant useradd creates the account the leftover
+	// /etc/sudoers.d file grants it passwordless root — while this invite records
+	// sudo=no. The grant this invite actually wants is (re)written below; the sshd
+	// exception likewise. Both removers only ever touch this tool's own
+	// managed-prefixed file, so calling them blindly is safe (revoke relies on the
+	// same property), and clearing then re-granting is idempotent.
+	a.removeSudoGrant(username)
+	a.removeSSHDException(username)
+
 	if err := a.Users.Create(username, resolveShell()); err != nil {
 		a.errorf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
 		return 1

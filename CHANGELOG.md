@@ -2,6 +2,76 @@
 
 All notable changes to this project are documented here.
 
+## v2.6.1 - What a three-round audit of the whole program found
+
+A line-by-line audit of all 7142 lines (three rounds — correctness, cross-module
+invariants, adversarial/supply-chain — each finding verified by independent
+refuters) turned up one critical and five high-severity defects, all fixed here.
+Round 3 (adversarial and supply-chain) found nothing that survived verification:
+the ed25519 upgrade chain, the symlink-safe write layer, input validation, and
+the unprivileged-invitee surface all held.
+
+- **Critical — a reused name no longer inherits a stale grant.** invite cleared a
+  reused username's stale auto-revoke *unit* but not its stale sudo grant or sshd
+  exception. So a `--no-sudo` invite reusing a name that still carried an orphaned
+  `/etc/sudoers.d` NOPASSWD:ALL drop-in (left by an out-of-band deletion, or a
+  revoke whose grant removal failed) created an account that silently held
+  passwordless root — while the registry row, `status`, and the audit all recorded
+  sudo=no. invite now clears both the grant and the exception before the account
+  exists, so a reused name starts clean.
+
+- **High — the auto-revoke no longer strands a root-capable account on a lost
+  row.** The auto-revoke task ran `revoke --user X --yes`; if the registry row was
+  gone by expiry (the uninstall-witness design assumes rows vanish), revoke refused
+  the "unregistered" account *before* stripping its grants, and a fired one-shot
+  timer does not retry. The task now runs with `--force --confirm-force`, so it
+  deletes a GECOS/UID-proven managed account and strips its grant even with no row —
+  while revoke's protection gate still refuses any real account, --force or not.
+
+- **High — uninstall verifies the artifacts are gone, not just the accounts.** The
+  survivor check keyed only on `user.Exists`, so a NOPASSWD grant that survived a
+  failed or blocked removal (an immutable file, an EPERM) let the binary come off
+  while the passwordless-root file stayed — re-arming on name reuse. The teardown
+  now re-inventories every witness (grants, exceptions, units) after the revoke
+  loop and blocks the binary on anything left; this also catches an account created
+  by a concurrent invite between the plan and the teardown.
+
+- **High — uninstall refuses early on a binary it cannot remove.** A symlinked
+  install path (ordinary on versioned/Nix layouts) without --force used to let the
+  teardown delete every account and all state, then fail at the last step. The
+  blocker is now a gate before anything is torn down, not a warning after.
+
+- **High — orphaned auto-revoke units are finally swept.** `schedule.Orphans`
+  existed but nothing called it: doctor reported an orphaned unit as clean and
+  `cleanup-expired --compact` never removed it, so a unit whose account was gone
+  fired forever against the installed binary. Both now sweep and report it, v1
+  units included.
+
+- **Medium — orphan detection sees a name taken over by a real account.** The
+  sweeps keyed on "does an account with this name exist", so an orphaned grant
+  whose name a real, unmanaged account later reused was reported by nobody while it
+  handed that account our root. The predicate is now "a live account *we* manage".
+
+- **Medium — the version gate rejects 4-part versions**, as its doc always
+  promised; a 4-part release used to be mis-ordered as an older prerelease and the
+  upgrade silently declined. **Medium —** uninstall writes its "ok" audit only
+  after the binary is actually gone (and a "fail" on every abort), and
+  `cleanup-expired --compact` now audits every grant/exception/unit/row it removes.
+  **Medium —** doctor reports an account set to auto-delete whose task is gone
+  (chage still blocks its login, so this is tidiness, not exposure).
+
+- **Low —** three `/etc/passwd`- and `/proc`-reading helpers switched from a
+  scanner that silently swallowed a mid-file read error (an existing account could
+  read as absent) to whole-file reads; `DisableLogin` now attempts the password
+  lock even if the expiry step fails; `Delete` returns the real `deluser` error
+  instead of a misleading "no tool available"; `Schedule` keeps the real systemd
+  error instead of a misleading "no systemctl or at"; the release `keygen` tightens
+  an existing key file's mode to 0600; and the upgrade downloader pins its
+  public-IP check to the address actually dialed (a DNS-rebinding hardening —
+  defense in depth; the fetch was already https-only and signature-gated).
+
+  Patch: every change is a defect fix or hardening. The CLI contract is unchanged.
+
 ## v2.6.0 - Uninstall means uninstall
 
 - **`uninstall` removes what this tool put on the host, instead of one file.** It

@@ -380,3 +380,177 @@ func TestUninstallRefusesWhenV1RegistryIsUnreadable(t *testing.T) {
 		t.Errorf("want a refusal; got %q", errb.String())
 	}
 }
+
+// TestUninstallBlocksOnAnUnremovableGrant is HIGH #2. The survivor check used to
+// key only on user.Exists, but sudoers.Remove documents that it reports failure
+// precisely so the teardown won't call itself done while a NOPASSWD:ALL file it
+// could not delete remains. A grant that survives (here: a non-empty directory at
+// the grant path, which os.Remove cannot unlink even as root) must block the
+// binary removal, because it re-arms root the instant its username is reused.
+func TestUninstallBlocksOnAnUnremovableGrant(t *testing.T) {
+	const name = "ltawedge1"
+	a, _, _ := uninstallApp(t, "")
+	a.Users = user.New()
+	newRealAccount(t, a, name) // registers it with the real UID, so revoke deletes it cleanly
+	// Wedge its grant path with a non-empty directory: revoke deletes the
+	// account, its grant removal fails, and the account is gone — so a user.Exists
+	// check sees no survivor while the grant is still on disk.
+	grant := a.Sudoers.FilePath(name)
+	if err := os.MkdirAll(filepath.Join(grant, "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 when a grant could not be removed", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Error("HIGH: the binary was removed while a NOPASSWD grant survived")
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Error("the state dir was removed while a grant survived")
+	}
+}
+
+// TestUninstallReInventoriesBeforeRemovingTheBinary is HIGH #3. The plan is a
+// point-in-time snapshot; an account (or grant) appearing between the plan and
+// the teardown must still block the binary. Here the plan is empty but a live
+// managed account with a grant is present when teardown runs — a fresh
+// re-inventory must catch it, or the binary would come off over a live account
+// whose auto-revoke task points at it.
+func TestUninstallReInventoriesBeforeRemovingTheBinary(t *testing.T) {
+	const name = "ltatoctou1"
+	a, _, _ := uninstallApp(t, "")
+	a.Users = user.New()
+	newRealAccount(t, a, name)
+	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+	// An empty plan — as if the account was created after the plan was built.
+	if rc := a.teardown(teardownPlan{stateDir: a.StateDir, binaryPath: a.InstallPath}, false, false); rc != 1 {
+		t.Errorf("rc=%d, want 1: a re-inventory must catch an account the plan missed", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Error("HIGH: binary removed over an account the point-in-time plan did not list")
+	}
+}
+
+// TestUninstallRefusesEarlyOnAnUnremovableBinary is HIGH #4. binaryBlocker was
+// computed to be discovered "now rather than in the last step after everything
+// else is already destroyed", but it was only ever printed as a warning — nothing
+// refused on it. A symlinked install path (ordinary on versioned/Nix layouts)
+// without --force would let the teardown delete every account and the state dir,
+// then fail at the very last step with nothing left to do but --force, which is
+// the footgun the redesign removes. The blocker must refuse BEFORE any teardown.
+func TestUninstallRefusesEarlyOnAnUnremovableBinary(t *testing.T) {
+	const name = "ltablocker1"
+	a, _, _ := uninstallApp(t, "")
+	a.Users = user.New()
+	newRealAccount(t, a, name)
+	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+	// Replace the install path with a symlink: RootSafeFile refuses it, so it is
+	// unremovable without --force.
+	if err := os.Remove(a.InstallPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/bin/true", a.InstallPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 (refuse early on an unremovable binary)", rc)
+	}
+	if !user.Exists(name) {
+		t.Error("HIGH: the account was deleted before the binary refusal — the teardown ran anyway")
+	}
+	if _, err := os.Lstat(a.InstallPath); err != nil {
+		t.Error("the symlink was removed despite no --force")
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Error("the state dir was removed before the binary refusal")
+	}
+}
+
+// TestCompactSweepsOrphanedUnits is HIGH #5. Scheduler.Orphans mirrors the
+// sudoers/sshd sweeps, but until now nothing called it: doctor reported an
+// orphaned auto-revoke unit as clean and cleanup-expired --compact never removed
+// it, so a unit whose account is gone fired forever against the installed binary
+// (and against a removed binary after an uninstall). compact must now sweep it.
+func TestCompactSweepsOrphanedUnits(t *testing.T) {
+	a, _, _ := uninstallApp(t, "")
+	// An orphaned unit: a .timer for a name with no account and no registry row.
+	unit := filepath.Join(a.Scheduler.SystemdDir, config.AutoRevokeUnitPrefix+"ltaorphanunit.timer")
+	mustWrite(t, unit, "[Timer]\n")
+
+	a.compact()
+
+	if _, err := os.Stat(unit); !os.IsNotExist(err) {
+		t.Error("HIGH: compact did not sweep an orphaned auto-revoke unit")
+	}
+	// doctor must also surface it before the sweep — build a fresh one with the
+	// orphan present again.
+	b, _, errb := uninstallApp(t, "")
+	mustWrite(t, filepath.Join(b.Scheduler.SystemdDir, config.AutoRevokeUnitPrefix+"ltaorphanunit2.timer"), "[Timer]\n")
+	if rc := b.doctor(nil); rc != 1 {
+		t.Errorf("doctor rc=%d, want 1 with an orphaned unit present", rc)
+	}
+	if !strings.Contains(errb.String(), "orphaned auto-delete task") {
+		t.Errorf("doctor did not report the orphaned unit: %q", errb.String())
+	}
+}
+
+// TestCompactSweepsAGrantWhoseNameARealAccountReused is the MEDIUM name-reuse
+// detection gap. The orphan sweeps used a bare user.Exists, so a managed grant
+// whose temp account is gone but whose NAME a real, unmanaged account later took
+// was reported by nobody: exists=true made it "not an orphan", while the
+// name-keyed drop-in silently handed OUR passwordless root to that real account.
+// The predicate is now "a live account WE manage", so a name taken over by an
+// account that is not ours makes the grant an orphan again.
+func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
+	const name = "xxvcc-reuse09"
+	a, _, _ := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	// A REAL, unmanaged account that happens to carry a temp-shaped name — no
+	// managed GECOS, no registry row vouching for it.
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "Real Person", name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	grant := a.Sudoers.FilePath(name)
+	mustWrite(t, grant, name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+	a.compact()
+
+	if _, err := os.Stat(grant); err == nil {
+		t.Error("MEDIUM: a grant whose name a real account reused was left on disk (invisible orphan)")
+	}
+	if !user.Exists(name) {
+		t.Error("compact must strip the grant but never delete the real account")
+	}
+}
+
+// TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft covers the MEDIUM tidiness
+// gap: an account that asked to auto-delete, still exists, and whose unit was
+// removed out of band will never be deleted (chage still blocks its login at
+// expiry, so this is tidiness, not a live-access hole). doctor now surfaces it.
+func TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft(t *testing.T) {
+	const name = "ltanotask1"
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	newRealAccount(t, a, name) // registers with the real UID
+	// Mark the row auto-revoke, but write NO unit for it.
+	rec, _, _ := a.Registry.Lookup(name)
+	rec.AutoRevoke = true
+	rec.AutoUnit = ""
+	if err := a.Registry.Record(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.doctor(nil); rc != 1 {
+		t.Errorf("doctor rc=%d, want 1", rc)
+	}
+	if !strings.Contains(errb.String(), "no task left") {
+		t.Errorf("doctor did not surface the taskless auto-delete account: %q", errb.String())
+	}
+}

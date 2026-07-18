@@ -4,6 +4,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -90,4 +92,38 @@ func toHex(b []byte) string {
 		out[i*2+1] = hexdigits[c&0xf]
 	}
 	return string(out)
+}
+
+// TestNewClientRedirectToPrivateIsRefused exercises the client New() actually
+// builds (the other tests inject their own). Two properties: a deliberate
+// internal mirror as the INITIAL url is reachable even on a loopback address,
+// and a redirect to a private/loopback address is refused. The redirect leg is
+// the DNS-rebinding hardening's job; here the target is loopback outright, which
+// both the name check and the dial-time Control hook reject.
+func TestNewClientRedirectToPrivateIsRefused(t *testing.T) {
+	// A loopback TLS server standing in for an internal mirror.
+	internal := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("mirror-body"))
+	}))
+	defer internal.Close()
+
+	m := New("/tmp/none", 1<<20)
+	// New()'s Transport uses the default dialer; trust the test CA and let it reach
+	// the loopback server, exactly as the operator's chosen mirror would be reached.
+	m.Client.Transport.(*http.Transport).TLSClientConfig = internal.Client().Transport.(*http.Transport).TLSClientConfig
+
+	// (a) initial URL on a loopback (private) address is allowed — internal mirror.
+	if _, err := m.download(internal.URL+"/bin", 1<<20); err != nil {
+		t.Errorf("initial internal-mirror URL should be reachable, got: %v", err)
+	}
+
+	// (b) a server that redirects to a private/loopback address: refused.
+	redirector := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/pivot", http.StatusFound)
+	}))
+	defer redirector.Close()
+	m.Client.Transport.(*http.Transport).TLSClientConfig = redirector.Client().Transport.(*http.Transport).TLSClientConfig
+	if _, err := m.download(redirector.URL+"/bin", 1<<20); err == nil {
+		t.Error("a redirect to a private/loopback address must be refused")
+	}
 }
