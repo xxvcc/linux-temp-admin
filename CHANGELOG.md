@@ -72,6 +72,13 @@ the unprivileged-invitee surface all held.
 
   Patch: every change is a defect fix or hardening. The CLI contract is unchanged.
 
+- **`doctor` now prints the version.** Two lines: the running process's version,
+  and — more usefully — the version of the command installed at
+  `/usr/local/sbin/linux-temp-admin`, which is the one the auto-revoke timer
+  actually runs. A mismatch between them (a stale installed copy) is flagged, since
+  this release spent its length closing installed-vs-running divergences. It is
+  additive output only; `doctor`'s exit code is unchanged.
+
 ## v2.6.0 - Uninstall means uninstall
 
 - **`uninstall` removes what this tool put on the host, instead of one file.** It

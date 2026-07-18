@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -554,3 +555,62 @@ func TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft(t *testing.T) {
 		t.Errorf("doctor did not surface the taskless auto-delete account: %q", errb.String())
 	}
 }
+
+// TestDoctorShowsVersions covers the version lines doctor prints: the running
+// process's version always, and the installed command's version (the one the
+// auto-revoke timer runs) with a mismatch flagged. The installed binary is a stub
+// that echoes whatever version the test wants, so all four states are exercised.
+func TestDoctorShowsVersions(t *testing.T) {
+	writeStub := func(t *testing.T, path, version string) {
+		t.Helper()
+		if version == "" { // an absent install
+			_ = os.Remove(path)
+			return
+		}
+		body := "#!/bin/sh\n[ \"$1\" = version ] && echo " + version + "\n"
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(path, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("running version is always shown", func(t *testing.T) {
+		a, out, _ := uninstallApp(t, "")
+		writeStub(t, a.InstallPath, "9.9.9")
+		a.doctor(nil)
+		if !strings.Contains(out.String(), "running version:") {
+			t.Errorf("doctor did not print the running version: %q", out.String())
+		}
+	})
+
+	t.Run("installed version matching is a success line", func(t *testing.T) {
+		a, out, _ := uninstallApp(t, "")
+		writeStub(t, a.InstallPath, buildinfoVersion())
+		a.doctor(nil)
+		if !strings.Contains(out.String(), "installed command version: "+buildinfoVersion()) {
+			t.Errorf("doctor did not report the matching installed version: %q", out.String())
+		}
+	})
+
+	t.Run("installed version mismatch is warned", func(t *testing.T) {
+		a, _, errb := uninstallApp(t, "")
+		writeStub(t, a.InstallPath, "0.0.1-stale")
+		a.doctor(nil)
+		if !strings.Contains(errb.String(), "differs from the running") {
+			t.Errorf("doctor did not flag the version mismatch: %q", errb.String())
+		}
+	})
+
+	t.Run("no installed command is warned", func(t *testing.T) {
+		a, _, errb := uninstallApp(t, "")
+		writeStub(t, a.InstallPath, "") // remove it
+		a.doctor(nil)
+		if !strings.Contains(errb.String(), "not installed") {
+			t.Errorf("doctor did not report the missing installed command: %q", errb.String())
+		}
+	})
+}
+
+func buildinfoVersion() string { return buildinfo.Version }

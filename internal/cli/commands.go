@@ -1,11 +1,16 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
@@ -240,6 +245,38 @@ func (a *App) accountIsOursAndLive(name string) bool {
 	return false
 }
 
+// installedCommandVersion best-effort reads the version of the binary at
+// InstallPath — the one the auto-revoke timer runs, which can differ from this
+// process. It returns (version, "ok") when it read one, and ("", state) where
+// state is "absent" (nothing installed), "unreadable" (present but the version
+// could not be obtained), or "" (nothing to check, e.g. no InstallPath set).
+//
+// It execs the installed binary, so it refuses to run anything at an unsafe path
+// (RootSafeFile) — never exec a symlink or a non-root-owned file — and bounds the
+// call with a timeout so a wedged binary cannot hang the report.
+func (a *App) installedCommandVersion() (string, string) {
+	if a.InstallPath == "" {
+		return "", ""
+	}
+	if _, err := os.Lstat(a.InstallPath); err != nil {
+		return "", "absent"
+	}
+	if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+		return "", "unreadable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, a.InstallPath, "version").Output()
+	if err != nil {
+		return "", "unreadable"
+	}
+	v := strings.TrimSpace(string(out))
+	if !validate.InstalledVersion(v) {
+		return "", "unreadable"
+	}
+	return v, "ok"
+}
+
 // compact is the sweep itself, with none of the framing the cleanup-expired
 // subcommand wraps it in. It is split out for the manage screen, which has just
 // drawn the table and is where revoke already lives: re-printing the list under a
@@ -327,6 +364,26 @@ func (a *App) doctor(args []string) int {
 	}
 	rc := 0
 	a.info(a.P.M("linux-temp-admin 诊断报告", "linux-temp-admin doctor report"))
+	a.info(fmt.Sprintf(a.P.M("运行版本：%s", "running version: %s"), buildinfo.Version))
+	// The version that matters most is not this process's but the one installed at
+	// InstallPath: the auto-revoke timer's ExecStart runs THAT binary, so a stale or
+	// missing installed copy is a real diagnostic concern. Surface it, and flag a
+	// mismatch — this whole tool just spent a release closing installed-vs-running
+	// divergences.
+	switch v, state := a.installedCommandVersion(); state {
+	case "absent":
+		a.warnf("%s", a.P.M("已安装命令：未安装（自动删除任务需要它）",
+			"installed command: not installed (the auto-delete task needs it)"))
+	case "unreadable":
+		a.warnf("%s%s", a.P.M("无法读取已安装命令的版本：", "could not read the installed command's version: "), a.InstallPath)
+	case "ok":
+		if v == buildinfo.Version {
+			a.success(fmt.Sprintf(a.P.M("已安装命令版本：%s", "installed command version: %s"), v))
+		} else {
+			a.warnf(fmt.Sprintf(a.P.M("已安装命令版本 %s 与运行中的 %s 不一致（自动删除任务执行的是已安装的那份，可用 upgrade 或 install 对齐）",
+				"installed command version %s differs from the running %s (the auto-delete task runs the installed one; align with upgrade or install)"), v, buildinfo.Version))
+		}
+	}
 	if a.Geteuid() == 0 {
 		a.success(a.P.M("当前以 root 运行。", "running as root."))
 	} else {
