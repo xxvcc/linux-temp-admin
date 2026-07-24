@@ -12,17 +12,55 @@ import (
 // realSystem drives systemctl and at via os/exec.
 type realSystem struct{}
 
+// systemctlError retains the command and its output so callers can classify the
+// small set of failures that are safe to treat as idempotent success without
+// hiding unrelated systemd, permission, or D-Bus errors.
+type systemctlError struct {
+	args   []string
+	err    error
+	output string
+}
+
+func (e *systemctlError) Error() string {
+	return fmt.Sprintf("systemctl %s: %v: %s", strings.Join(e.args, " "), e.err, e.output)
+}
+
+func (e *systemctlError) Unwrap() error { return e.err }
+
 func has(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
 func (realSystem) HasSystemctl() bool { return has("systemctl") }
 func (realSystem) HasAt() bool        { return has("at") }
 
 func (realSystem) Systemctl(args ...string) error {
-	out, err := exec.Command("systemctl", args...).CombinedOutput()
+	cmd := exec.Command("systemctl", args...)
+	// Classification below relies on systemctl's diagnostics. Force the stable C
+	// locale instead of trying to recognize every translated error message.
+	cmd.Env = append(cmd.Environ(), "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return &systemctlError{
+			args:   append([]string(nil), args...),
+			err:    err,
+			output: strings.TrimSpace(string(out)),
+		}
 	}
 	return nil
+}
+
+// systemctlUnitFileMissing reports only the exact, benign failure produced when
+// `systemctl disable --now` races with (or follows) removal of its target unit.
+// All other exit failures remain visible to the caller.
+func systemctlUnitFileMissing(err error, unit string) bool {
+	var commandErr *systemctlError
+	if !errors.As(err, &commandErr) || len(commandErr.args) != 3 {
+		return false
+	}
+	if commandErr.args[0] != "disable" || commandErr.args[1] != "--now" || commandErr.args[2] != unit {
+		return false
+	}
+	want := fmt.Sprintf("Failed to disable unit: Unit file %s does not exist.", unit)
+	return commandErr.output == want
 }
 
 func (realSystem) ScheduleAt(command string, hours int) (string, error) {

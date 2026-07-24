@@ -252,7 +252,9 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 		_, serviceErr := os.Lstat(servicePath)
 		hadUnit := timerErr == nil || serviceErr == nil
 		if s.Sys.HasSystemctl() {
-			if err := s.Sys.Systemctl("disable", "--now", unit+".timer"); err != nil && hadUnit {
+			timerUnit := unit + ".timer"
+			err := s.Sys.Systemctl("disable", "--now", timerUnit)
+			if err != nil && hadUnit && !systemctlUnitFileMissing(err, timerUnit) {
 				errs = append(errs, err)
 			}
 			_ = s.Sys.Systemctl("reset-failed", unit+".timer", unit+".service")

@@ -37,3 +37,30 @@ func TestAtrmJobReportsFailureForStillQueuedJob(t *testing.T) {
 		t.Fatalf("AtrmJob error = %v, want the real removal failure", err)
 	}
 }
+
+func TestSystemctlMissingUnitErrorIsPreciselyClassified(t *testing.T) {
+	dir := t.TempDir()
+	const unit = "linux-temp-admin-v2-revoke-xxvcc-a1.timer"
+	writeCommand(t, dir, "systemctl", "echo 'Failed to disable unit: Unit file "+unit+" does not exist.' >&2; exit 1")
+	t.Setenv("PATH", dir)
+
+	err := (realSystem{}).Systemctl("disable", "--now", unit)
+	if !systemctlUnitFileMissing(err, unit) {
+		t.Fatalf("systemctlUnitFileMissing(%v) = false, want true", err)
+	}
+	if systemctlUnitFileMissing(err, "different.timer") {
+		t.Fatal("a missing-unit error must only match its exact target")
+	}
+}
+
+func TestSystemctlOtherFailureIsNotClassifiedAsMissingUnit(t *testing.T) {
+	dir := t.TempDir()
+	const unit = "linux-temp-admin-v2-revoke-xxvcc-a1.timer"
+	writeCommand(t, dir, "systemctl", "echo 'Failed to connect to bus: Permission denied' >&2; exit 1")
+	t.Setenv("PATH", dir)
+
+	err := (realSystem{}).Systemctl("disable", "--now", unit)
+	if systemctlUnitFileMissing(err, unit) {
+		t.Fatalf("permission failure was misclassified as a missing unit: %v", err)
+	}
+}

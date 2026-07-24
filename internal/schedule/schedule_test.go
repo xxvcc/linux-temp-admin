@@ -22,12 +22,16 @@ type fakeSystem struct {
 	removeAtErr  error
 	atrmErr      error
 	atJobsErr    error
+	systemctlErr func(args ...string) error
 }
 
 func (f *fakeSystem) HasSystemctl() bool { return f.hasSystemctl }
 func (f *fakeSystem) HasAt() bool        { return f.hasAt }
 func (f *fakeSystem) Systemctl(args ...string) error {
 	f.calls = append(f.calls, args)
+	if f.systemctlErr != nil {
+		return f.systemctlErr(args...)
+	}
 	return nil
 }
 func (f *fakeSystem) ScheduleAt(command string, hours int) (string, error) {
@@ -151,6 +155,77 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 			t.Errorf("missing systemctl %q; calls=%v", want, sys.calls)
 		}
 	}
+}
+
+func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	s.UnderUnit = func(string) bool { return false }
+	unit := s.UnitName("xxvcc-a1")
+	servicePath := filepath.Join(dir, unit+".service")
+	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+			}
+		}
+		return nil
+	}
+
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatalf("missing timer should be idempotent success: %v", err)
+	}
+	if _, err := os.Lstat(servicePath); !os.IsNotExist(err) {
+		t.Error("service-only orphan should be removed")
+	}
+	if !calledSystemctl(sys.calls, "daemon-reload") {
+		t.Errorf("removing the service must reload systemd; calls=%v", sys.calls)
+	}
+}
+
+func TestCancelStillReportsNonMissingTimerFailure(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	s.UnderUnit = func(string) bool { return false }
+	unit := s.UnitName("xxvcc-a1")
+	servicePath := filepath.Join(dir, unit+".service")
+	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to connect to bus: Permission denied",
+			}
+		}
+		return nil
+	}
+
+	err := s.Cancel("xxvcc-a1", "")
+	if err == nil || !strings.Contains(err.Error(), "Permission denied") {
+		t.Fatalf("Cancel error = %v, want the real systemctl failure", err)
+	}
+	if _, err := os.Lstat(servicePath); !os.IsNotExist(err) {
+		t.Error("cleanup should still remove the service after a systemctl failure")
+	}
+}
+
+func calledSystemctl(calls [][]string, command string) bool {
+	for _, call := range calls {
+		if len(call) > 0 && call[0] == command {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCancelPropagatesAtRemovalFailure(t *testing.T) {

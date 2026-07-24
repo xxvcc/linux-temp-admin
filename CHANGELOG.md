@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## v2.7.3 - Idempotent orphan schedule cleanup
+
+- Treat the exact `systemctl disable --now` "unit file does not exist" result as
+  idempotent success when cleaning an orphaned auto-delete task. A fired revoke
+  can intentionally leave only its `.service` file behind after removing the
+  timer; compact now removes that service without falsely reporting failure.
+- Preserve every other `systemctl` failure, including permission and D-Bus
+  errors, and cover both the service-only cleanup and fail-closed paths with
+  regression tests.
+
 ## v2.7.2 - Serialized lifecycle and release hardening
 
 - Serialize every account, grant, schedule, registry, and installed-command
