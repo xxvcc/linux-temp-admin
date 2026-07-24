@@ -33,18 +33,36 @@ escalated:x:0:0:` + config.ManagedGECOS + `:/home/escalated:/bin/bash
 
 func TestLookupAndManaged(t *testing.T) {
 	setPasswd(t, samplePasswd)
-	pw, ok := Lookup("tmp1000")
+	pw, ok, err := Lookup("tmp1000")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || pw.UID != 1001 || pw.Home != "/home/tmp1000" {
 		t.Fatalf("Lookup tmp1000 = %+v ok=%v", pw, ok)
 	}
-	if !IsManaged("tmp1000") {
+	if managed, err := IsManaged("tmp1000"); err != nil || !managed {
 		t.Error("tmp1000 should be managed")
 	}
-	if IsManaged("human") {
+	if managed, err := IsManaged("human"); err != nil || managed {
 		t.Error("human should not be managed")
 	}
-	if Exists("nope") {
+	if exists, err := Exists("nope"); err != nil || exists {
 		t.Error("nonexistent user should not Exist")
+	}
+}
+
+func TestLookupErrorsAreNotAbsence(t *testing.T) {
+	old := passwdPath
+	passwdPath = t.TempDir() // ReadFile on a directory fails.
+	t.Cleanup(func() { passwdPath = old })
+	if _, _, err := Lookup("someone"); err == nil {
+		t.Fatal("Lookup must report an unreadable passwd database")
+	}
+	if _, err := Exists("someone"); err == nil {
+		t.Fatal("Exists must preserve the passwd read error")
+	}
+	if _, err := IsProtectedRevokeTarget("someone", true, 1001); err == nil {
+		t.Fatal("revoke protection must fail closed on a passwd read error")
 	}
 }
 
@@ -67,7 +85,7 @@ func TestIsReservedName(t *testing.T) {
 	// Every reserved name must also be refused by the revoke path (defense in
 	// depth: the two sides share this predicate and must never diverge).
 	for _, n := range reserved {
-		if !IsProtectedRevokeTarget(n, true, 0) {
+		if protected, err := IsProtectedRevokeTarget(n, true, 0); err != nil || !protected {
 			t.Errorf("reserved %q is not a protected revoke target", n)
 		}
 	}
@@ -92,18 +110,17 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"human", true, 0, true},            // real uid, registered but NOT managed -> protected (stale entry / name reuse)
 		{"tmp1000", false, 0, false},        // managed real uid -> deletable even unregistered
 
-		// The recorded UID is the immutable witness. An account that erased its own
-		// GECOS marker used to become permanently unrevocable; now the UID recorded at
-		// creation still proves it is ours.
-		{"wiped", true, 1002, false}, // marker erased BUT recorded uid matches -> still deletable
+		// A recorded UID detects contradictions but cannot prove identity on its own:
+		// Linux can reuse the same UID after an account is deleted and recreated.
+		{"wiped", true, 1002, true},  // marker erased: UID alone is reusable and cannot prove identity
 		{"wiped", true, 0, true},     // same account, legacy row with no recorded uid -> old GECOS rule -> protected
 		{"wiped", false, 1002, true}, // unregistered: a recorded uid we never wrote proves nothing
 		{"wiped", true, 9999, true},  // recorded uid does NOT match -> not the account we made -> protected
 
-		// A recorded UID must never make a REAL account deletable: the pair only
-		// matches for an account this tool actually created.
-		{"human", true, 1000, false}, // registry says we created uid 1000 under this name -> ours
-		{"human", true, 1234, true},  // recorded uid disagrees with passwd -> real account stays protected
+		// A recorded UID must never make a real account deletable, even when it
+		// matches exactly: the username and UID can both be reused.
+		{"human", true, 1000, true}, // matching UID can belong to a recreated real account
+		{"human", true, 1234, true}, // recorded uid disagrees with passwd -> real account stays protected
 
 		// A recorded UID that disagrees is not a MISSING witness but a CONTRADICTING
 		// one, and the marker must not overrule it. The two rows above only ever
@@ -119,7 +136,11 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"escalated", true, 0, true},
 	}
 	for _, c := range cases {
-		if got := IsProtectedRevokeTarget(c.name, c.registered, c.recordedUID); got != c.want {
+		got, err := IsProtectedRevokeTarget(c.name, c.registered, c.recordedUID)
+		if err != nil {
+			t.Fatalf("IsProtectedRevokeTarget(%q): %v", c.name, err)
+		}
+		if got != c.want {
 			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d) = %v, want %v",
 				c.name, c.registered, c.recordedUID, got, c.want)
 		}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -48,14 +49,28 @@ func (a *App) status(args []string) int {
 			a.errorf("%s", a.P.M("用户名不合法："+u, "invalid username: "+u))
 			return 1
 		}
-		pw, ok := user.Lookup(u)
+		pw, ok, err := user.Lookup(u)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), err)
+			return 1
+		}
 		if !ok {
 			a.errorf("%s", a.P.M("用户不存在："+u, "user does not exist: "+u))
 			return 1
 		}
+		managed, err := user.IsManaged(u)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), err)
+			return 1
+		}
 		a.printf("user=%s uid=%d gid=%d home=%s shell=%s managed=%v",
-			pw.Name, pw.UID, pw.GID, pw.Home, pw.Shell, user.IsManaged(u))
-		if unit, _ := a.Registry.UnitFor(u); unit != "" {
+			pw.Name, pw.UID, pw.GID, pw.Home, pw.Shell, managed)
+		unit, err := a.Registry.UnitFor(u)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
+			return 1
+		}
+		if unit != "" {
 			a.printf("auto-revoke unit=%s", unit)
 		}
 		return 0
@@ -65,6 +80,7 @@ func (a *App) status(args []string) int {
 	recs, err := a.Registry.List()
 	if err != nil {
 		a.warnf("%v", err)
+		return 1
 	}
 	if len(recs) == 0 {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
@@ -107,7 +123,9 @@ func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
 	}
 	for i, r := range recs {
 		state := a.P.M("缺失", "missing")
-		if user.Exists(r.User) {
+		if exists, err := user.Exists(r.User); err != nil {
+			state = a.P.M("未知", "unknown")
+		} else if exists {
 			state = a.P.M("在册", "active")
 		}
 		cells := []string{r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port)}
@@ -151,8 +169,12 @@ func (a *App) manageUsers() int {
 	recs, err := a.Registry.List()
 	if err != nil {
 		a.warnf("%v", err)
+		return 1
 	}
-	orphans := a.orphanArtifacts(recs)
+	orphans, orphanErr := a.orphanArtifacts(recs)
+	if orphanErr != nil {
+		a.warnf("%s: %v", a.P.M("扫描孤儿残留失败", "scanning for orphaned leftovers failed"), orphanErr)
+	}
 
 	a.info(a.P.M("已登记的临时用户：", "Registered temporary users:"))
 	if len(recs) == 0 {
@@ -180,6 +202,9 @@ func (a *App) manageUsers() int {
 	// walked away without ever offering `c`, so the leftovers could not be cleaned
 	// from here at all.
 	if len(recs) == 0 && len(orphans) == 0 {
+		if orphanErr != nil {
+			return 1
+		}
 		return 0
 	}
 
@@ -188,6 +213,9 @@ func (a *App) manageUsers() int {
 		"a number or username revokes it · c cleans up stale rows and orphaned grants · Enter returns: ")))
 	switch {
 	case choice == "":
+		if orphanErr != nil {
+			return 1
+		}
 		return 0
 	case strings.EqualFold(choice, "c"):
 		// compact() is the bare sweep, so the root gate the cleanup-expired
@@ -195,8 +223,7 @@ func (a *App) manageUsers() int {
 		if !a.requireRoot() {
 			return 1
 		}
-		a.compact()
-		return 0
+		return a.compact()
 	}
 	// A row number is shorthand for its username; anything else is taken as a name
 	// and validated downstream, exactly as `revoke --user` would.
@@ -227,19 +254,23 @@ func (a *App) cleanupExpired(args []string) int {
 	// The account list is status's job — this used to print its own poorer copy of
 	// it. Show it here too, but through the one renderer, so the two can never
 	// drift apart.
-	recs, _ := a.Registry.List()
+	recs, err := a.Registry.List()
+	if err != nil {
+		a.warnf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
+		return 1
+	}
 	if len(recs) > 0 {
 		a.printf("%s", a.usersTable(recs, false).String())
 	}
 	if compact {
-		a.compact()
+		return a.compact()
 	}
 	return 0
 }
 
 // accountIsOursAndLive reports whether name is a temporary account this tool
-// currently manages — it exists AND is either marked managed (the GECOS marker)
-// or vouched for by a registry row that recorded its exact UID.
+// currently manages: the current passwd entry must carry the managed GECOS
+// marker. A matching UID is not enough because Linux can reuse UIDs.
 //
 // It is the predicate the orphan sweeps use instead of a bare user.Exists,
 // because a grant/exception/unit outlives its account in TWO ways, not one: the
@@ -250,24 +281,13 @@ func (a *App) cleanupExpired(args []string) int {
 // cleanup. Requiring the account to be provably ours closes that: a name taken
 // over by something that is not ours makes the leftover an orphan again.
 //
-// It never mistakes a live managed account for an orphan: a normal temp account
-// carries the marker, and one whose marker was erased is still vouched for by its
-// recorded UID.
-func (a *App) accountIsOursAndLive(name string) bool {
-	if !user.Exists(name) {
-		return false
-	}
-	if user.IsManaged(name) {
-		return true
-	}
-	if a.Registry != nil {
-		if rec, found, _ := a.Registry.Lookup(name); found && rec.UID > 0 {
-			if pw, ok := user.Lookup(name); ok && pw.UID == rec.UID {
-				return true
-			}
-		}
-	}
-	return false
+// A managed account whose marker was erased is intentionally treated as
+// unverifiable. That may require operator recovery, but it cannot transfer a
+// name-scoped privilege to an unrelated replacement account.
+func (a *App) accountIsOursAndLive(name string) (bool, error) {
+	// UIDs can be reused after an out-of-band deletion. Only the marker on the
+	// current passwd entry proves that this name still belongs to a managed account.
+	return user.IsManaged(name)
 }
 
 // installedCommandVersion best-effort reads the version of the binary at
@@ -314,12 +334,13 @@ type orphanArtifact struct {
 // account of ours AND whose name has no registry row (rows are already in the
 // table, marked 缺失). It is the same union of sweeps compact() acts on and doctor
 // reports, so the three views agree.
-func (a *App) orphanArtifacts(recs []registry.Record) []orphanArtifact {
+func (a *App) orphanArtifacts(recs []registry.Record) ([]orphanArtifact, error) {
 	inRegistry := make(map[string]bool, len(recs))
 	for _, r := range recs {
 		inRegistry[r.User] = true
 	}
 	kinds := map[string][]string{}
+	var scanErrs []error
 	addKind := func(users []string, label string) {
 		for _, u := range users {
 			if !inRegistry[u] {
@@ -328,17 +349,23 @@ func (a *App) orphanArtifacts(recs []registry.Record) []orphanArtifact {
 		}
 	}
 	if a.Sudoers != nil {
-		if o, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err == nil {
+		if o, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err != nil {
+			scanErrs = append(scanErrs, fmt.Errorf("sudoers: %w", err))
+		} else {
 			addKind(o, a.P.M("sudo 授权", "sudo grant"))
 		}
 	}
 	if a.SSHD != nil {
-		if o, err := a.SSHD.Orphans(a.accountIsOursAndLive); err == nil {
+		if o, err := a.SSHD.Orphans(a.accountIsOursAndLive); err != nil {
+			scanErrs = append(scanErrs, fmt.Errorf("sshd: %w", err))
+		} else {
 			addKind(o, a.P.M("sshd 例外", "sshd exception"))
 		}
 	}
 	if a.Scheduler != nil {
-		if o, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err == nil {
+		if o, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err != nil {
+			scanErrs = append(scanErrs, fmt.Errorf("scheduler: %w", err))
+		} else {
 			addKind(o, a.P.M("自动删除任务", "auto-delete task"))
 		}
 	}
@@ -351,7 +378,7 @@ func (a *App) orphanArtifacts(recs []registry.Record) []orphanArtifact {
 	for _, n := range names {
 		out = append(out, orphanArtifact{name: n, kinds: kinds[n]})
 	}
-	return out
+	return out, errors.Join(scanErrs...)
 }
 
 // compact is the sweep itself, with none of the framing the cleanup-expired
@@ -362,7 +389,8 @@ func (a *App) orphanArtifacts(recs []registry.Record) []orphanArtifact {
 //
 // The subcommand's root gate does NOT come with it. Every caller has to keep its
 // own — this function sweeps.
-func (a *App) compact() {
+func (a *App) compact() int {
+	rc := 0
 	// Sweep the live grants BEFORE the registry rows: compacting drops the rows
 	// that name these accounts, and a grant nobody can name any more is a grant
 	// nobody will ever find.
@@ -370,6 +398,7 @@ func (a *App) compact() {
 		orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
+			rc = 1
 		}
 		for _, u := range orphans {
 			if err := a.SSHD.Remove(u); err != nil {
@@ -377,6 +406,7 @@ func (a *App) compact() {
 				// was deleted and only the reload was skipped), so use a neutral prefix
 				// that does not assert the removal failed.
 				a.warnf("%s: %v", a.P.M("清理孤儿 sshd 例外时", "while cleaning up the orphaned sshd exception"), err)
+				rc = 1
 				continue
 			}
 			a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
@@ -390,6 +420,7 @@ func (a *App) compact() {
 		orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
+			rc = 1
 		}
 		for _, u := range orphans {
 			// Announce the removal only once it happened: this used to print "removed"
@@ -398,6 +429,7 @@ func (a *App) compact() {
 			if err := a.Sudoers.Remove(u); err != nil {
 				a.errorf("%s: %v", a.P.M("无法移除孤儿 sudo 授权（该文件仍会在用户名被复用时立即生效，请手动删除）",
 					"could not remove an orphaned sudo grant (it re-arms the instant its username is reused; delete it by hand)"), err)
+				rc = 1
 				continue
 			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
@@ -414,9 +446,14 @@ func (a *App) compact() {
 		orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive)
 		if err != nil {
 			a.warnf("%v", err)
+			rc = 1
 		}
 		for _, u := range orphans {
-			a.Scheduler.Cancel(u, "")
+			if err := a.Scheduler.Cancel(u, ""); err != nil {
+				a.warnf("%s: %v", a.P.M("无法移除孤儿自动删除任务", "could not remove orphaned auto-delete task"), err)
+				rc = 1
+				continue
+			}
 			a.info(a.P.M("已移除孤儿自动删除任务："+u, "removed an orphaned auto-delete task: "+u))
 			a.audit("schedule.cleanup", u, "ok", "orphaned auto-revoke unit removed", nil)
 		}
@@ -424,6 +461,7 @@ func (a *App) compact() {
 	removed, err := a.Registry.Compact(user.Exists)
 	if err != nil {
 		a.warnf("%v", err)
+		rc = 1
 	} else {
 		a.info(fmt.Sprintf(a.P.M("已压实注册表：移除 %d 条指向已不存在用户的记录。",
 			"Compacted the registry: removed %d entries for users that no longer exist."), removed))
@@ -431,6 +469,7 @@ func (a *App) compact() {
 			a.audit("registry.compact", "", "ok", fmt.Sprintf("removed %d stale rows", removed), nil)
 		}
 	}
+	return rc
 }
 
 func (a *App) doctor(args []string) int {
@@ -516,7 +555,10 @@ func (a *App) doctor(args []string) int {
 	// host's policy, and it re-arms the moment the username is reused. Nothing else
 	// looks for these, so doctor must.
 	if a.SSHD != nil {
-		if orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
+		if orphans, err := a.SSHD.Orphans(a.accountIsOursAndLive); err != nil {
+			a.warnf("%s: %v", a.P.M("无法扫描孤儿 sshd 例外", "cannot scan for orphaned sshd exceptions"), err)
+			rc = 1
+		} else if len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号已不存在）：",
 					"orphaned sshd exception (its account no longer exists): "), a.SSHD.FilePath(u))
@@ -537,7 +579,10 @@ func (a *App) doctor(args []string) int {
 	// directory being "safe" says nothing about what is in it. Report them the same
 	// way the sshd exceptions are reported.
 	if a.Sudoers != nil {
-		if orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
+		if orphans, err := a.Sudoers.Orphans(a.accountIsOursAndLive); err != nil {
+			a.warnf("%s: %v", a.P.M("无法扫描孤儿 sudo 授权", "cannot scan for orphaned sudo grants"), err)
+			rc = 1
+		} else if len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号已不存在，NOPASSWD:ALL 仍在）：",
 					"orphaned sudo grant (its account is gone; NOPASSWD:ALL still on disk): "), a.Sudoers.FilePath(u))
@@ -552,7 +597,10 @@ func (a *App) doctor(args []string) int {
 	// against a binary that no longer exists — so it belongs in the same health list
 	// the two grants are in.
 	if a.Scheduler != nil {
-		if orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err == nil && len(orphans) > 0 {
+		if orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err != nil {
+			a.warnf("%s: %v", a.P.M("无法扫描孤儿自动删除任务", "cannot scan for orphaned auto-delete tasks"), err)
+			rc = 1
+		} else if len(orphans) > 0 {
 			for _, u := range orphans {
 				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号已不存在）：",
 					"orphaned auto-delete task (its account no longer exists): "), u)
@@ -570,15 +618,33 @@ func (a *App) doctor(args []string) int {
 	// account does not linger disabled-but-undeleted forever; revoke finishes it.
 	if a.Scheduler != nil && a.Registry != nil {
 		haveUnit := map[string]bool{}
-		if units, err := a.Scheduler.UnitUsers(); err == nil {
+		schedulesKnown := true
+		if units, err := a.Scheduler.ScheduledUsers(); err != nil {
+			a.warnf("%s: %v", a.P.M("无法读取自动删除任务", "cannot read auto-delete tasks"), err)
+			rc = 1
+			schedulesKnown = false
+		} else {
 			for _, u := range units {
 				haveUnit[u] = true
 			}
 		}
-		recs, _ := a.Registry.List()
+		recs, registryErr := a.Registry.List()
+		if registryErr != nil {
+			a.warnf("%s: %v", a.P.M("无法读取注册表", "cannot read registry"), registryErr)
+			rc = 1
+		}
 		var stranded []string
 		for _, r := range recs {
-			if r.AutoRevoke && user.Exists(r.User) && !haveUnit[r.User] && !strings.HasPrefix(r.AutoUnit, "at:") {
+			if !schedulesKnown || registryErr != nil {
+				break
+			}
+			exists, existsErr := user.Exists(r.User)
+			if existsErr != nil {
+				a.warnf("%s %s: %v", a.P.M("无法确认账号状态：", "cannot determine account state:"), r.User, existsErr)
+				rc = 1
+				continue
+			}
+			if r.AutoRevoke && exists && !haveUnit[r.User] {
 				stranded = append(stranded, r.User)
 			}
 		}

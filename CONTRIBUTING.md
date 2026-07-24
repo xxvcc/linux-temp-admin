@@ -14,21 +14,33 @@ The tool lives in `cmd/` and `internal/`, and ships as a signed static Go binary
 
 ## Local Checks
 
-**Go** — requires Go 1.25+:
+**Go** — requires Go 1.26.5+:
 
 ```bash
 go build ./...
 go vet -printf.funcs=printf,errorf,warnf ./...
+go vet -tags integration -printf.funcs=printf,errorf,warnf ./...
 test -z "$(gofmt -l .)"            # gofmt must be clean
-go test -race ./...
-sudo go test -race -tags integration ./...   # root integration tests (disposable host)
+go test -count=1 ./...
+go test -count=1 -race ./...
+sudo -E env "PATH=$PATH" go test -count=1 -tags integration ./...
+sudo -E env "PATH=$PATH" go test -count=1 -race -tags integration ./...
+staticcheck ./...
+staticcheck -tags integration ./...
+govulncheck ./...
 ```
+
+The integration suites use fixed disposable account names. Run the two integration commands **serially**, never concurrently, and only on a disposable host.
 
 **Release/install scripts**, if you touch `scripts/`:
 
 ```bash
+bash -n scripts/release.sh scripts/sign-release.sh
+sh -n scripts/install.sh
 shellcheck -S warning scripts/*.sh
 ```
+
+If a workflow changes, run `actionlint` too. Release changes must also exercise invalid version/tag rejection and static `linux/amd64` plus `linux/arm64` builds.
 
 For changes that touch account creation, revoke, sudoers, systemd timers, or `at`, also test in a disposable VM/container. Do not test destructive paths on a machine with real users unless you fully understand the impact.
 

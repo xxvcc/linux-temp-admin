@@ -4,13 +4,20 @@
 
 ## Testing
 
-- [ ] `go build ./... && go vet -printf.funcs=printf,errorf,warnf ./...`
+- [ ] `go build ./...`; `go vet` passes with ordinary and integration tags
 - [ ] `gofmt -l .` is empty
-- [ ] `go test -race ./...` (and `-tags integration` on a disposable host, if touched)
+- [ ] Ordinary and race tests pass
+- [ ] Integration and integration-race tests pass serially on a disposable host, or are unaffected
+- [ ] Staticcheck (ordinary and integration tags) and `govulncheck ./...` pass
 
 Release/install scripts, if changed:
 
-- [ ] `shellcheck -S warning scripts/*.sh`
+- [ ] `bash -n` / `sh -n` and `shellcheck -S warning scripts/*.sh`
+- [ ] Invalid version/tag rejection and static amd64/arm64 builds pass
+
+Workflows, if changed:
+
+- [ ] `actionlint`
 
 ## Safety Notes
 

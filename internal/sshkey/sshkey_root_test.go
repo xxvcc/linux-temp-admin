@@ -16,6 +16,9 @@ func TestWriteAuthorizedKeys(t *testing.T) {
 		t.Skip("requires root")
 	}
 	home := t.TempDir()
+	if err := os.Chown(home, testUID, testGID); err != nil {
+		t.Fatal(err)
+	}
 	line := []byte("ssh-ed25519 AAAAExample comment\n")
 	if err := WriteAuthorizedKeys(home, testUID, testGID, line); err != nil {
 		t.Fatal(err)
@@ -46,6 +49,9 @@ func TestWriteAuthorizedKeysRefusesSymlink(t *testing.T) {
 		t.Skip("requires root")
 	}
 	home := t.TempDir()
+	if err := os.Chown(home, testUID, testGID); err != nil {
+		t.Fatal(err)
+	}
 	sshDir := filepath.Join(home, ".ssh")
 	if err := os.Mkdir(sshDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -62,5 +68,15 @@ func TestWriteAuthorizedKeysRefusesSymlink(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(secret); string(b) != "ORIGINAL" {
 		t.Errorf("symlink was followed: secret = %q", b)
+	}
+}
+
+func TestWriteAuthorizedKeysRefusesRootOwnedHome(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	home := t.TempDir()
+	if err := WriteAuthorizedKeys(home, testUID, testGID, []byte("ssh-ed25519 AAAAExample\n")); err == nil {
+		t.Fatal("expected a root-owned home to be refused")
 	}
 }

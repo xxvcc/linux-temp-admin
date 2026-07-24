@@ -24,14 +24,19 @@ func TestUserLifecycle(t *testing.T) {
 	if err := m.Create(name, "/bin/sh"); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if !Exists(name) {
+	exists, err := Exists(name)
+	if err != nil || !exists {
 		t.Fatal("account should exist after Create")
 	}
-	pw, ok := Lookup(name)
+	pw, ok, err := Lookup(name)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || pw.UID < 1 {
 		t.Fatalf("Lookup after create: %+v ok=%v", pw, ok)
 	}
-	if !IsManaged(name) {
+	managed, err := IsManaged(name)
+	if err != nil || !managed {
 		t.Error("created account should carry the managed GECOS tag")
 	}
 	if err := m.LockPassword(name); err != nil {
@@ -43,7 +48,7 @@ func TestUserLifecycle(t *testing.T) {
 	if err := m.Delete(name); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if Exists(name) {
+	if exists, err := Exists(name); err != nil || exists {
 		t.Error("account should be gone after Delete")
 	}
 }

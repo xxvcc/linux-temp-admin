@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,12 +11,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/schedule"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 )
+
+type failingScheduleSystem struct{}
+
+func (failingScheduleSystem) HasSystemctl() bool                     { return false }
+func (failingScheduleSystem) Systemctl(...string) error              { return nil }
+func (failingScheduleSystem) HasAt() bool                            { return true }
+func (failingScheduleSystem) ScheduleAt(string, int) (string, error) { return "", nil }
+func (failingScheduleSystem) RemoveAtJobsFor(string) error           { return nil }
+func (failingScheduleSystem) AtrmJob(string) error                   { return nil }
+func (failingScheduleSystem) AtJobs() ([]schedule.AtJob, error) {
+	return nil, errors.New("at queue unreadable")
+}
 
 // newTestApp builds a minimal, root-free App: Geteuid is faked to 0 and the
 // registry points at a temp dir. Collaborators that only the mutating paths need
@@ -89,7 +105,7 @@ func TestReadLineEOFvsBlank(t *testing.T) {
 
 func TestDispatchRouting(t *testing.T) {
 	a, out, _ := newTestApp(t, "")
-	if rc := a.Dispatch([]string{"version"}); rc != 0 || !strings.Contains(out.String(), "2.0.0") {
+	if rc := a.Dispatch([]string{"version"}); rc != 0 || !strings.Contains(out.String(), buildinfo.Version) {
 		t.Errorf("version: rc=%d out=%q", rc, out.String())
 	}
 	a2, out2, _ := newTestApp(t, "")
@@ -100,6 +116,62 @@ func TestDispatchRouting(t *testing.T) {
 	if rc := a3.Dispatch([]string{"bogus"}); rc != 1 {
 		t.Errorf("unknown command: rc=%d, want 1", rc)
 	}
+}
+
+func TestOrphanScanErrorsAreNotHealthy(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: "/usr/local/sbin/linux-temp-admin",
+		UnitPrefix: "linux-temp-admin-test-", Sys: failingScheduleSystem{},
+	}
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+
+	if _, err := a.orphanArtifacts(nil); err == nil || !strings.Contains(err.Error(), "at queue unreadable") {
+		t.Fatalf("orphanArtifacts error = %v, want scheduler scan failure", err)
+	}
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc=%d, want 1 when scheduler inventory cannot be read", rc)
+	}
+	if !strings.Contains(errb.String(), "at queue unreadable") {
+		t.Errorf("doctor hid the scheduler error: %q", errb.String())
+	}
+}
+
+func TestEnsureStableInstalledRejectsUnsafeExistingCommand(t *testing.T) {
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("#!/bin/sh\necho 0.0.0-dev\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "linux-temp-admin")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		a := &App{InstallPath: link, Selfmanage: &selfmanage.Manager{InstallPath: link}}
+		if err := a.ensureStableInstalled(); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("ensureStableInstalled error = %v, want symlink refusal", err)
+		}
+	})
+
+	t.Run("non-root owner", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("requires root to create a non-root-owned command")
+		}
+		path := filepath.Join(t.TempDir(), "linux-temp-admin")
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho 0.0.0-dev\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(path, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+		a := &App{InstallPath: path, Selfmanage: &selfmanage.Manager{InstallPath: path}}
+		if err := a.ensureStableInstalled(); err == nil || !strings.Contains(err.Error(), "not owned by root") {
+			t.Fatalf("ensureStableInstalled error = %v, want owner refusal", err)
+		}
+	})
 }
 
 const menuTitleEN = "Linux Temporary Admin Manager"

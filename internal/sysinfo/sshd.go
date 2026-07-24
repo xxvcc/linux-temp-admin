@@ -106,36 +106,69 @@ var sshdConfigDropInDir = "/etc/ssh/sshd_config.d"
 // that requires a second factor except on the LAN, would read as "key login
 // works" from a no-address probe and print a verified invite that then fails.
 //
-// Detection, not interpretation: it scans the main config and the drop-in
-// directory for a `Match` line naming Address/Host as a criterion and reports
-// only that one exists. A caller treats that as "cannot verify" and downgrades
-// the invite to UNVERIFIED — it never turns into a blocker or a refusal, so a
-// false positive costs only a needless caveat. A Match hidden in a nested
-// Include this scan does not reach falls back to the prior behaviour (the login
-// is judged from the no-address view); it is never made worse.
+// Detection, not interpretation: it scans the main config and recursively follows
+// Include directives for a `Match` line naming Address/Host as a criterion. A
+// caller treats that as "cannot verify" and downgrades the invite to UNVERIFIED.
+// An include that cannot be read is also unverifiable, so an incomplete scan can
+// never produce a false verified claim.
 func HasAddressScopedMatch() bool {
 	files := []string{sshdConfigPath}
 	if entries, err := filepath.Glob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
 		files = append(files, entries...)
+	} else {
+		return true
 	}
+	seen := map[string]bool{}
+	baseDir := filepath.Dir(sshdConfigPath)
 	for _, f := range files {
-		if fileHasAddressScopedMatch(f) {
+		found, complete := fileHasAddressScopedMatch(f, baseDir, seen)
+		if found || !complete {
 			return true
 		}
 	}
 	return false
 }
 
-func fileHasAddressScopedMatch(path string) bool {
+func fileHasAddressScopedMatch(path, baseDir string, seen map[string]bool) (found, complete bool) {
+	path = filepath.Clean(path)
+	if seen[path] {
+		return false, true
+	}
+	seen[path] = true
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 2 || !strings.EqualFold(fields[0], "Match") {
+		line, _, _ := strings.Cut(sc.Text(), "#")
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if strings.EqualFold(fields[0], "Include") {
+			for _, pattern := range fields[1:] {
+				if !filepath.IsAbs(pattern) {
+					pattern = filepath.Join(baseDir, pattern)
+				}
+				matches, err := filepath.Glob(pattern)
+				if err != nil {
+					return false, false
+				}
+				if len(matches) == 0 && !strings.ContainsAny(pattern, "*?[") {
+					return false, false
+				}
+				for _, include := range matches {
+					found, complete := fileHasAddressScopedMatch(include, baseDir, seen)
+					if found || !complete {
+						return found, complete
+					}
+				}
+			}
+			continue
+		}
+		if !strings.EqualFold(fields[0], "Match") {
 			continue
 		}
 		// A Match line is keyword/value pairs: `Match User bob Address 10.0.0.0/8`.
@@ -143,11 +176,11 @@ func fileHasAddressScopedMatch(path string) bool {
 		// connects from, which is unknowable here.
 		for _, tok := range fields[1:] {
 			if strings.EqualFold(tok, "address") || strings.EqualFold(tok, "host") {
-				return true
+				return true, true
 			}
 		}
 	}
-	return false
+	return false, sc.Err() == nil
 }
 
 // Blocker is one reason a login would fail. The values are stable identifiers,

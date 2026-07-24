@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/expiry"
+	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sshkey"
@@ -106,7 +108,12 @@ func (a *App) invite(args []string) int {
 				return 1
 			}
 			cand := *prefix + "-" + h
-			if !user.Exists(cand) {
+			exists, lookupErr := user.Exists(cand)
+			if lookupErr != nil {
+				a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), lookupErr)
+				return 1
+			}
+			if !exists {
 				username = cand
 				break
 			}
@@ -471,7 +478,7 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 //
 // This is where a wrong prediction is caught. planLogin had to guess the group
 // set before the account existed; sshd decides Allow/DenyGroups on the real one.
-func (a *App) confirmLogin(username string, pw user.Passwd, plan *loginPlan) bool {
+func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bool {
 	cfg, err := a.sshdConfig(username)
 	if err != nil {
 		if plan.fixSSHD {
@@ -484,7 +491,6 @@ func (a *App) confirmLogin(username string, pw user.Passwd, plan *loginPlan) boo
 		plan.unverified = "the effective sshd config could not be read"
 		return true
 	}
-	groups := user.Groups(pw)
 	rep := a.checkKeyLogin(cfg, username, groups)
 	if plan.password {
 		rep = a.checkPasswordLogin(cfg, username, groups)
@@ -754,17 +760,24 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		kp = k
 	}
 
-	var cleanups []func()
-	rollback := func() {
+	var cleanups []func() error
+	rollback := func() error {
 		a.warnf("%s", a.P.M("创建失败，正在回滚："+username, "creation failed; rolling back: "+username))
+		var rollbackErrs []error
 		for i := len(cleanups) - 1; i >= 0; i-- {
-			cleanups[i]()
+			if err := cleanups[i](); err != nil {
+				rollbackErrs = append(rollbackErrs, err)
+			}
 		}
+		return errors.Join(rollbackErrs...)
 	}
 	failf := func(format string, args ...any) int {
 		a.errorf(format, args...)
 		a.audit("account.create", username, "fail", fmt.Sprintf(format, args...), nil)
-		rollback()
+		if err := rollback(); err != nil {
+			a.errorf("%s: %v", a.P.M("回滚未完整完成，请立即人工核查", "rollback did not complete; inspect immediately"), err)
+			a.audit("account.rollback", username, "fail", err.Error(), nil)
+		}
 		return 1
 	}
 
@@ -782,18 +795,26 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// nothing — stripping a live account's grant (and reloading sshd out from under
 	// its invitee) on the way to that failure is a regression. The generated-name
 	// path is already existence-checked; an explicit --user is not, so guard here.
-	if !user.Exists(username) {
-		a.removeSudoGrant(username)
-		a.removeSSHDException(username)
+	exists, lookupErr := user.Exists(username)
+	if lookupErr != nil {
+		return failf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), lookupErr)
+	}
+	if !exists {
+		if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
+			return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
+		}
 	}
 
 	if err := a.Users.Create(username, resolveShell()); err != nil {
 		a.errorf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
 		return 1
 	}
-	cleanups = append(cleanups, func() { _ = a.Users.Delete(username) })
+	cleanups = append(cleanups, func() error { return a.Users.Delete(username) })
 
-	pw, ok := user.Lookup(username)
+	pw, ok, lookupErr := user.Lookup(username)
+	if lookupErr != nil {
+		return failf("%s: %v", a.P.M("读取新账号信息失败", "reading the new account failed"), lookupErr)
+	}
 	if !ok {
 		return failf("%s", a.P.M("无法定位新用户家目录", "cannot locate new user's home"))
 	}
@@ -805,7 +826,11 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// name when USERGROUPS_ENAB is on, and on a host that puts new accounts in a
 	// shared group instead (openSUSE ships GROUP=100 "users"), a `DenyGroups users`
 	// rule would refuse this login while the invite claimed it was verified.
-	if !a.confirmLogin(username, pw, &plan) {
+	groups, groupsErr := user.Groups(pw)
+	if groupsErr != nil {
+		return failf("%s: %v", a.P.M("无法可靠读取新账号的用户组", "cannot reliably read the new account's groups"), groupsErr)
+	}
+	if !a.confirmLogin(username, groups, &plan) {
 		return failf("%s", a.P.M("按该账号的真实用户组复核后，sshd 不会接受此登录",
 			"re-checked against the account's real groups: sshd would not accept this login"))
 	}
@@ -829,12 +854,12 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// nothing to roll back beyond the account itself.
 	sshdDropIn := ""
 	if plan.fixSSHD {
-		res, err := a.SSHD.Grant(username, user.Groups(pw), plan.report)
+		res, err := a.SSHD.Grant(username, groups, plan.report)
 		if err != nil {
 			return failf("%s: %v", a.P.M("为该账号开启 sshd 公钥登录失败", "enabling the sshd public-key login for this account failed"), err)
 		}
 		sshdDropIn = res.Path
-		cleanups = append(cleanups, func() { _ = a.SSHD.Remove(username) })
+		cleanups = append(cleanups, func() error { return a.SSHD.Remove(username) })
 		a.success(a.P.M("已为该账号单独开启公钥登录（全局策略未改动）："+res.Path,
 			"public-key login enabled for this account only (the global policy is untouched): "+res.Path))
 		// Two independent things must both hold before the invite may say "verified":
@@ -878,13 +903,15 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	if wantSudo {
 		if err := a.Sudoers.Grant(username); err == nil {
 			sudoGranted = true
-			cleanups = append(cleanups, func() { a.removeSudoGrant(username) })
+			cleanups = append(cleanups, func() error { return a.removeSudoGrant(username) })
 		} else {
 			// Grant may have written a live drop-in before its verification step
 			// failed; remove it unconditionally so a failed grant can never leave an
 			// unregistered NOPASSWD grant behind. Remove only ever touches the
 			// managed-prefixed file for this user, so it is safe to call blindly.
-			a.removeSudoGrant(username)
+			if cleanupErr := a.removeSudoGrant(username); cleanupErr != nil {
+				return failf("%s: %v", a.P.M("sudo 授权失败且清理失败", "sudo grant failed and cleanup failed"), cleanupErr)
+			}
 			a.warnf("%s: %v", a.P.M("授予 sudo 失败，创建为普通账号", "sudo grant failed; created as a normal account"), err)
 		}
 	}
@@ -897,26 +924,35 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// something that needs cleaning up, not only when a timer is being scheduled.
 	if wantAuto || sshdDropIn != "" {
 		if err := a.ensureStableInstalled(); err != nil {
-			a.warnf("%s: %v", a.P.M("无法安装/更新稳定命令；撤销时请使用与本次相同版本的二进制",
-				"cannot install/refresh the stable command; revoke with a binary at least as new as this one"), err)
+			return failf("%s: %v", a.P.M("无法安装或验证稳定命令", "cannot install or verify the stable command"), err)
 		}
 	}
 
 	// Clear any stale schedule left by a reused username before scheduling.
-	staleUnit, _ := a.Registry.UnitFor(username)
-	a.Scheduler.Cancel(username, staleUnit)
+	staleUnit, err := a.Registry.UnitFor(username)
+	if err != nil {
+		return failf("%s: %v", a.P.M("读取旧自动删除任务失败", "reading stale auto-delete task failed"), err)
+	}
+	if err := a.Scheduler.Cancel(username, staleUnit); err != nil {
+		return failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
+	}
 	autoUnit := ""
 	autoScheduled := false
+	generation := ""
 	if wantAuto {
+		generation, err = a.RandHex(16)
+		if err != nil {
+			return failf("%s: %v", a.P.M("生成账号世代标识失败", "generating account generation failed"), err)
+		}
 		// The auto-revoke task's ExecStart runs the installed stable command, so a
 		// binary must be present at InstallPath (ensured just above), otherwise the
 		// timer would fire and fail on a non-installed run.
-		if _, err := os.Stat(a.InstallPath); err != nil {
-			a.warnf("%s: %v", a.P.M("稳定命令不可用，自动删除改为仅设置到期", "the stable command is unavailable; auto-delete falls back to account expiry only"), err)
-		} else if unit, err := a.Scheduler.Schedule(username, hours); err == nil {
+		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+			return failf("%s: %v", a.P.M("稳定命令不安全", "the stable command is unsafe"), err)
+		} else if unit, err := a.Scheduler.Schedule(username, pw.UID, generation, hours); err == nil {
 			autoUnit = unit
 			autoScheduled = true
-			cleanups = append(cleanups, func() { a.Scheduler.Cancel(username, unit) })
+			cleanups = append(cleanups, func() error { return a.Scheduler.Cancel(username, unit) })
 		} else {
 			a.warnf("%s: %v", a.P.M("自动删除任务创建失败，仅设置到期", "auto-delete scheduling failed; account expiry only"), err)
 		}
@@ -936,53 +972,38 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		Fingerprint: fingerprint,
 		AutoRevoke:  autoScheduled,
 		AutoUnit:    autoUnit,
-		// Pin the UID as it is right now, before the invitee has ever had access.
-		// This is revoke's immutable proof that the passwd entry it is looking at is
-		// the account created here — the GECOS marker beside it can be rewritten by
-		// the account itself, this cannot be rewritten retroactively.
-		UID: pw.UID,
+		// Pin the UID to detect contradictions during revoke. It is not identity proof
+		// by itself because Linux may reuse a UID after out-of-band account deletion;
+		// the current account must still carry the managed GECOS marker.
+		UID:        pw.UID,
+		Generation: generation,
 	}
-	registered := false
 	if err := a.Registry.Record(rec); err != nil {
-		a.warnf("%s: %v", a.P.M("登记注册表失败", "registry record failed"), err)
-	} else {
-		registered = true
+		return failf("%s: %v", a.P.M("登记注册表失败", "registry record failed"), err)
 	}
-	if !registered {
-		// An unregistered account whose only way in is an sshd exception is pure
-		// liability: the exception must come off (nothing automatic could ever remove
-		// it), and taking it off is precisely what makes the login impossible again —
-		// the drop-in only exists because the preflight PROVED sshd refuses this key
-		// without it. There is no version of this worth printing, so roll the whole
-		// thing back. Unlike the sudoers grant, whose removal merely costs the
-		// invitee root, removing this one costs them the login itself.
-		if sshdDropIn != "" {
-			return failf("%s", a.P.M("登记注册表失败，且该账号依赖 sshd 例外才能登录；已整体回滚，主机未留下任何改动。",
-				"the registry write failed and this account can only log in via an sshd exception; rolled everything back, leaving the host untouched."))
+	registered := true
+	// Registry cleanup runs last during rollback, after account deletion. If the
+	// account survived, keep the row as the witness needed for manual recovery.
+	cleanups = append([]func() error{func() error {
+		exists, err := user.Exists(username)
+		if err != nil {
+			return err
 		}
-		// Otherwise the account exists but is unregistered: an auto-revoke task could
-		// never delete it (revoke refuses unregistered without --force), and a NOPASSWD
-		// grant should not linger unregistered. Cancel the task and drop sudo.
-		if autoScheduled {
-			a.Scheduler.Cancel(username, autoUnit)
-			autoScheduled = false
-			autoUnit = ""
+		if exists {
+			return fmt.Errorf("account still exists; keeping registry record")
 		}
-		if sudoGranted {
-			a.removeSudoGrant(username)
-			sudoGranted = false
-		}
-		a.warnf("%s", a.P.M("账号已创建但未登记；请用 revoke --force 手动撤销。",
-			"account created but not registered; revoke manually with --force."))
-	}
+		return a.Registry.Remove(username)
+	}}, cleanups...)
 
-	a.printInvite(inviteBundle{
+	if err := a.printInvite(inviteBundle{
 		user: username, host: host, port: port, hours: hours,
 		sudo: sudoGranted, auto: autoScheduled, autoUnit: autoUnit,
 		permanent: permanent, expires: expiresDisplay,
 		registered: registered, kp: kp, password: password,
 		sshdDropIn: sshdDropIn, verified: plan.verified, unverified: plan.unverified,
-	})
+	}); err != nil {
+		return failf("%s: %v", a.P.M("邀请凭据输出失败", "writing invite credentials failed"), err)
+	}
 	a.audit("account.create", username, "ok", "", map[string]string{
 		"host":        host,
 		"port":        fmt.Sprintf("%d", port),
@@ -1059,7 +1080,8 @@ func (b inviteBundle) loginLine() string {
 	return login + " (UNVERIFIED: " + reason + ")"
 }
 
-func (a *App) printInvite(b inviteBundle) {
+func (a *App) printInvite(b inviteBundle) error {
+	var out strings.Builder
 	yesno := func(v bool) string {
 		if v {
 			return "yes"
@@ -1070,7 +1092,7 @@ func (a *App) printInvite(b inviteBundle) {
 	if b.byPassword() {
 		passwordLine = "enabled (this invite's only credential)"
 	}
-	fmt.Fprintf(a.Out, `
+	fmt.Fprintf(&out, `
 ----- BEGIN LINUX TEMP ADMIN INVITE -----
 
 Host: %s
@@ -1091,10 +1113,10 @@ Sshd exception: %s
 	// the header carries the Host, Port, and User to build it from, and the noise
 	// was not worth it for a recipient who runs ssh.
 	if b.byPassword() {
-		fmt.Fprintf(a.Out, "\n%s\n%s\n",
+		fmt.Fprintf(&out, "\n%s\n%s\n",
 			a.P.M("登录密码（只显示这一次）:", "Login password (shown only once):"), b.password)
 	} else {
-		fmt.Fprintf(a.Out, `
+		fmt.Fprintf(&out, `
 %s
 cat > './%s.key' <<'EOF_KEY'
 %sEOF_KEY
@@ -1104,21 +1126,21 @@ chmod 600 './%s.key'
 	}
 
 	if b.sshdDropIn != "" {
-		fmt.Fprint(a.Out, "\n"+a.P.M(
+		fmt.Fprint(&out, "\n"+a.P.M(
 			"Sshd 提示: 已为该账号单独写入一个 sshd 例外（仅 Match User 块，全局策略未改动）；撤销时会删除该文件并 reload sshd。",
 			"Sshd note: a per-account sshd exception was written (a Match User block only; the global policy is untouched). Revoking deletes that file and reloads sshd.")+"\n")
 	}
 	if b.byPassword() {
-		fmt.Fprint(a.Out, "\n"+a.P.M(
+		fmt.Fprint(&out, "\n"+a.P.M(
 			"密码提示: 密码登录可被全网爆破，且必须以明文交付；这是本工具最弱的一种授权方式，用完请立即撤销。",
 			"Password note: a password login is brute-forceable from anywhere and must be delivered in the clear. This is the weakest grant this tool issues; revoke as soon as you are done.")+"\n")
 	}
 	if b.permanent {
-		fmt.Fprint(a.Out, "\n"+a.P.M(
+		fmt.Fprint(&out, "\n"+a.P.M(
 			"永久账号提示: 未选择自动删除，此账号不会过期、不会被自动删除；用完请手动撤销（revoke）。",
 			"Permanent-account note: auto-delete was not chosen, so this account does not expire and is not auto-deleted. Revoke it by hand when done.")+"\n")
 	} else if !b.auto {
-		fmt.Fprint(a.Out, "\n"+a.P.M(
+		fmt.Fprint(&out, "\n"+a.P.M(
 			"自动删除提示: 未创建自动删除任务；账号到期只阻止登录，不删除用户，请按需手动撤销。",
 			"Auto-delete note: no auto-delete task was created; expiry only blocks login and does not delete the user. Revoke manually when needed.")+"\n")
 	}
@@ -1126,10 +1148,12 @@ chmod 600 './%s.key'
 	if b.byPassword() {
 		secret = a.P.M("密码", "password")
 	}
-	fmt.Fprint(a.Out, "\n"+a.P.M(
+	fmt.Fprint(&out, "\n"+a.P.M(
 		"安全提醒: "+secret+"只显示这一次、服务器不保存；仅通过可信私聊发送；用完立即撤销。",
 		"Security notes: the "+secret+" is shown only once and not stored on the server; send only via trusted private chat; revoke immediately after use.")+
 		"\n\n----- END LINUX TEMP ADMIN INVITE -----\n")
+	_, err := fmt.Fprint(a.Out, out.String())
+	return err
 }
 
 // --- helpers ---
@@ -1154,15 +1178,6 @@ func orNone(s string) string {
 	return s
 }
 
-func isIPv6(host string) bool {
-	for i := 0; i < len(host); i++ {
-		if host[i] == ':' {
-			return true
-		}
-	}
-	return false
-}
-
 // ensureStableInstalled makes sure the binary at InstallPath can actually carry
 // out the auto-revoke this invite is about to schedule.
 //
@@ -1175,28 +1190,42 @@ func isIPv6(host string) bool {
 // running a freshly built binary from their home directory), so it is not an
 // edge case.
 //
-// An older binary is therefore replaced by this one. A newer or equal one, or
-// one whose version cannot be read, is left alone — never overwrite a binary we
-// failed to identify.
+// An older binary is therefore replaced by this one. A newer or equal one is
+// left alone. An installed command that cannot be safely identified aborts the
+// invite, because executing or overwriting an untrusted root path is unsafe.
 func (a *App) ensureStableInstalled() error {
 	if a.Selfmanage == nil {
 		return fmt.Errorf("self-manager not configured")
 	}
 	force := false
-	if _, err := os.Stat(a.InstallPath); err == nil {
+	if _, err := os.Lstat(a.InstallPath); err == nil {
+		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+			return fmt.Errorf("installed command is unsafe: %w", err)
+		}
 		installed, err := a.installedVersion()
 		if err != nil {
-			return nil
+			return fmt.Errorf("probe installed command: %w", err)
 		}
-		if !version.Greater(buildinfo.Version, installed) {
+		if strings.HasSuffix(buildinfo.Version, "-dev") {
+			// A development build is not ordered against releases. Install these exact
+			// bytes so its scheduled cleanup always runs the code creating the account.
+			force = true
+		} else if !version.Greater(buildinfo.Version, installed) {
 			return nil
+		} else {
+			a.info(fmt.Sprintf(a.P.M("已安装的稳定命令较旧（%s → %s）；自动删除任务由它执行，故一并升级。",
+				"the installed stable command is older (%s -> %s); the auto-delete task runs it, so it is upgraded too."),
+				installed, buildinfo.Version))
+			force = true
 		}
-		a.info(fmt.Sprintf(a.P.M("已安装的稳定命令较旧（%s → %s）；自动删除任务由它执行，故一并升级。",
-			"the installed stable command is older (%s -> %s); the auto-delete task runs it, so it is upgraded too."),
-			installed, buildinfo.Version))
-		force = true
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	exe, err := os.Executable()
+	executable := a.Executable
+	if executable == nil {
+		executable = os.Executable
+	}
+	exe, err := executable()
 	if err != nil {
 		return err
 	}
@@ -1204,8 +1233,20 @@ func (a *App) ensureStableInstalled() error {
 	if err != nil {
 		return err
 	}
-	_, err = a.Selfmanage.Install(bin, force)
-	return err
+	if _, err = a.Selfmanage.Install(bin, force); err != nil {
+		return err
+	}
+	if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+		return fmt.Errorf("installed command verification: %w", err)
+	}
+	installed, err := a.installedVersion()
+	if err != nil {
+		return fmt.Errorf("verify installed command version: %w", err)
+	}
+	if installed != buildinfo.Version {
+		return fmt.Errorf("installed command reports %s, want %s", installed, buildinfo.Version)
+	}
+	return nil
 }
 
 // installedVersion asks the installed command what version it is.

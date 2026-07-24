@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: '1.26.x'
           check-latest: true
       - name: Vet
         # -printf.funcs also checks our concatenating log helpers (printf/errorf/warnf)
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: '1.26.x'
           check-latest: true
       - name: Integration tests (root)
         run: sudo -E env "PATH=$PATH" go test -race -tags integration ./...
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: '1.26.x'
           check-latest: true
       - name: Static build ${{ matrix.goarch }}
         env:
@@ -63,12 +63,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: '1.26.x'
           check-latest: true
       - name: Govulncheck
         # Fails the build on any vulnerability the code actually calls. A finding is
         # cleared by building with a patched Go/dep (check-latest above pulls the newest
-        # 1.25.x, which carries the stdlib security backports) or by an explicit,
+        # 1.26.x, while go.mod pins the current security floor) or by an explicit,
         # documented suppression.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest

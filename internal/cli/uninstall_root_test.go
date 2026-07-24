@@ -155,7 +155,7 @@ func TestInventoryIgnoresTheGECOSMarker(t *testing.T) {
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
-	if !user.IsManaged(name) {
+	if !mustUserManaged(t, name) {
 		t.Fatalf("%s should carry the managed marker; the fixture is wrong", name)
 	}
 
@@ -270,7 +270,7 @@ func TestUninstallKeepsTheBinaryWhenAnAccountSurvives(t *testing.T) {
 	newRealAccount(t, a, name)
 
 	// Rewrite the row so the recorded UID no longer matches: revoke will refuse.
-	pw, _ := user.Lookup(name)
+	pw, _ := mustUserLookup(t, name)
 	if err := a.Registry.Record(registry.Record{
 		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
 		Host: "203.0.113.5", Port: 22, UID: pw.UID + 4242,
@@ -281,7 +281,7 @@ func TestUninstallKeepsTheBinaryWhenAnAccountSurvives(t *testing.T) {
 	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
 		t.Errorf("rc=%d, want 1 when an account survives", rc)
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Fatal("the survivor was deleted; this test proves nothing")
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
@@ -310,7 +310,7 @@ func TestUninstallRefusesFromTheAccountItWouldDelete(t *testing.T) {
 	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
 		t.Errorf("rc=%d, want 1", rc)
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Error("the uninstall deleted the account running it")
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
@@ -348,7 +348,7 @@ func TestUninstallRemovesAWitnessOnlyAccount(t *testing.T) {
 	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 0 {
 		t.Fatalf("rc=%d, want 0: a witness-only account must be removable, not a permanent blocker", rc)
 	}
-	if user.Exists(name) {
+	if mustUserExists(t, name) {
 		t.Error("the witness-only account survived the uninstall")
 	}
 	if _, err := os.Stat(a.Sudoers.FilePath(name)); !os.IsNotExist(err) {
@@ -379,6 +379,23 @@ func TestUninstallRefusesWhenV1RegistryIsUnreadable(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "refusing to uninstall") {
 		t.Errorf("want a refusal; got %q", errb.String())
+	}
+}
+
+func TestUninstallRefusesMalformedV1Registry(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	v1 := filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile))
+	if err := os.WriteFile(v1, []byte("not a valid username\t2026-07-24\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if rc := a.uninstall([]string{"--yes"}); rc != 1 {
+		t.Errorf("rc=%d, want 1 for a malformed v1 registry", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Error("the binary was removed despite a malformed v1 registry")
+	}
+	if !strings.Contains(errb.String(), "invalid username") {
+		t.Errorf("malformed row was not reported: %q", errb.String())
 	}
 }
 
@@ -460,7 +477,7 @@ func TestUninstallRefusesEarlyOnAnUnremovableBinary(t *testing.T) {
 	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
 		t.Errorf("rc=%d, want 1 (refuse early on an unremovable binary)", rc)
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Error("HIGH: the account was deleted before the binary refusal — the teardown ran anyway")
 	}
 	if _, err := os.Lstat(a.InstallPath); err != nil {
@@ -526,7 +543,7 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 	if _, err := os.Stat(grant); err == nil {
 		t.Error("MEDIUM: a grant whose name a real account reused was left on disk (invisible orphan)")
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Error("compact must strip the grant but never delete the real account")
 	}
 }
@@ -535,17 +552,22 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 // gap: an account that asked to auto-delete, still exists, and whose unit was
 // removed out of band will never be deleted (chage still blocks its login at
 // expiry, so this is tidiness, not a live-access hole). doctor now surfaces it.
-func TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft(t *testing.T) {
-	const name = "ltanotask1"
+func TestDoctorReportsAutoDeleteAccountsWithNoTaskLeft(t *testing.T) {
+	const systemdName = "ltanotask1"
+	const atName = "ltanotask2"
 	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	newRealAccount(t, a, name) // registers with the real UID
-	// Mark the row auto-revoke, but write NO unit for it.
-	rec, _, _ := a.Registry.Lookup(name)
-	rec.AutoRevoke = true
-	rec.AutoUnit = ""
-	if err := a.Registry.Record(rec); err != nil {
-		t.Fatal(err)
+	for name, unit := range map[string]string{systemdName: "", atName: "at:42"} {
+		newRealAccount(t, a, name) // registers with the real UID
+		rec, _, err := a.Registry.Lookup(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec.AutoRevoke = true
+		rec.AutoUnit = unit
+		if err := a.Registry.Record(rec); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if rc := a.doctor(nil); rc != 1 {
@@ -553,6 +575,11 @@ func TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "no task left") {
 		t.Errorf("doctor did not surface the taskless auto-delete account: %q", errb.String())
+	}
+	for _, name := range []string{systemdName, atName} {
+		if !strings.Contains(errb.String(), name) {
+			t.Errorf("doctor did not report %s: %q", name, errb.String())
+		}
 	}
 }
 

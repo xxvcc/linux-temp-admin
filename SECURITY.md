@@ -46,5 +46,7 @@ Out of scope:
 - Treat every invite bundle as a secret because it contains a one-time private key.
 - Revoke access immediately after use; do not rely only on expiry.
 - Grant `--sudo` only to users you trust with full root access.
-- Keep `/usr/local/sbin/linux-temp-admin` root-owned and not group/world writable.
+- Keep `/usr/local/sbin/linux-temp-admin` a root-owned regular file, never a symlink, and not group/world writable. Invites refuse to schedule against a command that fails those checks or cannot report a valid version.
+- Keep `/var/lib/linux-temp-admin/v2/registry.tsv` root-owned and unmodified. Registry corruption or read failure is handled fail-closed; unattended revokes additionally require the recorded UID and random generation token to match, and every live deletion still requires the exact managed GECOS marker.
+- Treat revoke or rollback cleanup errors as unresolved incidents. The command returns nonzero and retains the account/registry when a name-scoped sudoers or sshd grant cannot be safely removed.
 - v2: `upgrade` verifies an ed25519 signature against the embedded release key before installing (fails closed); the `install.sh` bootstrap verifies both the published SHA-256 checksum and a detached ed25519 signature (against the release key embedded in the script) over HTTPS, failing closed unless `LTA_ALLOW_UNVERIFIED=1` is set when openssl is unavailable. Report any way to bypass either check.

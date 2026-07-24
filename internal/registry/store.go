@@ -92,9 +92,17 @@ func (s *Store) readAll() ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
+	lines := strings.Split(string(b), "\n")
+	if len(lines) == 0 || lines[0] != Header {
+		return nil, fmt.Errorf("registry header is missing or unsupported")
+	}
 	var recs []Record
-	for _, line := range strings.Split(string(b), "\n") {
-		if r, ok := ParseLine(line); ok {
+	for i, line := range lines[1:] {
+		r, ok, err := ParseLine(line)
+		if err != nil {
+			return nil, fmt.Errorf("registry line %d: %w", i+2, err)
+		}
+		if ok {
 			recs = append(recs, r)
 		}
 	}
@@ -115,6 +123,12 @@ func (s *Store) writeAll(recs []Record) error {
 
 // Record upserts rec (replacing any existing entry for the same user).
 func (s *Store) Record(rec Record) error {
+	if _, ok, err := ParseLine(rec.TSV()); err != nil || !ok {
+		if err == nil {
+			err = fmt.Errorf("record did not produce a data row")
+		}
+		return fmt.Errorf("invalid registry record: %w", err)
+	}
 	return s.withLock(func() error {
 		recs, err := s.readAll()
 		if err != nil {
@@ -207,7 +221,7 @@ func (s *Store) UnitFor(user string) (string, error) {
 // held lock (re-checking existence inside it) so a concurrent recreate cannot
 // lose its fresh entry. exists reports whether an account is still present.
 // Returns the number of entries pruned.
-func (s *Store) Compact(exists func(user string) bool) (int, error) {
+func (s *Store) Compact(exists func(user string) (bool, error)) (int, error) {
 	removed := 0
 	err := s.withLock(func() error {
 		recs, err := s.readAll()
@@ -216,7 +230,11 @@ func (s *Store) Compact(exists func(user string) bool) (int, error) {
 		}
 		out := recs[:0:0]
 		for _, r := range recs {
-			if exists(r.User) {
+			live, err := exists(r.User)
+			if err != nil {
+				return err
+			}
+			if live {
 				out = append(out, r)
 			} else {
 				removed++

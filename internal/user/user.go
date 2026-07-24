@@ -33,15 +33,17 @@ type Passwd struct {
 }
 
 // Lookup returns the passwd entry for name (local accounts only; no NSS).
-func Lookup(name string) (Passwd, bool) {
+// A caller must distinguish a confirmed absence from an unreadable or malformed
+// account database; destructive lifecycle operations fail closed on err.
+func Lookup(name string) (Passwd, bool, error) {
 	// os.ReadFile, not a bufio.Scanner: a scanner ignores a mid-file read error and
 	// stops early, which would make an account later in the file look absent — and
 	// Lookup backs user.Exists, which the teardown trusts as ground truth. ReadFile
-	// either returns the whole file or an error; a read error reads as "absent",
-	// the same as a missing file, but a partial read can never masquerade as EOF.
+	// either returns the whole file or an error, so a partial read can never
+	// masquerade as EOF or as a missing account.
 	data, err := os.ReadFile(passwdPath)
 	if err != nil {
-		return Passwd{}, false
+		return Passwd{}, false, fmt.Errorf("read passwd database: %w", err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.Split(line, ":")
@@ -51,64 +53,43 @@ func Lookup(name string) (Passwd, bool) {
 		uid, err1 := strconv.Atoi(parts[2])
 		gid, err2 := strconv.Atoi(parts[3])
 		if err1 != nil || err2 != nil {
-			return Passwd{}, false
+			return Passwd{}, false, fmt.Errorf("malformed passwd entry for %s", name)
 		}
-		return Passwd{Name: parts[0], UID: uid, GID: gid, GECOS: parts[4], Home: parts[5], Shell: parts[6]}, true
+		return Passwd{Name: parts[0], UID: uid, GID: gid, GECOS: parts[4], Home: parts[5], Shell: parts[6]}, true, nil
 	}
-	return Passwd{}, false
+	return Passwd{}, false, nil
 }
 
 // Exists reports whether name is a local account.
-func Exists(name string) bool { _, ok := Lookup(name); return ok }
-
-// groupPath is the group database; overridable in tests.
-var groupPath = "/etc/group"
+func Exists(name string) (bool, error) {
+	_, ok, err := Lookup(name)
+	return ok, err
+}
 
 // Groups returns pw's group names: its primary group, plus every group that
 // lists it as a member. This is exactly the set sshd evaluates AllowGroups and
 // DenyGroups against, so an invite can tell whether a whitelist would admit the
 // account it is about to create.
-func Groups(pw Passwd) []string {
-	// Whole-file read for the same reason as Lookup: a truncated scan would
-	// under-report group membership, and that feeds the AllowGroups/DenyGroups
-	// preview an invite decides a login on.
-	data, err := os.ReadFile(groupPath)
+func Groups(pw Passwd) ([]string, error) {
+	// Use the system identity resolver rather than parsing /etc/group: sshd also
+	// consults NSS, so LDAP/SSSD memberships must participate in DenyGroups.
+	out, err := exec.Command("id", "-Gn", pw.Name).Output()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("resolve groups for %s: %w", pw.Name, err)
 	}
-	var primary string
-	var extra []string
-	for _, line := range strings.Split(string(data), "\n") {
-		// name:passwd:gid:member,member,...
-		parts := strings.Split(line, ":")
-		if len(parts) < 4 {
-			continue
-		}
-		if gid, err := strconv.Atoi(parts[2]); err == nil && gid == pw.GID {
-			primary = parts[0]
-			continue
-		}
-		for _, m := range strings.Split(parts[3], ",") {
-			if m == pw.Name {
-				extra = append(extra, parts[0])
-				break
-			}
-		}
+	groups := strings.Fields(string(out))
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("identity resolver returned no groups for %s", pw.Name)
 	}
-	// The primary group comes first: it is the one a grant names when it has to
-	// satisfy an AllowGroups whitelist.
-	if primary == "" {
-		return extra
-	}
-	return append([]string{primary}, extra...)
+	return groups, nil
 }
 
 // IsManaged reports whether name's GECOS carries the exact managed tag this tool
 // sets — an exact match on the GECOS full-name subfield, not a bare substring, so
 // a self-set partial GECOS cannot pose as managed.
-func IsManaged(name string) bool {
-	pw, ok := Lookup(name)
-	return ok && hasManagedGECOS(pw.GECOS)
+func IsManaged(name string) (bool, error) {
+	pw, ok, err := Lookup(name)
+	return ok && hasManagedGECOS(pw.GECOS), err
 }
 
 // hasManagedGECOS reports whether a GECOS value is exactly the managed tag. It
@@ -154,61 +135,42 @@ func IsReservedName(name string) bool {
 // since-deleted temp account is never touched, even if a stale registry entry
 // still names it.
 //
-// "Proven to be ours" has two independent witnesses, and either suffices:
-//
-//   - The recorded UID still matches the account's current UID. This is the
-//     stronger witness: it was fixed at creation, before the invitee had any
-//     access, and it cannot be forged by the account itself the way GECOS can
-//     (an invitee with the granted NOPASSWD sudo — or plain chfn where
-//     CHFN_RESTRICT permits — can erase the marker and, without this, make its
-//     own account permanently unrevocable). It stays reuse-proof because a
-//     recreated account under the same name draws a fresh UID.
-//   - The managed GECOS marker. Still honoured, because rows written before the
-//     UID was recorded carry no UID, and those accounts must remain revocable.
+// A current managed GECOS marker proves the account is in this tool's namespace.
+// A recorded UID is a contradiction detector, not a sufficient witness: Linux
+// can reuse the same UID after an out-of-band deletion and recreation. If the
+// recorded and current UIDs differ, deletion is refused; if they match, the
+// marker is still required.
 //
 // An account that escalates itself to UID 0 stays protected: never auto-delete a
 // root account. The caller is expected to report that tamper rather than retry —
 // see UIDTampered.
-func IsProtectedRevokeTarget(name string, registered bool, recordedUID int) bool {
+func IsProtectedRevokeTarget(name string, registered bool, recordedUID int) (bool, error) {
 	if IsReservedName(name) {
-		return true
+		return true, nil
 	}
-	pw, ok := Lookup(name)
+	pw, ok, err := Lookup(name)
+	if err != nil {
+		return true, err
+	}
 	if !ok {
-		// Unresolvable: protect unless the registry vouches for it.
-		return !registered
+		return !registered, nil
 	}
 	if pw.UID == 0 {
-		return true
+		return true, nil
 	}
-	// A UID recorded at creation decides this on its own, in BOTH directions.
-	//
-	// It matching proves the account is the one the tool made, whatever its GECOS
-	// says now. It DISAGREEING is not a missing witness but a contradicting one:
-	// whatever this account is today, it is provably not the one created under this
-	// name, and a disproof must not be overruled by the marker the account itself
-	// can write. Letting it be overruled had teeth beyond deleting the wrong
-	// account: revoke aims its SIGKILL sweep at the UID standing in passwd
-	// (revoke.go), so an account carrying a UID the tool never issued had that sweep
-	// pointed wherever its UID now pointed — at a real user's processes if the two
-	// collide. The caller reports the tamper; see UIDTampered.
-	//
-	// Only a row that recorded no UID at all falls through to the marker, because
-	// those rows predate the UID being recorded and their accounts must stay
-	// revocable.
 	if registered && recordedUID > 0 {
-		return pw.UID != recordedUID
+		if pw.UID != recordedUID {
+			return true, nil
+		}
 	}
 	managed := hasManagedGECOS(pw.GECOS)
 	if pw.UID < 1000 {
-		return !(registered && managed)
+		return !(registered && managed), nil
 	}
-	// A registry entry is name-keyed and can outlive the account it named (stale
-	// entries are pruned only by an explicit `cleanup-expired --compact`), so a reused
-	// username could inherit a stale entry that wrongly vouches for a real account. The
-	// managed GECOS marker, by contrast, is per-account and reuse-proof, so it — not
-	// `registered` — is what makes a real-UID account safe to delete.
-	return !managed
+	// UIDs are reusable. Even a matching recorded UID cannot prove that this is the
+	// same account generation after an out-of-band deletion and recreation. Require
+	// the per-account marker as well; ambiguity is safer to leave for an operator.
+	return !managed, nil
 }
 
 // UIDTampered reports whether name's current UID differs from the one the
@@ -217,15 +179,18 @@ func IsProtectedRevokeTarget(name string, registered bool, recordedUID int) bool
 // root and permanently protected). It is advisory: the caller reports it so the
 // operator knows automatic revocation cannot proceed and why. Returns false when
 // nothing was recorded (an older row) or the account is gone.
-func UIDTampered(name string, recordedUID int) (current int, tampered bool) {
+func UIDTampered(name string, recordedUID int) (current int, tampered bool, err error) {
 	if recordedUID <= 0 {
-		return 0, false
+		return 0, false, nil
 	}
-	pw, ok := Lookup(name)
+	pw, ok, err := Lookup(name)
+	if err != nil {
+		return 0, false, err
+	}
 	if !ok {
-		return 0, false
+		return 0, false, nil
 	}
-	return pw.UID, pw.UID != recordedUID
+	return pw.UID, pw.UID != recordedUID, nil
 }
 
 // Runner executes account-management commands; injectable for tests.

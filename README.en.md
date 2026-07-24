@@ -85,7 +85,7 @@ A non-interactive run (a script, CI, the auto-revoke timer) has nobody to ask, s
 
 ## Install, upgrade, and doctor
 
-The install script is the recommended path: it downloads the latest released binary for your architecture (amd64 / arm64), **verifies its SHA-256 and a detached ed25519 signature against the release key embedded in the script**, and installs it to `/usr/local/sbin/linux-temp-admin` — failing closed on any mismatch (and, when openssl is unavailable, refusing to install unless `LTA_ALLOW_UNVERIFIED=1` is set).
+The install script is the recommended path: it must run as root, downloads the latest released binary for your architecture (amd64 / arm64), **verifies its SHA-256 and a detached ed25519 signature against the release key embedded in the script**, and installs it to `/usr/local/sbin/linux-temp-admin` — failing closed on any mismatch (and, when openssl is unavailable, refusing to install unless `LTA_ALLOW_UNVERIFIED=1` is set). Downloads and redirects are HTTPS-only and each response is capped at 64 MiB; use curl, or wget with both `--https-only` and `--max-filesize` support.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh
@@ -102,8 +102,8 @@ sudo linux-temp-admin uninstall         # uninstall: accounts, grants, auto-dele
 sudo ./linux-temp-admin install         # put the binary in hand into place (note the leading ./)
 ```
 
-- **`upgrade`** fetches a new binary from GitHub and installs it only **after the embedded ed25519 public key verifies it** (fail-closed); HTTPS only, capped at 64 MiB, overwrites only when the version is newer. To repair or pin a custom source, use `--force --url URL` (its signature is `URL.sig`). **Use this for routine updates.**
-- **`install`** places a binary you **already have** (no network, no signature check) — for an air-gapped host or a self-built binary. It copies the binary that is *currently running*, so it is only meaningful when you run a copy from elsewhere (`sudo ./linux-temp-admin install`, where the leading `./` is the point). It refuses to overwrite a *different* binary without `--force`.
+- **`upgrade`** fetches a new binary from GitHub and installs it only **after the embedded ed25519 public key verifies it** (fail-closed); HTTPS only, capped at 64 MiB, overwrites only when the version is newer. The address actually dialed after a redirect cannot be private or reserved (including documentation, benchmarking, NAT64, and 6to4 ranges). To repair or pin a custom source, use `--force --url URL` (its signature is `URL.sig`). **Use this for routine updates.**
+- **`install`** places a binary you **already have** (no network, no signature check) — for an air-gapped host or a self-built binary. It copies the binary that is *currently running*, so it is only meaningful when you run a copy from elsewhere (`sudo ./linux-temp-admin install`, where the leading `./` is the point). It refuses to overwrite a *different* binary without `--force`. Because auto-delete jobs execute the installed path, an invite refuses an unsafe installed command or one whose version cannot be read; development builds install the exact bytes currently running.
 
 ## Full walkthrough
 
@@ -131,7 +131,7 @@ The following is a format sample only and **cannot be used to log in**. The real
 Host: 203.0.113.10
 Port: 22
 User: xxvcc-a1b2c3d4e5
-Expires: 2026-07-09 01:00:00 CST
+Expires: 2030-01-02 12:00:00 CST
 Sudo: yes
 Login: SSH key only (verified against the effective sshd config)
 Password login: locked
@@ -313,14 +313,14 @@ The binary itself has no runtime dependencies. It only calls the system's **acco
 
 ### Expiry vs auto-delete
 
-The default lifetime is 24 hours, and **auto-delete is on by default**. With auto-delete on, the tool both sets a day-granularity account expiry with `chage -E` (to block further logins at the deadline) and writes an auto-delete task that actually removes the user then: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed command, so the tool ensures `/usr/local/sbin/linux-temp-admin` exists first (and even if the registry row is gone by expiry, the task still proves the account is one this tool made before deleting it and stripping its grants).
+The default lifetime is 24 hours, and **auto-delete is on by default**. With auto-delete on, the tool both sets a day-granularity account expiry with `chage -E` (to block further logins at the deadline) and writes an auto-delete task that actually removes the user then: a persistent systemd timer preferred, `at` as fallback, degrading to expiry-only (with a "revoke manually" note in the bundle) if neither is available. The auto-delete task invokes the installed command, so the tool ensures `/usr/local/sbin/linux-temp-admin` exists first. Each task is bound to the creation UID, a random 128-bit generation token, and the matching registry row; any mismatch (including a lost row or a recreated account) safely skips deletion. Failed systemd revokes retry with rate limiting; `at` and legacy one-shot failures need manual attention, and `doctor` reports registered accounts whose auto-delete task is missing.
 
 **Auto-delete off = a permanent account**: no expiry is set and it is never deleted — revoke it by hand. `--hours` is ignored in that case.
 
 Two host notes:
 
 - In interactive mode without `--host`, cloud metadata and local interfaces are probed **silently** (neither leaves this host or its link), and whatever they find becomes the default in the host prompt — press Enter to accept it, or type over it. Only when no public IP is found locally does it **ask** before querying `https://api.ipify.org`, `https://ifconfig.me/ip`, and `https://icanhazip.com`: that step discloses your server's address to a third party, so it needs an explicit yes. `--yes` mode never reaches out at all; it requires an explicit `--host`.
-- `--host` accepts a plain domain, IPv4, or IPv6 only; do not append a port (use `--port`). The SSH command in the bundle brackets IPv6 addresses automatically.
+- `--host` accepts a plain domain, IPv4, or IPv6 only; do not append a port (use `--port`). The SSH command in the bundle brackets IPv6 addresses automatically. Auto-detection accepts only routable public addresses and excludes private, link-local, documentation, benchmarking, CGNAT, and other reserved ranges; an explicit domain or address remains the operator's choice.
 
 ### Files written
 
@@ -332,6 +332,7 @@ Two host notes:
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.service  # with NoNewPrivileges and similar light confinement
 /etc/systemd/system/linux-temp-admin-v2-revoke-USER.timer
 /etc/sudoers.d/linux-temp-admin-USER                         # only when NOPASSWD sudo is enabled
+/etc/ssh/sshd_config.d/10-linux-temp-admin-USER.conf         # only with --fix-sshd; one Match User block, removed by revoke
 /home/USER/.ssh/authorized_keys
 # plus a fallback auto-delete job in the at queue when systemd is unavailable
 ```
@@ -343,10 +344,12 @@ Two host notes:
 - **sshd's global configuration is never edited.** `--fix-sshd` writes a separate drop-in holding a single `Match User` block (no other account's policy changes by one byte); it is syntax-checked with `sshd -t`, proved effective with `sshd -T`, reloaded (never restarted), removed on any failure, and deleted by `revoke`. **An explicit `DenyUsers`/`DenyGroups` rule is never bypassed.**
 - `--password-login` is the weakest grant available (brute-forceable from anywhere, delivered in the clear). It is opt-in only, and refuses unless sshd is verified to accept passwords.
 - **NOPASSWD sudo is essentially root.** Grant it only to trusted parties. Revoking deletes the account itself; it does not clean up processes, cron jobs, systemd units, or SUID files that account left behind as root.
-- Deleting a user also deletes the home directory and SSH key. If the system's delete command fails, the tool stops and tells you to check manually rather than pretending the revoke succeeded.
-- **Guard against accidental deletion**: `revoke` only deletes users this tool registered. Deleting an unregistered account that **this tool created** (its GECOS carries the `linux-temp-admin` marker) requires an explicit `--force`, plus `--confirm-force USER` when non-interactive.
-- Even with `--force`, it refuses to delete root, well-known system accounts, UID 0, low-UID system accounts, and **any real account that this tool did not create (no marker) and did not register** — use the system's `userdel` for those.
-- A failure partway through creation rolls back what it can (cancel auto-revoke, remove the sudoers drop-in and registry entry, delete the just-created user).
+- Deleting a user also deletes the home directory and SSH key. An SSH home must belong exactly to the target UID and can never be a root/UID-0 directory. If the system's delete command fails, the tool stops and tells you to check manually rather than pretending the revoke succeeded.
+- **Guard against accidental deletion**: `revoke` normally requires a registry row, but a row and matching UID are still not identity proof; the current account must also retain the exact managed GECOS marker. A UID, marker, or scheduled generation mismatch refuses or skips deletion. Deleting an unregistered account with the exact marker requires explicit `--force`, plus `--confirm-force USER` when non-interactive.
+- Even with `--force`, it refuses to delete root, well-known system accounts, UID 0, low-UID system accounts, and **any real account that this tool did not create (no exact marker)** — use the system's `userdel` for those.
+- A failure at any creation step attempts a full rollback of the schedule, sudoers grant, sshd exception, registry row, and newly created account. Any rollback failure is reported and returns nonzero instead of presenting partial success as success.
+- If a sudoers grant or sshd exception cannot be fully removed during revoke, the account and registry row are retained and login is disabled when possible, preventing a surviving name-scoped grant from re-arming after username reuse. Cleanup, registry, and scheduler errors also return nonzero.
+- The registry strictly validates its schema, fields, UID, and generation token. If it is corrupt or unreadable, `status`, `doctor`, cleanup, revoke, and uninstall fail closed instead of treating "unreadable" as "no accounts."
 - Upgrades are HTTPS-only and ed25519-signature-enforced; a verification failure aborts, so an unsigned or mis-signed binary is never installed.
 - Every privileged action (account create/delete, install/upgrade/uninstall) is appended as a JSON line to the root-owned `/var/log/linux-temp-admin/audit.log` (time, actor `SUDO_USER`, action, target, result).
 - When stdout is not a TTY, printing the private key is refused by default; pass `--allow-non-tty-private-key-output` only when the output channel is known to be safe.

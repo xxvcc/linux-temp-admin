@@ -195,7 +195,7 @@ func TestOrphansFindsExceptionsWhoseAccountIsGone(t *testing.T) {
 		}
 	}
 	m := &Manager{Dir: dir}
-	orphans, err := m.Orphans(func(u string) bool { return u == "xxvcc-alive" })
+	orphans, err := m.Orphans(func(u string) (bool, error) { return u == "xxvcc-alive", nil })
 	if err != nil {
 		t.Fatal(err)
 	}

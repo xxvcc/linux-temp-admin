@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
@@ -23,8 +24,36 @@ func (fakeSys) HasSystemctl() bool                     { return false }
 func (fakeSys) Systemctl(...string) error              { return nil }
 func (fakeSys) HasAt() bool                            { return false }
 func (fakeSys) ScheduleAt(string, int) (string, error) { return "", nil }
-func (fakeSys) RemoveAtJobsFor(string)                 {}
-func (fakeSys) AtrmJob(string)                         {}
+func (fakeSys) RemoveAtJobsFor(string) error           { return nil }
+func (fakeSys) AtrmJob(string) error                   { return nil }
+func (fakeSys) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+
+func mustUserExists(t *testing.T, name string) bool {
+	t.Helper()
+	exists, err := user.Exists(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exists
+}
+
+func mustUserLookup(t *testing.T, name string) (user.Passwd, bool) {
+	t.Helper()
+	pw, ok, err := user.Lookup(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pw, ok
+}
+
+func mustUserManaged(t *testing.T, name string) bool {
+	t.Helper()
+	managed, err := user.IsManaged(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return managed
+}
 
 // newManageApp is newTestApp plus the collaborators a revoke reached from the
 // menu actually touches, all pointed at temp dirs. It needs root: the registry
@@ -262,10 +291,10 @@ func newRealAccount(t *testing.T, a *App, name string) int {
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", name).CombinedOutput(); err != nil {
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd %s: %v: %s", name, err, out)
 	}
-	pw, ok := user.Lookup(name)
+	pw, ok := mustUserLookup(t, name)
 	if !ok {
 		t.Fatalf("%s was not created", name)
 	}
@@ -292,7 +321,7 @@ func TestManageUsersRevokeRefusesWithoutTheFullName(t *testing.T) {
 	if rc := a.manageUsers(); rc != 0 {
 		t.Fatalf("a refused confirmation is a cancel, not an error: rc=%d", rc)
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Fatal("THE ACCOUNT WAS DELETED without the operator typing its name")
 	}
 	if got := regUsers(t, a); len(got) != 1 || got[0] != name {
@@ -315,7 +344,7 @@ func TestManageUsersRevokeDeletesOnceTheFullNameIsTyped(t *testing.T) {
 	if rc := a.manageUsers(); rc != 0 {
 		t.Fatalf("rc=%d, want 0", rc)
 	}
-	if user.Exists(name) {
+	if mustUserExists(t, name) {
 		t.Error("the account survived a confirmed revoke")
 	}
 	if got := regUsers(t, a); len(got) != 0 {
@@ -370,7 +399,7 @@ func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
-	pw, ok := user.Lookup(name)
+	pw, ok := mustUserLookup(t, name)
 	if !ok {
 		t.Fatal("account not created")
 	}
@@ -387,7 +416,7 @@ func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	if rc := a.revoke([]string{"--user", name, "--yes"}); rc != 1 {
 		t.Errorf("rc=%d, want 1 (refused)", rc)
 	}
-	if !user.Exists(name) {
+	if !mustUserExists(t, name) {
 		t.Error("THE ACCOUNT WAS DELETED even though its UID proves it is not the one the tool made")
 	}
 	if !strings.Contains(errb.String(), "UID") {

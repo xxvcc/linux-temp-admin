@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here.
 
+## v2.7.1 - Fail-closed account lifecycle hardening
+
+- **Auto-revoke is bound to one account generation.** New scheduled jobs carry
+  the creation UID and a random 128-bit generation token, both recorded in the
+  registry. A missing row, changed token, changed UID, recreated account, or
+  missing exact managed GECOS marker safely skips/refuses deletion. Failed
+  systemd revokes retry with rate limiting, and `doctor` now detects missing `at`
+  jobs as well as missing systemd timers.
+
+- **Registry and account reads fail closed.** The v2 registry strictly validates
+  its header, row shape, usernames, ports, booleans, UIDs, and generation tokens;
+  corrupt or unreadable v1/v2 inventory blocks uninstall. NSS-backed group lookup
+  now uses `id -Gn`, and sshd `Match` analysis follows nested explicit `Include`s,
+  refusing an unreadable include instead of guessing.
+
+- **Invite and revoke cleanup is transactional and observable.** Registry or
+  invite-output failure triggers full rollback. Rollback, scheduler cancellation,
+  sudoers, sshd, registry, and compact/status/doctor cleanup errors propagate as
+  nonzero results. A surviving name-scoped grant keeps the account and registry
+  row in place while login is disabled when possible, preventing privilege from
+  re-arming after username reuse.
+
+- **Installed-command and filesystem safety is stricter.** Auto-delete refuses a
+  stable command unless it is a root-owned regular non-symlink with a readable
+  valid version. Development builds install their exact current bytes. SSH home
+  directories must belong exactly to the target UID and can never resolve to a
+  root/UID-0 directory.
+
+- **Install and release tooling is hardened.** The bootstrap installer requires
+  root, HTTPS-only redirects, a 64 MiB response limit, and successful root chown.
+  Release key generation is create-only and rejects symlinks; release versions
+  and tags must use the documented semantic-version form. Upgrade redirect
+  address validation rejects additional reserved, documentation, benchmarking,
+  NAT64, and 6to4 ranges at dial time.
+
+- The Go security floor is now 1.26.5, with CI using the latest 1.26.x patch.
+
 ## v2.7.0 - A shorter invite flow, and "no auto-delete" means permanent
 
 - **The interactive invite asks less.** The public IP, when detected locally

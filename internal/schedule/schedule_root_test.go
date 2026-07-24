@@ -23,7 +23,7 @@ func TestScheduleWritesSystemdUnits(t *testing.T) {
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
 
-	unit, err := s.Schedule("xxvcc-a1", 24)
+	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 24)
 	if err != nil {
 		t.Fatal(err)
 	}

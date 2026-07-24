@@ -74,7 +74,7 @@ func TestStoreCompact(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	removed, err := s.Compact(func(user string) bool { return user == "xxvcc-live" })
+	removed, err := s.Compact(func(user string) (bool, error) { return user == "xxvcc-live", nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,5 +109,35 @@ func TestStoreConcurrentRecord(t *testing.T) {
 	}
 	if len(recs) != n {
 		t.Errorf("got %d records after %d concurrent writes, want %d", len(recs), n, n)
+	}
+}
+
+func TestStoreRejectsCorruptRegistry(t *testing.T) {
+	s := newStore(t)
+	if err := os.WriteFile(s.File, []byte(registry.Header+"\ninvalid\trow\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(); err == nil {
+		t.Fatal("a corrupt record must make the registry unreadable")
+	}
+	if err := os.WriteFile(s.File, []byte("# wrong schema\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.List(); err == nil {
+		t.Fatal("an unsupported registry header must be rejected")
+	}
+}
+
+func TestStoreRejectsInvalidRecordBeforeWriting(t *testing.T) {
+	s := newStore(t)
+	if err := s.Record(registry.Record{User: "not a valid username", Port: 22}); err == nil {
+		t.Fatal("Record accepted an invalid username")
+	}
+	recs, err := s.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 0 {
+		t.Errorf("invalid Record poisoned the registry: %v", recs)
 	}
 }

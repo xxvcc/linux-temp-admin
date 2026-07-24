@@ -13,6 +13,8 @@ set -Eeuo pipefail
 
 VERSION="${1:?usage: release.sh X.Y.Z}"
 : "${LTA_SIGN_KEY:?set LTA_SIGN_KEY to the ed25519 private key file}"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
+  || { echo "version must be X.Y.Z or X.Y.Z-prerelease" >&2; exit 1; }
 
 cd "$(dirname "$0")/.."
 rm -rf dist && mkdir -p dist

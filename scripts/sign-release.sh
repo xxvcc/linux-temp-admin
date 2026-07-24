@@ -24,6 +24,8 @@ set -Eeuo pipefail
 
 TAG="${1:?usage: sign-release.sh vX.Y.Z}"
 : "${LTA_SIGN_KEY:?set LTA_SIGN_KEY to the ed25519 private key file}"
+[[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
+  || { echo "tag must be vX.Y.Z or vX.Y.Z-prerelease" >&2; exit 1; }
 
 cd "$(dirname "$0")/.."
 PUBHEX="internal/selfmanage/release_pubkey.hex"

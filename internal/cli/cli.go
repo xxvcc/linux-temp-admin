@@ -67,6 +67,7 @@ type App struct {
 	StdoutIsTTY  func() bool
 	StdinIsTTY   func() bool
 	Geteuid      func() int
+	Executable   func() (string, error)
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -96,6 +97,7 @@ func NewApp(lang i18n.Lang) *App {
 		StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
 		StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
 		Geteuid:      os.Geteuid,
+		Executable:   os.Executable,
 	}
 }
 

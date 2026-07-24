@@ -150,7 +150,7 @@ func (m *Manager) All() ([]string, error) {
 // something went wrong — an account deleted out of band, or a revoke that could
 // not finish — so nothing else will notice them. This is what lets `doctor`
 // report them and `cleanup-expired --compact` remove them.
-func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
+func (m *Manager) Orphans(exists func(string) (bool, error)) ([]string, error) {
 	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*"))
 	if err != nil {
 		return nil, err
@@ -160,8 +160,14 @@ func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
 		user := strings.TrimPrefix(filepath.Base(path), filePrefix)
 		// validate.Username keeps a hand-made file with a strange name from being
 		// reported (and later removed) as if this tool had written it.
-		if user != "" && validate.Username(user) && !exists(user) {
-			orphans = append(orphans, user)
+		if user != "" && validate.Username(user) {
+			live, err := exists(user)
+			if err != nil {
+				return nil, err
+			}
+			if !live {
+				orphans = append(orphans, user)
+			}
 		}
 	}
 	return orphans, nil

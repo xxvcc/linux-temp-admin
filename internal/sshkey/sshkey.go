@@ -56,6 +56,12 @@ func GenerateEd25519(comment string) (*KeyPair, error) {
 // authorizedKey to .ssh/authorized_keys (0600, owned by uid:gid), refusing any
 // symlinked component and never following one.
 func WriteAuthorizedKeys(homeDir string, uid, gid int, authorizedKey []byte) error {
+	if uid < 1 || gid < 1 {
+		return fmt.Errorf("refusing non-user uid/gid %d:%d", uid, gid)
+	}
+	if !filepath.IsAbs(homeDir) || filepath.Clean(homeDir) == "/" {
+		return fmt.Errorf("home directory %s is not a safe absolute user home", homeDir)
+	}
 	fi, err := os.Lstat(homeDir)
 	if err != nil {
 		return fmt.Errorf("home directory: %w", err)
@@ -63,15 +69,15 @@ func WriteAuthorizedKeys(homeDir string, uid, gid int, authorizedKey []byte) err
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("home directory %s is not a safe directory", homeDir)
 	}
-	// The home must belong to the account (or root); refuse to write into a dir
+	// The home must belong exactly to the account; refuse to write into a dir
 	// owned by anyone else, so a hijacked home can't redirect the key write. Fail
 	// closed if ownership can't be determined (mirrors fsutil's stat handling).
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("cannot determine owner of home directory %s", homeDir)
 	}
-	if st.Uid != uint32(uid) && st.Uid != 0 {
-		return fmt.Errorf("home directory %s is not owned by the account or root", homeDir)
+	if st.Uid != uint32(uid) {
+		return fmt.Errorf("home directory %s is not owned by the account", homeDir)
 	}
 	sshDir := filepath.Join(homeDir, ".ssh")
 	if fi, err := os.Lstat(sshDir); err == nil {

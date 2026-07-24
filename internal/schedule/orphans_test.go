@@ -16,8 +16,10 @@ func newFinder(t *testing.T, files ...string) *Scheduler {
 	}
 	return &Scheduler{
 		SystemdDir:         dir,
+		InstallPath:        "/usr/local/sbin/linux-temp-admin",
 		UnitPrefix:         "linux-temp-admin-v2-revoke-",
 		LegacyUnitPrefixes: []string{"linux-temp-admin-revoke-"},
+		Sys:                &fakeSystem{},
 	}
 }
 
@@ -102,9 +104,22 @@ func TestOrphansAreUnitsWhoseAccountIsGone(t *testing.T) {
 		"linux-temp-admin-v2-revoke-gone.timer",
 		"linux-temp-admin-revoke-v1gone.timer",
 	)
-	orphans, err := s.Orphans(func(u string) bool { return u == "alive" })
+	orphans, err := s.Orphans(func(u string) (bool, error) { return u == "alive", nil })
 	if err != nil {
 		t.Fatal(err)
 	}
 	eq(t, orphans, "gone", "v1gone")
+}
+
+func TestScheduledUsersIncludesAtJobsWithoutRegistry(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = &fakeSystem{atJobs: []AtJob{
+		{ID: "7", Body: "/usr/local/sbin/linux-temp-admin revoke --user queueduser --yes --force\n"},
+		{ID: "8", Body: "/bin/echo unrelated\n"},
+	}}
+	users, err := s.ScheduledUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, users, "queueduser")
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -110,15 +111,16 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	}
 
 	var inventoryErr error
+	addInventoryErr := func(err error) { inventoryErr = errors.Join(inventoryErr, err) }
 	if recs, err := a.Registry.List(); err != nil {
-		inventoryErr = fmt.Errorf("%s: %w", a.P.M("读取注册表失败", "reading the registry failed"), err)
+		addInventoryErr(fmt.Errorf("%s: %w", a.P.M("读取注册表失败", "reading the registry failed"), err))
 	} else {
 		for _, r := range recs {
 			add(r.User, witnessRegistry)
 		}
 	}
 	if users, err := a.v1RegistryUsers(); err != nil {
-		inventoryErr = fmt.Errorf("%s: %w", a.P.M("读取 v1 注册表失败", "reading the v1 registry failed"), err)
+		addInventoryErr(fmt.Errorf("%s: %w", a.P.M("读取 v1 注册表失败", "reading the v1 registry failed"), err))
 	} else {
 		for _, u := range users {
 			add(u, witnessV1)
@@ -126,7 +128,7 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	}
 	if a.Sudoers != nil {
 		if users, err := a.Sudoers.All(); err != nil {
-			inventoryErr = fmt.Errorf("%s: %w", a.P.M("扫描 sudo 授权失败", "scanning sudo grants failed"), err)
+			addInventoryErr(fmt.Errorf("%s: %w", a.P.M("扫描 sudo 授权失败", "scanning sudo grants failed"), err))
 		} else {
 			for _, u := range users {
 				add(u, witnessSudoers)
@@ -135,7 +137,7 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	}
 	if a.SSHD != nil {
 		if users, err := a.SSHD.All(); err != nil {
-			inventoryErr = fmt.Errorf("%s: %w", a.P.M("扫描 sshd 例外失败", "scanning sshd exceptions failed"), err)
+			addInventoryErr(fmt.Errorf("%s: %w", a.P.M("扫描 sshd 例外失败", "scanning sshd exceptions failed"), err))
 		} else {
 			for _, u := range users {
 				add(u, witnessSSHD)
@@ -143,8 +145,8 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 		}
 	}
 	if a.Scheduler != nil {
-		if users, err := a.Scheduler.UnitUsers(); err != nil {
-			inventoryErr = fmt.Errorf("%s: %w", a.P.M("扫描自动删除任务失败", "scanning auto-delete tasks failed"), err)
+		if users, err := a.Scheduler.ScheduledUsers(); err != nil {
+			addInventoryErr(fmt.Errorf("%s: %w", a.P.M("扫描自动删除任务失败", "scanning auto-delete tasks failed"), err))
 		} else {
 			for _, u := range users {
 				add(u, witnessUnit)
@@ -167,7 +169,11 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	for _, n := range names {
 		ws := found[n]
 		sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
-		plan.accounts = append(plan.accounts, teardownAccount{name: n, exists: user.Exists(n), witnesses: ws})
+		exists, err := user.Exists(n)
+		if err != nil {
+			addInventoryErr(fmt.Errorf("%s %s: %w", a.P.M("读取账号失败", "reading account"), n, err))
+		}
+		plan.accounts = append(plan.accounts, teardownAccount{name: n, exists: exists, witnesses: ws})
 	}
 	plan.binaryBlocker = a.binaryBlocker(force)
 	plan.inventoryErr = inventoryErr
@@ -213,8 +219,8 @@ func (a *App) binaryBlocker(force bool) string {
 // with a v1 account still live and it strands exactly as a v2 one would.
 //
 // The format is v1's: tab-separated, username first (its own removal pass keyed
-// on `awk -F '\t' '$1 != u'`). A line that does not parse to a valid username is
-// skipped; the filesystem witnesses are what make that safe.
+// on `awk -F '\t' '$1 != u'`). A malformed non-empty row is an error: this file
+// may be the only witness naming an account v1 created without a sudo grant.
 //
 // It distinguishes absent from unreadable, and the caller treats the two
 // differently. Absent is the normal case — nothing was upgraded from v1 — and
@@ -234,15 +240,18 @@ func (a *App) v1RegistryUsers() ([]string, error) {
 	defer f.Close()
 	var users []string
 	sc := bufio.NewScanner(f)
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		name, _, _ := strings.Cut(line, "\t")
-		if validate.Username(name) {
-			users = append(users, name)
+		if !validate.Username(name) {
+			return nil, fmt.Errorf("v1 registry line %d has invalid username %q", lineNo, name)
 		}
+		users = append(users, name)
 	}
 	if err := sc.Err(); err != nil {
 		// A partial read already yielded some names; returning them AND the error
@@ -329,12 +338,12 @@ func (a *App) uninstall(args []string) int {
 	// exists to close. Refuse while that is still something the operator can act on.
 	// (The pre-teardown uninstall refused on this too; its test is what caught the
 	// regression when this was first written as a warning.)
-	if plan.inventoryErr != nil && !force {
+	if plan.inventoryErr != nil {
 		a.errorf("%s: %v", a.P.M("无法确定这台机器上有哪些账号，拒绝卸载",
 			"cannot determine which accounts are on this host; refusing to uninstall"), plan.inventoryErr)
 		a.warnf("%s", a.P.M(
-			"清单不全就卸载，会删掉命令、留下它没看见的账号——而它们的自动删除任务执行的正是这个命令。请先修好上面的问题，或用 --force 明确接受这个风险。",
-			"uninstalling on a partial inventory removes the command and leaves behind the accounts it never saw, whose auto-delete tasks invoke that very command. Fix the above and retry, or pass --force to accept that risk explicitly."))
+			"清单不全就卸载，会删掉命令、留下它没看见的账号——而它们的自动删除任务执行的正是这个命令。请先修好上面的问题再重试。",
+			"uninstalling on a partial inventory removes the command and leaves behind accounts it never saw. Repair the account database or managed state before retrying."))
 		return 1
 	}
 

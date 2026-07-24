@@ -53,20 +53,58 @@ func (s *Scheduler) UnitUsers() ([]string, error) {
 	return users, nil
 }
 
+// ScheduledUsers returns accounts named by either systemd units or queued at
+// jobs. This is the complete uninstall inventory even when registry rows vanish.
+func (s *Scheduler) ScheduledUsers() ([]string, error) {
+	users, err := s.UnitUsers()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(users))
+	for _, user := range users {
+		seen[user] = true
+	}
+	jobs, err := s.Sys.AtJobs()
+	if err != nil {
+		return nil, err
+	}
+	prefix := s.InstallPath + " revoke --user "
+	for _, job := range jobs {
+		i := strings.Index(job.Body, prefix)
+		if i < 0 {
+			continue
+		}
+		fields := strings.Fields(job.Body[i+len(prefix):])
+		if len(fields) > 0 && validate.Username(fields[0]) {
+			seen[fields[0]] = true
+		}
+	}
+	users = users[:0]
+	for user := range seen {
+		users = append(users, user)
+	}
+	sort.Strings(users)
+	return users, nil
+}
+
 // Orphans returns the accounts whose auto-revoke unit is still on disk although
 // the account itself is gone. exists reports whether an account is still present.
 //
 // It mirrors sudoers.Orphans and sshdconf.Orphans, which had no counterpart here:
 // of the three things an invite leaves on a host, the unit was the one no sweep
 // could find.
-func (s *Scheduler) Orphans(exists func(string) bool) ([]string, error) {
-	users, err := s.UnitUsers()
+func (s *Scheduler) Orphans(exists func(string) (bool, error)) ([]string, error) {
+	users, err := s.ScheduledUsers()
 	if err != nil {
 		return nil, err
 	}
 	var orphans []string
 	for _, u := range users {
-		if !exists(u) {
+		live, err := exists(u)
+		if err != nil {
+			return nil, err
+		}
+		if !live {
 			orphans = append(orphans, u)
 		}
 	}

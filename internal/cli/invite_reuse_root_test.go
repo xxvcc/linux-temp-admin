@@ -4,9 +4,11 @@ package cli_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +39,7 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 	sudoDir := rootDir(t, 0o750)
 	sshdDir := rootDir(t, 0o755)
 	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
-	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 0.0.0-dev\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
@@ -59,15 +61,21 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 			UnitPrefix: config.AutoRevokeUnitPrefix, LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
 			Now: now, Sys: fakeSched{},
 		},
-		Registry:     &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
-		SSHD:         sshdMgr,
-		SSHDConfig:   func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		Detector:     netdetect.New(),
-		Selfmanage:   &selfmanage.Manager{InstallPath: installPath},
-		Audit:        &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
-		InstallPath:  installPath,
-		Now:          now,
-		RandHex:      func(int) (string, error) { return "abcdef0123", nil },
+		Registry:    &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
+		SSHD:        sshdMgr,
+		SSHDConfig:  func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		Detector:    netdetect.New(),
+		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
+		Audit:       &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
+		InstallPath: installPath,
+		Executable:  func() (string, error) { return installPath, nil },
+		Now:         now,
+		RandHex: func(n int) (string, error) {
+			if n == 16 {
+				return "0123456789abcdef0123456789abcdef", nil
+			}
+			return "abcdef0123", nil
+		},
 		RandPassword: func(int) (string, error) { return "pw-abcdefgh", nil },
 		StdoutIsTTY:  func() bool { return true },
 		StdinIsTTY:   func() bool { return false },
@@ -109,7 +117,7 @@ func TestInviteNoSudoDoesNotInheritAStaleGrant(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
 	}
-	if !user.Exists(name) {
+	if !mustExternalUserExists(t, name) {
 		t.Fatal("the account should have been created")
 	}
 
@@ -121,17 +129,10 @@ func TestInviteNoSudoDoesNotInheritAStaleGrant(t *testing.T) {
 	}
 }
 
-// TestAutoRevokeDeletesEvenWhenTheRegistryRowIsLost is HIGH #1. The auto-revoke
-// timer fires unattended at expiry, and by then the registry row it would need
-// may be gone (hand-edit, backup restore, corruption — the whole uninstall-witness
-// design assumes rows vanish). The baked command now carries --force
-// --confirm-force so the firing can still delete a GECOS-managed temp account and
-// strip its NOPASSWD grant, instead of refusing "unregistered" and stranding a
-// root-capable account with no retry (a one-shot timer does not fire twice).
-//
-// The account is real and carries the managed GECOS but has NO registry row —
-// exactly the lost-row state. The command run is the one the scheduler bakes.
-func TestAutoRevokeDeletesEvenWhenTheRegistryRowIsLost(t *testing.T) {
+// A scheduled deletion has no trustworthy identity when its registry row is
+// gone. It must exit successfully without touching either the account or its
+// name-scoped grant; chage expiry still blocks future login.
+func TestAutoRevokeSkipsWhenRegistryRowIsLost(t *testing.T) {
 	a, sudoMgr, _, installPath := inviteApp(t)
 	const name = "xxvcc-lostrow1"
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
@@ -145,44 +146,205 @@ func TestAutoRevokeDeletesEvenWhenTheRegistryRowIsLost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The exact command the scheduler bakes into the unit / at job.
+	pw, ok := mustExternalUserLookup(t, name)
+	if !ok {
+		t.Fatal("created account was not found")
+	}
+
+	// The exact identity-bearing command the scheduler bakes into a task, but no
+	// corresponding registry row exists.
 	sched := &schedule.Scheduler{InstallPath: installPath}
-	cmd := sched.RevokeCommand(name) // "<path> revoke --user X --yes --force --confirm-force X"
-	args := strings.Fields(cmd)[1:]  // drop the binary path
+	cmd := sched.RevokeCommand(name, pw.UID, "11111111111111111111111111111111")
+	args := strings.Fields(cmd)[1:] // drop the binary path
 
 	if rc := a.Dispatch(args); rc != 0 {
-		t.Fatalf("auto-revoke command rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+		t.Fatalf("stale auto-revoke command rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
 	}
-	if user.Exists(name) {
-		t.Error("HIGH: a GECOS-managed account with a lost registry row survived auto-revoke")
+	if !mustExternalUserExists(t, name) {
+		t.Error("a task with no registry identity deleted the account")
 	}
-	if _, err := os.Stat(grant); err == nil {
-		t.Error("HIGH: its NOPASSWD grant was stranded")
+	if _, err := os.Stat(grant); err != nil {
+		t.Error("a task with no registry identity removed the account's grant")
 	}
 }
 
-// TestAutoRevokeForceStillProtectsARealAccount is the other half: the force
-// tokens must not turn the auto-revoke into a way to delete an account this tool
-// did not make. A real account (no managed GECOS, no row) must be refused even
-// with --force, because IsProtectedRevokeTarget ignores --force.
-func TestAutoRevokeForceStillProtectsARealAccount(t *testing.T) {
+// A matching username and UID do not prove identity because Linux can reuse both
+// after out-of-band deletion. The current account must still carry the managed
+// marker even when the scheduled generation matches the stale registry row.
+func TestAutoRevokeProtectsSameUIDUnmanagedReplacement(t *testing.T) {
 	a, _, _, installPath := inviteApp(t)
 	const name = "ltarealacct1"
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	// A real account: an ordinary GECOS, NOT the managed marker.
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "Real Person", name).CombinedOutput(); err != nil {
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
+	original, ok := mustExternalUserLookup(t, name)
+	if !ok {
+		t.Fatal("created account was not found")
+	}
+	const generation = "22222222222222222222222222222222"
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Registry.Record(registry.Record{User: name, Port: 22, UID: original.UID, Generation: generation, AutoRevoke: true}); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("userdel", "-r", "--", name).CombinedOutput(); err != nil {
+		t.Fatalf("userdel: %v: %s", err, out)
+	}
+	// Recreate the same name with the exact same UID, but as a real unmanaged user.
+	if out, err := exec.Command("useradd", "-m", "-u", strconv.Itoa(original.UID), "-s", "/bin/bash", "-c", "Real Person", name).CombinedOutput(); err != nil {
+		t.Fatalf("replacement useradd: %v: %s", err, out)
+	}
 	sched := &schedule.Scheduler{InstallPath: installPath}
-	args := strings.Fields(sched.RevokeCommand(name))[1:]
+	args := strings.Fields(sched.RevokeCommand(name, original.UID, generation))[1:]
 
 	if rc := a.Dispatch(args); rc == 0 {
-		t.Error("the forced auto-revoke deleted a real, unmanaged account")
+		t.Error("auto-revoke accepted an unmanaged replacement with the same UID")
 	}
-	if !user.Exists(name) {
-		t.Error("SECURITY: --force auto-revoke deleted a real account it did not create")
+	if !mustExternalUserExists(t, name) {
+		t.Error("auto-revoke deleted an unmanaged replacement account")
+	}
+	if ok, err := a.Registry.Contains(name); err != nil || !ok {
+		t.Errorf("recovery registry row was not preserved: present=%v err=%v", ok, err)
+	}
+}
+
+func TestAutoRevokeSkipsStaleGeneration(t *testing.T) {
+	a, sudoMgr, _, installPath := inviteApp(t)
+	const name = "xxvcc-stalegen1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	pw, ok := mustExternalUserLookup(t, name)
+	if !ok {
+		t.Fatal("created account was not found")
+	}
+	const currentGeneration = "33333333333333333333333333333333"
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Registry.Record(registry.Record{User: name, Port: 22, UID: pw.UID, Generation: currentGeneration, AutoRevoke: true}); err != nil {
+		t.Fatal(err)
+	}
+	grant := sudoMgr.FilePath(name)
+	if err := os.WriteFile(grant, []byte(name+" ALL=(ALL) NOPASSWD:ALL\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Fields((&schedule.Scheduler{InstallPath: installPath}).RevokeCommand(
+		name, pw.UID, "44444444444444444444444444444444"))[1:]
+	if rc := a.Dispatch(args); rc != 0 {
+		t.Fatalf("stale generation rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Error("stale generation deleted the current account")
+	}
+	if _, err := os.Stat(grant); err != nil {
+		t.Error("stale generation removed the current account's grant")
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found || rec.Generation != currentGeneration {
+		t.Errorf("current registry identity changed: found=%v generation=%q err=%v", found, rec.Generation, err)
+	}
+}
+
+func TestInviteOutputFailureRollsBackAllState(t *testing.T) {
+	a, sudoMgr, sshdMgr, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	a.Out = failingWriter{}
+	const name = "xxvcc-outputfail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "24", "--sudo", "--confirm-sudo", name, "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want failure when credentials cannot be written", rc)
+	}
+	if mustExternalUserExists(t, name) {
+		t.Error("output failure left the account behind")
+	}
+	if present, err := a.Registry.Contains(name); err != nil || present {
+		t.Errorf("output failure left a registry row: present=%v err=%v", present, err)
+	}
+	if _, err := os.Lstat(sudoMgr.FilePath(name)); !os.IsNotExist(err) {
+		t.Errorf("output failure left a sudo grant: %v", err)
+	}
+	if _, err := os.Lstat(sshdMgr.FilePath(name)); !os.IsNotExist(err) {
+		t.Errorf("output failure left an sshd exception: %v", err)
+	}
+	if len(tracker.jobs) != 0 {
+		t.Errorf("output failure left scheduled jobs: %v", tracker.jobs)
+	}
+}
+
+func TestRevokeSudoCleanupFailureKeepsDisabledAccountAndRecoveryState(t *testing.T) {
+	a, sudoMgr, _, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	const name = "xxvcc-sudofail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "24", "--sudo", "--confirm-sudo", name, "--yes"}); rc != 0 {
+		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	grant := sudoMgr.FilePath(name)
+	if err := os.Remove(grant); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(grant, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(grant, "still-live"), []byte("grant cannot be removed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes"}); rc != 1 {
+		t.Fatalf("revoke rc=%d, want nonzero when sudo cleanup fails", rc)
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Error("revoke freed the username while a sudo artifact survived")
+	}
+	if present, err := a.Registry.Contains(name); err != nil || !present {
+		t.Errorf("recovery registry row missing: present=%v err=%v", present, err)
+	}
+	if len(tracker.jobs) == 0 {
+		t.Error("recovery auto-delete task was removed despite failed grant cleanup")
+	}
+}
+
+func TestRevokeScheduleCleanupFailureReturnsNonzeroAndKeepsRegistry(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	const name = "xxvcc-schedfail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "24", "--no-sudo", "--yes"}); rc != 0 {
+		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	tracker.removeErr = errors.New("cannot enumerate at jobs")
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes"}); rc != 1 {
+		t.Fatalf("revoke rc=%d, want nonzero when schedule cleanup fails", rc)
+	}
+	if mustExternalUserExists(t, name) {
+		t.Error("account should already be deleted before schedule cleanup")
+	}
+	if present, err := a.Registry.Contains(name); err != nil || !present {
+		t.Errorf("registry row needed for recovery was removed: present=%v err=%v", present, err)
 	}
 }
 

@@ -21,7 +21,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.25'
+          go-version: '1.26.x'
           check-latest: true
 
       - name: Derive version and gate (v2+ tags only)
@@ -30,8 +30,8 @@ jobs:
           set -Eeuo pipefail
           version="${GITHUB_REF_NAME#v}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
-          major="${version%%.*}"
-          if [[ "${major}" =~ ^[0-9]+$ ]] && [[ "${major}" -ge 2 ]]; then
+          if [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
+             && [[ "${BASH_REMATCH[1]}" -ge 2 ]]; then
             echo "go_release=true" >> "$GITHUB_OUTPUT"
           else
             echo "go_release=false" >> "$GITHUB_OUTPUT"

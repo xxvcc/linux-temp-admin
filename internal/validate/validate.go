@@ -24,10 +24,14 @@ var (
 	dnsLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 	// exactly three numeric components + optional [._+~-]-led suffix
 	installedVersionRe = regexp.MustCompile(`^[0-9]+([.][0-9]+){2}([-_+~][A-Za-z0-9._+~-]+)?$`)
+	generationRe       = regexp.MustCompile(`^[a-f0-9]{32}$`)
 )
 
 // Username reports whether s is a valid temporary username.
 func Username(s string) bool { return usernameRe.MatchString(s) }
+
+// Generation reports whether s is a 128-bit lowercase hex account-generation token.
+func Generation(s string) bool { return generationRe.MatchString(s) }
 
 // Prefix reports whether s is a valid username prefix.
 func Prefix(s string) bool {

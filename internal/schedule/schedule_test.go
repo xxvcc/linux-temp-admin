@@ -1,6 +1,7 @@
 package schedule
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,10 @@ type fakeSystem struct {
 	atID         string
 	removedFor   []string
 	atrmd        []string
+	atJobs       []AtJob
+	removeAtErr  error
+	atrmErr      error
+	atJobsErr    error
 }
 
 func (f *fakeSystem) HasSystemctl() bool { return f.hasSystemctl }
@@ -29,8 +34,12 @@ func (f *fakeSystem) ScheduleAt(command string, hours int) (string, error) {
 	f.atCommand, f.atHours = command, hours
 	return f.atID, nil
 }
-func (f *fakeSystem) RemoveAtJobsFor(command string) { f.removedFor = append(f.removedFor, command) }
-func (f *fakeSystem) AtrmJob(id string)              { f.atrmd = append(f.atrmd, id) }
+func (f *fakeSystem) RemoveAtJobsFor(command string) error {
+	f.removedFor = append(f.removedFor, command)
+	return f.removeAtErr
+}
+func (f *fakeSystem) AtrmJob(id string) error  { f.atrmd = append(f.atrmd, id); return f.atrmErr }
+func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
 
 func newScheduler(dir string, sys System) *Scheduler {
 	return &Scheduler{
@@ -50,15 +59,16 @@ func TestOnCalendarAndNames(t *testing.T) {
 	if got := s.UnitName("xxvcc-a1"); got != "linux-temp-admin-v2-revoke-xxvcc-a1" {
 		t.Errorf("UnitName = %q", got)
 	}
-	if got := s.RevokeCommand("xxvcc-a1"); got != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes --force --confirm-force xxvcc-a1" {
+	if got := s.RevokeCommand("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef"); got != "/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes --force --confirm-force xxvcc-a1 --expected-uid 1001 --generation 0123456789abcdef0123456789abcdef" {
 		t.Errorf("RevokeCommand = %q", got)
 	}
 }
 
 func TestUnitContents(t *testing.T) {
 	s := newScheduler("/x", &fakeSystem{})
-	svc := s.serviceContent("xxvcc-a1")
+	svc := s.serviceContent("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef")
 	for _, want := range []string{"Type=oneshot", "NoNewPrivileges=yes", "User=root",
+		"Restart=on-failure", "--expected-uid 1001", "--generation 0123456789abcdef0123456789abcdef",
 		"ExecStart=/usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1 --yes"} {
 		if !strings.Contains(svc, want) {
 			t.Errorf("service missing %q:\n%s", want, svc)
@@ -76,14 +86,14 @@ func TestUnitContents(t *testing.T) {
 func TestScheduleFallsBackToAt(t *testing.T) {
 	sys := &fakeSystem{hasSystemctl: false, hasAt: true, atID: "42"}
 	s := newScheduler(t.TempDir(), sys)
-	unit, err := s.Schedule("xxvcc-a1", 6)
+	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if unit != "at:42" {
 		t.Errorf("unit = %q, want at:42", unit)
 	}
-	if sys.atCommand != s.RevokeCommand("xxvcc-a1") || sys.atHours != 6 {
+	if sys.atCommand != s.RevokeCommand("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef") || sys.atHours != 6 {
 		t.Errorf("ScheduleAt got %q, %d", sys.atCommand, sys.atHours)
 	}
 	// The queued command carries --force --confirm-force so a lost registry row at
@@ -95,7 +105,7 @@ func TestScheduleFallsBackToAt(t *testing.T) {
 
 func TestScheduleNoBackend(t *testing.T) {
 	s := newScheduler(t.TempDir(), &fakeSystem{})
-	if _, err := s.Schedule("xxvcc-a1", 6); err == nil {
+	if _, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6); err == nil {
 		t.Fatal("expected error when no systemctl or at")
 	}
 }
@@ -111,7 +121,9 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	os.WriteFile(svc, []byte("x"), 0o644)
 	os.WriteFile(tmr, []byte("x"), 0o644)
 
-	s.Cancel("xxvcc-a1", "")
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	// The sweep matches on the stable "--yes" prefix, so it still finds an at job
 	// queued by an OLDER version whose body has no --force tokens.
@@ -141,6 +153,14 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	}
 }
 
+func TestCancelPropagatesAtRemovalFailure(t *testing.T) {
+	sys := &fakeSystem{removeAtErr: errors.New("atq failed")}
+	s := newScheduler(t.TempDir(), sys)
+	if err := s.Cancel("xxvcc-a1", ""); err == nil || !strings.Contains(err.Error(), "atq failed") {
+		t.Fatalf("Cancel error = %v, want at removal failure", err)
+	}
+}
+
 // TestCancelUnderFiringServiceLeavesServiceFile documents the INVOCATION_ID guard:
 // when Cancel runs inside the firing systemd service, it still disables the timer
 // and removes the .timer file, but leaves its own .service file and skips
@@ -156,7 +176,9 @@ func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
 	os.WriteFile(svc, []byte("x"), 0o644)
 	os.WriteFile(tmr, []byte("x"), 0o644)
 
-	s.Cancel("xxvcc-a1", "")
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := os.Lstat(tmr); !os.IsNotExist(err) {
 		t.Error("timer file should still be removed under the firing service")
@@ -212,7 +234,9 @@ func TestCancelRemovesLegacyUnitsToo(t *testing.T) {
 		}
 	}
 
-	s.Cancel("oldu", "")
+	if err := s.Cancel("oldu", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, p := range []string{v1timer, v1svc} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {

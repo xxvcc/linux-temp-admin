@@ -7,8 +7,11 @@
 package registry
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
 // Header is the first line of a v2 registry file; it also carries the schema
@@ -35,17 +38,16 @@ type Record struct {
 	AutoRevoke  bool
 	AutoUnit    string // systemd unit name, "at:<id>", or empty
 
-	// UID is the account's UID as it was at creation. It is the tool's only
-	// immutable proof that a given /etc/passwd entry is the account it made:
-	// the GECOS marker can be rewritten by the account itself (with sudo, or via
-	// chfn where CHFN_RESTRICT permits), whereas the (name, uid) pair recorded
-	// here was fixed before the invitee ever had access. A recreated account
-	// reusing the name draws a fresh uid, so this stays reuse-proof.
+	// UID is the account's UID as it was at creation. Revoke uses a mismatch as
+	// evidence that the account was replaced or tampered with. A match is not
+	// identity proof by itself because Linux can reuse a UID after deletion; the
+	// current passwd entry must still carry the managed GECOS marker.
 	//
 	// 0 means "not recorded" — a row written by a build older than this field.
 	// A real temporary account never has uid 0 (that is protected outright), so
 	// 0 is unambiguous as the unknown marker.
-	UID int
+	UID        int
+	Generation string
 }
 
 var fieldSanitizer = strings.NewReplacer("\t", " ", "\r", " ", "\n", " ")
@@ -60,8 +62,9 @@ func boolYN(b bool) string {
 	return "no"
 }
 
-// uidField is the index of the appended UID column (the 10th field).
+// uidField and generationField are append-only compatibility columns.
 const uidField = 9
+const generationField = 10
 
 // TSV renders the record as one tab-separated line (no trailing newline).
 func (r Record) TSV() string {
@@ -76,22 +79,32 @@ func (r Record) TSV() string {
 		boolYN(r.AutoRevoke),
 		sanitize(r.AutoUnit),
 		strconv.Itoa(r.UID), // appended; older builds ignore this trailing field
+		sanitize(r.Generation),
 	}, "\t")
 }
 
-// ParseLine parses one registry line into a Record. It returns ok=false for the
-// header, blank lines, and lines with too few fields (which are ignored rather
-// than treated as corrupt records). Fields appended after the original nine are
-// read only when present, so an older registry parses with them zero-valued.
-func ParseLine(line string) (Record, bool) {
+// ParseLine parses one registry line into a Record. It returns ok=false only for
+// the header and blank lines. Malformed non-empty rows are errors. Fields appended
+// after the original nine are read only when present, so an older registry parses
+// with them zero-valued.
+func ParseLine(line string) (Record, bool, error) {
 	if line == "" || strings.HasPrefix(line, "#") {
-		return Record{}, false
+		return Record{}, false, nil
 	}
 	f := strings.Split(line, "\t")
 	if len(f) < fieldCount {
-		return Record{}, false
+		return Record{}, false, fmt.Errorf("record has %d fields, want at least %d", len(f), fieldCount)
 	}
-	port, _ := strconv.Atoi(f[5])
+	if !validate.Username(f[0]) {
+		return Record{}, false, fmt.Errorf("invalid username %q", f[0])
+	}
+	port, err := strconv.Atoi(f[5])
+	if err != nil || !validate.Port(port) {
+		return Record{}, false, fmt.Errorf("invalid port %q", f[5])
+	}
+	if (f[3] != "yes" && f[3] != "no") || (f[7] != "yes" && f[7] != "no") {
+		return Record{}, false, fmt.Errorf("invalid boolean field")
+	}
 	rec := Record{
 		User:        f[0],
 		Created:     f[1],
@@ -104,7 +117,16 @@ func ParseLine(line string) (Record, bool) {
 		AutoUnit:    f[8],
 	}
 	if len(f) > uidField {
-		rec.UID, _ = strconv.Atoi(f[uidField]) // absent/garbage -> 0 = "not recorded"
+		rec.UID, err = strconv.Atoi(f[uidField])
+		if err != nil || rec.UID < 0 {
+			return Record{}, false, fmt.Errorf("invalid uid %q", f[uidField])
+		}
 	}
-	return rec, true
+	if len(f) > generationField {
+		rec.Generation = f[generationField]
+		if rec.Generation != "" && !validate.Generation(rec.Generation) {
+			return Record{}, false, fmt.Errorf("invalid generation %q", rec.Generation)
+		}
+	}
+	return rec, true, nil
 }

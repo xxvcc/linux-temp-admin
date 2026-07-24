@@ -18,6 +18,12 @@ set -eu
 
 BASE="https://github.com/xxvcc/linux-temp-admin/releases/latest/download"
 DEST="${DEST:-/usr/local/sbin/linux-temp-admin}"
+MAX_DOWNLOAD_BYTES=67108864
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "run this installer as root" >&2
+  exit 1
+fi
 
 # Release signing public key (ed25519) as a SubjectPublicKeyInfo PEM — the same key
 # as internal/selfmanage/release_pubkey.hex, in the form openssl reads. Keep the two
@@ -38,27 +44,23 @@ asset="linux-temp-admin-linux-${arch}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Choose a downloader once. GNU wget supports --https-only (refuse an http
-# downgrade on a redirect); BusyBox wget does not, so only pass it when the flag is
-# advertised — otherwise fall back to plain wget so busybox-only hosts still work.
+# Choose a downloader that can enforce HTTPS redirects and a response-size cap.
 if command -v curl >/dev/null 2>&1; then
   DL=curl
-elif command -v wget >/dev/null 2>&1; then
-  if wget --help 2>&1 | grep -q -- '--https-only'; then
-    DL=wget-https
-  else
-    DL=wget
-  fi
+elif command -v wget >/dev/null 2>&1 \
+     && wget --help 2>&1 | grep -q -- '--https-only' \
+     && wget --help 2>&1 | grep -q -- '--max-filesize'; then
+  DL=wget
 else
-  echo "need curl or wget to download over HTTPS" >&2
+  echo "need curl or wget with HTTPS-only redirects and download-size limits" >&2
   exit 1
 fi
 
 fetch() {
   case "$DL" in
-    curl)       curl -fsSL --proto '=https' --proto-redir '=https' "$1" -o "$2" ;;
-    wget-https) wget --https-only -qO "$2" "$1" ;;
-    *)          wget -qO "$2" "$1" ;;
+    curl) curl -fsSL --proto '=https' --proto-redir '=https' \
+            --max-filesize "$MAX_DOWNLOAD_BYTES" "$1" -o "$2" ;;
+    wget) wget --https-only --max-filesize="$MAX_DOWNLOAD_BYTES" -qO "$2" "$1" ;;
   esac
 }
 
@@ -106,7 +108,7 @@ fi
 mkdir -p "$(dirname "$DEST")"
 cp "$tmp/bin" "${DEST}.new"
 chmod 0755 "${DEST}.new"
-chown root:root "${DEST}.new" 2>/dev/null || true
+chown root:root "${DEST}.new"
 mv "${DEST}.new" "$DEST"
 echo "installed ${DEST}"
 "$DEST" version

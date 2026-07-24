@@ -334,6 +334,27 @@ func TestHasAddressScopedMatch(t *testing.T) {
 	if HasAddressScopedMatch() {
 		t.Error("a plain `Match User` block is not address-scoped and must not be flagged")
 	}
+
+	// Includes are relative to the main ssh configuration directory even when an
+	// included file contains another Include. The address-scoped Match must not be
+	// hidden two levels away from the main file.
+	nested := dir + "/nested"
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(main, "Include first.conf\n")
+	write(dir+"/first.conf", "Include nested/second.conf\n")
+	write(nested+"/second.conf", "Match User bob Address 198.51.100.0/24\n    PermitTTY no\n")
+	if !HasAddressScopedMatch() {
+		t.Error("a nested Include containing `Match Address` must be detected")
+	}
+
+	// An explicit Include that cannot be read makes the scan incomplete. The
+	// caller must downgrade to unverifiable instead of claiming key login works.
+	write(main, "Include missing.conf\n")
+	if !HasAddressScopedMatch() {
+		t.Error("an unreadable explicit Include must make the result unverifiable")
+	}
 }
 
 // TestMatchSSHDPattern pins the matcher against OpenSSH's match.c semantics:

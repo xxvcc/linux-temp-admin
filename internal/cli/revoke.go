@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"strconv"
@@ -18,6 +19,8 @@ func (a *App) revoke(args []string) int {
 	fs.SetOutput(a.Err)
 	userFlag := fs.String("user", "", "")
 	confirmForce := fs.String("confirm-force", "", "")
+	expectedUID := fs.Int("expected-uid", 0, "")
+	generation := fs.String("generation", "", "")
 	var fYes, fForce bool
 	fs.BoolVar(&fYes, "yes", false, "")
 	fs.BoolVar(&fYes, "y", false, "")
@@ -39,12 +42,27 @@ func (a *App) revoke(args []string) int {
 		return 1
 	}
 
-	// One read gives every fact this path acts on — registration, the recorded
-	// creation UID (the immutable proof the account is ours), and the auto-revoke
-	// unit — so they cannot disagree with each other.
+	// One read gives every registry fact this path acts on: registration, the
+	// creation UID used to detect replacement/tampering, the generation token, and
+	// the auto-revoke unit.
 	rec, registered, err := a.Registry.Lookup(username)
 	if err != nil {
-		a.warnf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
+		a.errorf("%s: %v", a.P.M("读取注册表失败，拒绝继续", "reading registry failed; refusing to continue"), err)
+		return 1
+	}
+
+	// New scheduled jobs are bound to one account generation. A stale job exits
+	// successfully so systemd does not retry it against a replacement account.
+	if *generation != "" || *expectedUID != 0 {
+		if !validate.Generation(*generation) || *expectedUID < 1 {
+			a.errorf("%s", a.P.M("自动撤销身份参数不完整或不合法", "invalid or incomplete auto-revoke identity"))
+			return 1
+		}
+		if !registered || rec.Generation != *generation || rec.UID != *expectedUID {
+			a.warnf("%s", a.P.M("陈旧的自动撤销任务已忽略：账号世代不再匹配", "ignored stale auto-revoke task: account generation no longer matches"))
+			a.audit("account.delete", username, "skip", "stale scheduled generation", nil)
+			return 0
+		}
 	}
 
 	if !fForce && !registered {
@@ -58,15 +76,31 @@ func (a *App) revoke(args []string) int {
 		return 1
 	}
 
-	if !user.Exists(username) {
+	pw, exists, err := user.Lookup(username)
+	if err != nil {
+		a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝清理状态", "reading account database failed; refusing state cleanup"), err)
+		return 1
+	}
+	if !exists {
 		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/sshd 例外/自动删除任务："+username,
 			"user does not exist; cleaning up registry/sudoers/sshd exception/auto-delete task: "+username))
-		// Nothing to delete, so the auto-revoke fallback has no job left to do.
-		a.Scheduler.Cancel(username, rec.AutoUnit)
-		a.removeSudoGrant(username)
-		a.removeSSHDException(username)
+		var cleanupErrs []error
+		if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+		if err := a.removeSudoGrant(username); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+		if err := a.removeSSHDException(username); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+		if err := errors.Join(cleanupErrs...); err != nil {
+			a.errorf("%s: %v", a.P.M("账号虽不存在，但残留授权或任务未清除；保留登记", "the account is absent, but grants or schedules remain; keeping the registry record"), err)
+			return 1
+		}
 		if err := a.Registry.Remove(username); err != nil {
-			a.warnf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
+			a.errorf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
+			return 1
 		}
 		a.audit("account.cleanup", username, "ok", "user absent; cleaned registry/sudoers/sshd/schedule", nil)
 		return 0
@@ -92,23 +126,44 @@ func (a *App) revoke(args []string) int {
 	// below refuses — which an invitee with sudo can force by rewriting its own
 	// passwd entry — the account may survive, but it must not survive still holding
 	// NOPASSWD sudo and an sshd exception.
-	a.removeSudoGrant(username)
-	a.removeSSHDException(username)
+	grantErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 
-	if user.IsProtectedRevokeTarget(username, registered, rec.UID) {
+	protected, protectErr := user.IsProtectedRevokeTarget(username, registered, rec.UID)
+	if protectErr != nil {
+		a.errorf("%s: %v", a.P.M("无法确认目标账号身份，拒绝删除", "cannot verify target account identity; refusing deletion"), protectErr)
+		return 1
+	}
+	if protected {
 		a.errorf("%s", a.P.M("拒绝删除受保护或系统用户："+username,
 			"refusing to delete a protected or system user: "+username))
 		// Name the tamper if that is why: an account that rewrote its own UID (most
 		// dangerously to 0) is now protected by the very check meant to shield real
 		// accounts, and the operator has to clean it up by hand.
-		if cur, tampered := user.UIDTampered(username, rec.UID); tampered {
+		if rec.UID > 0 && pw.UID != rec.UID {
 			a.errorf("%s", a.P.M(
-				fmt.Sprintf("该账号的 UID 已被改动：创建时为 %d，现在是 %d。它已不再是本工具创建的那个账号，请手动核查后处理。", rec.UID, cur),
-				fmt.Sprintf("this account's UID was changed: it was created as %d and is now %d. It is no longer the account this tool made; inspect and remove it by hand.", rec.UID, cur)))
+				fmt.Sprintf("该账号的 UID 已被改动：创建时为 %d，现在是 %d。它已不再是本工具创建的那个账号，请手动核查后处理。", rec.UID, pw.UID),
+				fmt.Sprintf("this account's UID was changed: it was created as %d and is now %d. It is no longer the account this tool made; inspect and remove it by hand.", rec.UID, pw.UID)))
 		}
-		a.warnf("%s", a.P.M("已移除该账号的 sudo 授权与 sshd 例外；自动删除任务保留，以便到期重试。",
-			"its sudo grant and sshd exception were removed; the auto-delete task is left armed so it retries at expiry."))
+		if grantErr != nil {
+			a.errorf("%s: %v", a.P.M("账号受保护且授权未完全移除", "the account is protected and its grants were not fully removed"), grantErr)
+		}
+		a.warnf("%s", a.P.M("自动删除任务保留；请人工核查，旧的一次性任务不会自动重试。",
+			"the auto-delete task is retained; inspect manually because legacy one-shot jobs do not retry."))
 		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
+		return 1
+	}
+
+	if grantErr != nil {
+		// Do not free the username while a name-scoped privilege file survives.
+		disableErr := a.Users.DisableLogin(username)
+		if disableErr == nil {
+			user.TerminateProcesses(pw.UID)
+			a.errorf("%s: %v", a.P.M("授权未完全移除；账号已禁用但不会删除，以免残留授权在用户名复用时重新生效",
+				"grants were not fully removed; the account was disabled but not deleted so a surviving name-scoped grant cannot re-arm on reuse"), grantErr)
+		} else {
+			a.errorf("%s: %v", a.P.M("授权未完全移除，且禁用登录也失败；账号和登记均已保留，请立即人工处理",
+				"grants were not fully removed and disabling login also failed; the account and registry were retained for immediate manual recovery"), errors.Join(grantErr, disableErr))
+		}
 		return 1
 	}
 
@@ -118,25 +173,27 @@ func (a *App) revoke(args []string) int {
 	if err := a.Users.DisableLogin(username); err != nil {
 		a.warnf("%s: %v", a.P.M("禁用登录失败，仍继续删除", "could not disable the login; continuing to delete anyway"), err)
 	}
-	if pw, ok := user.Lookup(username); ok {
-		user.TerminateProcesses(pw.UID)
-	}
+	user.TerminateProcesses(pw.UID)
 	if err := a.Users.Delete(username); err != nil {
 		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), err)
 		// The auto-revoke task is deliberately still armed: it is the fallback that
 		// retries this deletion, and tearing it down on the way to a failure would
 		// leave the account with nothing coming for it. The login is already
 		// disabled, so the account cannot be used in the meantime.
-		a.warnf("%s", a.P.M("登录已禁用，自动删除任务保留以便重试；请手动核查。",
-			"the login is disabled and the auto-delete task is left armed to retry; please check by hand."))
+		a.warnf("%s", a.P.M("登录已禁用；systemd 任务会按策略重试，at/旧任务需手动重试。",
+			"the login is disabled; systemd jobs retry by policy, while at/legacy jobs require a manual retry."))
 		a.audit("account.delete", username, "fail", err.Error(), nil)
 		return 1
 	}
 
 	// Only now that the account is provably gone is the fallback safe to remove.
-	a.Scheduler.Cancel(username, rec.AutoUnit)
+	if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+		a.errorf("%s: %v", a.P.M("用户已删除，但自动删除任务清理失败；保留登记", "user deleted, but schedule cleanup failed; keeping the registry record"), err)
+		return 1
+	}
 	if err := a.Registry.Remove(username); err != nil {
-		a.warnf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
+		a.errorf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
+		return 1
 	}
 	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(fForce), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
@@ -151,14 +208,16 @@ func (a *App) revoke(args []string) int {
 // the drop-in grants passwordless root the moment its username exists. Everything
 // else in a revoke can fail and leave the host no worse than it was found; this
 // one failing leaves a live grant behind, and it used to do so without a word.
-func (a *App) removeSudoGrant(username string) {
+func (a *App) removeSudoGrant(username string) error {
 	if a.Sudoers == nil {
-		return
+		return nil
 	}
 	if err := a.Sudoers.Remove(username); err != nil {
 		a.errorf("%s: %v", a.P.M("无法移除 sudo 授权（该账号可能仍有免密 root，请手动删除该文件）",
 			"could not remove the sudo grant (this account may still hold passwordless root; delete the file by hand)"), err)
+		return err
 	}
+	return nil
 }
 
 // removeSSHDException deletes any per-account sshd drop-in this tool wrote for
@@ -167,12 +226,12 @@ func (a *App) removeSudoGrant(username string) {
 // file, so this is called blindly: revoke never has to know whether a grant was
 // made, which means a grant can never be orphaned by a lost registry entry.
 //
-// A failure is reported but never blocks the revoke: the account itself going
-// away is what matters most, and a leftover Match block for a user that no
-// longer exists grants nobody anything.
-func (a *App) removeSSHDException(username string) {
+// A failure is reported and blocks account deletion. Remove can fail before the
+// file is gone, and freeing the username while a name-scoped exception may still
+// exist would let a replacement account inherit it.
+func (a *App) removeSSHDException(username string) error {
 	if a.SSHD == nil {
-		return
+		return nil
 	}
 	if err := a.SSHD.Remove(username); err != nil {
 		// Remove's own error already says precisely what happened — in the common
@@ -181,7 +240,9 @@ func (a *App) removeSSHDException(username string) {
 		// "removal failed; delete it by hand", which would name a path that is already
 		// gone and bury the real problem.
 		a.warnf("%s: %v", a.P.M("sshd 例外", "sshd exception"), err)
+		return err
 	}
+	return nil
 }
 
 // selectUser shows the registered accounts and reads a row number or a username.

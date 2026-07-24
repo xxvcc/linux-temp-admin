@@ -6,6 +6,7 @@
 package schedule
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,9 +25,17 @@ type System interface {
 	// ScheduleAt queues command to run in `hours` hours and returns the job id.
 	ScheduleAt(command string, hours int) (jobID string, err error)
 	// RemoveAtJobsFor atrm's every queued job whose body contains command.
-	RemoveAtJobsFor(command string)
-	// AtrmJob removes a specific at job by id (no-op if id is empty/invalid).
-	AtrmJob(id string)
+	RemoveAtJobsFor(command string) error
+	// AtrmJob removes a specific at job by id. An already-absent job is success.
+	AtrmJob(id string) error
+	// AtJobs returns queued job bodies so uninstall can inventory jobs whose
+	// registry row has been lost.
+	AtJobs() ([]AtJob, error)
+}
+
+type AtJob struct {
+	ID   string
+	Body string
 }
 
 // Scheduler writes units / queues jobs. Paths and time source are fields for tests.
@@ -84,19 +93,14 @@ func (s *Scheduler) UnitName(user string) string { return s.UnitPrefix + user }
 
 // RevokeCommand is the command the auto-revoke task runs at expiry.
 //
-// It carries --force --confirm-force <user> because the auto-revoke fires
-// UNATTENDED, and the registry row it would otherwise need may be gone by then:
-// the whole uninstall-witness design is premised on rows vanishing (hand-edit,
-// backup restore, corruption). Without --force, a lost row makes revoke refuse an
-// "unregistered" account before it even strips the grants — stranding a
-// NOPASSWD-sudo account with no retry, since a fired one-shot timer does not run
-// again. With --force the account is still safe: revoke's protection gate
-// (IsProtectedRevokeTarget) deletes only what the recorded UID or the managed
-// GECOS proves this tool made, and protects every real account regardless of
-// --force. confirm-force is the username, fixed at creation, which is exactly the
-// token revoke demands for a forced unregistered delete.
-func (s *Scheduler) RevokeCommand(user string) string {
-	return fmt.Sprintf("%s revoke --user %s --yes --force --confirm-force %s", s.InstallPath, user, user)
+// It carries the UID and a random generation token recorded with the account.
+// Revoke requires both to match the current registry row before an unattended
+// deletion can proceed, so a stale task cannot delete a replacement account even
+// when Linux reuses the same username and UID. The force confirmation is retained
+// for command-line compatibility, but it cannot bypass the generation check.
+func (s *Scheduler) RevokeCommand(user string, uid int, generation string) string {
+	return fmt.Sprintf("%s revoke --user %s --yes --force --confirm-force %s --expected-uid %d --generation %s",
+		s.InstallPath, user, user, uid, generation)
 }
 
 // revokeAtNeedle is the stable substring used to FIND this account's queued at
@@ -112,10 +116,12 @@ func OnCalendar(now time.Time, hours int) string {
 	return now.UTC().Add(time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05 UTC")
 }
 
-func (s *Scheduler) serviceContent(user string) string {
+func (s *Scheduler) serviceContent(user string, uid int, generation string) string {
 	return fmt.Sprintf(`[Unit]
 Description=linux-temp-admin auto revoke %s
 Documentation=https://github.com/xxvcc/linux-temp-admin
+StartLimitIntervalSec=1h
+StartLimitBurst=12
 
 [Service]
 Type=oneshot
@@ -123,7 +129,9 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 User=root
 ExecStart=%s
-`, user, s.RevokeCommand(user))
+Restart=on-failure
+RestartSec=5min
+`, user, s.RevokeCommand(user, uid, generation))
 }
 
 func timerContent(unit, onCalendar string) string {
@@ -150,30 +158,30 @@ WantedBy=timers.target
 // systemd host that could not write a unit report the fallback's misleading "no
 // systemctl or at available", sending the operator to debug a missing tool that
 // was in fact present.
-func (s *Scheduler) Schedule(user string, hours int) (string, error) {
+func (s *Scheduler) Schedule(user string, uid int, generation string, hours int) (string, error) {
 	var systemdErr error
 	if s.Sys.HasSystemctl() {
-		unit, err := s.scheduleSystemd(user, hours)
+		unit, err := s.scheduleSystemd(user, uid, generation, hours)
 		if err == nil {
 			return unit, nil
 		}
 		systemdErr = err
 	}
-	unit, atErr := s.scheduleAt(user, hours)
+	unit, atErr := s.scheduleAt(user, uid, generation, hours)
 	if atErr != nil && systemdErr != nil {
 		return "", fmt.Errorf("systemd: %w; at fallback: %v", systemdErr, atErr)
 	}
 	return unit, atErr
 }
 
-func (s *Scheduler) scheduleSystemd(user string, hours int) (string, error) {
+func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hours int) (string, error) {
 	unit := s.UnitName(user)
 	if strings.ContainsAny(unit, "/ ") {
 		return "", fmt.Errorf("invalid unit name %q", unit)
 	}
 	servicePath := filepath.Join(s.SystemdDir, unit+".service")
 	timerPath := filepath.Join(s.SystemdDir, unit+".timer")
-	if err := fsutil.WriteRootFile(servicePath, []byte(s.serviceContent(user)), 0o644); err != nil {
+	if err := fsutil.WriteRootFile(servicePath, []byte(s.serviceContent(user, uid, generation)), 0o644); err != nil {
 		return "", err
 	}
 	oc := OnCalendar(s.Now(), hours)
@@ -195,11 +203,11 @@ func (s *Scheduler) scheduleSystemd(user string, hours int) (string, error) {
 	return unit, nil
 }
 
-func (s *Scheduler) scheduleAt(user string, hours int) (string, error) {
+func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours int) (string, error) {
 	if !s.Sys.HasAt() {
 		return "", fmt.Errorf("no systemctl or at available; account expiry only")
 	}
-	id, err := s.Sys.ScheduleAt(s.RevokeCommand(user), hours)
+	id, err := s.Sys.ScheduleAt(s.RevokeCommand(user, uid, generation), hours)
 	if err != nil {
 		return "", err
 	}
@@ -212,13 +220,18 @@ func (s *Scheduler) scheduleAt(user string, hours int) (string, error) {
 // firing service for THIS unit (UnderUnit) is the .service file left and
 // daemon-reload skipped, so it never deletes the file it is executing from; a
 // manual revoke — even from another systemd scope — cleans the .service up.
-func (s *Scheduler) Cancel(user, recordedUnit string) {
+func (s *Scheduler) Cancel(user, recordedUnit string) error {
+	var errs []error
 	// Remove a specifically-recorded at job even where atq is unavailable (so
 	// RemoveAtJobsFor's body sweep can't run).
 	if strings.HasPrefix(recordedUnit, "at:") {
-		s.Sys.AtrmJob(strings.TrimPrefix(recordedUnit, "at:"))
+		if err := s.Sys.AtrmJob(strings.TrimPrefix(recordedUnit, "at:")); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user))
+	if err := s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user)); err != nil {
+		errs = append(errs, err)
+	}
 
 	// Cancel every unit namespace that could name this account, not only the one
 	// this build writes. A v1 unit carries no "-v2-" infix and v1's install path
@@ -227,31 +240,63 @@ func (s *Scheduler) Cancel(user, recordedUnit string) {
 	// the v2 name alone would leave it armed. There is normally at most one unit per
 	// account, so the extra names are no-ops on a pure-v2 host.
 	reloadNeeded := false
+	skipReload := false
 	for _, prefix := range s.unitPrefixes() {
 		unit := prefix + user
 		if strings.ContainsAny(unit, "/ ") {
 			continue
 		}
+		timerPath := filepath.Join(s.SystemdDir, unit+".timer")
+		servicePath := filepath.Join(s.SystemdDir, unit+".service")
+		_, timerErr := os.Lstat(timerPath)
+		_, serviceErr := os.Lstat(servicePath)
+		hadUnit := timerErr == nil || serviceErr == nil
 		if s.Sys.HasSystemctl() {
-			_ = s.Sys.Systemctl("disable", "--now", unit+".timer")
+			if err := s.Sys.Systemctl("disable", "--now", unit+".timer"); err != nil && hadUnit {
+				errs = append(errs, err)
+			}
 			_ = s.Sys.Systemctl("reset-failed", unit+".timer", unit+".service")
 		}
-		removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".timer"))
+		if removed, err := removeIfNotSymlink(timerPath); err != nil {
+			errs = append(errs, err)
+		} else if removed {
+			reloadNeeded = true
+		}
 		// Never delete the .service this very run is executing from (a firing v2
 		// auto-revoke); a manual revoke, even from another systemd scope, does clean
 		// it. The firing unit is always the v2 one, so this only guards that name.
-		if s.UnderUnit == nil || !s.UnderUnit(unit) {
-			removeIfNotSymlink(filepath.Join(s.SystemdDir, unit+".service"))
-			reloadNeeded = true
+		underUnit := s.UnderUnit != nil && s.UnderUnit(unit)
+		if underUnit {
+			skipReload = true
+		} else {
+			if removed, err := removeIfNotSymlink(servicePath); err != nil {
+				errs = append(errs, err)
+			} else if removed {
+				reloadNeeded = true
+			}
 		}
 	}
-	if reloadNeeded && s.Sys.HasSystemctl() {
-		_ = s.Sys.Systemctl("daemon-reload")
+	if reloadNeeded && !skipReload && s.Sys.HasSystemctl() {
+		if err := s.Sys.Systemctl("daemon-reload"); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
 }
 
-func removeIfNotSymlink(path string) {
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink == 0 {
-		_ = os.Remove(path)
+func removeIfNotSymlink(path string) (bool, error) {
+	fi, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("refusing to remove symlinked schedule file %s", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
 }

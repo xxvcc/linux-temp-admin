@@ -270,7 +270,7 @@ func (m *Manager) All() ([]string, error) {
 	return users, nil
 }
 
-func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
+func (m *Manager) Orphans(exists func(string) (bool, error)) ([]string, error) {
 	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*.conf"))
 	if err != nil {
 		return nil, err
@@ -278,8 +278,14 @@ func (m *Manager) Orphans(exists func(string) bool) ([]string, error) {
 	var orphans []string
 	for _, path := range matches {
 		user := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), filePrefix), ".conf")
-		if user != "" && validate.Username(user) && !exists(user) {
-			orphans = append(orphans, user)
+		if user != "" && validate.Username(user) {
+			live, err := exists(user)
+			if err != nil {
+				return nil, err
+			}
+			if !live {
+				orphans = append(orphans, user)
+			}
 		}
 	}
 	return orphans, nil

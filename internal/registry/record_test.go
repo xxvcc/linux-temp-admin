@@ -16,12 +16,17 @@ func TestRoundTrip(t *testing.T) {
 		Fingerprint: "SHA256:abcdef",
 		AutoRevoke:  true,
 		AutoUnit:    "linux-temp-admin-v2-revoke-xxvcc-a1b2c3",
+		UID:         1001,
+		Generation:  "0123456789abcdef0123456789abcdef",
 	}
 	line := in.TSV()
 	if strings.Contains(line, "\n") {
 		t.Fatalf("TSV must be a single line: %q", line)
 	}
-	got, ok := ParseLine(line)
+	got, ok, err := ParseLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatalf("ParseLine failed for %q", line)
 	}
@@ -31,7 +36,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestSanitizeFlattensControlChars(t *testing.T) {
-	in := Record{User: "u\tx", Host: "a\nb\rc", Port: 22}
+	in := Record{User: "userx", Host: "a\nb\rc", Port: 22}
 	line := in.TSV()
 	// A field value must never be able to add fields of its own. The count is
 	// derived from what TSV writes today (fieldCount is only the parser's MINIMUM,
@@ -40,7 +45,10 @@ func TestSanitizeFlattensControlChars(t *testing.T) {
 	if n := len(strings.Split(line, "\t")); n != len(strings.Split(Record{}.TSV(), "\t")) {
 		t.Errorf("embedded control chars broke the layout: %d fields (%q)", n, line)
 	}
-	got, ok := ParseLine(line)
+	got, ok, err := ParseLine(line)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("ParseLine failed after sanitize")
 	}
@@ -50,10 +58,35 @@ func TestSanitizeFlattensControlChars(t *testing.T) {
 }
 
 func TestParseLineRejectsNonRecords(t *testing.T) {
-	for _, line := range []string{"", Header, "# comment", "too\tfew\tfields"} {
-		if _, ok := ParseLine(line); ok {
-			t.Errorf("ParseLine(%q) = ok, want rejected", line)
+	for _, line := range []string{"", Header, "# comment"} {
+		if _, ok, err := ParseLine(line); ok || err != nil {
+			t.Errorf("ParseLine(%q) = ok=%v err=%v, want ignored", line, ok, err)
 		}
+	}
+	if _, _, err := ParseLine("too\tfew\tfields"); err == nil {
+		t.Error("malformed record must return an error")
+	}
+}
+
+func TestParseLineRejectsCorruptFields(t *testing.T) {
+	valid := strings.Split(Record{User: "xxvcc-a1", Port: 22}.TSV(), "\t")
+	tests := map[string][]string{}
+	for name, mutate := range map[string]func([]string){
+		"boolean":    func(f []string) { f[3] = "maybe" },
+		"port":       func(f []string) { f[5] = "not-a-port" },
+		"uid":        func(f []string) { f[9] = "broken" },
+		"generation": func(f []string) { f[10] = "too-short" },
+	} {
+		fields := append([]string(nil), valid...)
+		mutate(fields)
+		tests[name] = fields
+	}
+	for name, fields := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := ParseLine(strings.Join(fields, "\t")); err == nil {
+				t.Fatal("corrupt record must return an error")
+			}
+		})
 	}
 }
 
@@ -66,7 +99,10 @@ func TestParseLineAcceptsLegacyNineFieldRow(t *testing.T) {
 		"xxvcc-a1", "2026-07-07 12:00:00 UTC", "2026-07-08 12:00 CST",
 		"yes", "203.0.113.5", "22", "SHA256:abc", "yes", "unit.timer",
 	}, "\t")
-	got, ok := ParseLine(legacy)
+	got, ok, err := ParseLine(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("a legacy 9-field row must still parse")
 	}

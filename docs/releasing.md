@@ -2,6 +2,7 @@
 
 v2 ships signed static binaries. `upgrade` verifies an **ed25519 signature**
 against a public key embedded in the binary, failing closed on any mismatch.
+Building and running the release helpers requires Go 1.26.5 or newer.
 
 ## Signing key
 
@@ -21,6 +22,9 @@ To rotate, or set up on a fresh maintainer machine:
 go run ./cmd/lta-release keygen ~/.lta/signing.key   # prints the PUBLIC key hex
 ```
 
+`keygen` is create-only: it refuses an existing path and any symlink instead of
+overwriting key material. Move the old file aside deliberately before a rotation.
+
 Replace the hex line in `internal/selfmanage/release_pubkey.hex` with the printed
 public key and commit. (Rotation only takes effect on installs that upgrade to a
 build carrying the new key.)
@@ -30,7 +34,9 @@ build carrying the new key.)
 The build runs in CI; **signing stays offline** — the signing key never touches
 GitHub Actions. Two steps:
 
-**1. Tag → CI builds a draft.** Push a `v2+` tag. The `Release` workflow
+**1. Tag → CI builds a draft.** Push an exact semantic-version tag with major 2
+or newer: `vMAJOR.MINOR.PATCH` or `vMAJOR.MINOR.PATCH-prerelease`. Four-component,
+metadata-suffixed, malformed, and pre-v2 tags are rejected. The `Release` workflow
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)) builds the
 static `linux/amd64` + `linux/arm64` binaries (`-trimpath`, version stamped from
 the tag), writes `SHA256SUMS`, and stages them in a **draft** GitHub Release.
@@ -75,7 +81,9 @@ same binaries; it signs each and writes `SHA256SUMS` (covering the sigs too).
   the published `SHA256SUMS` and a detached ed25519 signature against the release
   key embedded in `install.sh`, before installing. It fails closed on any
   mismatch; if openssl (>= 3.0) is unavailable it refuses to install unless
-  `LTA_ALLOW_UNVERIFIED=1` is set (checksum-only fallback).
+  `LTA_ALLOW_UNVERIFIED=1` is set (checksum-only fallback). The script must run as
+  root, accepts HTTPS redirects only, caps each response at 64 MiB, and requires
+  curl or wget with both `--https-only` and `--max-filesize` support.
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh | sudo sh

@@ -4,9 +4,11 @@ package cli_test
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,8 +42,71 @@ func (fakeSched) HasSystemctl() bool                     { return false }
 func (fakeSched) Systemctl(...string) error              { return nil }
 func (fakeSched) HasAt() bool                            { return true }
 func (fakeSched) ScheduleAt(string, int) (string, error) { return "1", nil }
-func (fakeSched) RemoveAtJobsFor(string)                 {}
-func (fakeSched) AtrmJob(string)                         {}
+func (fakeSched) RemoveAtJobsFor(string) error           { return nil }
+func (fakeSched) AtrmJob(string) error                   { return nil }
+func (fakeSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+
+type trackingSched struct {
+	jobs      map[string]string
+	next      int
+	removeErr error
+}
+
+func newTrackingSched() *trackingSched { return &trackingSched{jobs: map[string]string{}} }
+
+func (*trackingSched) HasSystemctl() bool        { return false }
+func (*trackingSched) Systemctl(...string) error { return nil }
+func (*trackingSched) HasAt() bool               { return true }
+func (s *trackingSched) ScheduleAt(command string, _ int) (string, error) {
+	s.next++
+	id := strconv.Itoa(s.next)
+	s.jobs[id] = command
+	return id, nil
+}
+func (s *trackingSched) RemoveAtJobsFor(command string) error {
+	if s.removeErr != nil {
+		return s.removeErr
+	}
+	for id, body := range s.jobs {
+		if strings.Contains(body, command) {
+			delete(s.jobs, id)
+		}
+	}
+	return nil
+}
+func (s *trackingSched) AtrmJob(id string) error {
+	delete(s.jobs, id)
+	return nil
+}
+func (s *trackingSched) AtJobs() ([]schedule.AtJob, error) {
+	jobs := make([]schedule.AtJob, 0, len(s.jobs))
+	for id, body := range s.jobs {
+		jobs = append(jobs, schedule.AtJob{ID: id, Body: body})
+	}
+	return jobs, nil
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("output unavailable") }
+
+func mustExternalUserExists(t *testing.T, name string) bool {
+	t.Helper()
+	exists, err := user.Exists(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exists
+}
+
+func mustExternalUserLookup(t *testing.T, name string) (user.Passwd, bool) {
+	t.Helper()
+	pw, ok, err := user.Lookup(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pw, ok
+}
 
 func rootDir(t *testing.T, mode os.FileMode) string {
 	t.Helper()
@@ -68,8 +133,8 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	sudoDir := rootDir(t, 0o750)
 	sshdDir := rootDir(t, 0o755)
 	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
-	// A stub at InstallPath so ensureStableInstalled treats it as present.
-	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	// A safe stable-command stub that reports the development build's version.
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 0.0.0-dev\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
@@ -102,8 +167,14 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Actor: func() (string, int) { return "e2e", 0 },
 		},
 		InstallPath: installPath,
+		Executable:  func() (string, error) { return installPath, nil },
 		Now:         now,
-		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
+		RandHex: func(n int) (string, error) {
+			if n == 16 {
+				return "0123456789abcdef0123456789abcdef", nil
+			}
+			return "abcdef0123", nil
+		},
 		StdoutIsTTY: func() bool { return true },
 		StdinIsTTY:  func() bool { return false },
 		Geteuid:     func() int { return 0 },
@@ -116,10 +187,10 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, errb.String())
 	}
 
-	if !user.Exists(username) {
+	if !mustExternalUserExists(t, username) {
 		t.Fatal("account should exist after invite")
 	}
-	pw, _ := user.Lookup(username)
+	pw, _ := mustExternalUserLookup(t, username)
 	ak := filepath.Join(pw.Home, ".ssh", "authorized_keys")
 	akBytes, err := os.ReadFile(ak)
 	if err != nil {
@@ -172,7 +243,7 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("revoke rc=%d\nstderr:\n%s", rc, errb.String())
 	}
-	if user.Exists(username) {
+	if mustExternalUserExists(t, username) {
 		t.Error("account should be gone after revoke")
 	}
 	if ok, _ := app.Registry.Contains(username); ok {
@@ -205,7 +276,7 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 	sudoDir := rootDir(t, 0o750)
 	sshdDir := rootDir(t, 0o755)
 	installPath := filepath.Join(rootDir(t, 0o755), "linux-temp-admin")
-	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(installPath, []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 0.0.0-dev\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
@@ -242,8 +313,14 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 		Detector:    netdetect.New(),
 		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
 		InstallPath: installPath,
+		Executable:  func() (string, error) { return installPath, nil },
 		Now:         now,
-		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
+		RandHex: func(n int) (string, error) {
+			if n == 16 {
+				return "0123456789abcdef0123456789abcdef", nil
+			}
+			return "abcdef0123", nil
+		},
 		StdoutIsTTY: func() bool { return true },
 		StdinIsTTY:  func() bool { return false },
 		Geteuid:     func() int { return 0 },
@@ -255,7 +332,7 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 	if rc == 0 {
 		t.Fatal("invite should refuse on a host that rejects keys when --fix-sshd was not passed")
 	}
-	if user.Exists(username) {
+	if mustExternalUserExists(t, username) {
 		t.Fatal("a refused invite must not create an account")
 	}
 	if ents, _ := os.ReadDir(sshdDir); len(ents) != 0 {

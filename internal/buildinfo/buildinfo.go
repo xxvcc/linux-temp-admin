@@ -8,4 +8,4 @@ const Name = "linux-temp-admin"
 
 // Version is the semantic version. Overridden at build time via
 // -ldflags "-X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=x.y.z".
-var Version = "2.0.0-dev"
+var Version = "0.0.0-dev"

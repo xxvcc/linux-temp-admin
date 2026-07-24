@@ -56,10 +56,22 @@ func TestIsPublicIP(t *testing.T) {
 		{"192.168.1.1", false},         // RFC1918
 		{"172.16.0.1", false},          // RFC1918
 		{"100.100.100.200", false},     // CGNAT (RFC6598)
+		{"0.1.2.3", false},             // "this network" (RFC1122)
+		{"192.0.2.1", false},           // TEST-NET-1
+		{"198.18.0.1", false},          // benchmarking (RFC2544)
+		{"198.51.100.1", false},        // TEST-NET-2
+		{"203.0.113.1", false},         // TEST-NET-3
+		{"240.0.0.1", false},           // reserved for future use
 		{"0.0.0.0", false},             // unspecified
 		{"::1", false},                 // IPv6 loopback
 		{"fd00::1", false},             // IPv6 ULA
 		{"fe80::1", false},             // IPv6 link-local
+		{"64:ff9b::a00:1", false},      // NAT64 well-known prefix
+		{"100::1", false},              // discard-only prefix
+		{"2001:db8::1", false},         // IPv6 documentation
+		{"2002:a00:1::1", false},       // deprecated 6to4, embeds private IPv4
+		{"3fff::1", false},             // IPv6 documentation
+		{"::ffff:10.0.0.1", false},     // IPv4-mapped private address
 	}
 	for _, c := range cases {
 		ip := net.ParseIP(c.ip)
