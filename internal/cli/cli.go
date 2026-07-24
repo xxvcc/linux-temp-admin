@@ -19,6 +19,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
@@ -48,6 +49,7 @@ type App struct {
 	Detector   *netdetect.Detector
 	Selfmanage *selfmanage.Manager
 	Audit      *audit.Logger
+	Lifecycle  *lifecycle.Lock
 
 	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
 	// test's verdict comes from a fixture, not from the test host's own sshd.
@@ -67,7 +69,9 @@ type App struct {
 	StdoutIsTTY  func() bool
 	StdinIsTTY   func() bool
 	Geteuid      func() int
-	Executable   func() (string, error)
+	// Executable is a test hook. Production leaves it nil and reads /proc/self/exe,
+	// which remains bound to the running inode if its original pathname is replaced.
+	Executable func() (string, error)
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -87,6 +91,7 @@ func NewApp(lang i18n.Lang) *App {
 		Detector:     netdetect.New(),
 		Selfmanage:   selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
 		Audit:        audit.Default(),
+		Lifecycle:    lifecycle.New(config.LifecycleLockFile),
 		SSHDConfig:   sysinfo.SSHDEffective,
 		InstallPath:  config.InstallPath,
 		StateDir:     config.StateDir,
@@ -97,7 +102,6 @@ func NewApp(lang i18n.Lang) *App {
 		StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
 		StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
 		Geteuid:      os.Geteuid,
-		Executable:   os.Executable,
 	}
 }
 
@@ -303,6 +307,25 @@ func (a *App) requireRoot() bool {
 		return false
 	}
 	return true
+}
+
+// withLifecycleLock serializes complete privileged state transitions. Tests that
+// construct App directly may leave Lifecycle nil; production NewApp never does.
+func (a *App) withLifecycleLock(fn func() int) int {
+	if a.Lifecycle == nil {
+		return fn()
+	}
+	release, err := a.Lifecycle.Acquire()
+	if err != nil {
+		a.errorf("%s: %v", a.P.M("无法获取生命周期锁", "cannot acquire the lifecycle lock"), err)
+		return 1
+	}
+	rc := fn()
+	if err := release(); err != nil {
+		a.errorf("%s: %v", a.P.M("无法释放生命周期锁", "cannot release the lifecycle lock"), err)
+		return 1
+	}
+	return rc
 }
 
 // prompt reads a single line, printing the message to stderr first.

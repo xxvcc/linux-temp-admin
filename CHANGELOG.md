@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## v2.7.2 - Serialized lifecycle and release hardening
+
+- Serialize every account, grant, schedule, registry, and installed-command
+  mutation with one root-owned lifecycle lock under `/run`, including scheduled
+  revokes and full uninstall. This closes invite/revoke and invite/uninstall
+  interleavings that could leave a live account without a registry row or task.
+- Read install bytes from `/proc/self/exe` rather than reopening the mutable launch
+  pathname. Account creation also checks NSS before touching stale grants or
+  creating a local identity, preventing LDAP/SSSD username shadowing.
+- Refuse and fully roll back an auto-delete invite when neither systemd nor `at`
+  can schedule the exact deadline. Document `chage` accurately as a later,
+  day-granularity backstop rather than the exact expiry mechanism.
+- Parse sshd `Match` criterion/value positions and treat `LocalAddress`,
+  `LocalPort`, routing-domain, and unknown connection criteria as unverifiable.
+  sshd grant rollback now reports removal and restore-reload failures, and the
+  invite path independently retries cleanup before removing the account.
+- Gate the Release workflow on ordinary, race, root integration, formatting, and
+  shell checks; refuse to overwrite published assets; require the offline signer
+  to match clean HEAD/local tag/remote tag/draft state; generate publishable notes
+  and preserve prerelease status.
+
 ## v2.7.1 - Fail-closed account lifecycle hardening
 
 - **Auto-revoke is bound to one account generation.** New scheduled jobs carry

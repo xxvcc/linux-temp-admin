@@ -205,7 +205,7 @@ func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hou
 
 func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours int) (string, error) {
 	if !s.Sys.HasAt() {
-		return "", fmt.Errorf("no systemctl or at available; account expiry only")
+		return "", fmt.Errorf("no systemctl or at available")
 	}
 	id, err := s.Sys.ScheduleAt(s.RevokeCommand(user, uid, generation), hours)
 	if err != nil {

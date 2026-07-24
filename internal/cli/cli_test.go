@@ -13,6 +13,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -100,6 +101,48 @@ func TestReadLineEOFvsBlank(t *testing.T) {
 		if s != want.s || ok != want.ok {
 			t.Errorf("readLine = (%q,%v), want (%q,%v)", s, ok, want.s, want.ok)
 		}
+	}
+}
+
+func TestRevokeWaitsForLifecycleLockBeforeReadingState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lifecycle.lock")
+	release, err := lifecycle.New(path).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _, _ := newTestApp(t, "")
+	a.Lifecycle = lifecycle.New(path)
+	done := make(chan int, 1)
+	go func() { done <- a.revoke([]string{"--user", "BAD!"}) }()
+	select {
+	case <-done:
+		t.Fatal("revoke reached validation while another lifecycle mutation held the lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rc := <-done:
+		if rc != 1 {
+			t.Fatalf("revoke rc=%d, want validation failure after acquiring the lock", rc)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoke did not continue after the lifecycle lock was released")
+	}
+}
+
+func TestReadRunningBinaryUsesProcSelfExe(t *testing.T) {
+	got, err := (&App{}).readRunningBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(procSelfExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("production running-binary reader did not read /proc/self/exe")
 	}
 }
 
@@ -560,6 +603,30 @@ func TestPlanDepsAllPresent(t *testing.T) {
 	pkgs, ok := a.planDeps(false, false, false, true)
 	if !ok || len(pkgs) != 0 {
 		t.Errorf("planDeps = %v, %v; want nil,true when nothing is missing", pkgs, ok)
+	}
+}
+
+// A generated username is chosen before dependency planning. If `id` itself is
+// missing, that early step must still reach the dependency gate so --install-deps
+// can repair the host; the authoritative NSS collision check runs later, after
+// dependencies are installed and while the lifecycle lock is held.
+func TestGeneratedInviteReachesDependencyGateWithoutID(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	rc := a.invite([]string{"--host", "192.0.2.1", "--no-sudo", "--no-auto-revoke", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want the missing-dependency refusal", rc)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "missing dependencies") || !strings.Contains(got, "id") {
+		t.Fatalf("invite did not reach the dependency gate without id: %q", got)
+	}
+	if strings.Contains(got, "NSS") {
+		t.Fatalf("username selection tried NSS before id could be installed: %q", got)
 	}
 }
 

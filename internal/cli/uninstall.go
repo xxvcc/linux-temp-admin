@@ -328,7 +328,12 @@ func (a *App) uninstall(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
+	return a.withLifecycleLock(func() int {
+		return a.uninstallLocked(force, yes, removeUsers, purgeAudit)
+	})
+}
 
+func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
 	plan := a.teardownPlan(purgeAudit, force)
 
 	// A witness that could not be read is fatal, not advisory. Every way of failing
@@ -428,7 +433,7 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// --force and still refuse a real non-managed account — that is what the
 	// survivor check below is for.
 	for _, acc := range plan.accounts {
-		a.revoke([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name})
+		a.revokeLocked([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name})
 	}
 
 	// Re-inventory from scratch, do not trust the plan or revoke's rc. Two things

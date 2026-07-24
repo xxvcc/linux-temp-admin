@@ -55,17 +55,20 @@ func TestPackageCandidate(t *testing.T) {
 	if got := PackageCandidate("chage", "dnf"); got != "shadow-utils" {
 		t.Errorf("chage/dnf = %q, want shadow-utils", got)
 	}
+	if got := PackageCandidate("id", "apk"); got != "coreutils" {
+		t.Errorf("id/apk = %q, want coreutils", got)
+	}
 	if got := PackageCandidate("unknown-tool", "apt"); got != "" {
 		t.Errorf("unknown = %q, want empty", got)
 	}
 }
 
 func TestRequiredDepsShape(t *testing.T) {
-	// Without sudo: 4 account deps. With sudo: 5.
-	if n := len(RequiredDeps(false)); n != 4 {
-		t.Errorf("RequiredDeps(false) has %d deps, want 4", n)
+	// Without sudo: id plus 4 account deps. With sudo: 6.
+	if n := len(RequiredDeps(false)); n != 5 {
+		t.Errorf("RequiredDeps(false) has %d deps, want 5", n)
 	}
-	if n := len(RequiredDeps(true)); n != 5 {
-		t.Errorf("RequiredDeps(true) has %d deps, want 5", n)
+	if n := len(RequiredDeps(true)); n != 6 {
+		t.Errorf("RequiredDeps(true) has %d deps, want 6", n)
 	}
 }

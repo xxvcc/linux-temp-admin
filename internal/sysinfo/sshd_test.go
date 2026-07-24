@@ -297,7 +297,7 @@ func TestBareAllowUsersSuppressesTheUnverifiableSibling(t *testing.T) {
 	}
 }
 
-func TestHasAddressScopedMatch(t *testing.T) {
+func TestHasConnectionScopedMatch(t *testing.T) {
 	dir := t.TempDir()
 	main := dir + "/sshd_config"
 	dropins := dir + "/sshd_config.d"
@@ -317,26 +317,40 @@ func TestHasAddressScopedMatch(t *testing.T) {
 	// The exact shape the probe cannot otherwise see: pubkey on globally, denied
 	// from a specific network -- `sshd -T -C user=X` with no address reads it as OK.
 	write(main, "PubkeyAuthentication yes\nMatch Address 203.0.113.0/24\n    DenyUsers "+acct+"\n")
-	if !HasAddressScopedMatch() {
+	if !HasConnectionScopedMatch() {
 		t.Error("a `Match Address` block in the main config must be detected")
 	}
 
 	// In a drop-in, on the Host criterion, and as a later criterion after User.
 	write(main, "PubkeyAuthentication yes\n")
 	write(dropins+"/10-x.conf", "Match User bob Host bastion.example\n    X11Forwarding no\n")
-	if !HasAddressScopedMatch() {
+	if !HasConnectionScopedMatch() {
 		t.Error("a `Match ... Host` criterion in a drop-in must be detected")
 	}
 
-	// No address/host-scoped Match at all -> not flagged. A `Match User` alone is
-	// fully evaluable via `sshd -T -C user=`, so it is not address-scoped.
+	// No connection-scoped Match at all -> not flagged. A `Match User` alone is
+	// fully evaluable via `sshd -T -C user=`.
 	write(dropins+"/10-x.conf", "Match User bob\n    PermitTTY no\n")
-	if HasAddressScopedMatch() {
-		t.Error("a plain `Match User` block is not address-scoped and must not be flagged")
+	if HasConnectionScopedMatch() {
+		t.Error("a plain `Match User` block is not connection-scoped and must not be flagged")
 	}
 
+	// Criterion values that happen to equal criterion names are not criteria.
+	write(dropins+"/10-x.conf", "Match User host Group address\n    PermitTTY no\n")
+	if HasConnectionScopedMatch() {
+		t.Error("Match values named host/address were mistaken for criteria")
+	}
+
+	// These server-side connection attributes are supported Match criteria too,
+	// and a user-only -C probe cannot evaluate either one.
+	write(dropins+"/10-x.conf", "Match LocalAddress 192.0.2.10 LocalPort 2222\n    PubkeyAuthentication no\n")
+	if !HasConnectionScopedMatch() {
+		t.Error("LocalAddress/LocalPort Match criteria must make the probe unverifiable")
+	}
+	write(dropins+"/10-x.conf", "Match User bob\n    PermitTTY no\n")
+
 	// Includes are relative to the main ssh configuration directory even when an
-	// included file contains another Include. The address-scoped Match must not be
+	// included file contains another Include. The connection-scoped Match must not be
 	// hidden two levels away from the main file.
 	nested := dir + "/nested"
 	if err := os.MkdirAll(nested, 0o755); err != nil {
@@ -345,14 +359,14 @@ func TestHasAddressScopedMatch(t *testing.T) {
 	write(main, "Include first.conf\n")
 	write(dir+"/first.conf", "Include nested/second.conf\n")
 	write(nested+"/second.conf", "Match User bob Address 198.51.100.0/24\n    PermitTTY no\n")
-	if !HasAddressScopedMatch() {
+	if !HasConnectionScopedMatch() {
 		t.Error("a nested Include containing `Match Address` must be detected")
 	}
 
 	// An explicit Include that cannot be read makes the scan incomplete. The
 	// caller must downgrade to unverifiable instead of claiming key login works.
 	write(main, "Include missing.conf\n")
-	if !HasAddressScopedMatch() {
+	if !HasConnectionScopedMatch() {
 		t.Error("an unreadable explicit Include must make the result unverifiable")
 	}
 }

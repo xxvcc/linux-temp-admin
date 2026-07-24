@@ -34,12 +34,16 @@ build carrying the new key.)
 The build runs in CI; **signing stays offline** — the signing key never touches
 GitHub Actions. Two steps:
 
-**1. Tag → CI builds a draft.** Push an exact semantic-version tag with major 2
+**1. Tag → CI tests and builds a draft.** Push an exact semantic-version tag with major 2
 or newer: `vMAJOR.MINOR.PATCH` or `vMAJOR.MINOR.PATCH-prerelease`. Four-component,
 metadata-suffixed, malformed, and pre-v2 tags are rejected. The `Release` workflow
 ([`.github/workflows/release.yml`](../.github/workflows/release.yml)) builds the
-static `linux/amd64` + `linux/arm64` binaries (`-trimpath`, version stamped from
-the tag), writes `SHA256SUMS`, and stages them in a **draft** GitHub Release.
+first runs vet, ordinary race tests, root integration race tests, formatting,
+shell syntax, and ShellCheck. Only after all gates pass does it build static
+`linux/amd64` + `linux/arm64` binaries (`-trimpath`, version stamped from the
+tag), write `SHA256SUMS`, and stage them in a **draft** GitHub Release with
+generated final release notes. A rerun may refresh a draft, but refuses to
+overwrite assets after publication.
 
 ```sh
 git tag -a v2.0.1 -m "linux-temp-admin v2.0.1"
@@ -50,6 +54,8 @@ git push origin v2.0.1        # CI builds + stages the draft
 the exact CI-built binaries and publish:
 
 ```sh
+git fetch --tags origin
+git switch --detach v2.0.1
 LTA_SIGN_KEY=~/.lta/signing.key scripts/sign-release.sh v2.0.1
 ```
 
@@ -59,7 +65,10 @@ verifies their checksums, signs each (`<binary>.sig`, raw 64-byte ed25519),
 refreshes `SHA256SUMS` to cover the `.sig` files, uploads them, and flips the
 release from draft to published. It signs the bytes CI actually published, so
 the signature is valid for the exact assets users download — no reproducible
-build assumption required.
+build assumption required. Before downloading anything it requires a clean
+worktree at the tag, verifies the local tag object equals GitHub's tag object,
+and refuses unless the release is still a draft. Prerelease tags remain marked
+prerelease; only a stable tag becomes Latest.
 
 The release is public only after step 2, so users never see an unsigned release.
 

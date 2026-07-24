@@ -24,8 +24,8 @@ func LockInstant(date string) (time.Time, error) {
 	return time.ParseInLocation(dateLayout, date, time.UTC)
 }
 
-// DisplayLocal returns a human-readable local-time expiry for the invite output
-// (now + hours). This is informational; Date is what actually enforces expiry.
+// DisplayLocal returns the exact scheduled-revoke deadline for the invite output
+// (now + hours). Date supplies only the later day-granularity lockout backstop.
 func DisplayLocal(now time.Time, hours int) string {
 	return now.Add(time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05 MST")
 }

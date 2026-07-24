@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
@@ -204,6 +205,21 @@ func TestGrantRollsBackWhenTheReloadFails(t *testing.T) {
 	}
 	if ents, _ := os.ReadDir(m.Dir); len(ents) != 0 {
 		t.Errorf("a grant whose reload failed left the drop-in behind: %v", ents)
+	}
+}
+
+func TestGrantReportsRollbackRemovalFailure(t *testing.T) {
+	reloads := 0
+	m := okManager(t, &reloads)
+	m.Effective = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(blocked), nil }
+	m.RemoveFile = func(string) error { return fmt.Errorf("filesystem is read-only") }
+
+	_, err := m.Grant(acct, []string{acct}, report(blocked))
+	if err == nil || !strings.Contains(err.Error(), "remove failed sshd drop-in") {
+		t.Fatalf("Grant error = %v, want the rollback removal failure", err)
+	}
+	if _, statErr := os.Lstat(m.FilePath(acct)); statErr != nil {
+		t.Fatalf("fixture did not leave the unremovable drop-in behind: %v", statErr)
 	}
 }
 

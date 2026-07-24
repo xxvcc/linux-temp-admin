@@ -51,6 +51,28 @@ func TestLookupAndManaged(t *testing.T) {
 	}
 }
 
+func TestNameInUseConsultsNSSAfterLocalMiss(t *testing.T) {
+	// Hide every local row from this package while leaving the real resolver
+	// available. root must still be found through `id`, exercising the same path
+	// used for LDAP/SSSD identities without requiring either service in CI.
+	setPasswd(t, "")
+	inUse, err := NameInUse("root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inUse {
+		t.Fatal("NSS-visible identity was treated as an unused local username")
+	}
+}
+
+func TestNameInUseFailsClosedWithoutResolver(t *testing.T) {
+	setPasswd(t, "")
+	t.Setenv("PATH", t.TempDir())
+	if _, err := NameInUse("unused-name"); err == nil {
+		t.Fatal("missing NSS resolver was treated as proof that a username is unused")
+	}
+}
+
 func TestLookupErrorsAreNotAbsence(t *testing.T) {
 	old := passwdPath
 	passwdPath = t.TempDir() // ReadFile on a directory fails.

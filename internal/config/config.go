@@ -71,6 +71,9 @@ const (
 
 	// InstallPath is where the stable command is installed.
 	InstallPath = "/usr/local/sbin/linux-temp-admin"
+	// LifecycleLockFile serializes every account/install mutation. It deliberately
+	// lives outside StateDir because uninstall removes StateDir while holding it.
+	LifecycleLockFile = "/run/" + ManagedTag + ".lock"
 	// SystemdDir holds generated auto-revoke units.
 	SystemdDir = "/etc/systemd/system"
 	// AutoRevokeUnitPrefix namespaces generated systemd units. The "-v2-" infix is

@@ -108,6 +108,9 @@ func (a *App) invite(args []string) int {
 				return 1
 			}
 			cand := *prefix + "-" + h
+			// Dependency planning happens later and may need to install `id`. Use the
+			// local database while choosing a candidate, then perform the authoritative
+			// local+NSS check inside the lifecycle lock immediately before creation.
 			exists, lookupErr := user.Exists(cand)
 			if lookupErr != nil {
 				a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), lookupErr)
@@ -280,13 +283,15 @@ func (a *App) invite(args []string) int {
 		}
 	}
 
-	// Now that it is confirmed, make the host changes: install the dependencies,
-	// then create the account.
+	// Dependency packages are host prerequisites, not lifecycle state; install
+	// them before taking the account lock so a package manager cannot delay an
+	// already-due scheduled revoke. The account transaction starts below.
 	if !a.installDeps(grantSudo == "yes", depPkgs) {
 		return 1
 	}
-
-	return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan)
+	return a.withLifecycleLock(func() int {
+		return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan)
+	})
 }
 
 // promptHours asks for the account lifetime, offering current as the default a
@@ -570,23 +575,23 @@ func (a *App) reportBlockers(rep sysinfo.LoginReport) {
 }
 
 // checkKeyLogin runs the key-login check and augments it with the one thing the
-// per-user `sshd -T` probe cannot see: an address- or host-scoped `Match` block.
-// Whether such a block admits the invitee depends on their source address, which
-// is unknowable here, so its mere presence makes the login unverifiable — never a
+// per-user `sshd -T` probe cannot see: a connection-scoped `Match` block.
+// Whether such a block admits the invitee depends on attributes such as source
+// address or local port, which are unknowable here, so its mere presence makes the login unverifiable — never a
 // blocker, so it neither refuses the invite nor triggers a fix, only downgrades a
 // "verified" claim to an honest UNVERIFIED.
 func (a *App) checkKeyLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return withAddressScopedMatch(sysinfo.CheckKeyLogin(cfg, user, groups))
+	return withConnectionScopedMatch(sysinfo.CheckKeyLogin(cfg, user, groups))
 }
 
 func (a *App) checkPasswordLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return withAddressScopedMatch(sysinfo.CheckPasswordLogin(cfg, user, groups))
+	return withConnectionScopedMatch(sysinfo.CheckPasswordLogin(cfg, user, groups))
 }
 
-func withAddressScopedMatch(rep sysinfo.LoginReport) sysinfo.LoginReport {
-	if sysinfo.HasAddressScopedMatch() {
+func withConnectionScopedMatch(rep sysinfo.LoginReport) sysinfo.LoginReport {
+	if sysinfo.HasConnectionScopedMatch() {
 		rep.Unverifiable = append(rep.Unverifiable,
-			"sshd has an address- or host-scoped Match rule; whether this account is admitted depends on the invitee's source address, which cannot be checked here")
+			"sshd has a connection-scoped Match rule; whether this account is admitted depends on address, port, or routing attributes that cannot be checked here")
 	}
 	return rep
 }
@@ -795,14 +800,17 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// nothing — stripping a live account's grant (and reloading sshd out from under
 	// its invitee) on the way to that failure is a regression. The generated-name
 	// path is already existence-checked; an explicit --user is not, so guard here.
-	exists, lookupErr := user.Exists(username)
+	exists, lookupErr := user.NameInUse(username)
 	if lookupErr != nil {
-		return failf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), lookupErr)
+		return failf("%s: %v", a.P.M("读取本地/NSS 账号数据库失败", "reading the local/NSS account database failed"), lookupErr)
 	}
-	if !exists {
-		if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
-			return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
-		}
+	if exists {
+		a.errorf("%s", a.P.M("本地或 NSS 中已存在同名账号，拒绝创建："+username,
+			"an account with this name already exists locally or in NSS; refusing creation: "+username))
+		return 1
+	}
+	if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
+		return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
 	}
 
 	if err := a.Users.Create(username, resolveShell()); err != nil {
@@ -850,13 +858,14 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 
 	// The sshd exception goes in only once the account (and its key) exist, and it
 	// is proved effective against the account's real groups before sshd is
-	// reloaded. Grant removes its own file on any failure, so a failure here adds
-	// nothing to roll back beyond the account itself.
+	// reloaded. Grant attempts its own rollback on failure; the CLI retries removal
+	// independently before account rollback can free the username.
 	sshdDropIn := ""
 	if plan.fixSSHD {
 		res, err := a.SSHD.Grant(username, groups, plan.report)
 		if err != nil {
-			return failf("%s: %v", a.P.M("为该账号开启 sshd 公钥登录失败", "enabling the sshd public-key login for this account failed"), err)
+			cleanupErr := a.removeSSHDException(username)
+			return failf("%s: %v", a.P.M("为该账号开启 sshd 公钥登录失败", "enabling the sshd public-key login for this account failed"), errors.Join(err, cleanupErr))
 		}
 		sshdDropIn = res.Path
 		cleanups = append(cleanups, func() error { return a.SSHD.Remove(username) })
@@ -954,7 +963,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			autoScheduled = true
 			cleanups = append(cleanups, func() error { return a.Scheduler.Cancel(username, unit) })
 		} else {
-			a.warnf("%s: %v", a.P.M("自动删除任务创建失败，仅设置到期", "auto-delete scheduling failed; account expiry only"), err)
+			return failf("%s: %v", a.P.M("自动删除任务创建失败，已拒绝创建临时账号", "auto-delete scheduling failed; refusing to create the temporary account"), err)
 		}
 	}
 
@@ -1139,10 +1148,6 @@ chmod 600 './%s.key'
 		fmt.Fprint(&out, "\n"+a.P.M(
 			"永久账号提示: 未选择自动删除，此账号不会过期、不会被自动删除；用完请手动撤销（revoke）。",
 			"Permanent-account note: auto-delete was not chosen, so this account does not expire and is not auto-deleted. Revoke it by hand when done.")+"\n")
-	} else if !b.auto {
-		fmt.Fprint(&out, "\n"+a.P.M(
-			"自动删除提示: 未创建自动删除任务；账号到期只阻止登录，不删除用户，请按需手动撤销。",
-			"Auto-delete note: no auto-delete task was created; expiry only blocks login and does not delete the user. Revoke manually when needed.")+"\n")
 	}
 	secret := a.P.M("私钥", "private key")
 	if b.byPassword() {
@@ -1221,15 +1226,7 @@ func (a *App) ensureStableInstalled() error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	executable := a.Executable
-	if executable == nil {
-		executable = os.Executable
-	}
-	exe, err := executable()
-	if err != nil {
-		return err
-	}
-	bin, err := os.ReadFile(exe)
+	bin, err := a.readRunningBinary()
 	if err != nil {
 		return err
 	}

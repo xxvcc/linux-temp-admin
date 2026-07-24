@@ -47,11 +47,10 @@ func (c *SSHDConfig) Has(key string) bool { return len(c.vals[key]) > 0 }
 // evaluates it happily for an account that does not exist yet — which is what
 // lets invite check a username *before* creating it.
 //
-// No address is supplied, because the tool cannot know which IP the invitee will
-// connect from. That makes `Match Address` blocks evaluate as non-matching, so a
-// server that enables pubkey auth only for one network reads here as "disabled".
-// That bias is deliberate: it can produce a needless warning, never a false
-// promise that a key login will work.
+// Only the user is supplied because the tool cannot know the future connection's
+// source/server address, local port, or routing attributes. sshd may therefore
+// leave connection-scoped Match blocks unevaluated; the caller separately scans
+// the configuration and downgrades such a result to UNVERIFIED.
 //
 // A blank user asks for the plain global view (`sshd -T`).
 func SSHDEffective(user string) (*SSHDConfig, error) {
@@ -96,22 +95,24 @@ func ParseSSHD(out string) *SSHDConfig {
 // sshdConfigDropInDir is the standard drop-in directory; overridable in tests.
 var sshdConfigDropInDir = "/etc/ssh/sshd_config.d"
 
-// HasAddressScopedMatch reports whether sshd's configuration contains a `Match`
-// stanza keyed on the client's Address or Host.
+// HasConnectionScopedMatch reports whether sshd's configuration contains a
+// `Match` criterion that `sshd -T -C user=X` cannot evaluate without more
+// connection attributes.
 //
 // This is the one thing `sshd -T -C user=X` cannot answer: it evaluates Match
 // blocks for the connection spec it is given, and the tool cannot supply the
-// invitee's source address because it does not know it. So a host that enables
+// invitee's source/server address, port, or routing domain because it does not
+// know them. So a host that enables
 // pubkey auth globally but denies it from the internet (`Match Address`), or
 // that requires a second factor except on the LAN, would read as "key login
 // works" from a no-address probe and print a verified invite that then fails.
 //
 // Detection, not interpretation: it scans the main config and recursively follows
-// Include directives for a `Match` line naming Address/Host as a criterion. A
+// Include directives and parses Match criterion/value pairs. A
 // caller treats that as "cannot verify" and downgrades the invite to UNVERIFIED.
 // An include that cannot be read is also unverifiable, so an incomplete scan can
 // never produce a false verified claim.
-func HasAddressScopedMatch() bool {
+func HasConnectionScopedMatch() bool {
 	files := []string{sshdConfigPath}
 	if entries, err := filepath.Glob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
 		files = append(files, entries...)
@@ -121,7 +122,7 @@ func HasAddressScopedMatch() bool {
 	seen := map[string]bool{}
 	baseDir := filepath.Dir(sshdConfigPath)
 	for _, f := range files {
-		found, complete := fileHasAddressScopedMatch(f, baseDir, seen)
+		found, complete := fileHasConnectionScopedMatch(f, baseDir, seen)
 		if found || !complete {
 			return true
 		}
@@ -129,7 +130,7 @@ func HasAddressScopedMatch() bool {
 	return false
 }
 
-func fileHasAddressScopedMatch(path, baseDir string, seen map[string]bool) (found, complete bool) {
+func fileHasConnectionScopedMatch(path, baseDir string, seen map[string]bool) (found, complete bool) {
 	path = filepath.Clean(path)
 	if seen[path] {
 		return false, true
@@ -160,7 +161,7 @@ func fileHasAddressScopedMatch(path, baseDir string, seen map[string]bool) (foun
 					return false, false
 				}
 				for _, include := range matches {
-					found, complete := fileHasAddressScopedMatch(include, baseDir, seen)
+					found, complete := fileHasConnectionScopedMatch(include, baseDir, seen)
 					if found || !complete {
 						return found, complete
 					}
@@ -171,11 +172,24 @@ func fileHasAddressScopedMatch(path, baseDir string, seen map[string]bool) (foun
 		if !strings.EqualFold(fields[0], "Match") {
 			continue
 		}
-		// A Match line is keyword/value pairs: `Match User bob Address 10.0.0.0/8`.
-		// Any Address/Host criterion makes the outcome depend on where the client
-		// connects from, which is unknowable here.
-		for _, tok := range fields[1:] {
-			if strings.EqualFold(tok, "address") || strings.EqualFold(tok, "host") {
+		// Match is a sequence of criterion/value pairs, except the standalone All.
+		// Parse criterion positions rather than searching every token: `Match User
+		// host` has a value named "host", not a Host criterion.
+		for i := 1; i < len(fields); {
+			criterion := strings.ToLower(fields[i])
+			switch criterion {
+			case "all":
+				i++
+			case "user", "group":
+				if i+1 >= len(fields) {
+					return false, false
+				}
+				i += 2
+			case "address", "host", "localaddress", "localport", "rdomain", "localnetwork", "tagged":
+				return true, true
+			default:
+				// A newer criterion we do not understand is not evidence that the
+				// user-only probe covered it. Downgrade instead of guessing.
 				return true, true
 			}
 		}

@@ -46,6 +46,16 @@ func (fakeSched) RemoveAtJobsFor(string) error           { return nil }
 func (fakeSched) AtrmJob(string) error                   { return nil }
 func (fakeSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
 
+type unavailableSched struct{}
+
+func (unavailableSched) HasSystemctl() bool                     { return false }
+func (unavailableSched) Systemctl(...string) error              { return nil }
+func (unavailableSched) HasAt() bool                            { return false }
+func (unavailableSched) ScheduleAt(string, int) (string, error) { return "", errors.New("unavailable") }
+func (unavailableSched) RemoveAtJobsFor(string) error           { return nil }
+func (unavailableSched) AtrmJob(string) error                   { return nil }
+func (unavailableSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+
 type trackingSched struct {
 	jobs      map[string]string
 	next      int
@@ -256,6 +266,36 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		t.Errorf("audit log after revoke: %v", err)
 	} else if !strings.Contains(string(b), `"account.delete"`) {
 		t.Errorf("audit log missing account.delete:\n%s", b)
+	}
+}
+
+func TestInviteRollsBackWhenAutoDeleteCannotBeScheduled(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	const name = "lta-nosched1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	a, _, _, _ := inviteApp(t)
+	a.Scheduler.Sys = unavailableSched{}
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--no-sudo", "--no-fix-sshd", "--auto-revoke", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want failure when no exact auto-delete task can be created", rc)
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("account survived the failed auto-delete transaction")
+	}
+	if ok, err := a.Registry.Contains(name); err != nil || ok {
+		t.Fatalf("registry contains rolled-back account: ok=%v err=%v", ok, err)
+	}
+	if strings.Contains(a.Out.(*bytes.Buffer).String(), "BEGIN LINUX TEMP ADMIN INVITE") {
+		t.Fatal("credentials were printed for an account that could not be scheduled")
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "auto-delete scheduling failed") {
+		t.Fatalf("failure did not identify the scheduler: %s", a.Err.(*bytes.Buffer).String())
 	}
 }
 

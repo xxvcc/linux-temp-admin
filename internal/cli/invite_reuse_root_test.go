@@ -129,6 +129,49 @@ func TestInviteNoSudoDoesNotInheritAStaleGrant(t *testing.T) {
 	}
 }
 
+func TestInviteRetriesSSHDGrantCleanupBeforeAccountRollback(t *testing.T) {
+	a, _, sshdMgr, _ := inviteApp(t)
+	const name = "xxvcc-sshretry1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	// The grant reload fails. Its first removal attempt also fails, but the CLI's
+	// independent cleanup retry succeeds before account rollback frees the name.
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdNoPubkey), nil }
+	removes := 0
+	sshdMgr.RemoveFile = func(path string) error {
+		removes++
+		if removes == 1 {
+			return errors.New("transient read-only filesystem")
+		}
+		return os.Remove(path)
+	}
+	reloads := 0
+	sshdMgr.Reload = func() error {
+		reloads++
+		if reloads == 1 {
+			return errors.New("reload failed")
+		}
+		return nil
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--no-sudo", "--no-auto-revoke", "--fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want the failed grant transaction to roll back", rc)
+	}
+	if removes < 2 {
+		t.Fatalf("sshd drop-in removal attempts=%d, want Grant plus CLI retry", removes)
+	}
+	if _, err := os.Lstat(sshdMgr.FilePath(name)); !os.IsNotExist(err) {
+		t.Fatalf("sshd drop-in survived the independent cleanup retry: %v", err)
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("account survived a failed sshd grant")
+	}
+}
+
 // A scheduled deletion has no trustworthy identity when its registry row is
 // gone. It must exit successfully without touching either the account or its
 // name-scoped grant; chage expiry still blocks future login.

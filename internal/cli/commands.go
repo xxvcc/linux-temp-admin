@@ -390,6 +390,10 @@ func (a *App) orphanArtifacts(recs []registry.Record) ([]orphanArtifact, error) 
 // The subcommand's root gate does NOT come with it. Every caller has to keep its
 // own — this function sweeps.
 func (a *App) compact() int {
+	return a.withLifecycleLock(a.compactLocked)
+}
+
+func (a *App) compactLocked() int {
 	rc := 0
 	// Sweep the live grants BEFORE the registry rows: compacting drops the rows
 	// that name these accounts, and a grant nobody can name any more is a grant
@@ -611,11 +615,10 @@ func (a *App) doctor(args []string) int {
 		}
 	}
 	// The other direction: a registered account that asked to be auto-deleted, still
-	// exists, and has NO task on disk to do it. chage -E still blocks its login at
-	// the expiry date, so this is not a live-access hole — but the deletion the
-	// operator asked for will never happen (the timer was removed out of band, or
-	// Schedule failed at invite and only expiry-locking was set). Surface it so the
-	// account does not linger disabled-but-undeleted forever; revoke finishes it.
+	// exists, and has NO task on disk to do it. New invites refuse this state, so it
+	// means a task was removed out of band (or predates that invariant). chage -E is
+	// only a later, day-granularity lockout backstop; surface the missing exact-time
+	// mechanism immediately so the operator can revoke the account.
 	if a.Scheduler != nil && a.Registry != nil {
 		haveUnit := map[string]bool{}
 		schedulesKnown := true
@@ -650,8 +653,8 @@ func (a *App) doctor(args []string) int {
 		}
 		if len(stranded) > 0 {
 			for _, u := range stranded {
-				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无对应任务（登录仍会在到期日被 chage 阻止）：",
-					"account set to auto-delete but has no task left to do it (chage still blocks its login at expiry): "), u)
+				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无对应任务（chage 仅提供按天粒度的较晚兜底锁定）：",
+					"account set to auto-delete but has no task left to do it (chage only provides a later, day-granularity lockout backstop): "), u)
 			}
 			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
 				"remove them with `revoke --user <name>` once expired."))

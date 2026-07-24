@@ -15,6 +15,12 @@ func (a *App) revoke(args []string) int {
 	if !a.requireRoot() {
 		return 1
 	}
+	return a.withLifecycleLock(func() int { return a.revokeLocked(args) })
+}
+
+// revokeLocked performs one complete revoke while the process-wide lifecycle
+// lock is held. uninstall calls this form because it already holds that lock.
+func (a *App) revokeLocked(args []string) int {
 	fs := flag.NewFlagSet("revoke", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
 	userFlag := fs.String("user", "", "")

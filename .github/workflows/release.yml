@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,14 +33,35 @@ jobs:
         run: |
           set -Eeuo pipefail
           version="${GITHUB_REF_NAME#v}"
+          prerelease=false
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           if [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
              && [[ "${BASH_REMATCH[1]}" -ge 2 ]]; then
             echo "go_release=true" >> "$GITHUB_OUTPUT"
+            if [[ -n "${BASH_REMATCH[4]}" ]]; then
+              prerelease=true
+            fi
           else
             echo "go_release=false" >> "$GITHUB_OUTPUT"
             echo "::notice::${GITHUB_REF_NAME} is not a v2+ tag; skipping the release build."
           fi
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
+      - name: Release test gate
+        if: steps.v.outputs.go_release == 'true'
+        run: |
+          set -Eeuo pipefail
+          go vet -printf.funcs=printf,errorf,warnf ./...
+          go test -race ./...
+          sudo -E env "PATH=$PATH" go test -count=1 -race -tags integration ./...
+          test -z "$(gofmt -l .)"
+          sh -n scripts/install.sh
+          bash -n scripts/release.sh scripts/sign-release.sh
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck -S warning scripts/*.sh
 
       - name: Build static binaries (amd64, arm64)
         if: steps.v.outputs.go_release == 'true'
@@ -73,20 +98,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.v.outputs.prerelease }}
         run: |
           set -Eeuo pipefail
-          notes="Automated CI build for ${TAG}. **Draft** — detached ed25519 signatures (\`*.sig\`) are added by the maintainer offline via scripts/sign-release.sh, which then publishes this release. Do not rely on a draft's assets."
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG exists; updating assets (--clobber)"
+            is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "release $TAG is already published; refusing to replace public assets" >&2
+              exit 1
+            fi
+            echo "draft release $TAG exists; refreshing unsigned assets"
             gh release upload "$TAG" \
               dist/linux-temp-admin-linux-amd64 \
               dist/linux-temp-admin-linux-arm64 \
               dist/SHA256SUMS --clobber
           else
+            release_flags=(--draft --title "$TAG" --generate-notes)
+            if [[ "$PRERELEASE" == "true" ]]; then
+              release_flags+=(--prerelease)
+            fi
             gh release create "$TAG" \
               dist/linux-temp-admin-linux-amd64 \
               dist/linux-temp-admin-linux-arm64 \
               dist/SHA256SUMS \
-              --draft --title "$TAG" --notes "$notes"
+              "${release_flags[@]}"
           fi
           echo "Draft release staged. Sign & publish locally: LTA_SIGN_KEY=~/.lta/signing.key scripts/sign-release.sh $TAG"

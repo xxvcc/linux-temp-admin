@@ -550,8 +550,8 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 
 // TestDoctorReportsAnAutoDeleteAccountWithNoTaskLeft covers the MEDIUM tidiness
 // gap: an account that asked to auto-delete, still exists, and whose unit was
-// removed out of band will never be deleted (chage still blocks its login at
-// expiry, so this is tidiness, not a live-access hole). doctor now surfaces it.
+// removed out of band will never be deleted. chage is only a later day-granular
+// lockout backstop, so doctor must surface the missing exact-time task.
 func TestDoctorReportsAutoDeleteAccountsWithNoTaskLeft(t *testing.T) {
 	const systemdName = "ltanotask1"
 	const atName = "ltanotask2"

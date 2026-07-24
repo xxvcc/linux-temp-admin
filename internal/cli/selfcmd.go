@@ -2,12 +2,34 @@ package cli
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 )
+
+const procSelfExe = "/proc/self/exe"
+
+// readRunningBinary reads the inode this process is executing, not the mutable
+// pathname it was launched through. Executable exists only to point tests at a
+// fixture; production leaves it nil and uses Linux's stable /proc handle.
+func (a *App) readRunningBinary() ([]byte, error) {
+	path := procSelfExe
+	if a.Executable != nil {
+		var err error
+		path, err = a.Executable()
+		if err != nil {
+			return nil, fmt.Errorf("locate test executable: %w", err)
+		}
+	}
+	bin, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	return bin, nil
+}
 
 func (a *App) install(args []string) int {
 	if !a.requireRoot() {
@@ -20,14 +42,13 @@ func (a *App) install(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
-	exe, err := os.Executable()
+	return a.withLifecycleLock(func() int { return a.installLocked(force) })
+}
+
+func (a *App) installLocked(force bool) int {
+	bin, err := a.readRunningBinary()
 	if err != nil {
-		a.errorf("%s: %v", a.P.M("无法定位当前程序", "cannot locate the running binary"), err)
-		return 1
-	}
-	bin, err := os.ReadFile(exe)
-	if err != nil {
-		a.errorf("%v", err)
+		a.errorf("%s: %v", a.P.M("无法读取当前运行程序", "cannot read the running binary"), err)
 		return 1
 	}
 	installed, err := a.Selfmanage.Install(bin, force)
@@ -75,6 +96,12 @@ func (a *App) upgrade(args []string) int {
 			return 0
 		}
 	}
+	return a.withLifecycleLock(func() int {
+		return a.upgradeLocked(binURL, sigURL, force)
+	})
+}
+
+func (a *App) upgradeLocked(binURL, sigURL string, force bool) int {
 	newVer, err := a.Selfmanage.Upgrade(binURL, sigURL, buildinfo.Version, force)
 	if err != nil {
 		a.errorf("%s: %v", a.P.M("升级失败", "upgrade failed"), err)

@@ -61,6 +61,7 @@ type Dep struct {
 // needSudo adds sudo.
 func RequiredDeps(needSudo bool) []Dep {
 	deps := []Dep{
+		{Label: "id", Names: []string{"id"}},
 		{Label: "useradd/adduser", Names: []string{"useradd", "adduser"}},
 		{Label: "usermod", Names: []string{"usermod"}},
 		{Label: "chage", Names: []string{"chage"}},
@@ -104,6 +105,8 @@ func PackageCandidate(label, pm string) string {
 		case "apk", "pacman":
 			return "shadow"
 		}
+	case "id":
+		return "coreutils"
 	case "sudo":
 		return "sudo"
 	}

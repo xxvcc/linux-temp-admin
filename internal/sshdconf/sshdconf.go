@@ -80,21 +80,23 @@ type GrantResult struct {
 // three external steps are fields so tests can point at a temp dir and inject
 // fakes.
 type Manager struct {
-	Dir       string
-	Lock      string                                         // exclusive lock path; "" disables locking
-	Validate  func() error                                   // syntax check (default: sshd -t)
-	Effective func(user string) (*sysinfo.SSHDConfig, error) // effective config (default: sshd -T -C user=)
-	Reload    func() error                                   // ask sshd to re-read its config
+	Dir        string
+	Lock       string                                         // exclusive lock path; "" disables locking
+	Validate   func() error                                   // syntax check (default: sshd -t)
+	Effective  func(user string) (*sysinfo.SSHDConfig, error) // effective config (default: sshd -T -C user=)
+	Reload     func() error                                   // ask sshd to re-read its config
+	RemoveFile func(path string) error                        // defaults to os.Remove; injectable for rollback tests
 }
 
 // New returns a Manager for the real /etc/ssh/sshd_config.d.
 func New() *Manager {
 	return &Manager{
-		Dir:       DefaultDir,
-		Lock:      DefaultLock,
-		Validate:  sshdSyntaxCheck,
-		Effective: sysinfo.SSHDEffective,
-		Reload:    reload,
+		Dir:        DefaultDir,
+		Lock:       DefaultLock,
+		Validate:   sshdSyntaxCheck,
+		Effective:  sysinfo.SSHDEffective,
+		Reload:     reload,
+		RemoveFile: os.Remove,
 	}
 }
 
@@ -146,19 +148,26 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 		// Everything below reads the config from disk, so the grant is proved correct
 		// before the running sshd is asked to adopt it. Until the reload, the running
 		// daemon has not seen this file at all, so removing it fully undoes the grant.
-		fail := func(format string, args ...any) error {
-			_ = os.Remove(path)
-			return fmt.Errorf(format, args...)
+		rollback := func(cause error, restoreDaemon bool) error {
+			var rollbackErrs []error
+			if err := m.removeFile(path); err != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("remove failed sshd drop-in %s: %w", path, err))
+			} else if restoreDaemon && m.Reload != nil {
+				if err := m.Reload(); err != nil {
+					rollbackErrs = append(rollbackErrs, fmt.Errorf("restore sshd after failed reload: %w", err))
+				}
+			}
+			return errors.Join(append([]error{cause}, rollbackErrs...)...)
 		}
 		if m.Validate != nil {
 			if err := m.Validate(); err != nil {
-				return fail("sshd rejected the configuration this grant produced: %w", err)
+				return rollback(fmt.Errorf("sshd rejected the configuration this grant produced: %w", err), false)
 			}
 		}
 		if m.Effective != nil {
 			cfg, err := m.Effective(user)
 			if err != nil {
-				return fail("cannot re-read the effective sshd config: %w", err)
+				return rollback(fmt.Errorf("cannot re-read the effective sshd config: %w", err), false)
 			}
 			// OK, not Certain: this proves the blockers we set out to lift are gone.
 			// It must NOT demand Certain(), because a rule we can never evaluate — an
@@ -168,7 +177,7 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			// Whether such an unevaluable rule downgrades the invite to UNVERIFIED is the
 			// caller's decision, taken from the same report; it is not this proof's job.
 			if rep := sysinfo.CheckKeyLogin(cfg, user, groups); !rep.OK() {
-				return fail("the sshd drop-in did not take effect (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir)
+				return rollback(fmt.Errorf("the sshd drop-in did not take effect (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir), false)
 			}
 		}
 		if m.Reload != nil {
@@ -181,9 +190,7 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 				// must not claim a verified login on a daemon we never reached.
 				res.Reloaded = false
 			default:
-				_ = os.Remove(path)
-				_ = m.Reload() // best effort: put the daemon back where we found it
-				return fmt.Errorf("sshd reload failed: %w", err)
+				return rollback(fmt.Errorf("sshd reload failed: %w", err), true)
 			}
 		}
 		res.Path = path
@@ -215,7 +222,7 @@ func (m *Manager) Remove(user string) error {
 			}
 			return err
 		}
-		if err := os.Remove(path); err != nil {
+		if err := m.removeFile(path); err != nil {
 			return err
 		}
 		// The exception is gone from disk — the removal itself has succeeded, and the
@@ -242,6 +249,13 @@ func (m *Manager) Remove(user string) error {
 		}
 		return nil
 	})
+}
+
+func (m *Manager) removeFile(path string) error {
+	if m.RemoveFile != nil {
+		return m.RemoveFile(path)
+	}
+	return os.Remove(path)
 }
 
 // Orphans returns the accounts whose managed drop-in is still on disk although

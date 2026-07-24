@@ -66,6 +66,25 @@ func Exists(name string) (bool, error) {
 	return ok, err
 }
 
+// NameInUse reports whether either the local passwd database or the host's NSS
+// resolver knows name. Account ownership still comes only from /etc/passwd, but
+// invite must not create a local account that shadows an LDAP/SSSD identity.
+func NameInUse(name string) (bool, error) {
+	local, err := Exists(name)
+	if err != nil || local {
+		return local, err
+	}
+	err = exec.Command("id", "-u", name).Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false, nil
+	}
+	return false, fmt.Errorf("query NSS identity %s: %w", name, err)
+}
+
 // Groups returns pw's group names: its primary group, plus every group that
 // lists it as a member. This is exactly the set sshd evaluates AllowGroups and
 // DenyGroups against, so an invite can tell whether a whitelist would admit the

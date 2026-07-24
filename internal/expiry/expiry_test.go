@@ -24,8 +24,8 @@ func TestNeverPrematureWithinOneDay(t *testing.T) {
 					t.Errorf("hours=%d now=%s: lock %s is before now+hours %s (premature)",
 						hours, now.Format(time.RFC3339), lock.Format(time.RFC3339), window.Format(time.RFC3339))
 				}
-				if lock.After(window.Add(48 * time.Hour)) {
-					t.Errorf("hours=%d now=%s: lock %s is more than 2 days past the window %s",
+				if lock.After(window.Add(24 * time.Hour)) {
+					t.Errorf("hours=%d now=%s: lock %s is more than 1 day past the window %s",
 						hours, now.Format(time.RFC3339), lock.Format(time.RFC3339), window.Format(time.RFC3339))
 				}
 			}
