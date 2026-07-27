@@ -5,10 +5,30 @@ private key is never present on a networked machine, candidate source is never
 executed on the signing machine, and CI output is never signed merely because
 its own checksum file matches.
 
+## Maintainer model
+
+This repository currently uses a single-maintainer release process. Pull
+requests preserve an auditable diff and must pass every required status check
+and resolve every discussion, but GitHub does not require approval from another
+account, CODEOWNERS review, or approval of the last push. The
+`release-staging` and `release-mirror` environments likewise have no required
+reviewers; their branch/tag restrictions and disabled administrator bypass
+remain enforced.
+
+References below to independent caches, channels, machines, checks, or recorded
+values describe technical separation, not a second human reviewer. This model
+explicitly gives up human separation of duties: compromise of the sole
+maintainer's GitHub authority can change protected source and workflows without
+another person's approval. The required CI, OpenPGP-signed tag, offline ed25519
+release signature, reproducible rebuild, immutable Release, restricted mirror
+receiver, and public post-deployment verification remain mandatory. Keep the
+GitHub credential, OpenPGP private key, and offline ed25519 key separately
+protected; external review is useful but is not a release gate.
+
 ## One-time trusted tooling setup
 
-On an audited source commit, before preparing any candidate release, obtain its
-full 40-hex commit ID through the independent review record, place a standalone
+On an audited source commit, before preparing any candidate release, record its
+full 40-hex commit ID in the maintainer's release audit record, place a standalone
 root-owned checkout at the path below, and build the small network-incapable
 signer with the exact supported Go toolchain:
 
@@ -135,7 +155,7 @@ unset TAR_OPTIONS GZIP BZIP2 BZIP XZ_OPT
     fail "cannot resolve trusted signer source HEAD"
   fi
   [[ "$source_head" == "$TRUSTED_SIGNER_COMMIT" ]] \
-    || fail "trusted signer source HEAD is not the independently audited commit"
+    || fail "trusted signer source HEAD is not the recorded audited commit"
 
   source_tree="$build_root/source-tree"
   "${git_env[@]}" timeout -k 5 60 git \
@@ -241,7 +261,7 @@ private build/module caches, require the public Go module proxy and checksum
 database, disable direct VCS fetching, and clear caller-controlled `GOROOT`,
 experiment, FIPS, telemetry, and authentication settings. The signer is built
 twice with independent caches and installed only after the outputs compare
-byte-for-byte. Run the setup from a separately reviewed, canonical source tree
+byte-for-byte. Run the setup from a separately audited, canonical source tree
 whose complete contents and ancestry are root-owned and not writable by another
 account; the block verifies that boundary before Git or Go sees the tree. It also
 enters a clean privileged Bash, disables caller Git configuration and replacement
@@ -305,20 +325,19 @@ Before enabling release staging, configure these repository controls. They are
 part of the release trust boundary and cannot be enforced by files inside the
 repository:
 
-1. Protect `main` with a ruleset that requires pull requests, independent
-   approval including CODEOWNERS for `.github/workflows/**`, `scripts/**`,
-   `cmd/lta-release/**`, and this document, required CI status checks, resolved
-   conversations, and blocks force pushes and deletion. Do not permit bypass by
-   ordinary release operators.
+1. Protect `main` with a ruleset that requires pull requests, required CI status
+   checks, resolved conversations, and blocks force pushes and deletion. Set the
+   required approval count to zero, and do not require CODEOWNERS review or
+   approval of the last push. CODEOWNERS remains ownership metadata only. Do not
+   permit ruleset bypass by ordinary release operations.
 2. Protect `v*` tags with a ruleset that restricts creation, update, and deletion
    to the designated release maintainers. The pipeline additionally requires an
    annotated tag with a valid OpenPGP signature and independently pins its exact
    signing fingerprint.
-3. Create an environment named `release-staging`, require approval by a reviewer
-   other than the triggering operator, prevent self-review, disable administrator
-   bypass, and restrict deployments to the protected `main` branch. A
-   `workflow_run` receiver executes from the default branch even though it
-   validates and stages the triggering `v*` tag.
+3. Create an environment named `release-staging` with no required reviewers,
+   disable administrator bypass, and restrict deployments to the protected
+   `main` branch. A `workflow_run` receiver executes from the default branch even
+   though it validates and stages the triggering `v*` tag.
 4. Only after verifying those controls, set the repository Actions variable
    `LTA_RELEASE_ENVIRONMENT_CONFIGURED` to the exact value `true`. Missing or
    different values fail closed before the write-capable job can run. Remove the
@@ -374,7 +393,7 @@ Paste the complete output between `LTA_RELEASE_KEYS_BEGIN` and
 
 ## Release sequence
 
-### 1. Create a reviewed signed tag
+### 1. Create an audited signed tag
 
 The candidate commit must already be in `origin/main`. Use an OpenPGP-signed tag;
 `prepare-release.sh` and `publish-release.sh` both verify its signature against
@@ -446,10 +465,10 @@ exec /opt/lta-release-tools/prepare-release.sh \
 LTA_PREPARE_RELEASE
 ```
 
-Record the printed tag, commit, and prepared-manifest SHA-256 through an
-independent operator channel. Transfer the prepared directory to removable
+Record the printed tag, commit, and prepared-manifest SHA-256 in a separate
+authenticated release record. Transfer the prepared directory to removable
 media as data. A compromised CI can choose its binary and checksum together,
-but it cannot make those bytes equal the trusted rebuild unless the reviewed
+but it cannot make those bytes equal the trusted rebuild unless the audited
 source/toolchain or preparation workstation is also compromised.
 
 ### 3. Air-gapped signing
@@ -710,12 +729,11 @@ same-version forced self-upgrade from the public mirror. That canary first
 verifies the stable installer hash and fails if either client reports that it
 used the GitHub fallback.
 
-Create a protected GitHub Environment named `release-mirror`. Require an
-independent reviewer, prevent self-review and administrator bypass, and allow
-only protected `v*` tags plus the protected default branch used for an explicit
-recovery dispatch. Enable immutable Releases for the repository; synchronization
-fails closed when the selected GitHub Release is mutable. Configure exactly
-these environment values:
+Create a protected GitHub Environment named `release-mirror` with no required
+reviewers. Disable administrator bypass, and allow only protected `v*` tags plus
+the protected default branch used for an explicit recovery dispatch. Enable
+immutable Releases for the repository; synchronization fails closed when the
+selected GitHub Release is mutable. Configure exactly these environment values:
 
 - Actions variables: `MIRROR_HOST`, `MIRROR_PORT`, `MIRROR_USER`, and
   `LTA_RELEASE_MIRROR_ENVIRONMENT_CONFIGURED` with the exact value `true`;
@@ -732,7 +750,7 @@ from the repository's default branch and refuses any other repository identity.
 
 The production mirror uses the following exact layout. Treat a difference as
 configuration drift and clear the Environment configuration gate until it has
-been reviewed:
+been revalidated:
 
 - `ltamirror` is a password-locked, non-sudo account. Its login shell exists
   only so sshd can execute the forced command; its sole authorized key cannot
@@ -795,7 +813,7 @@ cmp scripts/mirror-receiver.py /usr/local/libexec/linux-temp-admin-mirror-receiv
 ```
 
 The final `cmp` is a post-install drift check and must succeed. For an Nginx
-change, preserve the prior root-owned include, install the reviewed repository
+change, preserve the prior root-owned include, install the audited repository
 copy, run `nginx -t`, reload the `nginx` service only after the syntax check, and
 repeat the public header, method, unknown-path, and byte-comparison probes. If
 syntax, reload, or a public probe fails, restore the preserved include, retest,
@@ -817,15 +835,15 @@ Recovery is deliberately narrow:
 4. A leftover `transfer-*` directory may be quarantined only after confirming
    that no `ltamirror` receiver or rsync process is active. `.deploy.lock` is
    persistent state and must not be treated as a stale transfer.
-5. After total mirror loss, rebuild this empty layout, restore the reviewed
+5. After total mirror loss, rebuild this empty layout, restore the audited
    receiver and Nginx include, rotate the deployment key, and dispatch each
    required immutable tag. Dispatch the current GitHub Latest tag after its
    version bytes are present so stable files are reconstructed last. Repeat all
    independent public checks before reopening the announcement gate.
 
 An intentional emergency downgrade is not normal deployment-key recovery: the
-receiver blocks it. It requires a separately approved root-host incident
-procedure, explicit client downgrade handling, and a new independent audit.
+receiver blocks it. It requires an explicitly authorized and recorded root-host
+incident procedure, explicit client downgrade handling, and a fresh audit.
 
 Do not announce a release until both mirror workflow jobs are green and an
 independent network check has fetched `latest.json`, the selected version's
@@ -945,7 +963,7 @@ trusts the TLS and mutable script route of the source ultimately used. The
 mirrored installer is copied from the released signed tag, but is not itself an
 offline-ed25519-signed GitHub Release asset.
 For a high-assurance first install, obtain all three values below through
-the review/signing record and an independent authenticated channel, then run:
+the release audit/signing record and a separate authenticated channel, then run:
 
 ```bash
 INSTALLER_COMMIT='replace-with-the-audited-40-hex-commit'
@@ -1097,8 +1115,8 @@ metadata are already safe; otherwise it is atomically repaired.
 - The private key is protected from candidate code, CI, GitHub, and networked
   preparation/publication. The air-gapped OS, fixed signer binary, trusted
   offline script, and physical transfer procedure remain trusted.
-- Reproducible comparison binds CI bytes to the reviewed tag under the fixed Go
-  toolchain. The reviewed source, signed-tag identity, trusted preparation copy,
+- Reproducible comparison binds CI bytes to the audited tag under the fixed Go
+  toolchain. The audited source, signed-tag identity, trusted preparation copy,
   Go distribution, and preparation workstation remain trusted.
 - The convenience bootstrap obtains its script and embedded trust anchors over
   TLS from the official mirror. The mirror takes that installer from the signed
@@ -1108,7 +1126,7 @@ metadata are already safe; otherwise it is atomically repaired.
   channel before running it.
 - A fresh bootstrap has no previously installed version state, so a release-host
   compromise can replay an older release that still has a valid offline
-  signature. Pin a reviewed installer commit and pass `LTA_RELEASE=vX.Y.Z` when
+  signature. Pin an audited installer commit and pass `LTA_RELEASE=vX.Y.Z` when
   rollback resistance is required for first installation; the installer rejects
   a candidate whose reported version does not exactly match that tag.
 - Publication is not transactionally coupled to public CDN verification. If the
@@ -1124,3 +1142,10 @@ metadata are already safe; otherwise it is atomically repaired.
   observed conflicts, but cannot eliminate an operation that starts immediately
   after the last check. The protected environment and organization-wide
   single-publisher lock are mandatory operational controls.
+- The single-maintainer model has no independent human approval boundary. A
+  compromise of that maintainer's GitHub authority can merge source or workflow
+  changes and request deployments. Offline release signing and client
+  verification still prevent an account-only attacker from forging an accepted
+  binary update, but the stable bootstrap script and release availability remain
+  operational trust surfaces. Monitor them from a separate system and rotate
+  affected credentials immediately after a suspected compromise.
