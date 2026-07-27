@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v2.8.3 - 2026-07-27
+
+- Run the release artifact handoff on the official actions' native Node.js 24
+  versions. The signed `v2.8.2` tag exposed the upload action's Node.js 20
+  deprecation warning after the read-only gate produced an unsigned artifact;
+  its unsigned draft was deliberately removed before release signing or
+  publication, and no published v2.8.2 assets exist.
+
 ## v2.8.2 - 2026-07-27
 
 - Serialize root integration test packages because they share the host account
