@@ -52,7 +52,7 @@ jobs:
       - name: Integration tests (root)
         # Root integration packages share the host account databases and must
         # not run useradd/userdel concurrently across package processes.
-        run: sudo -E env "PATH=$PATH" go test -race -p 1 -tags integration ./...
+        run: sudo -E env "PATH=$PATH" go test -count=1 -race -p 1 -tags integration ./...
 
   static-cross-build:
     name: Static cross-build (${{ matrix.goarch }})
