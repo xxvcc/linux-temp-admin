@@ -142,8 +142,8 @@ jobs:
           }
           rm -f -- "$lookup"
 
-          # Re-resolve the protected tag immediately before the first write so
-          # a queueing or environment delay cannot stale the earlier validation.
+          # Re-resolve the protected tag immediately before the first write;
+          # neither queueing nor an environment delay can make it stale.
           ref_json="$(timeout -k 5 60 gh api "repos/${GH_REPO}/git/ref/tags/${TAG}")"
           tag_object="$(jq -r '.object.sha' <<<"$ref_json")"
           [[ "$(jq -r '.object.type' <<<"$ref_json")" == tag ]]
