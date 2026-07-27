@@ -422,10 +422,10 @@ git -c user.name='XXV.CC' \
     -c user.signingkey="${TAG_SIGNING_FPR}!" \
     -c gpg.format=openpgp \
     -c gpg.program=/usr/bin/gpg \
-    tag -s v2.8.3 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.3'
+    tag -s v2.8.4 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.4'
 git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg \
-    verify-tag --raw v2.8.3
-git push origin v2.8.3
+    verify-tag --raw v2.8.4
+git push origin v2.8.4
 ```
 
 Before pushing, the `VALIDSIG` record from `verify-tag --raw` must identify the
@@ -489,7 +489,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/prepare-release.sh \
-  v2.8.3 /srv/linux-temp-admin /srv/release-transfer/v2.8.3-prepared
+  v2.8.4 /srv/linux-temp-admin /srv/release-transfer/v2.8.4-prepared
 LTA_PREPARE_RELEASE
 ```
 
@@ -509,7 +509,7 @@ the candidate or transfer media:
 LTA_SIGN_KEY=/offline/keys/release-v1.key
 LTA_TRUSTED_SIGNER=/opt/lta-release-tools/lta-release
 LTA_TRUSTED_SIGNER_SHA256='<offline-recorded signer sha256>'
-LTA_EXPECTED_TAG=v2.8.3
+LTA_EXPECTED_TAG=v2.8.4
 LTA_EXPECTED_COMMIT='<independently recorded 40-hex commit>'
 LTA_EXPECTED_PREPARED_MANIFEST_SHA256='<independently recorded sha256>'
 LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public key>'
@@ -521,7 +521,7 @@ LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public ke
   LTA_EXPECTED_PREPARED_MANIFEST_SHA256="$LTA_EXPECTED_PREPARED_MANIFEST_SHA256" \
   LTA_EXPECTED_RELEASE_SIGNER_PUBKEY="$LTA_EXPECTED_RELEASE_SIGNER_PUBKEY" \
   /opt/lta-release-tools/offline-sign-release.sh \
-  /media/in/v2.8.3-prepared /media/out/v2.8.3-signed
+  /media/in/v2.8.4-prepared /media/out/v2.8.4-signed
 ```
 
 The script copies the removable input into a size-bounded private local snapshot
@@ -572,7 +572,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/publish-release.sh \
-  /srv/release-transfer/v2.8.3-signed /srv/linux-temp-admin
+  /srv/release-transfer/v2.8.4-signed /srv/linux-temp-admin
 LTA_PUBLISH_RELEASE
 ```
 
@@ -637,7 +637,7 @@ noncanonical published stable tag, excludes the failed `TAG`, and verifies the
 exact resulting Latest state:
 
 ```bash
-TAG=v2.8.3  # the failed release; verify this value before running
+TAG=v2.8.4  # the failed release; verify this value before running
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   TAG="$TAG" /bin/bash -p <<'LTA_LATEST_RECOVERY'
@@ -749,7 +749,7 @@ announcement:
 
 ```bash
 gh workflow run mirror-release.yml --repo xxvcc/linux-temp-admin \
-  --ref main -f tag=v2.8.3
+  --ref main -f tag=v2.8.4
 gh run list --repo xxvcc/linux-temp-admin \
   --workflow mirror-release.yml --event workflow_dispatch --limit 1
 ```
@@ -929,87 +929,38 @@ out-of-band trust recovery and should be treated as potentially compromised.
 
 ## Host install and upgrade
 
-Bootstrap installation requires root, OpenSSL 3, sha256sum, timeout, and curl:
+End-user requirements, routine upgrades, and failure classification are in the
+[installation guide](installing.en.md). This release guide owns the single
+canonical high-assurance bootstrap below because its exact shell behavior is a
+release gate and is exercised by dynamic failure tests.
+
+The convenience install requires curl and a calling shell that supports
+`pipefail`. The downloaded installer runs as root and requires OpenSSL 3,
+sha256sum, timeout, and curl:
 
 ```bash
-/usr/bin/sudo /usr/bin/env -i \
-  HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-  /bin/sh <<'LTA_BOOTSTRAP'
-set -eu
-umask 077
-fail() { echo "error: $*" >&2; exit 1; }
-ulimit -c 0 || fail "cannot disable core dumps"
-[ -d /tmp ] && [ ! -L /tmp ] || fail "/tmp is not a real directory"
-tmp_meta=$(stat -Lc '%u %a' -- /tmp) || fail "cannot inspect /tmp"
-case "$tmp_meta" in
-  "0 1"[0-7][0-7][0-7]) ;;
-  *) fail "/tmp must be root-owned, sticky, and free of other special bits" ;;
-esac
-
-if ! FSIZE_BLOCK_BYTES=$(
-  ulimit -f 1 || exit 1
-  awk '$1 == "Max" && $2 == "file" && $3 == "size" { print $4; found=1 }
-       END { if (!found) exit 1 }' /proc/self/limits
-); then
-  fail "cannot determine the shell file-size limit unit"
-fi
-case "$FSIZE_BLOCK_BYTES" in
-  512 | 1024) ;;
-  *) fail "unsupported shell file-size limit unit" ;;
-esac
-INSTALLER_MAX_BYTES=1048576
-INSTALLER_BLOCKS=$(( (INSTALLER_MAX_BYTES + FSIZE_BLOCK_BYTES - 1) / FSIZE_BLOCK_BYTES ))
-installer=$(mktemp /tmp/.lta-bootstrap.XXXXXXXXXX) \
-  || fail "cannot create root-owned installer file"
-cleanup() { rm -f -- "$installer"; }
-trap cleanup 0
-trap 'exit 1' HUP INT TERM
-installer_downloaded=0
-for installer_url in \
-  https://dl.ll.cd/linux-temp-admin/install.sh \
-  https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh
-do
-  installer_download_rc=0
-  (
-    ulimit -f "$INSTALLER_BLOCKS" || exit 1
-    exec timeout -k 5 70 curl -q --fail --silent --show-error --location --max-redirs 0 \
-      --connect-timeout 10 --max-time 60 --max-filesize "$INSTALLER_MAX_BYTES" \
-      --proto '=https' --proto-redir '=https' \
-      --output "$installer" "$installer_url"
-  ) || installer_download_rc=$?
-  if [ "$installer_url" = https://dl.ll.cd/linux-temp-admin/install.sh ] && \
-     [ "$installer_download_rc" -eq 47 ]; then
-    fail "official mirror installer redirected; refusing source-policy fallback"
-  fi
-  if [ "$installer_download_rc" -eq 0 ]; then
-    installer_size=$(wc -c < "$installer") || fail "cannot measure installer"
-    case "$installer_size" in
-      '' | *[!0-9]*) fail "invalid installer size" ;;
-    esac
-    if [ "$installer_size" -gt 0 ] && [ "$installer_size" -le "$INSTALLER_MAX_BYTES" ]; then
-      installer_downloaded=1
-      break
-    fi
-  fi
-done
-[ "$installer_downloaded" -eq 1 ] || fail "installer download failed or exceeded its limit"
-/bin/sh "$installer"
-LTA_BOOTSTRAP
+set -o pipefail
+curl -fsSL https://dl.ll.cd/linux-temp-admin/install.sh | /usr/bin/sudo /bin/sh
 ```
 
-That convenience bootstrap tries the official mirror first and uses raw GitHub
-only after an installer transport, empty-response, or size-limit failure. An
-official-mirror redirect is a source-policy failure and aborts instead. It
-trusts the TLS and mutable script route of the source ultimately used. The
-mirrored installer is copied from the released signed tag, but is not itself an
-offline-ed25519-signed GitHub Release asset.
+That convenience command streams the official mirror response directly into a
+root shell. `pipefail` propagates curl DNS, TLS, HTTP, and transfer failures to
+the caller, but it does not authenticate the script, bound it before execution,
+or prevent already received partial script bytes from beginning execution. The
+first curl cannot use installer-implemented GitHub fallback because the
+installer is not running yet. Once running, the installer prefers the official
+mirror for the complete signed binary release set and uses GitHub only after a
+transport failure. The convenience path trusts curl, the HTTPS/redirect path it
+accepts, and the mirror's stable-script deployment. The mirrored installer is
+copied from the released signed tag, but is not itself an offline-ed25519-signed
+GitHub Release asset.
 For a high-assurance first install, obtain all three values below through
 the release audit/signing record and a separate authenticated channel, then run:
 
 ```bash
 INSTALLER_COMMIT='replace-with-the-audited-40-hex-commit'
 INSTALLER_SHA256='replace-with-the-independent-64-hex-script-hash'
-LTA_RELEASE_TAG='v2.8.3'
+LTA_RELEASE_TAG='v2.8.4'
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   INSTALLER_COMMIT="$INSTALLER_COMMIT" INSTALLER_SHA256="$INSTALLER_SHA256" \
@@ -1077,10 +1028,10 @@ ulimit -c 0 || fail "cannot disable core dumps"
 LTA_BOOTSTRAP
 ```
 
-Both downloads start only after a sanitized root shell is running. That root
-process validates the pinned values, creates the unpredictable `0600` file in
-an explicit trusted `/tmp`, downloads directly into it, checks its bounded size,
-and (for the high-assurance flow) verifies the independent hash before execution.
+The high-assurance download starts only after a sanitized root shell is running.
+That root process validates the pinned values, creates the unpredictable `0600`
+file in an explicit trusted `/tmp`, downloads directly into it, checks its
+bounded size, and verifies the independent hash before execution.
 No caller-owned inode is copied, opened, or executed by root. `/tmp` is accepted
 only when it is a real root-owned directory with exactly the sticky special bit;
 another unprivileged user then cannot replace or remove the root-owned file.
@@ -1088,11 +1039,12 @@ Root itself and the kernel/filesystem remain trusted. `/bin/sh` reads the file,
 so a `noexec` mount does not prevent this procedure. The exact release selector
 then prevents a release host from replaying a different still-valid signed version.
 
-Each bootstrap download disables `.curlrc`, limits both the initial and redirected
-protocols to HTTPS, and runs curl only after setting a kernel `RLIMIT_FSIZE`
-calculated from the active shell's measured 512- or 1024-byte unit. It completes
-successfully before any downloaded text is interpreted as shell code. The
-installer has no unsigned/checksum-only fallback. It drops imported shell
+The high-assurance bootstrap download disables `.curlrc`, limits both the initial
+and redirected protocols to HTTPS, and runs curl only after setting a kernel
+`RLIMIT_FSIZE` calculated from the active shell's measured 512- or 1024-byte
+unit. It completes successfully and passes the independent hash check before any
+downloaded text is interpreted as shell code. The installer itself has no
+unsigned/checksum-only fallback. It drops imported shell
 functions before fixing a trusted root `PATH`, disables core dumps, neutralizes
 caller-controlled OpenSSL configuration/provider paths, and gives each download
 explicit connect/total timeouts plus a kernel `RLIMIT_FSIZE`, so chunked
@@ -1163,12 +1115,14 @@ metadata are already safe; otherwise it is atomically repaired.
 - Reproducible comparison binds CI bytes to the audited tag under the fixed Go
   toolchain. The audited source, signed-tag identity, trusted preparation copy,
   Go distribution, and preparation workstation remain trusted.
-- The convenience bootstrap obtains its script and embedded trust anchors over
-  TLS from the official mirror. The mirror takes that installer from the signed
-  Git tag, but the script is not currently an offline-ed25519-signed Release
-  asset. High-assurance bootstrap therefore still uses an audited 40-hex commit
-  in the raw GitHub URL and verifies the script hash through an independent
-  channel before running it.
+- The convenience bootstrap starts at the official mirror's HTTPS URL, trusts
+  the redirect path accepted by curl, and streams the response into a root shell.
+  `pipefail` propagates curl failure but neither authenticates the script nor
+  retracts partial bytes that already began executing. The mirror takes that
+  installer from the signed Git tag, but the script is not currently an
+  offline-ed25519-signed Release asset. High-assurance bootstrap therefore still
+  uses an audited 40-hex commit in the raw GitHub URL and verifies the script hash
+  through an independent channel before running it.
 - A fresh bootstrap has no previously installed version state, so a release-host
   compromise can replay an older release that still has a valid offline
   signature. Pin an audited installer commit and pass `LTA_RELEASE=vX.Y.Z` when

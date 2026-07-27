@@ -12,12 +12,17 @@
 
 Release/install scripts, if changed:
 
-- [ ] `bash -n` / `sh -n` and `shellcheck -S warning scripts/*.sh`
+- [ ] `bash -n scripts/*.sh`, `sh -n scripts/install.sh`, and `shellcheck -S warning scripts/*.sh`
+- [ ] `python3 -B -m unittest -v scripts/mirror_receiver_test.py`
 - [ ] Invalid version/tag rejection and static amd64/arm64 builds pass
 
 Workflows, if changed:
 
 - [ ] `actionlint`
+
+Documentation, if changed:
+
+- [ ] Chinese and English user documents remain synchronized and all relative links resolve
 
 ## Safety Notes
 

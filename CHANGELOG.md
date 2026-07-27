@@ -2,12 +2,30 @@
 
 All notable changes to this project are documented here.
 
-## Unreleased
+## v2.8.4 - 2026-07-27
 
 - Run mirror synchronization only from an explicit protected-`main` dispatch.
   GitHub binds a `release` event workflow to the released tag, so the automatic
   trigger could not satisfy the default-branch trust check and must not receive
   the mirror deployment credential.
+- Restore a genuine 30-second quick start through the built-in official mirror:
+  propagate curl failure with `pipefail`, run the installer as root, and create
+  the first invitation only after installation succeeds.
+- Document the convenience stream's exact first-install trust boundary: it does
+  not authenticate the installer or retract partial script bytes, and GitHub
+  fallback begins only after the installer is running. Retain the commit-,
+  independent-hash-, and exact-release-pinned high-assurance procedure.
+- Align security, contribution, pull-request, and release guidance
+  with mirror-first complete-source downloads, protected-main mirror dispatch,
+  the full script/receiver checks, and the `v2.8.4` release examples. Enforce the
+  approved convenience command and high-assurance bootstrap properties in tests.
+- Refocus the bilingual README files on first-time users. Move detailed install,
+  upgrade, operator, and security behavior into paired user guides while keeping
+  vulnerability reporting, contribution, and release procedures in their own
+  documents.
+- Ignore third-party sudoers drop-ins whose names happen to be valid usernames.
+  Only files in the `linux-temp-admin-` namespace are now inventoried, so
+  `doctor`, cleanup, and uninstall do not report or act on unrelated policy.
 
 ## v2.8.3 - 2026-07-27
 

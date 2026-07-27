@@ -8,7 +8,7 @@ The tool lives in `cmd/` and `internal/`, and ships as a signed static Go binary
 
 ## Before You Start
 
-- Read `README.md` / `README.en.md` and `SECURITY.md`.
+- Read `README.md` / `README.en.md`, the paired user guides under `docs/`, and `SECURITY.md`.
 - Do not commit real invite bundles, private keys (including the release signing key), hostnames, server IPs, `/etc/shadow` data, or `authorized_keys` from real systems.
 - Prefer focused pull requests: one behavior change, hardening fix, or documentation improvement at a time.
 
@@ -38,8 +38,9 @@ host.
 **Release/install scripts**, if you touch `scripts/`:
 
 ```bash
-bash -n scripts/release.sh scripts/sign-release.sh
+bash -n scripts/*.sh
 sh -n scripts/install.sh
+python3 -B -m unittest -v scripts/mirror_receiver_test.py
 shellcheck -S warning scripts/*.sh
 ```
 
@@ -54,11 +55,11 @@ For changes that touch account creation, revoke, sudoers, systemd timers, or `at
 - Prefer root-owned temporary files plus atomic rename for managed root files; set owner/mode on the file descriptor and never follow a symlink at the target.
 - Do not silently overwrite an existing installed command if doing so could break another registered user's auto-revoke task.
 - Keep non-interactive automation explicit: dangerous actions need `--yes` plus a specific confirmation value when relevant.
-- Update both Chinese and English README files when user-facing behavior changes.
+- Update both languages of every affected user document when user-facing behavior changes.
 - Add or update tests for validation, parsing, quoting, and safety boundary changes.
 
 ## Pull Request Checklist
 
-- [ ] `build`, `vet` (with `-printf.funcs`), `gofmt`, and `test -race` pass; integration tests pass or are unaffected. (`scripts/` changes: ShellCheck passes.)
-- [ ] README / CHANGELOG updated when behavior changes.
+- [ ] `build`, `vet` (with `-printf.funcs`), `gofmt`, and `test -race` pass; integration tests pass or are unaffected. (`scripts/` changes: syntax checks, mirror receiver tests, and ShellCheck pass.)
+- [ ] README, affected user-guide pair, and CHANGELOG updated when behavior changes.
 - [ ] Security-sensitive behavior was tested in a disposable environment or clearly explained.
