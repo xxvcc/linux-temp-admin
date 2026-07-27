@@ -1,9 +1,15 @@
 package table
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
+
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
 func TestWidth(t *testing.T) {
 	cases := []struct {
@@ -59,6 +65,15 @@ func TestRenderShape(t *testing.T) {
 	// The header rule must sit between the header and the first row.
 	if strings.Index(got, "├") < strings.Index(got, "│ A │ B │") {
 		t.Errorf("header separator is above the header:\n%s", got)
+	}
+}
+
+func TestRenderPropagatesWriterError(t *testing.T) {
+	tb := New("A")
+	tb.Row("1")
+	err := tb.Render(failingWriter{err: io.ErrClosedPipe})
+	if !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Render error = %v, want writer failure", err)
 	}
 }
 

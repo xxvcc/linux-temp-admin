@@ -1,3 +1,5 @@
+package sysinfo
+
 // This file reads sshd's *effective* configuration and answers the one question
 // the tool used to assume: will this server actually let the account we are about
 // to create log in with the key we are about to write?
@@ -7,19 +9,30 @@
 // distro crypto policy, and it is the same evaluation the running sshd performs.
 // Guessing at the file's text would be worse than not looking at all, because a
 // wrong guess turns into a confidently false invite.
-package sysinfo
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
+
+	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"golang.org/x/sys/unix"
 )
 
 // sshdCommand is the sshd binary; overridable in tests.
 var sshdCommand = "sshd"
+
+var sshdProbeOptions = executil.Options{
+	Timeout:   10 * time.Second,
+	MaxOutput: 1 << 20,
+	ExtraEnv:  []string{"LC_ALL=C", "LANG=C"},
+}
 
 // SSHDConfig is sshd's effective configuration, as reported by `sshd -T`. Keys
 // are the lowercase directive names sshd prints; a directive that sshd repeats
@@ -61,7 +74,7 @@ func SSHDEffective(user string) (*SSHDConfig, error) {
 	if user != "" {
 		args = append(args, "-C", "user="+user)
 	}
-	out, err := exec.Command(sshdCommand, args...).Output()
+	out, err := executil.Output(sshdCommand, args, sshdProbeOptions)
 	if err != nil {
 		// A failed per-user probe must NOT fall back to the global view. The global
 		// view cannot see `Match User` blocks, so a host whose Match block blocks
@@ -80,9 +93,12 @@ func SSHDEffective(user string) (*SSHDConfig, error) {
 // the machine running the tests.
 func ParseSSHD(out string) *SSHDConfig {
 	c := &SSHDConfig{vals: map[string][]string{}}
-	sc := bufio.NewScanner(strings.NewReader(out))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
+	// SSHDEffective already captured the complete output in memory. Splitting that
+	// string avoids bufio.Scanner's 64 KiB token limit: a very long directive must
+	// not silently hide a later DenyUsers/DenyGroups rule and turn an incomplete
+	// parse into a false "login accepted" verdict.
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
@@ -94,6 +110,26 @@ func ParseSSHD(out string) *SSHDConfig {
 
 // sshdConfigDropInDir is the standard drop-in directory; overridable in tests.
 var sshdConfigDropInDir = "/etc/ssh/sshd_config.d"
+
+const (
+	maxSSHDIncludeDepth = 64
+	maxSSHDIncludeFiles = 256
+	maxSSHDIncludeGlobs = 1024
+	maxSSHDIncludeBytes = int64(64 << 20)
+)
+
+type sshdConfigIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+type sshdIncludeScan struct {
+	paths      map[string]bool
+	identities map[sshdConfigIdentity]bool
+	files      int
+	globs      int
+	bytes      int64
+}
 
 // HasConnectionScopedMatch reports whether sshd's configuration contains a
 // `Match` criterion that `sshd -T -C user=X` cannot evaluate without more
@@ -114,15 +150,18 @@ var sshdConfigDropInDir = "/etc/ssh/sshd_config.d"
 // never produce a false verified claim.
 func HasConnectionScopedMatch() bool {
 	files := []string{sshdConfigPath}
-	if entries, err := filepath.Glob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
+	if entries, err := strictGlob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
 		files = append(files, entries...)
 	} else {
 		return true
 	}
-	seen := map[string]bool{}
+	scan := &sshdIncludeScan{
+		paths:      map[string]bool{},
+		identities: map[sshdConfigIdentity]bool{},
+	}
 	baseDir := filepath.Dir(sshdConfigPath)
 	for _, f := range files {
-		found, complete := fileHasConnectionScopedMatch(f, baseDir, seen)
+		found, complete := fileHasConnectionScopedMatch(f, baseDir, scan, 0)
 		if found || !complete {
 			return true
 		}
@@ -130,18 +169,45 @@ func HasConnectionScopedMatch() bool {
 	return false
 }
 
-func fileHasConnectionScopedMatch(path, baseDir string, seen map[string]bool) (found, complete bool) {
+func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, depth int) (found, complete bool) {
+	if depth >= maxSSHDIncludeDepth {
+		return false, false
+	}
 	path = filepath.Clean(path)
-	if seen[path] {
+	if scan.paths[path] {
 		return false, true
 	}
-	seen[path] = true
-	f, err := os.Open(path)
+	scan.paths[path] = true
+	// sshd follows symlinked configuration files, so this scanner does too. Open
+	// nonblocking, then require the resolved descriptor to be regular and bounded:
+	// a damaged Include that names a FIFO or device must downgrade the verdict
+	// instead of hanging or streaming forever.
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return false, false
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxSSHDConfigBytes {
+		return false, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, false
+	}
+	identity := sshdConfigIdentity{dev: uint64(st.Dev), ino: st.Ino}
+	if scan.identities[identity] {
+		return false, true
+	}
+	if scan.files >= maxSSHDIncludeFiles || fi.Size() > maxSSHDIncludeBytes-scan.bytes {
+		return false, false
+	}
+	scan.identities[identity] = true
+	scan.files++
+	scan.bytes += fi.Size()
+	limited := &io.LimitedReader{R: f, N: maxSSHDConfigBytes + 1}
+	sc := bufio.NewScanner(limited)
+	sc.Buffer(make([]byte, 64<<10), maxSSHDConfigLine)
 	for sc.Scan() {
 		line, _, _ := strings.Cut(sc.Text(), "#")
 		fields := strings.Fields(line)
@@ -150,10 +216,14 @@ func fileHasConnectionScopedMatch(path, baseDir string, seen map[string]bool) (f
 		}
 		if strings.EqualFold(fields[0], "Include") {
 			for _, pattern := range fields[1:] {
+				if scan.globs >= maxSSHDIncludeGlobs {
+					return false, false
+				}
+				scan.globs++
 				if !filepath.IsAbs(pattern) {
 					pattern = filepath.Join(baseDir, pattern)
 				}
-				matches, err := filepath.Glob(pattern)
+				matches, err := strictGlob(pattern)
 				if err != nil {
 					return false, false
 				}
@@ -161,7 +231,7 @@ func fileHasConnectionScopedMatch(path, baseDir string, seen map[string]bool) (f
 					return false, false
 				}
 				for _, include := range matches {
-					found, complete := fileHasConnectionScopedMatch(include, baseDir, seen)
+					found, complete := fileHasConnectionScopedMatch(include, baseDir, scan, depth+1)
 					if found || !complete {
 						return found, complete
 					}
@@ -194,8 +264,114 @@ func fileHasConnectionScopedMatch(path, baseDir string, seen map[string]bool) (f
 			}
 		}
 	}
-	return false, sc.Err() == nil
+	return false, sc.Err() == nil && limited.N > 0
 }
+
+var errSSHDGlobLimit = errors.New("sshd Include directory exceeds traversal limit")
+
+var strictGlobReadDir = readSSHDGlobDir
+
+func readSSHDGlobDir(path string) ([]os.DirEntry, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(maxSSHDIncludeFiles + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(entries) > maxSSHDIncludeFiles {
+		return nil, errSSHDGlobLimit
+	}
+	return entries, nil
+}
+
+// strictGlob is filepath.Glob with one security-relevant difference: directory
+// I/O errors are returned instead of silently treated as no matches. An
+// incomplete sshd Include scan must downgrade the login verdict, not hide a
+// connection-scoped Match rule.
+func strictGlob(pattern string) ([]string, error) {
+	if _, err := filepath.Match(pattern, ""); err != nil {
+		return nil, err
+	}
+	return strictGlobDepth(pattern, 0)
+}
+
+func strictGlobDepth(pattern string, depth int) ([]string, error) {
+	const maxDepth = 256
+	if depth == maxDepth {
+		return nil, filepath.ErrBadPattern
+	}
+	if !globHasMeta(pattern) {
+		if _, err := os.Lstat(pattern); err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return []string{pattern}, nil
+	}
+
+	dir, file := filepath.Split(pattern)
+	switch dir {
+	case "":
+		dir = "."
+	case string(filepath.Separator):
+	default:
+		dir = dir[:len(dir)-1]
+	}
+	if !globHasMeta(dir) {
+		return strictGlobDir(dir, file, nil)
+	}
+	if dir == pattern {
+		return nil, filepath.ErrBadPattern
+	}
+	dirs, err := strictGlobDepth(dir, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
+	for _, matchedDir := range dirs {
+		matches, err = strictGlobDir(matchedDir, file, matches)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return matches, nil
+}
+
+func strictGlobDir(dir, pattern string, matches []string) ([]string, error) {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return matches, nil
+		}
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return matches, nil
+	}
+	entries, err := strictGlobReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		matched, err := filepath.Match(pattern, entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		if matched {
+			if len(matches) >= maxSSHDIncludeFiles {
+				return nil, errSSHDGlobLimit
+			}
+			matches = append(matches, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return matches, nil
+}
+
+func globHasMeta(path string) bool { return strings.ContainsAny(path, `*?[\`) }
 
 // Blocker is one reason a login would fail. The values are stable identifiers,
 // not messages: sysinfo stays free of i18n, and the cli layer renders them.

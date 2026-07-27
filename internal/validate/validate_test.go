@@ -1,6 +1,9 @@
 package validate
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 func TestUsername(t *testing.T) {
 	cases := []struct {
@@ -37,6 +40,33 @@ func TestPrefix(t *testing.T) {
 	for _, c := range cases {
 		if got := Prefix(c.in); got != c.want {
 			t.Errorf("Prefix(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestKernelAndAccountID(t *testing.T) {
+	for _, id := range []int{0, 1, 65534} {
+		if !KernelID(id) {
+			t.Errorf("KernelID(%d) = false, want true", id)
+		}
+	}
+	if AccountID(0) || !AccountID(1) {
+		t.Fatalf("AccountID root/non-root boundary is wrong")
+	}
+	for _, id := range []int{-1, -1000} {
+		if KernelID(id) || AccountID(id) {
+			t.Errorf("negative id %d was accepted", id)
+		}
+	}
+	if strconv.IntSize >= 64 {
+		reserved := int(uint64(^uint32(0)))
+		for _, id := range []int{reserved, reserved + 1} {
+			if KernelID(id) || AccountID(id) {
+				t.Errorf("out-of-range/reserved id %d was accepted", id)
+			}
+		}
+		if !KernelID(reserved-1) || !AccountID(reserved-1) {
+			t.Errorf("highest concrete Linux id %d was rejected", reserved-1)
 		}
 	}
 }
@@ -82,6 +112,10 @@ func TestPublicIPv4(t *testing.T) {
 		{"169.254.1.1", false},   // link-local
 		{"198.18.0.1", false},    // benchmark
 		{"192.0.2.1", false},     // TEST-NET-1
+		{"192.31.196.1", false},  // AS112-v4
+		{"192.52.193.1", false},  // AMT
+		{"192.88.99.1", false},   // deprecated 6to4 relay anycast
+		{"192.175.48.1", false},  // AS112 direct delegation
 		{"198.51.100.10", false}, // TEST-NET-2
 		{"203.0.113.10", false},  // TEST-NET-3
 		{"224.0.0.1", false},     // multicast
@@ -101,13 +135,28 @@ func TestPublicIPv6(t *testing.T) {
 	}{
 		{"2400:cb00:2049:1::a29f:1804", true}, // routable global unicast
 		{"2606:4700:4700::1111", true},        // Cloudflare resolver, global unicast
+		{"2000::1", true},                     // lower 2000::/3 boundary
+		{"3fef:ffff::1", true},                // representative high 2000::/3 address
+		{"3ff0::1", true},                     // outside the narrower 3fff::/20 documentation prefix
+		{"3fff:1000::1", true},                // immediately above 3fff::/20
 		{"::1", false},                        // loopback
 		{"::", false},                         // unspecified
+		{"100:0:0:1::1", false},               // IANA Dummy IPv6 Prefix
+		{"1fff:ffff::1", false},               // below current global-unicast allocation
+		{"4000::1", false},                    // above current global-unicast allocation
 		{"fe80::1", false},                    // link-local
+		{"fec0::1", false},                    // deprecated site-local
 		{"fc00::1", false},                    // unique-local fc00::/7
 		{"fd12:3456::1", false},               // unique-local
 		{"ff02::1", false},                    // multicast
 		{"2001:db8::1", false},                // documentation 2001:db8::/32
+		{"64:ff9b::8.8.8.8", false},           // NAT64 well-known prefix
+		{"64:ff9b:1::1", false},               // NAT64 local-use prefix
+		{"100::1", false},                     // discard-only prefix
+		{"2002:808:808::1", false},            // deprecated 6to4
+		{"3fff::1", false},                    // documentation prefix
+		{"3fff:0fff::1", false},               // upper 3fff::/20 documentation boundary
+		{"5f00::1", false},                    // IPv6 segment routing SIDs
 		{"8.8.8.8", false},                    // an IPv4 is PublicIPv4's job, not this one
 		{"::ffff:8.8.8.8", false},             // IPv4-mapped resolves to v4, rejected here
 		{"not-an-ip", false},
@@ -142,6 +191,19 @@ func TestInstalledVersion(t *testing.T) {
 	for _, c := range cases {
 		if got := InstalledVersion(c.in); got != c.want {
 			t.Errorf("InstalledVersion(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestReleaseVersion(t *testing.T) {
+	for _, value := range []string{"0.0.0", "2.8.0", "12.34.56-rc.10"} {
+		if !ReleaseVersion(value) {
+			t.Errorf("ReleaseVersion(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{"", "v2.8.0", "02.8.0", "2.08.0", "2.8", "2.8.0+build", "2.8.0-rc_1"} {
+		if ReleaseVersion(value) {
+			t.Errorf("ReleaseVersion(%q) = true, want false", value)
 		}
 	}
 }

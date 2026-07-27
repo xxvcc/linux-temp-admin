@@ -9,8 +9,11 @@
 package prefs
 
 import (
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
@@ -23,12 +26,23 @@ var File = config.PrefsFile
 // second preference can be added without a migration.
 const langKey = "lang"
 
+const maxPrefsBytes = 4 << 10
+
 // Lang returns the remembered language selector ("zh"/"en"), or "" if none is
 // remembered — the file is absent, unreadable, or has no language line. The
 // caller validates the value; this package does not know what a language is.
 func Lang() string {
-	b, err := os.ReadFile(File)
+	f, err := os.OpenFile(File, os.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxPrefsBytes+1))
+	if err != nil || len(b) > maxPrefsBytes {
 		return ""
 	}
 	for _, line := range strings.Split(string(b), "\n") {
@@ -43,7 +57,7 @@ func Lang() string {
 // SetLang remembers lang for future runs. The value is written as-is, so callers
 // must pass an already-validated selector.
 func SetLang(lang string) error {
-	if err := fsutil.EnsureDir(config.RegistryDir, 0o700, 0, 0); err != nil {
+	if err := fsutil.EnsureDir(filepath.Dir(File), 0o700, 0, 0); err != nil {
 		return err
 	}
 	return fsutil.WriteRootFile(File, []byte(langKey+"="+lang+"\n"), 0o600)

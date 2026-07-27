@@ -1,16 +1,13 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
+	"unicode/utf8"
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
@@ -18,6 +15,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/table"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -49,7 +47,7 @@ func (a *App) status(args []string) int {
 			a.errorf("%s", a.P.M("用户名不合法："+u, "invalid username: "+u))
 			return 1
 		}
-		pw, ok, err := user.Lookup(u)
+		pw, ok, err := a.lookupUser(u)
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), err)
 			return 1
@@ -58,20 +56,33 @@ func (a *App) status(args []string) int {
 			a.errorf("%s", a.P.M("用户不存在："+u, "user does not exist: "+u))
 			return 1
 		}
-		managed, err := user.IsManaged(u)
-		if err != nil {
-			a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), err)
-			return 1
-		}
-		a.printf("user=%s uid=%d gid=%d home=%s shell=%s managed=%v",
-			pw.Name, pw.UID, pw.GID, pw.Home, pw.Shell, managed)
-		unit, err := a.Registry.UnitFor(u)
+		rec, found, err := a.Registry.Lookup(u)
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
 			return 1
 		}
-		if unit != "" {
-			a.printf("auto-revoke unit=%s", unit)
+		managed := false
+		identity := "unregistered"
+		if found {
+			switch classifyRegisteredAccount(rec, pw, true, nil) {
+			case registeredActive:
+				managed, identity = true, "generation-bound"
+			case registeredLegacyIdentity:
+				identity = "legacy-unverified"
+			case registeredPending:
+				identity = "pending"
+			case registeredUIDMismatch:
+				identity = "uid-mismatch"
+			case registeredMarkerMismatch:
+				identity = "generation-marker-mismatch"
+			default:
+				identity = "unverified"
+			}
+		}
+		a.printf("user=%s uid=%d gid=%d home=%s shell=%s managed=%v identity=%s",
+			pw.Name, pw.UID, pw.GID, pw.Home, pw.Shell, managed, identity)
+		if found && rec.AutoUnit != "" {
+			a.printf("auto-revoke unit=%s", rec.AutoUnit)
 		}
 		return 0
 	}
@@ -86,7 +97,7 @@ func (a *App) status(args []string) int {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
 		return 0
 	}
-	a.printf("%s", a.usersTable(recs, false).String())
+	a.printf("%s", a.usersView(recs, false))
 	return 0
 }
 
@@ -118,23 +129,164 @@ func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
 		headers = append([]string{"#"}, headers...)
 	}
 	t := table.New(headers...)
-	yn := func(b bool) string {
-		return a.P.M(map[bool]string{true: "是", false: "否"}[b], map[bool]string{true: "yes", false: "no"}[b])
-	}
 	for i, r := range recs {
-		state := a.P.M("缺失", "missing")
-		if exists, err := user.Exists(r.User); err != nil {
-			state = a.P.M("未知", "unknown")
-		} else if exists {
-			state = a.P.M("在册", "active")
-		}
-		cells := []string{r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port)}
+		cells := a.userCells(r)
 		if numbered {
 			cells = append([]string{strconv.Itoa(i + 1)}, cells...)
 		}
 		t.Row(cells...)
 	}
 	return t
+}
+
+func (a *App) userCells(r registry.Record) []string {
+	yn := func(value bool) string {
+		return a.P.M(map[bool]string{true: "是", false: "否"}[value], map[bool]string{true: "yes", false: "no"}[value])
+	}
+	pw, exists, err := a.lookupUser(r.User)
+	var state string
+	switch classifyRegisteredAccount(r, pw, exists, err) {
+	case registeredActive:
+		state = a.P.M("在册", "active")
+	case registeredPending:
+		state = a.P.M("创建未完成", "pending")
+	case registeredIdentityUnverified:
+		state = a.P.M("身份未验证", "identity unverified")
+	case registeredLegacyIdentity:
+		state = a.P.M("旧版身份未验证", "legacy identity unverified")
+	case registeredUIDMismatch:
+		state = a.P.M("UID 不匹配", "UID mismatch")
+	case registeredMarkerMismatch:
+		state = a.P.M("标记不匹配", "marker mismatch")
+	case registeredUnknown:
+		state = a.P.M("未知", "unknown")
+	default:
+		state = a.P.M("缺失", "missing")
+	}
+	return []string{r.User, state, yn(r.Sudo), yn(r.AutoRevoke), r.Expires, r.Host, strconv.Itoa(r.Port)}
+}
+
+// usersView keeps the comparison table on ordinary terminals and switches to a
+// vertical record view when the table would be wider than the actual terminal.
+func (a *App) usersView(recs []registry.Record, numbered bool) string {
+	full := a.usersTable(recs, numbered).String()
+	width := 0
+	if a.TerminalWidth != nil {
+		width = a.TerminalWidth()
+	}
+	if width <= 0 || widestLine(full) <= width {
+		return full
+	}
+
+	labels := []string{
+		a.P.M("状态", "state"),
+		"sudo",
+		a.P.M("自动删除", "auto-delete"),
+		a.P.M("到期", "expires"),
+		a.P.M("主机", "host"),
+		a.P.M("端口", "port"),
+	}
+	var out strings.Builder
+	for i, rec := range recs {
+		cells := a.userCells(rec)
+		prefix := "- "
+		if numbered {
+			prefix = fmt.Sprintf("%d) ", i+1)
+		}
+		appendWrappedLine(&out, width, prefix, cells[0])
+		for field := 1; field < len(cells); field++ {
+			appendWrappedLine(&out, width, "   "+labels[field-1]+"=", cells[field])
+		}
+		if i+1 < len(recs) {
+			out.WriteByte('\n')
+		}
+	}
+	return out.String()
+}
+
+func widestLine(value string) int {
+	widest := 0
+	for _, line := range strings.Split(value, "\n") {
+		if width := table.Width(line); width > widest {
+			widest = width
+		}
+	}
+	return widest
+}
+
+func appendWrappedLine(out *strings.Builder, maxWidth int, prefix, value string) {
+	for {
+		available := maxWidth - table.Width(prefix)
+		if available < 1 {
+			available = 1
+		}
+		part, rest := takeDisplayWidth(value, available)
+		out.WriteString(prefix)
+		out.WriteString(part)
+		out.WriteByte('\n')
+		if rest == "" {
+			return
+		}
+		value = rest
+		prefix = "   "
+	}
+}
+
+func takeDisplayWidth(value string, maxWidth int) (string, string) {
+	width, end := 0, 0
+	for offset, r := range value {
+		runeWidth := table.Width(string(r))
+		if width+runeWidth > maxWidth && end > 0 {
+			break
+		}
+		width += runeWidth
+		end = offset + len(string(r))
+		if width >= maxWidth {
+			break
+		}
+	}
+	if end == 0 && value != "" {
+		_, size := utf8.DecodeRuneInString(value)
+		end = size
+	}
+	return value[:end], value[end:]
+}
+
+type registeredAccountState uint8
+
+const (
+	registeredMissing registeredAccountState = iota
+	registeredUnknown
+	registeredPending
+	registeredIdentityUnverified
+	registeredLegacyIdentity
+	registeredUIDMismatch
+	registeredMarkerMismatch
+	registeredActive
+)
+
+func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool, lookupErr error) registeredAccountState {
+	switch {
+	case lookupErr != nil:
+		return registeredUnknown
+	case !exists:
+		return registeredMissing
+	case rec.Pending:
+		return registeredPending
+	case rec.UID < 1:
+		return registeredIdentityUnverified
+	case pw.UID != rec.UID:
+		return registeredUIDMismatch
+	case !rec.IdentityBound:
+		if user.IsLegacyManagedEntry(pw) {
+			return registeredLegacyIdentity
+		}
+		return registeredMarkerMismatch
+	case !user.MatchesManagedGeneration(pw, rec.Generation):
+		return registeredMarkerMismatch
+	default:
+		return registeredActive
+	}
 }
 
 // manageUsers is the menu's one screen for the temporary accounts: it shows the
@@ -180,7 +332,7 @@ func (a *App) manageUsers() int {
 	if len(recs) == 0 {
 		a.printf("  %s", a.P.M("（无）", "(none)"))
 	} else {
-		a.printf("%s", a.usersTable(recs, true).String())
+		a.printf("%s", a.usersView(recs, true))
 	}
 
 	// Orphans have no registry row, so the table above cannot show them — this is
@@ -189,8 +341,8 @@ func (a *App) manageUsers() int {
 	// Surface them here, on the very screen whose `c` sweeps them, so the cleanup is
 	// discoverable instead of something you only learn about from doctor.
 	if len(orphans) > 0 {
-		a.warnf("%s", a.P.M("另有无登记行的孤儿残留（账号已不存在；按 c 清理）：",
-			"orphaned leftovers with no registry row (their account is gone; press c to clean):"))
+		a.warnf("%s", a.P.M("另有无登记行的孤儿残留（账号不存在或身份无法验证；按 c 清理）：",
+			"orphaned leftovers with no registry row (the account is absent or its identity is unverified; press c to clean):"))
 		for _, o := range orphans {
 			a.printf("  %s (%s)", o.name, strings.Join(o.kinds, " "))
 		}
@@ -260,7 +412,7 @@ func (a *App) cleanupExpired(args []string) int {
 		return 1
 	}
 	if len(recs) > 0 {
-		a.printf("%s", a.usersTable(recs, false).String())
+		a.printf("%s", a.usersView(recs, false))
 	}
 	if compact {
 		return a.compact()
@@ -268,9 +420,11 @@ func (a *App) cleanupExpired(args []string) int {
 	return 0
 }
 
-// accountIsOursAndLive reports whether name is a temporary account this tool
-// currently manages: the current passwd entry must carry the managed GECOS
-// marker. A matching UID is not enough because Linux can reuse UIDs.
+// accountIsOursAndLive reports whether name is still associated with a live
+// registry row for orphan-scanning purposes. Generation-bound identities must
+// match exactly. A migrated v2 row with its fixed legacy marker is also treated
+// as live here so cleanup does not silently cancel a genuine legacy account's
+// grants and timer; destructive paths still refuse that weaker identity.
 //
 // It is the predicate the orphan sweeps use instead of a bare user.Exists,
 // because a grant/exception/unit outlives its account in TWO ways, not one: the
@@ -281,13 +435,50 @@ func (a *App) cleanupExpired(args []string) int {
 // cleanup. Requiring the account to be provably ours closes that: a name taken
 // over by something that is not ours makes the leftover an orphan again.
 //
-// A managed account whose marker was erased is intentionally treated as
-// unverifiable. That may require operator recovery, but it cannot transfer a
-// name-scoped privilege to an unrelated replacement account.
+// A managed account whose marker was erased, whose row was lost, or whose UID no
+// longer matches is intentionally treated as unverifiable. That may require
+// operator recovery, but it cannot transfer a name-scoped privilege to an
+// unrelated replacement account.
 func (a *App) accountIsOursAndLive(name string) (bool, error) {
-	// UIDs can be reused after an out-of-band deletion. Only the marker on the
-	// current passwd entry proves that this name still belongs to a managed account.
-	return user.IsManaged(name)
+	if a.Registry == nil {
+		return false, fmt.Errorf("no registry available to verify %s", name)
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found {
+		return false, err
+	}
+	pw, exists, err := a.lookupUser(name)
+	if err != nil {
+		return false, err
+	}
+	state := classifyRegisteredAccount(rec, pw, exists, nil)
+	return state == registeredActive || state == registeredLegacyIdentity, nil
+}
+
+// completedAccountIdentity returns whether name currently resolves to the
+// completed v2 identity recorded by this tool, and whether a local account with
+// that name exists at all. The UID and marker are checked on the same passwd
+// snapshot; splitting them across two lookups would let a concurrent name reuse
+// splice facts from two different accounts into one apparent identity.
+func (a *App) completedAccountIdentity(name string) (ours, live bool, err error) {
+	if a.Registry == nil {
+		return false, false, fmt.Errorf("no registry available to verify %s", name)
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil {
+		return false, false, err
+	}
+	pw, exists, err := a.lookupUser(name)
+	if err != nil {
+		return false, false, err
+	}
+	if !exists {
+		return false, false, nil
+	}
+	if !found || rec.Pending || rec.UID < 1 || pw.UID != rec.UID || !rec.IdentityBound {
+		return false, true, nil
+	}
+	return user.MatchesManagedGeneration(pw, rec.Generation), true, nil
 }
 
 // installedCommandVersion best-effort reads the version of the binary at
@@ -303,20 +494,15 @@ func (a *App) installedCommandVersion() (string, string) {
 	if a.InstallPath == "" {
 		return "", ""
 	}
-	if _, err := os.Lstat(a.InstallPath); err != nil {
+	m := a.Selfmanage
+	if m == nil {
+		m = selfmanage.New(a.InstallPath, 0)
+	}
+	v, err := m.InstalledVersion()
+	if errors.Is(err, selfmanage.ErrNotInstalled) {
 		return "", "absent"
 	}
-	if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
-		return "", "unreadable"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, a.InstallPath, "version").Output()
 	if err != nil {
-		return "", "unreadable"
-	}
-	v := strings.TrimSpace(string(out))
-	if !validate.InstalledVersion(v) {
 		return "", "unreadable"
 	}
 	return v, "ok"
@@ -462,6 +648,11 @@ func (a *App) compactLocked() int {
 			a.audit("schedule.cleanup", u, "ok", "orphaned auto-revoke unit removed", nil)
 		}
 	}
+	if rc != 0 {
+		a.warnf("%s", a.P.M("孤儿扫描或清理未完整成功；为保留恢复线索，本次不压缩注册表。",
+			"orphan scanning or cleanup did not complete; the registry was not compacted so recovery evidence is retained."))
+		return rc
+	}
 	removed, err := a.Registry.Compact(user.Exists)
 	if err != nil {
 		a.warnf("%v", err)
@@ -494,20 +685,30 @@ func (a *App) doctor(args []string) int {
 	case "absent":
 		a.warnf("%s", a.P.M("已安装命令：未安装（自动删除任务需要它）",
 			"installed command: not installed (the auto-delete task needs it)"))
+		rc = 1
 	case "unreadable":
 		a.warnf("%s%s", a.P.M("无法读取已安装命令的版本：", "could not read the installed command's version: "), a.InstallPath)
+		rc = 1
 	case "ok":
 		if v == buildinfo.Version {
 			a.success(fmt.Sprintf(a.P.M("已安装命令版本：%s", "installed command version: %s"), v))
 		} else {
 			a.warnf("%s", fmt.Sprintf(a.P.M("已安装命令版本 %s 与运行中的 %s 不一致（自动删除任务执行的是已安装的那份，可用 upgrade 或 install 对齐）",
 				"installed command version %s differs from the running %s (the auto-delete task runs the installed one; align with upgrade or install)"), v, buildinfo.Version))
+			rc = 1
 		}
 	}
 	if a.Geteuid() == 0 {
 		a.success(a.P.M("当前以 root 运行。", "running as root."))
 	} else {
 		a.warnf("%s", a.P.M("当前不是 root；invite/revoke 需要 root。", "not running as root; invite/revoke require root."))
+	}
+	if err := user.CheckPidfd(); err != nil {
+		a.warnf("%s: %v", a.P.M("pidfd 不可用；无法在 PID 复用安全的前提下终止临时账号进程",
+			"pidfd is unavailable; temporary-account processes cannot be terminated safely across PID reuse"), err)
+		rc = 1
+	} else {
+		a.success(a.P.M("pidfd 进程撤销能力可用。", "pidfd process revocation is available."))
 	}
 	for _, d := range sysinfo.RequiredDeps(true) {
 		if d.Present {
@@ -534,13 +735,18 @@ func (a *App) doctor(args []string) int {
 	if cfg, err := a.sshdConfig(probe); err != nil {
 		a.warnf("%s (%v)", a.P.M("无法读取 sshd 有效配置；invite 无法验证公钥登录是否真的可用。",
 			"cannot read the effective sshd config; invite cannot verify that a key login would work."), err)
+		rc = 1
 	} else {
 		rep := a.checkKeyLogin(cfg, probe, []string{probe})
 		for _, w := range rep.Warnings {
 			a.warnf("%s", w)
 		}
-		if rep.OK() {
+		if rep.Certain() {
 			a.success(a.P.M("sshd 接受公钥登录。", "sshd accepts public-key logins."))
+		} else if rep.OK() {
+			a.warnf("%s", a.P.M("sshd 没有显示阻断公钥登录，但存在无法求值的连接条件，不能确认新邀请可登录。",
+				"sshd has no explicit key-login blocker, but connection-dependent rules could not be evaluated; a new invite cannot be confirmed healthy."))
+			rc = 1
 		} else {
 			a.warnf("%s", a.P.M("sshd 不会接受新建临时账号的公钥登录：",
 				"sshd would not accept a public-key login for a freshly created temporary account:"))
@@ -555,6 +761,57 @@ func (a *App) doctor(args []string) int {
 			a.warnf("%s", u)
 		}
 	}
+	// Read the registry once and inspect the account identity recorded in every
+	// row. A pending or legacy row is recovery evidence, not authority to delete a
+	// live account; a UID/GECOS mismatch means the name now resolves to something
+	// other than the completed identity this tool recorded.
+	var registryRecords []registry.Record
+	registryReadable := a.Registry == nil
+	if a.Registry != nil {
+		var err error
+		registryRecords, err = a.Registry.List()
+		if err != nil {
+			a.warnf("%s: %v", a.P.M("无法读取注册表", "cannot read registry"), err)
+			rc = 1
+		} else {
+			registryReadable = true
+			for _, rec := range registryRecords {
+				pw, exists, lookupErr := a.lookupUser(rec.User)
+				if lookupErr != nil {
+					a.warnf("%s %s: %v", a.P.M("无法验证登记账号身份：", "cannot verify registered account identity:"), rec.User, lookupErr)
+					rc = 1
+					continue
+				}
+				switch {
+				case rec.Pending:
+					a.warnf("%s%s", a.P.M("登记仍是未完成的 pending 创建意图，不能证明当前账号身份：",
+						"registry row is still an incomplete pending creation intent and cannot prove the current account identity: "), rec.User)
+					rc = 1
+				case !exists:
+					a.warnf("%s%s", a.P.M("登记指向已不存在的账号（可用 cleanup-expired --compact 清理）：",
+						"registry row points to an absent account (remove it with cleanup-expired --compact): "), rec.User)
+					rc = 1
+				case rec.UID < 1:
+					a.warnf("%s%s", a.P.M("活账号登记没有可信 UID，不能证明身份：",
+						"live account registry row has no trusted UID and cannot prove identity: "), rec.User)
+					rc = 1
+				case pw.UID != rec.UID:
+					a.warnf("%s", fmt.Sprintf(a.P.M("登记账号 %s 的 UID 不匹配：记录为 %d，当前为 %d；拒绝自动删除。",
+						"registered account %s has a UID mismatch: recorded %d, current %d; automatic deletion is refused."), rec.User, rec.UID, pw.UID))
+					rc = 1
+				case !rec.IdentityBound:
+					a.warnf("%s%s", a.P.M("登记账号来自旧版固定身份标记，无法排除同名/同 UID 重用；自动和批量删除已禁用，请人工核查后用 revoke --force 处理：",
+						"registered account uses a legacy fixed identity marker, so same-name/same-UID reuse cannot be excluded; automatic and bulk deletion are disabled; inspect it and use revoke --force: "), rec.User)
+					rc = 1
+				case !user.MatchesManagedGeneration(pw, rec.Generation):
+					a.warnf("%s%s", a.P.M("登记账号缺少与登记世代精确匹配的受管身份标记，可能已被替换或篡改：",
+						"registered account lacks a managed identity marker matching its recorded generation and may have been replaced or modified: "), rec.User)
+					rc = 1
+				}
+			}
+		}
+	}
+
 	// An sshd exception that outlived its account is a standing loosening of the
 	// host's policy, and it re-arms the moment the username is reused. Nothing else
 	// looks for these, so doctor must.
@@ -564,8 +821,8 @@ func (a *App) doctor(args []string) int {
 			rc = 1
 		} else if len(orphans) > 0 {
 			for _, u := range orphans {
-				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号已不存在）：",
-					"orphaned sshd exception (its account no longer exists): "), a.SSHD.FilePath(u))
+				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号不存在或身份无法验证）：",
+					"orphaned sshd exception (the account is absent or its identity is unverified): "), a.SSHD.FilePath(u))
 			}
 			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
 				"remove them with `cleanup-expired --compact`."))
@@ -588,8 +845,8 @@ func (a *App) doctor(args []string) int {
 			rc = 1
 		} else if len(orphans) > 0 {
 			for _, u := range orphans {
-				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号已不存在，NOPASSWD:ALL 仍在）：",
-					"orphaned sudo grant (its account is gone; NOPASSWD:ALL still on disk): "), a.Sudoers.FilePath(u))
+				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号不存在或身份无法验证，NOPASSWD:ALL 仍在）：",
+					"orphaned sudo grant (the account is absent or its identity is unverified; NOPASSWD:ALL is still on disk): "), a.Sudoers.FilePath(u))
 			}
 			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
 				"remove them with `cleanup-expired --compact`."))
@@ -606,55 +863,44 @@ func (a *App) doctor(args []string) int {
 			rc = 1
 		} else if len(orphans) > 0 {
 			for _, u := range orphans {
-				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号已不存在）：",
-					"orphaned auto-delete task (its account no longer exists): "), u)
+				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号不存在或身份无法验证）：",
+					"orphaned auto-delete task (the account is absent or its identity is unverified): "), u)
 			}
 			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
 				"remove them with `cleanup-expired --compact`."))
 			rc = 1
 		}
 	}
-	// The other direction: a registered account that asked to be auto-deleted, still
-	// exists, and has NO task on disk to do it. New invites refuse this state, so it
-	// means a task was removed out of band (or predates that invariant). chage -E is
-	// only a later, day-granularity lockout backstop; surface the missing exact-time
-	// mechanism immediately so the operator can revoke the account.
-	if a.Scheduler != nil && a.Registry != nil {
-		haveUnit := map[string]bool{}
-		schedulesKnown := true
-		if units, err := a.Scheduler.ScheduledUsers(); err != nil {
-			a.warnf("%s: %v", a.P.M("无法读取自动删除任务", "cannot read auto-delete tasks"), err)
-			rc = 1
-			schedulesKnown = false
-		} else {
-			for _, u := range units {
-				haveUnit[u] = true
-			}
-		}
-		recs, registryErr := a.Registry.List()
-		if registryErr != nil {
-			a.warnf("%s: %v", a.P.M("无法读取注册表", "cannot read registry"), registryErr)
-			rc = 1
-		}
+	// The other direction: prove that every live account marked for auto-revoke has
+	// the exact task recorded for its UID and generation. A matching username alone
+	// is not health: a stale unit/job can target another account generation, and a
+	// modified service body can run something else entirely.
+	if a.Scheduler != nil && a.Registry != nil && registryReadable {
 		var stranded []string
-		for _, r := range recs {
-			if !schedulesKnown || registryErr != nil {
-				break
-			}
+		for _, r := range registryRecords {
 			exists, existsErr := user.Exists(r.User)
 			if existsErr != nil {
 				a.warnf("%s %s: %v", a.P.M("无法确认账号状态：", "cannot determine account state:"), r.User, existsErr)
 				rc = 1
 				continue
 			}
-			if r.AutoRevoke && exists && !haveUnit[r.User] {
+			if !r.AutoRevoke || !exists {
+				continue
+			}
+			valid, err := a.Scheduler.ValidSchedule(r.User, r.UID, r.Generation, r.AutoUnit)
+			if err != nil {
+				a.warnf("%s %s: %v", a.P.M("无法验证自动删除任务：", "cannot verify auto-delete task:"), r.User, err)
+				rc = 1
+				continue
+			}
+			if !valid {
 				stranded = append(stranded, r.User)
 			}
 		}
 		if len(stranded) > 0 {
 			for _, u := range stranded {
-				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无对应任务（chage 仅提供按天粒度的较晚兜底锁定）：",
-					"account set to auto-delete but has no task left to do it (chage only provides a later, day-granularity lockout backstop): "), u)
+				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无可验证的对应任务（任务必须匹配 UID、世代、记录的 unit 和正文；chage 仅提供按天粒度的较晚兜底锁定）：",
+					"account set to auto-delete but has no valid task left to do it (the UID, generation, recorded unit, and body must all match; chage only provides a later, day-granularity lockout backstop): "), u)
 			}
 			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
 				"remove them with `revoke --user <name>` once expired."))
@@ -673,30 +919,43 @@ func (a *App) doctor(args []string) int {
 // for byte) or is a one-time bootstrap better done from the shell as
 // `sudo ./linux-temp-admin install`. Leaving it out makes `upgrade` the menu's
 // single, signature-verified update path.
-var menuItems = []struct {
-	zh, en string
-	run    func(*App) int
-}{
-	{"创建一次性临时管理员邀请", "Create one-time temp admin invite", func(a *App) int { return a.invite(nil) }},
+type menuItem struct {
+	zh, en      string
+	run         func(*App) commandResult
+	exitOnApply bool
+}
+
+// commandResult separates a command's process status from whether it completed
+// the terminal mutation the menu must stop running after. Cancellation and an
+// already-current upgrade both succeed without applying anything.
+type commandResult struct {
+	status  int
+	applied bool
+}
+
+func statusResult(status int) commandResult { return commandResult{status: status} }
+
+var menuItems = []menuItem{
+	{"创建临时管理员邀请", "Create temp admin invite", func(a *App) commandResult { return statusResult(a.invite(nil)) }, false},
 	// One entry for the temporary accounts, because there was only ever one list.
 	// It replaced three: revoke (which opened with a bare list of names to choose
 	// from), the list itself, and a cleanup whose target — a registry row whose
 	// account is gone — is a row of this very table, marked "missing".
-	{"管理临时用户（查看 / 撤销 / 清理）", "Temporary users (list / revoke / clean up)", func(a *App) int { return a.manageUsers() }},
-	{"系统诊断", "Run system doctor", func(a *App) int { return a.doctor(nil) }},
+	{"管理临时用户", "Manage temporary users", func(a *App) commandResult { return statusResult(a.manageUsers()) }, false},
+	{"系统诊断", "Run system doctor", func(a *App) commandResult { return statusResult(a.doctor(nil)) }, false},
 	// Just 升级, like 卸载 below: the old label spelled out "verify-signed, from
 	// GitHub, the stable command" — the whole mechanism — where the entry only needs
 	// to name the act. The command itself still shows "will download, verify, and
 	// upgrade from <url>" and asks for YES before touching anything, so the
 	// signature-verified part is stated where it matters, at the point of action,
 	// not carried as ballast in a menu line.
-	{"升级", "Upgrade", func(a *App) int { return a.upgrade(nil) }},
+	{"升级", "Upgrade", func(a *App) commandResult { return a.upgradeResult(nil) }, true},
 	// It says 卸载 with nothing qualifying it because it finally earns the word: it
 	// removes the accounts, their grants, their auto-delete tasks, the state and the
 	// command. The old label had to say "the stable command" — an opaque phrase for
 	// "the copy at the install path" — precisely because the object was the only
 	// honest part: uninstall deleted one file and left everything else on the host.
-	{"卸载", "Uninstall", func(a *App) int { return a.uninstall(nil) }},
+	{"卸载", "Uninstall", func(a *App) commandResult { return a.uninstallResult(nil) }, true},
 	// Kept next to last, in front of Exit. When this entry was added it was appended
 	// for a stronger reason — that appending changed no existing digit's meaning,
 	// where slotting it in earlier would have pushed Exit from 8 to 9 and turned an
@@ -705,8 +964,8 @@ var menuItems = []struct {
 	// 2 anyway, which is the cost the v2.5.0 CHANGELOG entry owns rather than hides.
 	// The habit it teaches survives its own arithmetic — a digit's meaning is the
 	// interface, so moving one is a real cost to weigh, not a free tidy-up.
-	{"切换语言 / Switch language", "Switch language / 切换语言", func(a *App) int { return a.switchLang() }},
-	{"退出", "Exit", nil},
+	{"语言 / Language", "Language / 语言", func(a *App) commandResult { return statusResult(a.switchLang()) }, false},
+	{"退出", "Exit", nil, false},
 }
 
 // switchLang re-asks the language and remembers the answer, so the one-time
@@ -726,15 +985,17 @@ func (a *App) switchLang() int {
 		a.warnf("%s", a.P.M("无效选择，语言未改变", "invalid choice; language unchanged"))
 		return 1
 	}
-	// Apply to this session first: the confirmation below should already read in the
-	// language just chosen, whether or not it can be persisted.
-	a.P = i18n.Printer{Lang: lang}
-	if err := prefs.SetLang(string(lang)); err != nil {
-		a.warnf("%s: %v", a.P.M("已切换，但未能记住（下次仍会用旧设置）", "switched, but could not be remembered (the next run will use the old setting)"), err)
-		return 1
-	}
-	a.success(a.P.M("语言已切换为中文，并已记住。", "language switched to English and remembered."))
-	return 0
+	return a.withLifecycleLock(func() int {
+		// Apply to this session first: any persistence error and the confirmation
+		// should already read in the language just chosen.
+		a.P = i18n.Printer{Lang: lang}
+		if err := prefs.SetLang(string(lang)); err != nil {
+			a.warnf("%s: %v", a.P.M("已切换，但未能记住（下次仍会用旧设置）", "switched, but could not be remembered (the next run will use the old setting)"), err)
+			return 1
+		}
+		a.success(a.P.M("语言已切换为中文，并已记住。", "language switched to English and remembered."))
+		return 0
+	})
 }
 
 // menu drives the interactive loop. The menu is drawn on entry and only when
@@ -745,8 +1006,8 @@ func (a *App) menu() int {
 	if !a.requireRoot() {
 		return 1
 	}
-	prompt := fmt.Sprintf(a.P.M("请选择 [1-%d]（回车显示菜单）: ", "select [1-%d] (Enter shows the menu): "), len(menuItems))
 	draw := true
+	status := 0
 	for {
 		if draw {
 			a.printf("\n%s", a.P.M("Linux 临时管理员管理器", "Linux Temporary Admin Manager"))
@@ -755,10 +1016,12 @@ func (a *App) menu() int {
 			}
 			draw = false
 		}
-		fmt.Fprint(a.Err, prompt)
+		// The language can change inside this loop, so resolve the prompt for every
+		// iteration instead of retaining the language that was active on entry.
+		fmt.Fprintf(a.Err, a.P.M("请选择 [1-%d]（回车显示菜单）: ", "select [1-%d] (Enter shows the menu): "), len(menuItems))
 		choice, ok := a.readLine()
 		if !ok {
-			return 0 // EOF
+			return status // EOF
 		}
 		if choice == "" { // a blank line asks for the menu back
 			draw = true
@@ -777,15 +1040,25 @@ func (a *App) menu() int {
 			}
 			continue
 		}
-		if run := menuItems[n-1].run; run != nil {
+		item := menuItems[n-1]
+		if item.run != nil {
 			// Frame the result with blank lines. The leading one does not rely on
 			// the terminal echoing the operator's Enter, so a piped or scripted run
 			// reads the same as an interactive one.
 			fmt.Fprintln(a.Out)
-			run(a)
+			result := item.run(a)
+			if result.status != 0 {
+				status = result.status
+			}
 			fmt.Fprintln(a.Out)
+			// A completed upgrade replaced the executable, and a completed uninstall
+			// removed it. Do not continue servicing privileged actions from the old,
+			// now untracked process image. Cancellation and a no-op upgrade stay here.
+			if item.exitOnApply && result.applied {
+				return status
+			}
 		} else {
-			return 0
+			return status
 		}
 	}
 }

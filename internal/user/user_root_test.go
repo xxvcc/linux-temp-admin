@@ -20,8 +20,9 @@ func TestUserLifecycle(t *testing.T) {
 	forceDelete()
 	t.Cleanup(forceDelete)
 
+	const generation = "0123456789abcdef0123456789abcdef"
 	m := New()
-	if err := m.Create(name, "/bin/sh"); err != nil {
+	if err := m.Create(name, "/bin/sh", generation); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	exists, err := Exists(name)
@@ -35,12 +36,15 @@ func TestUserLifecycle(t *testing.T) {
 	if !ok || pw.UID < 1 {
 		t.Fatalf("Lookup after create: %+v ok=%v", pw, ok)
 	}
+	if !MatchesManagedGeneration(pw, generation) {
+		t.Error("created account marker does not match its generation")
+	}
 	managed, err := IsManaged(name)
 	if err != nil || !managed {
 		t.Error("created account should carry the managed GECOS tag")
 	}
-	if err := m.LockPassword(name); err != nil {
-		t.Errorf("LockPassword: %v", err)
+	if err := m.DisablePasswordForKeyLogin(name); err != nil {
+		t.Errorf("DisablePasswordForKeyLogin: %v", err)
 	}
 	if err := m.SetExpiry(name, "2999-01-01"); err != nil {
 		t.Errorf("SetExpiry: %v", err)

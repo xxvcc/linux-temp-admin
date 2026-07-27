@@ -27,7 +27,11 @@ func rootDir(t *testing.T) string {
 
 func TestGrantWritesValidatedDropin(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{Dir: dir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }}
+	var validated []byte
+	m := &Manager{Dir: dir, Validate: func(content []byte) error {
+		validated = append([]byte(nil), content...)
+		return nil
+	}, Verify: func(string) error { return nil }}
 	const user = "xxvcc-a1"
 	if err := m.Grant(user); err != nil {
 		t.Fatal(err)
@@ -43,12 +47,14 @@ func TestGrantWritesValidatedDropin(t *testing.T) {
 	b, _ := os.ReadFile(path)
 	if want := user + " ALL=(ALL) NOPASSWD:ALL\n"; string(b) != want {
 		t.Errorf("content = %q, want %q", b, want)
+	} else if string(validated) != want {
+		t.Errorf("validated content = %q, want %q", validated, want)
 	}
 }
 
 func TestGrantRemovesFileOnValidationFailure(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{Dir: dir, Validate: func(string) error { return fmt.Errorf("bad syntax") }}
+	m := &Manager{Dir: dir, Validate: func([]byte) error { return fmt.Errorf("bad syntax") }}
 	if err := m.Grant("xxvcc-a1"); err == nil {
 		t.Fatal("expected Grant to fail on validation error")
 	}
@@ -59,7 +65,7 @@ func TestGrantRemovesFileOnValidationFailure(t *testing.T) {
 
 func TestGrantRemovesFileOnVerifyFailure(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{Dir: dir, Validate: func(string) error { return nil }, Verify: func(string) error { return fmt.Errorf("not effective") }}
+	m := &Manager{Dir: dir, Validate: func([]byte) error { return nil }, Verify: func(string) error { return fmt.Errorf("not effective") }}
 	if err := m.Grant("xxvcc-a1"); err == nil {
 		t.Fatal("expected Grant to fail on verify error")
 	}
@@ -70,7 +76,7 @@ func TestGrantRemovesFileOnVerifyFailure(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{Dir: dir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }}
+	m := &Manager{Dir: dir, Validate: func([]byte) error { return nil }, Verify: func(string) error { return nil }}
 	if err := m.Grant("xxvcc-a1"); err != nil {
 		t.Fatal(err)
 	}

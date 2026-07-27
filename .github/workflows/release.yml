@@ -1,126 +1,203 @@
 name: Release
 
-# Build the v2 static binaries + checksums when a version tag is pushed, and
-# stage them in a DRAFT GitHub Release. Signing is NOT done here: the ed25519
-# signing key stays offline. The maintainer runs scripts/sign-release.sh locally
-# to sign the CI-built binaries and publish the release. See docs/releasing.md.
-
+# CI produces an unsigned Actions artifact only. A separate workflow_run
+# workflow, whose definition comes from the default branch rather than the
+# candidate tag, may copy that artifact into a new unsigned draft.
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build:
+  gate-build:
+    name: Release gate and build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      go_release: ${{ steps.v.outputs.go_release }}
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.x'
-          check-latest: true
+          go-version: '1.26.5'
+          check-latest: false
+          cache: false
 
-      - name: Derive version and gate (v2+ tags only)
+      - name: Derive exact version and gate
         id: v
+        shell: bash
         run: |
           set -Eeuo pipefail
           version="${GITHUB_REF_NAME#v}"
           prerelease=false
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          if [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
-             && [[ "${BASH_REMATCH[1]}" -ge 2 ]]; then
+          if [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
+             && (( ${#BASH_REMATCH[1]} > 1 || 10#${BASH_REMATCH[1]} >= 2 )); then
             echo "go_release=true" >> "$GITHUB_OUTPUT"
-            if [[ -n "${BASH_REMATCH[4]}" ]]; then
-              prerelease=true
-            fi
+            [[ -z "${BASH_REMATCH[4]}" ]] || prerelease=true
           else
             echo "go_release=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::${GITHUB_REF_NAME} is not a v2+ tag; skipping the release build."
+            echo "::notice::${GITHUB_REF_NAME} is not an exact v2+ release tag; skipping."
           fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
       - name: Release test gate
         if: steps.v.outputs.go_release == 'true'
+        timeout-minutes: 30
+        env:
+          GOCACHE: ${{ runner.temp }}/lta-test-cache
+          GOMODCACHE: ${{ runner.temp }}/lta-module-cache
+          GOPATH: ${{ runner.temp }}/lta-go-path
+          GOTMPDIR: ${{ runner.temp }}/lta-go-tmp
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ''
+          GOPRIVATE: ''
+          GONOPROXY: ''
+          GOINSECURE: ''
+          GOVCS: '*:off'
+          GOAUTH: 'off'
+          GOTELEMETRY: 'off'
+          GOEXPERIMENT: ''
+          GOFIPS140: 'off'
+          GO111MODULE: 'on'
         run: |
           set -Eeuo pipefail
-          go vet -printf.funcs=printf,errorf,warnf ./...
-          go test -race ./...
-          sudo -E env "PATH=$PATH" go test -count=1 -race -tags integration ./...
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR" \
+            "${RUNNER_TEMP}/lta-root-test-cache" "${RUNNER_TEMP}/lta-root-module-cache" \
+            "${RUNNER_TEMP}/lta-root-go-path" "${RUNNER_TEMP}/lta-root-go-tmp"
+          index_file="$(mktemp)"
+          git ls-files -s -z > "$index_file"
+          while IFS= read -r -d '' index_entry; do
+            mode="${index_entry%% *}"
+            [[ "$mode" != 120000 && "$mode" != 160000 ]] \
+              || { echo "release source must not contain symlinks or submodules" >&2; exit 1; }
+          done < "$index_file"
+          env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
+            go vet -mod=readonly -printf.funcs=printf,errorf,warnf ./...
+          env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
+            go test -mod=readonly -count=1 -race ./...
+          sudo -E env "PATH=$PATH" GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
+            GO111MODULE=on GOEXPERIMENT= GOFIPS140=off GOTELEMETRY=off GOAUTH=off GOVCS='*:off' \
+            GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
+            GOCACHE="${RUNNER_TEMP}/lta-root-test-cache" GOMODCACHE="${RUNNER_TEMP}/lta-root-module-cache" \
+            GOPATH="${RUNNER_TEMP}/lta-root-go-path" GOTMPDIR="${RUNNER_TEMP}/lta-root-go-tmp" \
+            go test -mod=readonly -count=1 -race -tags integration ./...
           test -z "$(gofmt -l .)"
           sh -n scripts/install.sh
-          bash -n scripts/release.sh scripts/sign-release.sh
+          bash -n scripts/*.sh
+          python3 -B -m unittest -v scripts/mirror_receiver_test.py
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y shellcheck
           fi
           shellcheck -S warning scripts/*.sh
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
 
-      - name: Build static binaries (amd64, arm64)
+      - name: Build reproducible static binaries
         if: steps.v.outputs.go_release == 'true'
+        timeout-minutes: 15
         env:
           VERSION: ${{ steps.v.outputs.version }}
+          GOCACHE: ${{ runner.temp }}/lta-release-build-cache
+          GOMODCACHE: ${{ runner.temp }}/lta-module-cache
+          GOPATH: ${{ runner.temp }}/lta-go-path
+          GOTMPDIR: ${{ runner.temp }}/lta-go-tmp
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ''
+          GOPRIVATE: ''
+          GONOPROXY: ''
+          GOINSECURE: ''
         run: |
           set -Eeuo pipefail
-          rm -rf dist && mkdir -p dist
+          rm -rf dist
+          mkdir -p dist "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR"
           for arch in amd64 arm64; do
-            out="dist/linux-temp-admin-linux-${arch}"
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
-              -trimpath -tags osusergo,netgo \
+            unset GOAMD64 GOARM64
+            if [[ "$arch" == amd64 ]]; then
+              export GOAMD64=v1
+            else
+              export GOARM64=v8.0
+            fi
+            env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off GO111MODULE=on \
+              GOEXPERIMENT= GOFIPS140=off GOTELEMETRY=off GOAUTH=off GOVCS='*:off' \
+              GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
+              GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" GOPATH="$GOPATH" GOTMPDIR="$GOTMPDIR" \
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -mod=readonly -buildvcs=false -trimpath -tags osusergo,netgo \
               -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION}" \
-              -o "$out" ./cmd/linux-temp-admin
-            echo "built $out"
+              -o "dist/linux-temp-admin-linux-${arch}" ./cmd/linux-temp-admin
           done
-          ( cd dist && sha256sum linux-temp-admin-linux-* > SHA256SUMS )
-          echo "----- SHA256SUMS -----"; cat dist/SHA256SUMS
+          for asset in dist/linux-temp-admin-linux-amd64 dist/linux-temp-admin-linux-arm64; do
+            [[ -s "$asset" && "$(wc -c < "$asset")" -le 67108864 ]] \
+              || { echo "release binary is empty or exceeds the 64 MiB client limit: $asset" >&2; exit 1; }
+          done
+          ( cd dist && sha256sum linux-temp-admin-linux-amd64 linux-temp-admin-linux-arm64 > SHA256SUMS )
 
-      - name: Sanity-check the amd64 binary
+      - name: Release vulnerability gate
         if: steps.v.outputs.go_release == 'true'
+        timeout-minutes: 15
+        env:
+          GOCACHE: ${{ runner.temp }}/lta-vuln-cache
+          GOMODCACHE: ${{ runner.temp }}/lta-module-cache
+          GOPATH: ${{ runner.temp }}/lta-go-path
+          GOTMPDIR: ${{ runner.temp }}/lta-go-tmp
+          GOBIN: ${{ runner.temp }}/lta-audit-bin
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ''
+          GOPRIVATE: ''
+          GONOPROXY: ''
+          GOINSECURE: ''
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR" "$GOBIN"
+          env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off GO111MODULE=on \
+            GOEXPERIMENT= GOFIPS140=off GOTELEMETRY=off GOAUTH=off GOVCS='*:off' \
+            GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
+            GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" GOPATH="$GOPATH" GOTMPDIR="$GOTMPDIR" GOBIN="$GOBIN" \
+            go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off GO111MODULE=on \
+            GOEXPERIMENT= GOFIPS140=off GOTELEMETRY=off GOAUTH=off GOVCS='*:off' \
+            GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
+            GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" GOPATH="$GOPATH" GOTMPDIR="$GOTMPDIR" \
+            "$GOBIN/govulncheck" ./...
+
+      - name: Sanity-check amd64 release binary
+        if: steps.v.outputs.go_release == 'true'
+        timeout-minutes: 2
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -Eeuo pipefail
           got="$(./dist/linux-temp-admin-linux-amd64 version)"
-          [ "$got" = "$VERSION" ] || { echo "version mismatch: got '$got', want '$VERSION'"; exit 1; }
-          file dist/linux-temp-admin-linux-amd64 | grep -q 'statically linked' \
-            || { echo "binary is not statically linked"; exit 1; }
-          echo "ok: version=$got, statically linked"
+          [[ "$got" == "$VERSION" ]]
+          file dist/linux-temp-admin-linux-amd64 | grep -q 'statically linked'
 
-      - name: Stage DRAFT release with unsigned binaries + checksums
+      - name: Upload unsigned build artifact
         if: steps.v.outputs.go_release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          PRERELEASE: ${{ steps.v.outputs.prerelease }}
-        run: |
-          set -Eeuo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            is_draft="$(gh release view "$TAG" --json isDraft --jq '.isDraft')"
-            if [[ "$is_draft" != "true" ]]; then
-              echo "release $TAG is already published; refusing to replace public assets" >&2
-              exit 1
-            fi
-            echo "draft release $TAG exists; refreshing unsigned assets"
-            gh release upload "$TAG" \
-              dist/linux-temp-admin-linux-amd64 \
-              dist/linux-temp-admin-linux-arm64 \
-              dist/SHA256SUMS --clobber
-          else
-            release_flags=(--draft --title "$TAG" --generate-notes)
-            if [[ "$PRERELEASE" == "true" ]]; then
-              release_flags+=(--prerelease)
-            fi
-            gh release create "$TAG" \
-              dist/linux-temp-admin-linux-amd64 \
-              dist/linux-temp-admin-linux-arm64 \
-              dist/SHA256SUMS \
-              "${release_flags[@]}"
-          fi
-          echo "Draft release staged. Sign & publish locally: LTA_SIGN_KEY=~/.lta/signing.key scripts/sign-release.sh $TAG"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-release-${{ github.ref_name }}
+          path: |
+            dist/linux-temp-admin-linux-amd64
+            dist/linux-temp-admin-linux-arm64
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

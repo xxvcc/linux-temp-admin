@@ -2,11 +2,16 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLogWritesJSONLines(t *testing.T) {
@@ -60,6 +65,87 @@ func TestLogWritesJSONLines(t *testing.T) {
 	}
 }
 
+func TestLogRepairsAndVerifiesExistingFileMetadata(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	if err := os.WriteFile(file, []byte(""), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(file, 12345, 12345); err != nil {
+		// Some id-mapped/rootless test filesystems reject arbitrary numeric owners.
+		// Mode repair is still exercised there; owner repair is exercised wherever
+		// the filesystem supports constructing the unsafe fixture.
+		t.Logf("cannot create non-root owner fixture: %v", err)
+	}
+	l := &Logger{Dir: dir, File: file, Now: time.Now, Actor: func() (string, int) { return "root", 0 }}
+	if err := l.Log(Event{Action: "repair"}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := fi.Sys().(*syscall.Stat_t)
+	if !fi.Mode().IsRegular() || st.Uid != 0 || st.Gid != 0 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("audit type=%v owner=%d:%d mode=%o, want regular root:root 0600", fi.Mode(), st.Uid, st.Gid, fi.Mode().Perm())
+	}
+}
+
+func TestLogRejectsExistingNonRegularFile(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	if err := os.Mkdir(file, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	l := &Logger{Dir: dir, File: file, Now: time.Now, Actor: func() (string, int) { return "root", 0 }}
+	if err := l.Log(Event{Action: "x"}); err == nil {
+		t.Fatal("Log accepted a directory in place of a regular audit file")
+	}
+}
+
+func TestLogRejectsFIFOWithoutBlocking(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	if err := unix.Mkfifo(file, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := (&Logger{Dir: dir, File: file}).Log(Event{Action: "x"})
+	if err == nil || !strings.Contains(err.Error(), "not a safe regular file") {
+		t.Fatalf("FIFO audit log error = %v, want special-file refusal", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("FIFO audit log blocked for %s", elapsed)
+	}
+}
+
 func TestLogRefusesSymlinkTarget(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root")
@@ -84,6 +170,161 @@ func TestLogDisabledIsNoOp(t *testing.T) {
 	}
 	if err := (&Logger{}).Log(Event{Action: "x"}); err != nil { // empty paths => disabled
 		t.Errorf("empty logger should be a no-op, got %v", err)
+	}
+}
+
+func TestLogBoundsRecordAndTotalFileSize(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	l := &Logger{Dir: dir, File: file}
+	if err := l.Log(Event{Action: "oversized", Detail: strings.Repeat("x", maxAuditRecordBytes)}); err == nil ||
+		!strings.Contains(err.Error(), "audit record exceeds") {
+		t.Fatalf("oversized record error = %v, want record-size refusal", err)
+	}
+	if _, err := os.Lstat(file); !os.IsNotExist(err) {
+		t.Fatalf("oversized record created a log file: %v", err)
+	}
+
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(file, maxAuditLogBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Log(Event{Action: "at-cap"}); err == nil || !strings.Contains(err.Error(), "archive or rotate") {
+		t.Fatalf("full audit log error = %v, want total-size refusal", err)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != maxAuditLogBytes {
+		t.Fatalf("refused append changed audit size to %d, want %d", fi.Size(), maxAuditLogBytes)
+	}
+}
+
+func TestLogRollsBackPartialWrite(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	base := &Logger{Dir: dir, File: file}
+	if err := base.Log(Event{Action: "before"}); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failed := false
+	l := &Logger{Dir: dir, File: file}
+	l.write = func(f *os.File, p []byte) (int, error) {
+		if failed {
+			return 0, errors.New("injected write failure")
+		}
+		failed = true
+		n, err := f.Write(p[:len(p)/2])
+		if err != nil {
+			return n, err
+		}
+		return n, errors.New("injected write failure")
+	}
+	if err := l.Log(Event{Action: "partial"}); err == nil || !strings.Contains(err.Error(), "injected write failure") {
+		t.Fatalf("Log error = %v, want injected write failure", err)
+	}
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("partial record was not rolled back:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestLogSerializesConcurrentWriters(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "audit.log")
+	const writers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- (&Logger{Dir: dir, File: file}).Log(Event{Action: "concurrent"})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	if len(lines) != writers {
+		t.Fatalf("audit line count = %d, want %d", len(lines), writers)
+	}
+	for i, line := range lines {
+		var rec record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line %d is partial or interleaved: %v: %q", i, err, line)
+		}
+	}
+}
+
+func TestLogReportsSyncFailureAfterCompleteLine(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	l := &Logger{Dir: dir, File: filepath.Join(dir, "audit.log")}
+	l.sync = func(*os.File) error { return errors.New("injected sync failure") }
+	if err := l.Log(Event{Action: "complete"}); err == nil || !strings.Contains(err.Error(), "injected sync failure") {
+		t.Fatalf("Log error = %v, want sync failure", err)
+	}
+	b, err := os.ReadFile(l.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n"); len(lines) != 1 || !json.Valid([]byte(lines[0])) {
+		t.Fatalf("sync failure left an incomplete audit record: %q", b)
 	}
 }
 

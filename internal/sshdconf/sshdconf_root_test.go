@@ -3,10 +3,13 @@
 package sshdconf
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
@@ -25,6 +28,112 @@ func rootDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func verifySSHDPrivilegeSeparationDir(path string, info os.FileInfo) error {
+	if !info.IsDir() {
+		return fmt.Errorf("%s is %s, want a directory", path, info.Mode().Type())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine owner of %s", path)
+	}
+	if stat.Uid != 0 {
+		return fmt.Errorf("%s is owned by uid %d, want root", path, stat.Uid)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s has unsafe mode %04o: group/other write bits must be clear", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+// ensureSSHDPrivilegeSeparationDir supplies the runtime prerequisite that
+// distro packages normally create before starting sshd. Minimal CI images can
+// contain the real sshd binary without that directory.
+func ensureSSHDPrivilegeSeparationDir(t *testing.T, path string) {
+	t.Helper()
+
+	info, err := os.Lstat(path)
+	if err == nil {
+		if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspect sshd privilege separation directory: %v", err)
+	}
+
+	if err := os.Mkdir(path, 0o755); err != nil {
+		// Another process may have created the directory after Lstat. In that
+		// case it owns the lifecycle, so validate it without registering cleanup.
+		if errors.Is(err, os.ErrExist) {
+			info, statErr := os.Lstat(path)
+			if statErr != nil {
+				t.Fatalf("inspect concurrently created sshd privilege separation directory: %v", statErr)
+			}
+			if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		t.Fatalf("create sshd privilege separation directory: %v", err)
+	}
+
+	created, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("inspect created sshd privilege separation directory: %v", err)
+	}
+	t.Cleanup(func() {
+		current, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Errorf("inspect sshd privilege separation directory during cleanup: %v", err)
+			return
+		}
+		if !os.SameFile(created, current) {
+			return
+		}
+		if err := os.Remove(path); err != nil {
+			t.Errorf("remove test-created sshd privilege separation directory: %v", err)
+		}
+	})
+
+	dir, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open created sshd privilege separation directory: %v", err)
+	}
+	opened, err := dir.Stat()
+	if err != nil {
+		dir.Close()
+		t.Fatalf("inspect opened sshd privilege separation directory: %v", err)
+	}
+	if !os.SameFile(created, opened) {
+		dir.Close()
+		t.Fatal("sshd privilege separation directory was replaced while being opened")
+	}
+	if err := dir.Chmod(0o755); err != nil {
+		dir.Close()
+		t.Fatalf("set sshd privilege separation directory mode: %v", err)
+	}
+	if err := dir.Close(); err != nil {
+		t.Fatalf("close sshd privilege separation directory: %v", err)
+	}
+	info, err = os.Lstat(path)
+	if err != nil {
+		t.Fatalf("verify created sshd privilege separation directory: %v", err)
+	}
+	if !os.SameFile(created, info) {
+		t.Fatal("sshd privilege separation directory was replaced while being configured")
+	}
+	if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("created sshd privilege separation directory mode = %04o, want 0755", got)
+	}
 }
 
 // blocked is a host that refuses public-key logins; fixed is the same host once
@@ -75,6 +184,102 @@ func TestGrantWritesProvesAndReloads(t *testing.T) {
 	}
 }
 
+func TestDropInRestoresScopeForLaterIncludedFiles(t *testing.T) {
+	sshd, err := exec.LookPath("sshd")
+	if err != nil {
+		t.Skip("sshd is unavailable")
+	}
+	dir := rootDir(t)
+	body, err := dropIn(acct, []string{acct}, report(blocked))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "10-managed.conf"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// This is a normal global hardening directive in the next file expanded by
+	// the same Include glob. Without the managed file's final Match all, OpenSSH
+	// treats it as part of Match User above and other accounts keep the default.
+	if err := os.WriteFile(filepath.Join(dir, "20-hardening.conf"), []byte("PasswordAuthentication no\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "sshd_config")
+	if err := os.WriteFile(main, []byte("Include "+dir+"/*.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ensureSSHDPrivilegeSeparationDir(t, "/run/sshd")
+	out, err := exec.Command(sshd, "-T", "-f", main, "-C", "user=xxvcc-other,host=localhost,addr=127.0.0.1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("sshd -T: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	if got := sysinfo.ParseSSHD(string(out)).First("passwordauthentication"); got != "no" {
+		t.Fatalf("later global drop-in was captured by the managed Match block: PasswordAuthentication=%q, want no", got)
+	}
+}
+
+func TestEnsureSSHDPrivilegeSeparationDirLifecycle(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	t.Run("creates and cleans", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd")
+		t.Run("create", func(t *testing.T) {
+			ensureSSHDPrivilegeSeparationDir(t, path)
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("created directory: %v", err)
+			}
+			if got := info.Mode().Perm(); got != 0o755 {
+				t.Fatalf("created directory mode = %04o, want 0755", got)
+			}
+		})
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("test-created directory was not cleaned up: %v", err)
+		}
+	})
+
+	t.Run("leaves existing directory unchanged", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		ensureSSHDPrivilegeSeparationDir(t, path)
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("existing directory was removed: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("existing directory mode = %04o, want unchanged 0700", got)
+		}
+	})
+
+	t.Run("preserves replacement inode", func(t *testing.T) {
+		parent := t.TempDir()
+		path := filepath.Join(parent, "sshd")
+		displaced := filepath.Join(parent, "sshd-created-by-test")
+		t.Run("replace", func(t *testing.T) {
+			ensureSSHDPrivilegeSeparationDir(t, path)
+			if err := os.Rename(path, displaced); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		})
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("replacement directory was removed: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("replacement directory mode = %04o, want 0700", got)
+		}
+	})
+}
+
 func TestRemoveNeverReloadsOntoABrokenConfig(t *testing.T) {
 	// THE 3am SCENARIO. An operator edits /etc/ssh/sshd_config at 14:00, leaves a
 	// typo, and never reloads: the running sshd is still serving its old, good
@@ -106,6 +311,61 @@ func TestRemoveNeverReloadsOntoABrokenConfig(t *testing.T) {
 	if _, err := os.Lstat(res.Path); !os.IsNotExist(err) {
 		t.Error("Remove left the sshd exception on disk")
 	}
+	pending := res.Path + removePendingSuffix
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("Remove did not retain pending reload state: %v", err)
+	}
+
+	// Once the host config is repaired, a fresh process must discover the pending
+	// state even though the original drop-in is already gone, then finish the
+	// validate/reload transaction.
+	m.Validate = func() error { return nil }
+	if err := m.Remove(acct); err != nil {
+		t.Fatalf("Remove retry: %v", err)
+	}
+	if reloads != 1 {
+		t.Fatalf("Remove retry reloads = %d, want 1", reloads)
+	}
+	if _, err := os.Lstat(pending); !os.IsNotExist(err) {
+		t.Fatalf("successful Remove retry left pending state: %v", err)
+	}
+}
+
+func TestRemoveRetriesAfterReloadFailure(t *testing.T) {
+	reloads := 0
+	m := okManager(t, &reloads)
+	res, err := m.Grant(acct, []string{acct}, report(blocked))
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	reloads = 0
+	m.Reload = func() error {
+		reloads++
+		if reloads == 1 {
+			return fmt.Errorf("systemctl reload failed")
+		}
+		return nil
+	}
+
+	if err := m.Remove(acct); err == nil {
+		t.Fatal("first Remove succeeded despite reload failure")
+	}
+	if _, err := os.Lstat(res.Path); !os.IsNotExist(err) {
+		t.Fatalf("first Remove left the drop-in active: %v", err)
+	}
+	pending := res.Path + removePendingSuffix
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("first Remove did not retain pending reload state: %v", err)
+	}
+	if err := m.Remove(acct); err != nil {
+		t.Fatalf("Remove retry: %v", err)
+	}
+	if reloads != 2 {
+		t.Fatalf("reload calls = %d, want retry to reload again", reloads)
+	}
+	if _, err := os.Lstat(pending); !os.IsNotExist(err) {
+		t.Fatalf("successful Remove retry left pending state: %v", err)
+	}
 }
 
 func TestGrantKeepsTheFileButDoesNotClaimVerifiedWhenNothingCouldBeReloaded(t *testing.T) {
@@ -127,10 +387,21 @@ func TestGrantKeepsTheFileButDoesNotClaimVerifiedWhenNothingCouldBeReloaded(t *t
 	if _, err := os.Lstat(res.Path); err != nil {
 		t.Errorf("the proved drop-in should be kept: %v", err)
 	}
-	// Remove tolerates the same sentinel: there is nothing to reload on the way out
-	// either, and that is not a failure.
+	// Removal cannot make the same assumption: failure to find a reload mechanism
+	// does not prove that no manually-started daemon still holds the Match block.
+	if err := m.Remove(acct); err == nil || !errors.Is(err, ErrNoReloadMechanism) {
+		t.Fatalf("Remove error = %v, want an unconfirmed-removal failure", err)
+	}
+	pending := res.Path + removePendingSuffix
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("unconfirmed Remove did not retain pending state: %v", err)
+	}
+	m.Reload = func() error { return nil }
 	if err := m.Remove(acct); err != nil {
-		t.Errorf("Remove: %v", err)
+		t.Fatalf("confirmed retry Remove: %v", err)
+	}
+	if _, err := os.Lstat(pending); !os.IsNotExist(err) {
+		t.Fatalf("confirmed retry left pending state: %v", err)
 	}
 }
 
@@ -195,16 +466,36 @@ func TestGrantRollsBackWhenSSHDRejectsTheConfigItProduced(t *testing.T) {
 	}
 }
 
-func TestGrantRollsBackWhenTheReloadFails(t *testing.T) {
+func TestGrantKeepsPendingWhenBothReloadAttemptsFail(t *testing.T) {
 	reloads := 0
 	m := okManager(t, &reloads)
-	m.Reload = func() error { return fmt.Errorf("systemctl: Job for ssh.service failed") }
+	m.Reload = func() error {
+		reloads++
+		return fmt.Errorf("systemctl: Job for ssh.service failed")
+	}
 
 	if _, err := m.Grant(acct, []string{acct}, report(blocked)); err == nil {
 		t.Fatal("Grant must fail when sshd cannot be reloaded: the invite would not work yet")
 	}
-	if ents, _ := os.ReadDir(m.Dir); len(ents) != 0 {
-		t.Errorf("a grant whose reload failed left the drop-in behind: %v", ents)
+	if reloads != 2 {
+		t.Fatalf("reload attempts = %d, want initial reload plus rollback reload", reloads)
+	}
+	if _, err := os.Lstat(m.FilePath(acct)); !os.IsNotExist(err) {
+		t.Fatalf("failed Grant left its active drop-in: %v", err)
+	}
+	pending := m.FilePath(acct) + removePendingSuffix
+	if _, err := os.Lstat(pending); err != nil {
+		t.Fatalf("two failed reloads lost retry state: %v", err)
+	}
+	m.Reload = func() error { reloads++; return nil }
+	if err := m.Remove(acct); err != nil {
+		t.Fatalf("Remove retry: %v", err)
+	}
+	if reloads != 3 {
+		t.Fatalf("reload attempts after retry = %d, want 3", reloads)
+	}
+	if _, err := os.Lstat(pending); !os.IsNotExist(err) {
+		t.Fatalf("successful retry left pending state: %v", err)
 	}
 }
 
@@ -220,6 +511,42 @@ func TestGrantReportsRollbackRemovalFailure(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(m.FilePath(acct)); statErr != nil {
 		t.Fatalf("fixture did not leave the unremovable drop-in behind: %v", statErr)
+	}
+	if _, statErr := os.Lstat(m.FilePath(acct) + removePendingSuffix); statErr != nil {
+		t.Fatalf("rollback removal failure did not retain pending state: %v", statErr)
+	}
+}
+
+func TestRemoveRejectsUnsafePendingMarker(t *testing.T) {
+	tests := []struct {
+		name  string
+		plant func(string) error
+	}{
+		{"directory", func(path string) error { return os.Mkdir(path, 0o700) }},
+		{"wrong mode", func(path string) error { return os.WriteFile(path, nil, 0o644) }},
+		{"nonempty", func(path string) error { return os.WriteFile(path, []byte("Match all\n"), 0o600) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := rootDir(t)
+			m := &Manager{
+				Dir:      dir,
+				Validate: func() error { t.Fatal("unsafe marker reached validation"); return nil },
+				Reload:   func() error { t.Fatal("unsafe marker reached reload"); return nil },
+			}
+			pending := m.FilePath(acct) + removePendingSuffix
+			if err := tc.plant(pending); err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "wrong mode" {
+				if err := os.Chmod(pending, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.Remove(acct); err == nil {
+				t.Fatal("Remove accepted an unsafe pending marker")
+			}
+		})
 	}
 }
 

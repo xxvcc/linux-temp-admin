@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
@@ -15,6 +17,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/table"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"golang.org/x/sys/unix"
 )
 
 // witness is a place that names an account, and the reason the teardown believes
@@ -194,6 +197,12 @@ func (a *App) binaryBlocker(force bool) string {
 	if err != nil {
 		return err.Error()
 	}
+	// Even --force only authorizes unlinking an unsafe file-like entry (for
+	// example a symlink). A directory is not an installed command, and a non-empty
+	// one would fail only after accounts and state had already been destroyed.
+	if fi.IsDir() {
+		return a.P.M("是目录；请先人工处理", "is a directory; remove or relocate it manually")
+	}
 	// --force is exactly what makes an unsafe path removable (Selfmanage.Uninstall
 	// skips the RootSafeFile check under force), so with it set there is no blocker
 	// to report — saying "needs --force" while --force is present is just wrong.
@@ -229,8 +238,11 @@ func (a *App) binaryBlocker(force bool) string {
 // the exact silent under-report the inventory's fatal-error gate exists to catch,
 // and this is the one witness the code itself calls the only record of an account
 // v1 made without a sudo grant. So a present-but-unreadable registry is an error.
+const maxV1RegistryBytes = int64(16 << 20)
+
 func (a *App) v1RegistryUsers() ([]string, error) {
-	f, err := os.Open(filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile)))
+	path := filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile))
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -238,8 +250,19 @@ func (a *App) v1RegistryUsers() ([]string, error) {
 		return nil, err
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("v1 registry %s is not a regular file", path)
+	}
+	if fi.Size() > maxV1RegistryBytes {
+		return nil, fmt.Errorf("v1 registry exceeds %d-byte limit", maxV1RegistryBytes)
+	}
 	var users []string
-	sc := bufio.NewScanner(f)
+	limited := &io.LimitedReader{R: f, N: maxV1RegistryBytes + 1}
+	sc := bufio.NewScanner(limited)
 	lineNo := 0
 	for sc.Scan() {
 		lineNo++
@@ -257,6 +280,9 @@ func (a *App) v1RegistryUsers() ([]string, error) {
 		// A partial read already yielded some names; returning them AND the error
 		// would let the caller act on an inventory it was just told is incomplete.
 		return nil, err
+	}
+	if limited.N == 0 {
+		return nil, fmt.Errorf("v1 registry exceeds %d-byte limit", maxV1RegistryBytes)
 	}
 	return users, nil
 }
@@ -314,8 +340,12 @@ func (a *App) printTeardownPlan(p teardownPlan) {
 func callerAccount() string { return os.Getenv("SUDO_USER") }
 
 func (a *App) uninstall(args []string) int {
+	return a.uninstallResult(args).status
+}
+
+func (a *App) uninstallResult(args []string) commandResult {
 	if !a.requireRoot() {
-		return 1
+		return statusResult(1)
 	}
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
@@ -326,16 +356,40 @@ func (a *App) uninstall(args []string) int {
 	fs.BoolVar(&removeUsers, "remove-users", false, "")
 	fs.BoolVar(&purgeAudit, "purge-audit", false, "")
 	if !a.parseFlags(fs, args) {
-		return 1
+		return statusResult(1)
 	}
-	return a.withLifecycleLock(func() int {
-		return a.uninstallLocked(force, yes, removeUsers, purgeAudit)
+	plan := a.teardownPlan(purgeAudit, force)
+	if !a.authorizeUninstall(plan, yes, removeUsers) {
+		return statusResult(1)
+	}
+	if !yes {
+		if a.prompt(a.P.M("确认卸载请输入 YES: ", "type YES to uninstall: ")) != "YES" {
+			a.warnf("%s", a.P.M("已取消", "cancelled"))
+			return statusResult(0)
+		}
+	}
+	result := commandResult{}
+	result.status = a.withLifecycleLockAllowUninstalled(func() int {
+		current := a.teardownPlan(purgeAudit, force)
+		if current.inventoryErr != nil {
+			a.errorf("%s: %v", a.P.M("确认后无法重新读取完整卸载清单，拒绝执行",
+				"cannot rebuild a complete uninstall inventory after confirmation; refusing to proceed"), current.inventoryErr)
+			return 1
+		}
+		if !sameTeardownPlan(plan, current) {
+			a.errorf("%s", a.P.M("确认后卸载清单发生变化；未修改主机，请重新运行并确认最新清单",
+				"the uninstall inventory changed after confirmation; the host was not modified; rerun and confirm the current inventory"))
+			a.audit("uninstall", "", "fail", "inventory changed after confirmation", nil)
+			return 1
+		}
+		status := a.teardown(current, force, purgeAudit)
+		result = commandResult{status: status, applied: status == 0}
+		return status
 	})
+	return result
 }
 
-func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
-	plan := a.teardownPlan(purgeAudit, force)
-
+func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool {
 	// A witness that could not be read is fatal, not advisory. Every way of failing
 	// to read one makes accounts vanish from the inventory rather than announce
 	// themselves, and an inventory that under-reports is how a teardown deletes the
@@ -349,7 +403,7 @@ func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
 		a.warnf("%s", a.P.M(
 			"清单不全就卸载，会删掉命令、留下它没看见的账号——而它们的自动删除任务执行的正是这个命令。请先修好上面的问题再重试。",
 			"uninstalling on a partial inventory removes the command and leaves behind accounts it never saw. Repair the account database or managed state before retrying."))
-		return 1
+		return false
 	}
 
 	a.printTeardownPlan(plan)
@@ -367,7 +421,7 @@ func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
 			plan.binaryPath, plan.binaryBlocker)
 		a.warnf("%s", a.P.M("先处理该路径（或用 --force 明确接受），再重试——否则卸载会删光账号与状态却卡在最后一步。",
 			"resolve that path (or pass --force to accept it explicitly) and retry — otherwise the uninstall would remove every account and all state, then stop at the last step."))
-		return 1
+		return false
 	}
 
 	// Refuse before anything is touched, not partway through.
@@ -377,7 +431,7 @@ func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
 				a.errorf("%s", a.P.M(
 					"你正以临时账号 "+who+" 的身份运行卸载，而卸载会删除这个账号。请改用 root 或其他管理员登录后重试。",
 					"you are running this as the temporary account "+who+", which the uninstall would delete. Log in as root or another administrator and retry."))
-				return 1
+				return false
 			}
 		}
 	}
@@ -395,18 +449,29 @@ func (a *App) uninstallLocked(force, yes, removeUsers, purgeAudit bool) int {
 				fmt.Sprintf("a non-interactive run will not delete accounts. This host has %d managed by this tool, and the uninstall must remove them first; pass --remove-users to say so.", len(plan.accounts))))
 			a.warnf("%s", a.P.M("（不能只卸载命令、留下账号：它们的自动删除任务执行的就是这个命令，删掉命令它们就再也不会过期。）",
 				"(uninstalling the command and keeping the accounts is not an option: their auto-delete tasks invoke this very command, so removing it means they never expire.)"))
-			return 1
+			return false
 		}
 	}
+	return true
+}
 
-	if !yes {
-		if a.prompt(a.P.M("确认卸载请输入 YES: ", "type YES to uninstall: ")) != "YES" {
-			a.warnf("%s", a.P.M("已取消", "cancelled"))
-			return 0
+func sameTeardownPlan(a, b teardownPlan) bool {
+	if a.stateDir != b.stateDir || a.auditPath != b.auditPath || a.auditKept != b.auditKept ||
+		a.binaryPath != b.binaryPath || a.binaryBlocker != b.binaryBlocker || len(a.accounts) != len(b.accounts) {
+		return false
+	}
+	for i := range a.accounts {
+		left, right := a.accounts[i], b.accounts[i]
+		if left.name != right.name || left.exists != right.exists || len(left.witnesses) != len(right.witnesses) {
+			return false
+		}
+		for j := range left.witnesses {
+			if left.witnesses[j] != right.witnesses[j] {
+				return false
+			}
 		}
 	}
-
-	return a.teardown(plan, force, purgeAudit)
+	return true
 }
 
 // teardown executes the plan. Order is the whole design: every step leaves the
@@ -432,11 +497,33 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// revoke's protections (protected targets, the UID proof) are UNaffected by
 	// --force and still refuse a real non-managed account — that is what the
 	// survivor check below is for.
+	var failedRevokes []string
 	for _, acc := range plan.accounts {
-		a.revokeLocked([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name})
+		ours, live, identityErr := a.completedAccountIdentity(acc.name)
+		if identityErr != nil {
+			a.errorf("%s %s: %v", a.P.M("无法重新验证活账号身份，拒绝自动删除：",
+				"cannot re-verify the live account identity; refusing automatic deletion:"), acc.name, identityErr)
+			failedRevokes = append(failedRevokes, acc.name)
+			continue
+		}
+		if live && !ours {
+			// Every filesystem artifact and v1 row is name-scoped: it proves that this
+			// tool once managed the name, not that today's account is the same account
+			// generation. A pending/legacy v2 row is not identity either, and the GECOS
+			// marker is user-writable. Bulk uninstall therefore requires a completed,
+			// generation-bound identity and the same passwd snapshot to match its UID and
+			// marker; an operator can inspect and revoke an unverifiable account explicitly.
+			a.errorf("%s %s", a.P.M("缺少当前世代绑定身份登记，拒绝自动删除活账号：",
+				"refusing to auto-delete a live account without a current generation-bound identity record:"), acc.name)
+			failedRevokes = append(failedRevokes, acc.name)
+			continue
+		}
+		if rc := a.revokeLocked([]string{"--user", acc.name, "--yes", "--force", "--confirm-force", acc.name}); rc != 0 {
+			failedRevokes = append(failedRevokes, acc.name)
+		}
 	}
 
-	// Re-inventory from scratch, do not trust the plan or revoke's rc. Two things
+	// Re-inventory from scratch and also retain every revoke failure. Two things
 	// the point-in-time plan and a user.Exists check both miss:
 	//   - an artifact revoke could not remove — a NOPASSWD grant wedged with
 	//     chattr +i, an EPERM, a path swapped for a non-empty dir. The account is
@@ -448,7 +535,8 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	//     auto-revoke task points at the binary we are about to remove.
 	// A witness that names ANYTHING — an account, a grant, an exception, a unit —
 	// blocks the binary, exactly as a surviving account does. An unreadable witness
-	// blocks too: we cannot prove nothing is left.
+	// blocks too. So does a failed revoke even when no disk artifact remains: a
+	// systemd timer can remain active in manager memory after its unit file vanished.
 	residual := a.teardownPlan(purgeAudit, force)
 	if residual.inventoryErr != nil {
 		a.errorf("%s: %v", a.P.M("无法确认账号与授权已全部清除，卸载中止（命令与状态已保留）",
@@ -469,7 +557,7 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 			blocking = append(blocking, acc)
 		}
 	}
-	if len(blocking) > 0 {
+	if len(blocking) > 0 || len(failedRevokes) > 0 {
 		residual.accounts = blocking
 		a.errorf("%s", a.P.M(
 			"以下项未能清除（账号、sudo 授权、sshd 例外或自动删除任务仍在）：",
@@ -481,34 +569,45 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 			}
 			a.printf("  %s (%s)", acc.name, strings.Join(ws, " "))
 		}
+		if len(failedRevokes) > 0 {
+			a.errorf("%s %s", a.P.M("以下账号的撤销操作失败：", "revoke failed for these accounts:"), strings.Join(failedRevokes, " "))
+		}
 		a.errorf("%s", a.P.M(
 			"已保留已安装的命令和状态目录，卸载中止。留着一个带 sudo 的授权却删掉唯一能清理它的命令，比不卸载更糟。请先手动处理，再重试。",
 			"the installed command and the state directory were kept, and the uninstall stopped. Leaving a sudo grant behind while deleting the only thing that can clean it up is worse than not uninstalling. Deal with these by hand and retry."))
-		a.audit("uninstall", "", "fail", "residual: "+strings.Join(residual.names(), " "), nil)
+		a.audit("uninstall", "", "fail", "residual: "+strings.Join(residual.names(), " ")+"; failed revokes: "+strings.Join(failedRevokes, " "), nil)
 		return 1
 	}
 
-	// Nothing is left, so removal is safe. Purge the audit log only AFTER a final
-	// record of the teardown — the record precedes the purge, or "purge" would
-	// recreate the file it deleted and quietly mean "leave exactly one line".
-	if purgeAudit {
-		a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "yes"})
-		if err := os.RemoveAll(a.AuditLogDir); err != nil {
-			a.warnf("%s: %v", a.P.M("删除审计日志失败", "removing the audit log failed"), err)
-		} else {
-			a.info(a.P.M("已删除审计日志："+a.AuditLogDir, "removed the audit log: "+a.AuditLogDir))
+	// Releases before the persistent-timer cleanup fix could leave an inert
+	// stamp after both the account and its unit files were gone. There is no
+	// username witness left to feed through revoke, so sweep this tool's timer
+	// namespaces only after the fresh inventory above proved that no managed task
+	// remains live. A failure keeps the command and state available for a retry.
+	if a.Scheduler != nil {
+		if err := a.Scheduler.CleanupTimerStamps(); err != nil {
+			a.errorf("%s: %v", a.P.M("无法清除旧版 systemd 定时器时间戳，卸载中止（命令与状态已保留）",
+				"cannot remove legacy systemd timer timestamps; the uninstall stopped (command and state kept)"), err)
+			a.audit("uninstall", "", "fail", "timer timestamp cleanup failed: "+err.Error(), nil)
+			return 1
 		}
-		a.Audit = nil // nothing may audit after this: a.Audit would recreate the dir
 	}
 
-	stateGone := true
-	if err := a.removeStateDir(force); err != nil {
-		stateGone = false
-		a.warnf("%s: %v", a.P.M("删除状态目录失败（账号已全部移除，命令仍将卸载）",
-			"removing the state directory failed (every account is gone, so the command is still uninstalled)"), err)
-	} else {
-		a.info(a.P.M("已删除状态目录："+a.StateDir, "removed the state directory: "+a.StateDir))
+	if a.Lifecycle != nil {
+		if err := a.Lifecycle.MarkUninstalled(); err != nil {
+			a.errorf("%s: %v", a.P.M("无法写入卸载状态标记；状态与命令均已保留，以阻止排队中的旧进程重新启用工具",
+				"cannot record the uninstall-state marker; state and command were kept so a queued older process cannot re-enable the tool"), err)
+			a.audit("uninstall", "", "fail", "uninstall marker write failed: "+err.Error(), nil)
+			return 1
+		}
 	}
+	if err := a.removeStateDir(force); err != nil {
+		a.errorf("%s: %v", a.P.M("删除状态目录失败；工具已标记为卸载并保留命令，以便修复后重试",
+			"removing the state directory failed; the tool is marked uninstalled and the command was kept so uninstall can be retried after repair"), err)
+		a.audit("uninstall", "", "fail", "state directory cleanup failed: "+err.Error(), nil)
+		return 1
+	}
+	a.info(a.P.M("已删除状态目录："+a.StateDir, "removed the state directory: "+a.StateDir))
 
 	// The binary is the last thing removed and the first that can still fail here
 	// (a symlinked path without --force). The "ok" audit is written only once it is
@@ -519,17 +618,27 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 		a.audit("uninstall", "", "fail", "binary removal failed: "+err.Error(), nil)
 		return 1
 	}
-	if !purgeAudit {
+	if purgeAudit {
+		// Record the complete outcome before purging; logging after a successful
+		// purge would recreate the directory and turn "purge" into "keep one line".
+		a.audit("uninstall", "", "pending", "core teardown complete; audit purge pending",
+			map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "requested"})
+		if err := a.removeAuditDir(force); err != nil {
+			a.errorf("%s: %v", a.P.M("删除审计日志失败；命令已卸载但清理未完整完成",
+				"removing the audit log failed; the command is uninstalled but cleanup is incomplete"), err)
+			// Keep the logger live. A failed recursive removal may be partial, and this
+			// failure is exactly the event the surviving/recreated log must retain.
+			a.audit("uninstall", "", "fail", "audit purge failed: "+err.Error(), nil)
+			return 1
+		}
+		a.info(a.P.M("已删除审计日志："+a.AuditLogDir, "removed the audit log: "+a.AuditLogDir))
+		a.Audit = nil
+	} else {
 		a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "no"})
 	}
 
-	if stateGone {
-		a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
-			"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
-	} else {
-		a.success(a.P.M("已卸载命令，账号与授权已清除；但状态目录未能删除（见上），请手动清理 "+a.StateDir,
-			"uninstalled the command; accounts and grants are gone, but the state directory could not be removed (see above) — remove "+a.StateDir+" by hand."))
-	}
+	a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
+		"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
 	return 0
 }
 
@@ -540,16 +649,130 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 // directory is root-owned by construction, so anything else standing at that path
 // is not ours to delete recursively.
 func (a *App) removeStateDir(force bool) error {
-	if a.StateDir == "" {
-		return fmt.Errorf("no state directory configured")
+	if err := safeRecursiveRemovalPath(a.StateDir); err != nil {
+		return fmt.Errorf("unsafe state directory: %w", err)
 	}
 	if _, err := os.Lstat(a.StateDir); os.IsNotExist(err) {
 		return nil
+	}
+	if err := refuseMountedRemoval(a.StateDir); err != nil {
+		return err
 	}
 	if !force {
 		if err := fsutil.RootSafeDir(a.StateDir); err != nil {
 			return fmt.Errorf("refusing to remove an unsafe state directory: %w", err)
 		}
 	}
-	return os.RemoveAll(a.StateDir)
+	return a.removeAll(a.StateDir)
+}
+
+func (a *App) removeAuditDir(force bool) error {
+	if err := safeRecursiveRemovalPath(a.AuditLogDir); err != nil {
+		return fmt.Errorf("unsafe audit directory: %w", err)
+	}
+	if _, err := os.Lstat(a.AuditLogDir); os.IsNotExist(err) {
+		return nil
+	}
+	if err := refuseMountedRemoval(a.AuditLogDir); err != nil {
+		return err
+	}
+	if !force {
+		if err := fsutil.RootSafeDir(a.AuditLogDir); err != nil {
+			return fmt.Errorf("refusing to remove an unsafe audit directory: %w", err)
+		}
+	}
+	return a.removeAll(a.AuditLogDir)
+}
+
+func safeRecursiveRemovalPath(path string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) == string(filepath.Separator) {
+		return fmt.Errorf("refusing recursive removal of %q", path)
+	}
+	return nil
+}
+
+// refuseMountedRemoval prevents os.RemoveAll from crossing into a bind mount or
+// child filesystem. Mount ownership is independent of pathname ownership, and a
+// dedicated tool directory can be used as a mountpoint for unrelated data. This
+// check is intentionally not bypassed by --force.
+func refuseMountedRemoval(path string) error {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return fmt.Errorf("cannot inspect mount boundaries: %w", err)
+	}
+	defer f.Close()
+	return rejectMountsUnder(f, filepath.Clean(path))
+}
+
+func rejectMountsUnder(r io.Reader, root string) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 4096), 1024*1024)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 5 {
+			return fmt.Errorf("malformed mountinfo line")
+		}
+		mountpoint, err := unescapeMountInfoPath(fields[4])
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, filepath.Clean(mountpoint))
+		if err != nil {
+			return fmt.Errorf("compare mountpoint %q: %w", mountpoint, err)
+		}
+		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+			return fmt.Errorf("refusing recursive removal across mountpoint %s", mountpoint)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("read mount boundaries: %w", err)
+	}
+	return nil
+}
+
+func unescapeMountInfoPath(value string) (string, error) {
+	var out strings.Builder
+	for i := 0; i < len(value); i++ {
+		if value[i] != '\\' {
+			out.WriteByte(value[i])
+			continue
+		}
+		if i+3 >= len(value) {
+			return "", fmt.Errorf("malformed mountinfo escape in %q", value)
+		}
+		n, err := strconv.ParseUint(value[i+1:i+4], 8, 8)
+		if err != nil {
+			return "", fmt.Errorf("malformed mountinfo escape in %q", value)
+		}
+		out.WriteByte(byte(n))
+		i += 3
+	}
+	return out.String(), nil
+}
+
+func (a *App) removeAll(path string) error {
+	var err error
+	if a.RemoveAll != nil {
+		err = a.RemoveAll(path)
+	} else {
+		err = os.RemoveAll(path)
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf("recursive removal reported success but %s still exists", path)
+		}
+		return fmt.Errorf("verify recursive removal of %s: %w", path, err)
+	}
+	parent, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open recursive-removal parent: %w", err)
+	}
+	defer parent.Close()
+	if err := parent.Sync(); err != nil {
+		return &fsutil.DurabilityError{Operation: "recursive removal", Err: err}
+	}
+	return nil
 }

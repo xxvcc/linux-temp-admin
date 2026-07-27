@@ -14,17 +14,17 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
-// Header is the first line of a v2 registry file; it also carries the schema
-// version so a future format change is detectable.
-const Header = "# linux-temp-admin registry v2"
+// Header is the current registry schema. v3 makes the identity and pending
+// columns mandatory so an older writer cannot silently discard them.
+const Header = "# linux-temp-admin registry v3"
 
-// fieldCount is the minimum number of tab-separated fields a record line must
-// have to be parsed. It stays at 9 deliberately: fields added since are appended
-// and read only when present, so a registry written by an older build still
-// parses here, and a registry written here still parses under an older build
-// (which ignores the trailing extras). Never raise this — it would strand every
-// deployed host's existing rows, leaving those accounts unrevocable.
-const fieldCount = 9
+const legacyHeaderV2 = "# linux-temp-admin registry v2"
+
+const (
+	legacyFieldCount    = 9
+	legacyMaxFieldCount = 11
+	currentFieldCount   = 13
+)
 
 // Record is one managed temporary account.
 type Record struct {
@@ -48,6 +48,14 @@ type Record struct {
 	// 0 is unambiguous as the unknown marker.
 	UID        int
 	Generation string
+	// IdentityBound is true only for an account created with Generation embedded
+	// in its passwd GECOS marker. Migrated v2 rows remain false even when they have
+	// a generation column: released v2 accounts used one shared fixed marker.
+	IdentityBound bool
+	// Pending marks a creation intent written before useradd. It is cleared only
+	// after the new account's UID has been read and durably recorded. A live account
+	// named by a pending row has no proven identity and must never be auto-deleted.
+	Pending bool
 }
 
 var fieldSanitizer = strings.NewReplacer("\t", " ", "\r", " ", "\n", " ")
@@ -62,9 +70,11 @@ func boolYN(b bool) string {
 	return "no"
 }
 
-// uidField and generationField are append-only compatibility columns.
+// Column indexes are retained while migrating deployed v2 rows to v3.
 const uidField = 9
 const generationField = 10
+const pendingField = 11
+const identityBoundField = 12
 
 // TSV renders the record as one tab-separated line (no trailing newline).
 func (r Record) TSV() string {
@@ -80,20 +90,35 @@ func (r Record) TSV() string {
 		sanitize(r.AutoUnit),
 		strconv.Itoa(r.UID), // appended; older builds ignore this trailing field
 		sanitize(r.Generation),
+		boolYN(r.Pending),
+		boolYN(r.IdentityBound),
 	}, "\t")
 }
 
-// ParseLine parses one registry line into a Record. It returns ok=false only for
-// the header and blank lines. Malformed non-empty rows are errors. Fields appended
-// after the original nine are read only when present, so an older registry parses
-// with them zero-valued.
+// ParseLine parses a current-schema registry line. It returns ok=false only for
+// the exact current header and blank lines. Every other non-empty line, including
+// one beginning with '#', must be a valid 13-column record or is corruption.
 func ParseLine(line string) (Record, bool, error) {
-	if line == "" || strings.HasPrefix(line, "#") {
+	if line == "" || line == Header {
 		return Record{}, false, nil
 	}
+	return parseFields(line, currentFieldCount, currentFieldCount)
+}
+
+func parseLegacyV2Line(line string) (Record, bool, error) {
+	if line == "" {
+		return Record{}, false, nil
+	}
+	return parseFields(line, legacyFieldCount, legacyMaxFieldCount)
+}
+
+func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
 	f := strings.Split(line, "\t")
-	if len(f) < fieldCount {
-		return Record{}, false, fmt.Errorf("record has %d fields, want at least %d", len(f), fieldCount)
+	if len(f) < minFields || len(f) > maxFields {
+		if minFields == maxFields {
+			return Record{}, false, fmt.Errorf("record has %d fields, want exactly %d", len(f), minFields)
+		}
+		return Record{}, false, fmt.Errorf("record has %d fields, want %d..%d", len(f), minFields, maxFields)
 	}
 	if !validate.Username(f[0]) {
 		return Record{}, false, fmt.Errorf("invalid username %q", f[0])
@@ -118,7 +143,7 @@ func ParseLine(line string) (Record, bool, error) {
 	}
 	if len(f) > uidField {
 		rec.UID, err = strconv.Atoi(f[uidField])
-		if err != nil || rec.UID < 0 {
+		if err != nil || !validate.KernelID(rec.UID) {
 			return Record{}, false, fmt.Errorf("invalid uid %q", f[uidField])
 		}
 	}
@@ -127,6 +152,24 @@ func ParseLine(line string) (Record, bool, error) {
 		if rec.Generation != "" && !validate.Generation(rec.Generation) {
 			return Record{}, false, fmt.Errorf("invalid generation %q", rec.Generation)
 		}
+	}
+	if len(f) > pendingField {
+		if f[pendingField] != "yes" && f[pendingField] != "no" {
+			return Record{}, false, fmt.Errorf("invalid pending field %q", f[pendingField])
+		}
+		rec.Pending = f[pendingField] == "yes"
+	}
+	if len(f) > identityBoundField {
+		if f[identityBoundField] != "yes" && f[identityBoundField] != "no" {
+			return Record{}, false, fmt.Errorf("invalid identity-bound field %q", f[identityBoundField])
+		}
+		rec.IdentityBound = f[identityBoundField] == "yes"
+	}
+	if rec.IdentityBound && !validate.Generation(rec.Generation) {
+		return Record{}, false, fmt.Errorf("identity-bound record has no valid generation")
+	}
+	if rec.IdentityBound && !rec.Pending && !validate.AccountID(rec.UID) {
+		return Record{}, false, fmt.Errorf("completed identity-bound record has no valid uid")
 	}
 	return rec, true, nil
 }

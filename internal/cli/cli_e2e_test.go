@@ -5,6 +5,7 @@ package cli_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,9 +58,10 @@ func (unavailableSched) AtrmJob(string) error                   { return nil }
 func (unavailableSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
 
 type trackingSched struct {
-	jobs      map[string]string
-	next      int
-	removeErr error
+	jobs           map[string]string
+	next           int
+	removeErr      error
+	beforeSchedule func(string) error
 }
 
 func newTrackingSched() *trackingSched { return &trackingSched{jobs: map[string]string{}} }
@@ -68,6 +70,11 @@ func (*trackingSched) HasSystemctl() bool        { return false }
 func (*trackingSched) Systemctl(...string) error { return nil }
 func (*trackingSched) HasAt() bool               { return true }
 func (s *trackingSched) ScheduleAt(command string, _ int) (string, error) {
+	if s.beforeSchedule != nil {
+		if err := s.beforeSchedule(command); err != nil {
+			return "", err
+		}
+	}
 	s.next++
 	id := strconv.Itoa(s.next)
 	s.jobs[id] = command
@@ -99,6 +106,14 @@ func (s *trackingSched) AtJobs() ([]schedule.AtJob, error) {
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("output unavailable") }
+
+type partialFailingWriter struct{ wrote int }
+
+func (w *partialFailingWriter) Write(p []byte) (int, error) {
+	n := len(p) / 2
+	w.wrote += n
+	return n, errors.New("output interrupted after a partial credential write")
+}
 
 func mustExternalUserExists(t *testing.T, name string) bool {
 	t.Helper()
@@ -157,7 +172,7 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		In:      strings.NewReader(""),
 		P:       i18n.Printer{Lang: i18n.EN},
 		Users:   user.New(),
-		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }},
+		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func([]byte) error { return nil }, Verify: func(string) error { return nil }},
 		Scheduler: &schedule.Scheduler{
 			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
@@ -169,9 +184,10 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
 			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		},
-		SSHDConfig: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		Detector:   netdetect.New(),
-		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
+		SSHDConfig:                   func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		SSHDHasConnectionScopedMatch: func() bool { return false },
+		Detector:                     netdetect.New(),
+		Selfmanage:                   &selfmanage.Manager{InstallPath: installPath},
 		Audit: &audit.Logger{
 			Dir: filepath.Dir(auditFile), File: auditFile, Now: now,
 			Actor: func() (string, int) { return "e2e", 0 },
@@ -212,8 +228,12 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	if fi, _ := os.Lstat(ak); fi.Mode().Perm() != 0o600 {
 		t.Errorf("authorized_keys mode = %o, want 600", fi.Mode().Perm())
 	}
-	if ok, _ := app.Registry.Contains(username); !ok {
-		t.Error("registry should contain the user after invite")
+	rec, found, err := app.Registry.Lookup(username)
+	if err != nil || !found {
+		t.Fatalf("registry should contain the user after invite: found=%v err=%v", found, err)
+	}
+	if !rec.IdentityBound || rec.Generation == "" || !user.MatchesManagedGeneration(pw, rec.Generation) {
+		t.Fatalf("invite identity is not generation-bound: rec=%+v passwd=%+v", rec, pw)
 	}
 	if _, err := os.Lstat(filepath.Join(sudoDir, "linux-temp-admin-"+username)); err != nil {
 		t.Errorf("sudoers drop-in missing: %v", err)
@@ -299,6 +319,135 @@ func TestInviteRollsBackWhenAutoDeleteCannotBeScheduled(t *testing.T) {
 	}
 }
 
+func TestInvitePersistsIdentityIntentBeforeScheduling(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	const name = "lta-intent1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	a, _, _, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	sawIntent := false
+	tracker.beforeSchedule = func(command string) error {
+		rec, found, err := a.Registry.Lookup(name)
+		if err != nil {
+			return err
+		}
+		if !found || !rec.AutoRevoke || rec.AutoUnit != "" || rec.UID < 1 || rec.Generation == "" {
+			return fmt.Errorf("missing durable scheduling intent: found=%v record=%+v", found, rec)
+		}
+		if !strings.Contains(command, "--expected-uid "+strconv.Itoa(rec.UID)) ||
+			!strings.Contains(command, "--generation "+rec.Generation) {
+			return fmt.Errorf("scheduled identity does not match registry intent: %q vs %+v", command, rec)
+		}
+		sawIntent = true
+		return nil
+	}
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--no-sudo", "--no-fix-sshd", "--auto-revoke", "--yes"}); rc != 0 {
+		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !sawIntent {
+		t.Fatal("scheduler ran before the registry intent was observed")
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found || rec.AutoUnit != "at:1" {
+		t.Fatalf("final schedule was not committed to the registry: found=%v rec=%+v err=%v", found, rec, err)
+	}
+}
+
+func TestInvitePersistsAccountIntentBeforeCredentialMutation(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	const name = "lta-accountintent1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	a, _, _, _ := inviteApp(t)
+	probes := 0
+	sawIntent := false
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		probes++
+		if probes == 2 {
+			rec, found, err := a.Registry.Lookup(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found || rec.UID < 1 || rec.User != name {
+				t.Fatalf("account identity was not durable before login confirmation: found=%v rec=%+v", found, rec)
+			}
+			pw, exists := mustExternalUserLookup(t, name)
+			if !exists {
+				t.Fatal("account did not exist at its post-create login confirmation")
+			}
+			if _, err := os.Lstat(filepath.Join(pw.Home, ".ssh", "authorized_keys")); !os.IsNotExist(err) {
+				t.Fatalf("credentials existed before durable identity intent: %v", err)
+			}
+			sawIntent = true
+		}
+		return sysinfo.ParseSSHD(sshdOK), nil
+	}
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--no-sudo", "--no-fix-sshd", "--no-auto-revoke", "--yes"}); rc != 0 {
+		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !sawIntent {
+		t.Fatal("post-create login confirmation did not observe durable account intent")
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found || !rec.IdentityBound || rec.Generation == "" {
+		t.Fatalf("permanent invite lacks a bound generation: found=%v rec=%+v err=%v", found, rec, err)
+	}
+	pw, exists := mustExternalUserLookup(t, name)
+	if !exists || !user.MatchesManagedGeneration(pw, rec.Generation) {
+		t.Fatalf("permanent invite passwd marker does not match registry generation: exists=%v pw=%+v rec=%+v", exists, pw, rec)
+	}
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes"}); rc != 0 {
+		t.Fatalf("cleanup revoke rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+}
+
+func TestInviteRollsBackWhenExplicitSudoGrantFails(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	const name = "lta-sudofail2"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	a, sudoMgr, _, _ := inviteApp(t)
+	sudoMgr.Validate = func([]byte) error { return errors.New("injected sudo validation failure") }
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--sudo", "--confirm-sudo", name, "--no-auto-revoke", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want failure for an explicitly requested sudo grant", rc)
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("account survived the failed sudo transaction as a silently downgraded user")
+	}
+	if ok, err := a.Registry.Contains(name); err != nil || ok {
+		t.Fatalf("registry contains rolled-back account: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Lstat(sudoMgr.FilePath(name)); !os.IsNotExist(err) {
+		t.Fatalf("failed sudo grant left a drop-in: %v", err)
+	}
+	if strings.Contains(a.Out.(*bytes.Buffer).String(), "BEGIN LINUX TEMP ADMIN INVITE") {
+		t.Fatal("credentials were printed after the requested sudo grant failed")
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "refusing to create the account") {
+		t.Fatalf("failure did not preserve sudo transaction semantics: %s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
 // TestInviteFixSSHDThenRevokeEndToEnd covers the path this whole feature exists
 // for: a host whose sshd refuses public-key logins. The invite must write a
 // per-account exception, prove it, and print a verified invite -- and revoke must
@@ -337,12 +486,13 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 		Out: &out, Err: &errb, In: strings.NewReader(""),
 		P:       i18n.Printer{Lang: i18n.EN},
 		Users:   user.New(),
-		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }},
+		Sudoers: &sudoers.Manager{Dir: sudoDir, Validate: func([]byte) error { return nil }, Verify: func(string) error { return nil }},
 		SSHD: &sshdconf.Manager{
 			Dir: sshdDir, Validate: func() error { return nil }, Effective: effective,
 			Reload: func() error { reloads++; return nil },
 		},
-		SSHDConfig: effective,
+		SSHDConfig:                   effective,
+		SSHDHasConnectionScopedMatch: func() bool { return false },
 		Scheduler: &schedule.Scheduler{
 			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},

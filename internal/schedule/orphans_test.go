@@ -1,10 +1,25 @@
 package schedule
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestUnitUsersPropagatesDirectoryReadFailure(t *testing.T) {
+	old := readSystemdDir
+	readSystemdDir = func(string) ([]os.DirEntry, error) {
+		return nil, errors.New("injected directory I/O failure")
+	}
+	t.Cleanup(func() { readSystemdDir = old })
+
+	s := newFinder(t)
+	if _, err := s.UnitUsers(); err == nil || !strings.Contains(err.Error(), "injected directory I/O failure") {
+		t.Fatalf("UnitUsers error = %v, want directory failure", err)
+	}
+}
 
 func newFinder(t *testing.T, files ...string) *Scheduler {
 	t.Helper()
@@ -113,8 +128,8 @@ func TestOrphansAreUnitsWhoseAccountIsGone(t *testing.T) {
 
 func TestScheduledUsersIncludesAtJobsWithoutRegistry(t *testing.T) {
 	s := newFinder(t)
-	s.Sys = &fakeSystem{atJobs: []AtJob{
-		{ID: "7", Body: "/usr/local/sbin/linux-temp-admin revoke --user queueduser --yes --force\n"},
+	s.Sys = &fakeSystem{hasAt: true, atJobs: []AtJob{
+		{ID: "7", Body: "/usr/local/sbin/linux-temp-admin revoke --user queueduser --yes --force --confirm-force queueduser\n"},
 		{ID: "8", Body: "/bin/echo unrelated\n"},
 	}}
 	users, err := s.ScheduledUsers()
@@ -122,4 +137,34 @@ func TestScheduledUsersIncludesAtJobsWithoutRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	eq(t, users, "queueduser")
+}
+
+func TestScheduledUsersOnlyAcceptsKnownStandaloneRevokeCommands(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = &fakeSystem{hasAt: true, atJobs: []AtJob{
+		{ID: "1", Body: "# /usr/local/sbin/linux-temp-admin revoke --user comment --yes\n"},
+		{ID: "2", Body: "echo /usr/local/sbin/linux-temp-admin revoke --user echoed --yes\n"},
+		{ID: "3", Body: "/tmp/usr/local/sbin/linux-temp-admin revoke --user wrongpath --yes\n"},
+		{ID: "4", Body: "/usr/local/sbin/linux-temp-admin revoke --user badsuffix --yes --unknown\n"},
+		{ID: "5", Body: "/usr/local/sbin/linux-temp-admin revoke --user legacy --yes\n"},
+		{ID: "6", Body: "/usr/local/sbin/linux-temp-admin revoke --user forced --yes --force --confirm-force forced\n"},
+		{ID: "7", Body: "/usr/local/sbin/linux-temp-admin revoke --user current --yes --force --confirm-force current --expected-uid 1001 --generation 0123456789abcdef0123456789abcdef\n"},
+	}}
+
+	users, err := s.ScheduledUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, users, "current", "forced", "legacy")
+}
+
+func TestScheduledUsersAllowsCompletelyAbsentAtBackend(t *testing.T) {
+	s := newFinder(t, "linux-temp-admin-v2-revoke-unituser.timer")
+	s.Sys = &fakeSystem{atJobsErr: os.ErrNotExist}
+
+	users, err := s.ScheduledUsers()
+	if err != nil {
+		t.Fatalf("systemd-only inventory failed because optional at is absent: %v", err)
+	}
+	eq(t, users, "unituser")
 }

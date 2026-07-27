@@ -10,23 +10,32 @@ import (
 //go:embed release_pubkey.hex
 var releasePubkeyHex string
 
-// embeddedPublicKey parses the embedded release signing key (hex; comment lines
-// starting with '#' and whitespace ignored). Returns nil when unconfigured or
-// malformed, which disables signed upgrades.
-func embeddedPublicKey() ed25519.PublicKey {
-	var b strings.Builder
+// embeddedPublicKeys parses the embedded release keyring. Each non-comment line
+// is one complete hex-encoded ed25519 public key. Any malformed or duplicate key
+// invalidates the whole keyring so a botched rotation fails closed.
+func embeddedPublicKeys() []ed25519.PublicKey {
+	var keys []ed25519.PublicKey
+	seen := make(map[string]struct{})
 	for _, line := range strings.Split(releasePubkeyHex, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		b.WriteString(line)
+		raw, err := hex.DecodeString(line)
+		if err != nil || len(raw) != ed25519.PublicKeySize {
+			return nil
+		}
+		id := string(raw)
+		if _, ok := seen[id]; ok {
+			return nil
+		}
+		seen[id] = struct{}{}
+		keys = append(keys, ed25519.PublicKey(raw))
 	}
-	raw, err := hex.DecodeString(b.String())
-	if err != nil || len(raw) != ed25519.PublicKeySize {
+	if len(keys) == 0 {
 		return nil
 	}
-	return ed25519.PublicKey(raw)
+	return keys
 }
 
 func decodeHex(s string) ([]byte, error) { return hex.DecodeString(s) }

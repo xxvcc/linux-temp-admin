@@ -72,12 +72,12 @@ func newManageApp(t *testing.T, in string, users ...string) (*App, *bytes.Buffer
 	dir := t.TempDir()
 	a.Sudoers = &sudoers.Manager{
 		Dir:      dir,
-		Validate: func(string) error { return nil },
+		Validate: func([]byte) error { return nil },
 		Verify:   func(string) error { return nil },
 	}
 	a.Scheduler = &schedule.Scheduler{
 		SystemdDir: dir, InstallPath: a.InstallPath, UnitPrefix: "lta-test-",
-		Now: a.Now, Sys: fakeSys{}, UnderUnit: func(string) bool { return false },
+		Now: a.Now, Sys: fakeSys{},
 	}
 	// The store's dir has to be root-owned for its symlink-safety checks to pass;
 	// t.TempDir() belongs to whoever runs the suite.
@@ -288,10 +288,11 @@ func TestManageUsersDisplayedNumberIsTheOneThatActs(t *testing.T) {
 // account as UID-tampered before the confirmation gets to be what is under test.
 func newRealAccount(t *testing.T, a *App, name string) int {
 	t.Helper()
+	const generation = "0123456789abcdef0123456789abcdef"
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGenerationGECOSPrefix+generation, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd %s: %v: %s", name, err, out)
 	}
 	pw, ok := mustUserLookup(t, name)
@@ -300,7 +301,7 @@ func newRealAccount(t *testing.T, a *App, name string) int {
 	}
 	if err := a.Registry.Record(registry.Record{
 		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
-		Host: "203.0.113.5", Port: 22, UID: pw.UID,
+		Host: "203.0.113.5", Port: 22, UID: pw.UID, Generation: generation, IdentityBound: true,
 	}); err != nil {
 		t.Fatal(err)
 	}

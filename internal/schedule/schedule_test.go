@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,11 +48,12 @@ func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
 
 func newScheduler(dir string, sys System) *Scheduler {
 	return &Scheduler{
-		SystemdDir:  dir,
-		InstallPath: "/usr/local/sbin/linux-temp-admin",
-		UnitPrefix:  "linux-temp-admin-v2-revoke-",
-		Now:         func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
-		Sys:         sys,
+		SystemdDir:           dir,
+		SystemdTimerStateDir: filepath.Join(dir, "timer-state"),
+		InstallPath:          "/usr/local/sbin/linux-temp-admin",
+		UnitPrefix:           "linux-temp-admin-v2-revoke-",
+		Now:                  func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
+		Sys:                  sys,
 	}
 }
 
@@ -114,16 +116,151 @@ func TestScheduleNoBackend(t *testing.T) {
 	}
 }
 
+func TestScheduleRejectsReservedLinuxUIDBeforeMutation(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("int cannot represent the reserved uint32 uid sentinel")
+	}
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	s := newScheduler(t.TempDir(), sys)
+	reserved := int(uint64(^uint32(0)))
+	if _, err := s.Schedule("xxvcc-a1", reserved, testGeneration, 6); err == nil || !strings.Contains(err.Error(), "invalid Linux account UID") {
+		t.Fatalf("Schedule reserved UID error = %v, want range refusal", err)
+	}
+	if len(sys.calls) != 0 || sys.atCommand != "" {
+		t.Fatalf("Schedule mutated a backend before rejecting UID: systemctl=%v at=%q", sys.calls, sys.atCommand)
+	}
+}
+
+func TestScheduleRejectsInvalidIdentityAndLifetimeBeforeMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		user       string
+		generation string
+		hours      int
+	}{
+		{name: "username", user: "bad user", generation: testGeneration, hours: 1},
+		{name: "generation", user: "xxvcc-a1", generation: "bad", hours: 1},
+		{name: "zero hours", user: "xxvcc-a1", generation: testGeneration, hours: 0},
+		{name: "excessive hours", user: "xxvcc-a1", generation: testGeneration, hours: 24*366 + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sys := &fakeSystem{hasSystemctl: true, hasAt: true}
+			s := &Scheduler{SystemdDir: t.TempDir(), InstallPath: "/usr/local/sbin/linux-temp-admin", UnitPrefix: "lta-", Now: time.Now, Sys: sys}
+			if _, err := s.Schedule(tc.user, 1001, tc.generation, tc.hours); err == nil {
+				t.Fatal("Schedule accepted invalid input")
+			}
+			if len(sys.calls) != 0 || sys.atCommand != "" {
+				t.Fatalf("invalid input reached scheduler backend: calls=%v at=%q", sys.calls, sys.atCommand)
+			}
+			if entries, err := os.ReadDir(s.SystemdDir); err != nil || len(entries) != 0 {
+				t.Fatalf("invalid input changed systemd directory: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestScheduleRollsBackPartiallyEnabledSystemdTimerBeforeAtFallback(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("systemd schedule rollback requires root-owned fixtures")
+	}
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "enable" {
+			return errors.New("enable failed after starting timer")
+		}
+		return nil
+	}
+	s := newScheduler(dir, sys)
+	if err := os.Mkdir(s.SystemdTimerStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unit := s.UnitName("xxvcc-a1")
+	stamp := filepath.Join(s.SystemdTimerStateDir, "stamp-"+unit+".timer")
+	if err := os.WriteFile(stamp, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "at:42" {
+		t.Fatalf("Schedule = %q, want at fallback", got)
+	}
+	wantCalls := []string{
+		"daemon-reload",
+		"enable --now " + unit + ".timer",
+		"disable --now " + unit + ".timer",
+		"daemon-reload",
+	}
+	if gotCalls := joinedSystemctlCalls(sys.calls); strings.Join(gotCalls, "|") != strings.Join(wantCalls, "|") {
+		t.Fatalf("systemctl calls = %v, want %v", gotCalls, wantCalls)
+	}
+	for _, suffix := range []string{".service", ".timer"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, unit+suffix)); !os.IsNotExist(statErr) {
+			t.Errorf("%s survived rollback", suffix)
+		}
+	}
+	if _, statErr := os.Lstat(stamp); !os.IsNotExist(statErr) {
+		t.Errorf("persistent timer timestamp survived rollback: %v", statErr)
+	}
+}
+
+func TestScheduleDoesNotFallbackWhenSystemdRollbackFails(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("systemd schedule rollback requires root-owned fixtures")
+	}
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "enable" {
+			return errors.New("enable failed after starting timer")
+		}
+		if len(args) == 3 && args[0] == "disable" {
+			return errors.New("rollback disable failed")
+		}
+		return nil
+	}
+	s := newScheduler(dir, sys)
+
+	_, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
+	if err == nil || !strings.Contains(err.Error(), "enable failed") || !strings.Contains(err.Error(), "rollback disable failed") {
+		t.Fatalf("Schedule error = %v, want original and rollback failures", err)
+	}
+	if sys.atCommand != "" {
+		t.Fatalf("unsafe at fallback was attempted after incomplete rollback: %q", sys.atCommand)
+	}
+	unit := s.UnitName("xxvcc-a1")
+	for _, suffix := range []string{".service", ".timer"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, unit+suffix)); statErr != nil {
+			t.Errorf("%s was removed after rollback could not stop the timer: %v", suffix, statErr)
+		}
+	}
+}
+
+func joinedSystemctlCalls(calls [][]string) []string {
+	joined := make([]string, 0, len(calls))
+	for _, call := range calls {
+		joined = append(joined, strings.Join(call, " "))
+	}
+	return joined
+}
+
 func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
-	s.UnderUnit = func(string) bool { return false } // not the firing service -> full cleanup
 	unit := s.UnitName("xxvcc-a1")
 	svc := filepath.Join(dir, unit+".service")
 	tmr := filepath.Join(dir, unit+".timer")
+	if err := os.Mkdir(s.SystemdTimerStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stamp := filepath.Join(s.SystemdTimerStateDir, "stamp-"+unit+".timer")
 	os.WriteFile(svc, []byte("x"), 0o644)
 	os.WriteFile(tmr, []byte("x"), 0o644)
+	os.WriteFile(stamp, nil, 0o644)
 
 	if err := s.Cancel("xxvcc-a1", ""); err != nil {
 		t.Fatal(err)
@@ -144,6 +281,9 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	if _, err := os.Lstat(tmr); !os.IsNotExist(err) {
 		t.Error("timer file should be removed")
 	}
+	if _, err := os.Lstat(stamp); !os.IsNotExist(err) {
+		t.Error("persistent timer timestamp should be removed")
+	}
 	// systemctl disable + reset-failed + daemon-reload were invoked
 	var seen []string
 	for _, c := range sys.calls {
@@ -157,11 +297,89 @@ func TestCancelCleansBothAndRemovesUnits(t *testing.T) {
 	}
 }
 
+func TestCancelUnlinksSystemdTimerStampSymlinkWithoutFollowingIt(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	if err := os.Mkdir(s.SystemdTimerStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unit := s.UnitName("xxvcc-a1")
+	target := filepath.Join(dir, "must-survive")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := filepath.Join(s.SystemdTimerStateDir, "stamp-"+unit+".timer")
+	if err := os.Symlink(target, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Cancel("xxvcc-a1", unit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stamp); !os.IsNotExist(err) {
+		t.Fatalf("timer timestamp symlink survived cancellation: %v", err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "keep" {
+		t.Fatalf("timer timestamp target changed: content=%q err=%v", got, err)
+	}
+}
+
+func TestCleanupTimerStampsRemovesManagedNamespacesOnly(t *testing.T) {
+	dir := t.TempDir()
+	s := newScheduler(dir, &fakeSystem{})
+	s.LegacyUnitPrefixes = []string{"linux-temp-admin-revoke-"}
+	if err := os.Mkdir(s.SystemdTimerStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managed := []string{
+		"stamp-linux-temp-admin-v2-revoke-oldgone.timer",
+		"stamp-linux-temp-admin-revoke-oldergone.timer",
+		// Corrupt names in the owned namespace still belong to the old install and
+		// must not become permanent residue.
+		"stamp-linux-temp-admin-v2-revoke-bad$name.timer",
+	}
+	unrelated := []string{
+		"stamp-apt-daily.timer",
+		"stamp-linux-temp-admin-v2-revoke-.timer",
+		"linux-temp-admin-v2-revoke-no-stamp-prefix.timer",
+		"stamp-linux-temp-admin-v2-revoke-wrong.service",
+	}
+	for _, name := range append(append([]string(nil), managed...), unrelated...) {
+		if err := os.WriteFile(filepath.Join(s.SystemdTimerStateDir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.CleanupTimerStamps(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range managed {
+		if _, err := os.Lstat(filepath.Join(s.SystemdTimerStateDir, name)); !os.IsNotExist(err) {
+			t.Errorf("managed timestamp survived cleanup: %s", name)
+		}
+	}
+	for _, name := range unrelated {
+		if _, err := os.Lstat(filepath.Join(s.SystemdTimerStateDir, name)); err != nil {
+			t.Errorf("unrelated timestamp was removed: %s: %v", name, err)
+		}
+	}
+}
+
+func TestCleanupTimerStampsRejectsUnsafeStateDirectory(t *testing.T) {
+	s := newScheduler(t.TempDir(), &fakeSystem{})
+	for _, path := range []string{"relative", "/"} {
+		s.SystemdTimerStateDir = path
+		if err := s.CleanupTimerStamps(); err == nil || !strings.Contains(err.Error(), "unsafe systemd timer state directory") {
+			t.Errorf("CleanupTimerStamps(%q) error = %v, want unsafe-path refusal", path, err)
+		}
+	}
+}
+
 func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
-	s.UnderUnit = func(string) bool { return false }
 	unit := s.UnitName("xxvcc-a1")
 	servicePath := filepath.Join(dir, unit+".service")
 	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
@@ -193,7 +411,6 @@ func TestCancelStillReportsNonMissingTimerFailure(t *testing.T) {
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
-	s.UnderUnit = func(string) bool { return false }
 	unit := s.UnitName("xxvcc-a1")
 	servicePath := filepath.Join(dir, unit+".service")
 	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
@@ -214,8 +431,55 @@ func TestCancelStillReportsNonMissingTimerFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Permission denied") {
 		t.Fatalf("Cancel error = %v, want the real systemctl failure", err)
 	}
-	if _, err := os.Lstat(servicePath); !os.IsNotExist(err) {
-		t.Error("cleanup should still remove the service after a systemctl failure")
+	if _, err := os.Lstat(servicePath); err != nil {
+		t.Error("cleanup must preserve the service as retry evidence after a systemctl failure")
+	}
+}
+
+func TestCancelReportsStopFailureEvenWithoutUnitFiles(t *testing.T) {
+	sys := &fakeSystem{hasSystemctl: true}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{args: append([]string(nil), args...), err: errors.New("exit status 1"), output: "Failed to connect to bus: Permission denied"}
+		}
+		return nil
+	}
+	s := newScheduler(t.TempDir(), sys)
+	err := s.Cancel("xxvcc-a1", "")
+	if err == nil || !strings.Contains(err.Error(), "Permission denied") {
+		t.Fatalf("Cancel error = %v, want an in-memory timer stop failure", err)
+	}
+}
+
+func TestCancelPreservesSystemdEvidenceWhenSystemctlIsUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: false}
+	s := newScheduler(dir, sys)
+	unit := s.UnitName("xxvcc-a1")
+	for _, suffix := range []string{".service", ".timer"} {
+		if err := os.WriteFile(filepath.Join(dir, unit+suffix), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := s.Cancel("xxvcc-a1", unit)
+	if err == nil || !strings.Contains(err.Error(), "systemctl is unavailable") {
+		t.Fatalf("Cancel error = %v, want inability to prove the timer stopped", err)
+	}
+	for _, suffix := range []string{".service", ".timer"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, unit+suffix)); statErr != nil {
+			t.Errorf("%s was removed without stopping systemd: %v", suffix, statErr)
+		}
+	}
+}
+
+func TestCancelKeepsRecordedSystemdTaskWithoutFilesWhenSystemctlIsUnavailable(t *testing.T) {
+	sys := &fakeSystem{hasSystemctl: false}
+	s := newScheduler(t.TempDir(), sys)
+	unit := s.UnitName("xxvcc-a1")
+
+	if err := s.Cancel("xxvcc-a1", unit); err == nil || !strings.Contains(err.Error(), "systemctl is unavailable") {
+		t.Fatalf("Cancel error = %v, want recorded in-memory timer uncertainty", err)
 	}
 }
 
@@ -236,15 +500,14 @@ func TestCancelPropagatesAtRemovalFailure(t *testing.T) {
 	}
 }
 
-// TestCancelUnderFiringServiceLeavesServiceFile documents the INVOCATION_ID guard:
-// when Cancel runs inside the firing systemd service, it still disables the timer
-// and removes the .timer file, but leaves its own .service file and skips
-// daemon-reload so the currently-executing unit is not disturbed.
-func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
+// TestCancelUnderFiringServiceRemovesBothFiles pins the successful firing path:
+// the unit is already loaded, so unlinking its configuration and reloading does
+// not stop the oneshot process and avoids a permanent orphaned .service.
+func TestCancelUnderFiringServiceRemovesBothFiles(t *testing.T) {
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
-	s.UnderUnit = func(string) bool { return true } // simulate running as the firing service
+	t.Setenv("INVOCATION_ID", "test-firing-service")
 	unit := s.UnitName("xxvcc-a1")
 	svc := filepath.Join(dir, unit+".service")
 	tmr := filepath.Join(dir, unit+".timer")
@@ -258,8 +521,8 @@ func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
 	if _, err := os.Lstat(tmr); !os.IsNotExist(err) {
 		t.Error("timer file should still be removed under the firing service")
 	}
-	if _, err := os.Lstat(svc); err != nil {
-		t.Error("service file should be left in place under the firing service")
+	if _, err := os.Lstat(svc); !os.IsNotExist(err) {
+		t.Error("service file should be removed under the firing service")
 	}
 	var seen []string
 	for _, c := range sys.calls {
@@ -269,8 +532,8 @@ func TestCancelUnderFiringServiceLeavesServiceFile(t *testing.T) {
 	if !strings.Contains(joined, "disable") || !strings.Contains(joined, "reset-failed") {
 		t.Errorf("expected disable + reset-failed even under the firing service; calls=%v", sys.calls)
 	}
-	if strings.Contains(joined, "daemon-reload") {
-		t.Errorf("daemon-reload must be skipped under the firing service; calls=%v", sys.calls)
+	if !strings.Contains(joined, "daemon-reload") {
+		t.Errorf("daemon-reload must run after firing-service cleanup; calls=%v", sys.calls)
 	}
 }
 
@@ -279,6 +542,7 @@ func TestParseAtJobID(t *testing.T) {
 		"job 7 at Wed Jul  8 12:00:00 2026":                 "7",
 		"warning: commands will be executed\njob 12 at ...": "12",
 		"9\tWed Jul 8":   "9",
+		"job -1 at ...":  "",
 		"nothing useful": "",
 	}
 	for in, want := range cases {

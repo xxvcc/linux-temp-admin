@@ -1,3 +1,5 @@
+# Ownership metadata only; the single-maintainer ruleset does not require a
+# CODEOWNERS approval.
 # Default owner for everything in the repo.
 *                                   @xxvcc
 
