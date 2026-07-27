@@ -109,7 +109,7 @@ jobs:
             GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
             GOCACHE="$root_go_root/gocache" GOMODCACHE="$root_go_root/gomodcache" \
             GOPATH="$root_go_root/gopath" GOTMPDIR="$root_go_root/gotmp" \
-            go test -mod=readonly -count=1 -race -tags integration ./...
+            go test -mod=readonly -count=1 -race -p 1 -tags integration ./...
           test -z "$(gofmt -l .)"
           sh -n scripts/install.sh
           bash -n scripts/*.sh

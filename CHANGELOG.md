@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## v2.8.2 - 2026-07-27
+
+- Serialize root integration test packages because they share the host account
+  databases. The signed `v2.8.1` tag exposed a cross-package `useradd` lock
+  timeout in the release gate before any binary, draft, or Release was created
+  and remains only as an audit record; no published v2.8.1 artifacts exist.
+- Record that the current v1 ed25519 release key has historical network-host
+  exposure instead of claiming an air-gapped custody history it does not have.
+
 ## v2.8.1 - 2026-07-27
 
 - Keep the release-only root integration workspace below a fresh root-owned

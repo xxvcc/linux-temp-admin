@@ -3338,6 +3338,28 @@ func TestVulnerabilityScannerIsPinnedAndRunsInReleaseGate(t *testing.T) {
 	}
 }
 
+func TestRootIntegrationPackagesRunSerially(t *testing.T) {
+	workflows := map[string]struct {
+		path string
+		want string
+	}{
+		"Go": {
+			path: "../../.github/workflows/go.yml",
+			want: `go test -race -p 1 -tags integration ./...`,
+		},
+		"Release": {
+			path: "../../.github/workflows/release.yml",
+			want: `go test -mod=readonly -count=1 -race -p 1 -tags integration ./...`,
+		},
+	}
+	for name, workflow := range workflows {
+		content := readReleaseFile(t, workflow.path)
+		if !strings.Contains(content, workflow.want) {
+			t.Errorf("%s workflow does not serialize root integration packages", name)
+		}
+	}
+}
+
 func TestReleaseKeyringValidationIsPortableAcrossAwkImplementations(t *testing.T) {
 	const portableCheck = `length($0) != 64 || $0 !~ /^[0-9A-Fa-f]+$/`
 	const nonPortableCheck = `$0 !~ /^[0-9A-Fa-f]{64}$/`
