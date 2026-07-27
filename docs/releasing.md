@@ -353,12 +353,20 @@ organization-wide publication lock for the entire preparation, offline signing,
 and publication ceremony. Do not prepare or publish two tags concurrently from
 different workstations or workflow runs.
 
-This tag-signing key is separate from the offline ed25519 release key. Before
-the first release under this process, generate or import the maintainer OpenPGP
-key, configure Git's `user.signingkey` for it, protect its private half, and
-record the full fingerprint. Historical unsigned tags do not satisfy this gate.
+The OpenPGP tag-signing key is separate from the offline ed25519 release key.
+Before the first release under this process, generate or import a dedicated
+maintainer OpenPGP key whose UID contains an email verified on the `xxvcc`
+GitHub account. Upload only its armored public key to that account, protect the
+private half, and record both the full primary fingerprint and the fingerprint
+of the subkey that will actually sign tags. Prefer an offline primary key with a
+hardware-backed signing subkey. Historical unsigned tags do not satisfy this
+gate, and an OpenPGP key registered to another GitHub account is not a substitute.
 
-Generate the key only on the air-gapped machine:
+## Offline ed25519 release key
+
+The following command does not create an OpenPGP key. It creates the raw
+ed25519 private key used to sign release binaries and must run only on the
+air-gapped signing machine:
 
 ```bash
 /opt/lta-release-tools/lta-release keygen /offline/keys/release-v1.key
@@ -401,11 +409,27 @@ the independently pinned fingerprint and compare the local tag object with
 GitHub.
 
 ```bash
+TAG_SIGNING_FPR='<full-40-hex-OpenPGP-signing-subkey-fingerprint>'
 git switch main
 git pull --ff-only
-git tag -s v2.8.0 -m 'linux-temp-admin v2.8.0'
+RELEASE_COMMIT="$(git rev-parse --verify 'origin/main^{commit}')"
+test "$(git rev-parse --verify 'HEAD^{commit}')" = "$RELEASE_COMMIT"
+git -c user.name='XXV.CC' \
+    -c user.email='github@xxv.cc' \
+    -c user.signingkey="${TAG_SIGNING_FPR}!" \
+    -c gpg.format=openpgp \
+    -c gpg.program=/usr/bin/gpg \
+    tag -s v2.8.0 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.0'
+git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg \
+    verify-tag --raw v2.8.0
 git push origin v2.8.0
 ```
+
+Before pushing, the `VALIDSIG` record from `verify-tag --raw` must identify the
+recorded signing-subkey fingerprint. After pushing, query the GitHub tag-object
+API and require `verification.verified=true`, `verification.reason=valid`, and
+an armored OpenPGP signature before continuing. Use that same fingerprint as
+`LTA_EXPECTED_TAG_SIGNER_FINGERPRINT` during preparation and publication.
 
 The `Release` workflow uses exactly Go 1.26.5. Its read-only `gate-build` job
 runs vet, uncached race tests, root integration tests, formatting, shell checks,
