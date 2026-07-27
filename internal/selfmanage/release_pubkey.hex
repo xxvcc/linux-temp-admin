@@ -7,7 +7,8 @@
 #
 # CONFIGURED: signed self-upgrade is ENABLED. `upgrade` verifies each downloaded
 # release binary against every key before installing it, failing closed on any
-# mismatch. Private keys exist only on the air-gapped signing machine. Candidate
-# source and online preparation/publication never receive a private-key path.
+# mismatch. The current v1 key has historical network-host exposure; new keys
+# must follow the air-gapped custody model in docs/releasing.md. Candidate source
+# and online preparation/publication never receive a private-key path.
 #
 982471fb0c9f82f76143c89d045f8a931180f8cca27dad5286bb2000614eaf1c

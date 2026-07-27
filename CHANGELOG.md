@@ -10,6 +10,11 @@ All notable changes to this project are documented here.
   and remains only as an audit record; no published v2.8.1 artifacts exist.
 - Record that the current v1 ed25519 release key has historical network-host
   exposure instead of claiming an air-gapped custody history it does not have.
+- Keep documented root integration runs uncached and package-serialized, and
+  scan every workflow plus the contributor commands for unsafe parallel forms.
+- Adopt the single-maintainer release model: protected `main` requires no
+  independent approval, CODEOWNERS remains metadata, last-push approval is not
+  required, and neither protected release environment has required reviewers.
 
 ## v2.8.1 - 2026-07-27
 

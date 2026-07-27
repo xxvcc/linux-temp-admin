@@ -3339,25 +3339,161 @@ func TestVulnerabilityScannerIsPinnedAndRunsInReleaseGate(t *testing.T) {
 }
 
 func TestRootIntegrationPackagesRunSerially(t *testing.T) {
-	workflows := map[string]struct {
-		path string
-		want string
-	}{
-		"Go": {
-			path: "../../.github/workflows/go.yml",
-			want: `go test -race -p 1 -tags integration ./...`,
-		},
-		"Release": {
-			path: "../../.github/workflows/release.yml",
-			want: `go test -mod=readonly -count=1 -race -p 1 -tags integration ./...`,
-		},
+	var paths []string
+	for _, pattern := range []string{"../../.github/workflows/*.yml", "../../.github/workflows/*.yaml"} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, matches...)
 	}
-	for name, workflow := range workflows {
-		content := readReleaseFile(t, workflow.path)
-		if !strings.Contains(content, workflow.want) {
-			t.Errorf("%s workflow does not serialize root integration packages", name)
+	paths = append(paths, "../../CONTRIBUTING.md")
+	commandCount := 0
+	for _, path := range paths {
+		content := readReleaseFile(t, path)
+		count, unserialized := rootIntegrationPackageCommands(content)
+		commandCount += count
+		for _, line := range unserialized {
+			t.Errorf("%s:%d runs root integration packages without -p 1", path, line)
 		}
 	}
+	if commandCount != 4 {
+		t.Fatalf("found %d root integration package commands, want 4", commandCount)
+	}
+
+	goWorkflow := readReleaseFile(t, "../../.github/workflows/go.yml")
+	if !strings.Contains(goWorkflow, `go test -count=1 -race -p 1 -tags integration ./...`) {
+		t.Error("Go workflow does not force an uncached serialized root integration run")
+	}
+	releaseWorkflow := readReleaseFile(t, "../../.github/workflows/release.yml")
+	if !strings.Contains(releaseWorkflow, `go test -mod=readonly -count=1 -race -p 1 -tags integration ./...`) {
+		t.Error("Release workflow does not force an uncached serialized root integration run")
+	}
+
+	bait := "# go test -p 1 -tags integration ./...\n" +
+		"go test -tags integration ./... # -p 1\n" +
+		"go test -p 1 -tags integration ./... && go test -tags integration ./...\n" +
+		"go test -p 1 -tags integration ./...; go test -tags integration ./...\n"
+	count, unserialized := rootIntegrationPackageCommands(bait)
+	if count != 5 || len(unserialized) != 3 || unserialized[0] != 2 || unserialized[1] != 3 || unserialized[2] != 4 {
+		t.Fatalf("root command scan accepted a comment bait or missed a chained unserialized command: count=%d lines=%v", count, unserialized)
+	}
+}
+
+func rootIntegrationPackageCommands(content string) (int, []int) {
+	content = strings.ReplaceAll(content, "\\\n", " ")
+	commandCount := 0
+	var unserialized []int
+	for lineNumber, line := range strings.Split(content, "\n") {
+		for _, fields := range shellCommandFields(line) {
+			goTest := false
+			integration := false
+			allPackages := false
+			serialized := false
+			for i, field := range fields {
+				if field == "go" && i+1 < len(fields) && fields[i+1] == "test" {
+					goTest = true
+				}
+				if field == "-tags" && i+1 < len(fields) {
+					integration = integration || commaListContains(fields[i+1], "integration")
+				} else if strings.HasPrefix(field, "-tags=") {
+					integration = integration || commaListContains(strings.TrimPrefix(field, "-tags="), "integration")
+				}
+				if field == "./..." {
+					allPackages = true
+				}
+				if field == "-p=1" || (field == "-p" && i+1 < len(fields) && fields[i+1] == "1") {
+					serialized = true
+				}
+			}
+			if !goTest || !integration || !allPackages {
+				continue
+			}
+			commandCount++
+			if !serialized {
+				unserialized = append(unserialized, lineNumber+1)
+			}
+		}
+	}
+	return commandCount, unserialized
+}
+
+func shellCommandFields(line string) [][]string {
+	var commands [][]string
+	var fields []string
+	var field strings.Builder
+	var quote byte
+	escaped := false
+
+	flushField := func() {
+		if field.Len() == 0 {
+			return
+		}
+		fields = append(fields, field.String())
+		field.Reset()
+	}
+	flushCommand := func() {
+		flushField()
+		if len(fields) == 0 {
+			return
+		}
+		commands = append(commands, fields)
+		fields = nil
+	}
+
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if escaped {
+			field.WriteByte(ch)
+			escaped = false
+			continue
+		}
+		if quote != '\'' && ch == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			} else {
+				field.WriteByte(ch)
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '#' && field.Len() == 0 {
+			break
+		}
+		if ch == ';' || ch == '|' || (ch == '&' && i+1 < len(line) && line[i+1] == '&') {
+			flushCommand()
+			if i+1 < len(line) && line[i+1] == ch {
+				i++
+			}
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '\r' {
+			flushField()
+			continue
+		}
+		field.WriteByte(ch)
+	}
+	if escaped {
+		field.WriteByte('\\')
+	}
+	flushCommand()
+	return commands
+}
+
+func commaListContains(list, want string) bool {
+	for _, item := range strings.Split(list, ",") {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestReleaseKeyringValidationIsPortableAcrossAwkImplementations(t *testing.T) {
