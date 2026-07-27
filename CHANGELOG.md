@@ -2,7 +2,12 @@
 
 All notable changes to this project are documented here.
 
-## v2.8.0 - 2026-07-27
+## v2.8.1 - 2026-07-27
+
+- Keep the release-only root integration workspace below a fresh root-owned
+  `/tmp` directory. The signed `v2.8.0` tag exposed the runner-ownership gate
+  before any binary, draft, or Release was created and remains only as an audit
+  record; no published v2.8.0 artifacts exist.
 
 - Make account creation and revocation fail closed across UID reuse and process
   races. New users remain explicitly pending until their UID is durably

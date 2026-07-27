@@ -73,6 +73,23 @@ func TestReleaseWriterIsSeparatedFromCandidateWorkflow(t *testing.T) {
 		strings.Count(stage, "timeout-minutes:") != 2 {
 		t.Fatal("release workflows must bound every release-critical job")
 	}
+	for _, required := range []string{
+		`root_go_root="$(sudo mktemp -d /tmp/lta-release-root-go.XXXXXXXXXX)"`,
+		`sudo stat -Lc '%u %g %a' -- "$root_go_root"`,
+		`sudo install -d -o 0 -g 0 -m 0700`,
+		`sudo env "PATH=$PATH" HOME=/root TMPDIR=/tmp`,
+		`GOCACHE="$root_go_root/gocache"`,
+		`GOMODCACHE="$root_go_root/gomodcache"`,
+		`GOPATH="$root_go_root/gopath" GOTMPDIR="$root_go_root/gotmp"`,
+	} {
+		if !strings.Contains(release, required) {
+			t.Fatalf("release root test gate is missing safe root workspace guard %q", required)
+		}
+	}
+	if strings.Contains(release, `${RUNNER_TEMP}/lta-root-`) ||
+		strings.Contains(release, `sudo -E env "PATH=$PATH"`) {
+		t.Fatal("release root test gate inherits or stores privileged Go state below the runner account")
+	}
 }
 
 func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *testing.T) {
