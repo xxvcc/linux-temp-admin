@@ -177,6 +177,7 @@ func TestOrphansFindsGrantsWhoseAccountIsGone(t *testing.T) {
 		filePrefix + "xxvcc-gone",  // ours, account deleted -> orphan
 		filePrefix + "xxvcc-alive", // ours, account exists -> not an orphan
 		"90-someone-elses-file",    // not ours: never report or remove it
+		"foreign-valid-user",       // valid username, but still not our namespace
 		filePrefix + "BAD NAME",    // ours-looking but not a valid username -> ignore
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x ALL=(ALL) NOPASSWD:ALL\n"), 0o440); err != nil {

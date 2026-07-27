@@ -157,6 +157,9 @@ func (m *Manager) All() ([]string, error) {
 	}
 	var users []string
 	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), filePrefix) {
+			continue
+		}
 		user := strings.TrimPrefix(entry.Name(), filePrefix)
 		if user != "" && validate.Username(user) {
 			users = append(users, user)

@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
@@ -1781,15 +1782,276 @@ fi
 	})
 }
 
-func TestDocumentedBootstrapsRunInsideSanitizedRootShell(t *testing.T) {
+func TestDocumentedConvenienceBootstrapPolicy(t *testing.T) {
+	const installPipeline = "curl -fsSL https://dl.ll.cd/linux-temp-admin/install.sh | /usr/bin/sudo /bin/sh"
+	const readmeBootstrap = "set -o pipefail\n" + installPipeline + " &&\n" +
+		"/usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo"
+	const releaseBootstrap = "set -o pipefail\n" + installPipeline
+
+	documents := map[string]struct {
+		path      string
+		bootstrap string
+		riskText  string
+	}{
+		"README.md": {
+			path:      "../../README.md",
+			bootstrap: readmeBootstrap,
+			riskText:  "不认证脚本本身，也不能阻止已经收到的部分脚本开始执行",
+		},
+		"README.en.md": {
+			path:      "../../README.en.md",
+			bootstrap: readmeBootstrap,
+			riskText:  "does not authenticate the script or stop an already received partial script from beginning execution",
+		},
+		"installing.md": {
+			path:      "../../docs/installing.md",
+			bootstrap: releaseBootstrap,
+			riskText:  "不认证脚本本身，也不能阻止已经收到的部分脚本开始执行",
+		},
+		"installing.en.md": {
+			path:      "../../docs/installing.en.md",
+			bootstrap: releaseBootstrap,
+			riskText:  "does not authenticate the script or stop an already received partial script from beginning execution",
+		},
+		"releasing.md": {
+			path:      "../../docs/releasing.md",
+			bootstrap: releaseBootstrap,
+			riskText:  "does not authenticate the script",
+		},
+	}
+	for name, document := range documents {
+		content := readReleaseFile(t, document.path)
+		if got := strings.Count(content, document.bootstrap); got != 1 {
+			t.Errorf("%s convenience bootstrap count=%d, want 1", name, got)
+		}
+		if got := strings.Count(content, installPipeline); got != 1 {
+			t.Errorf("%s streaming install pipeline count=%d, want 1", name, got)
+		}
+		if got := strings.Count(content, "curl -fsSL"); got != 1 {
+			t.Errorf("%s curl -fsSL count=%d, want 1", name, got)
+		}
+		if !strings.Contains(content, document.riskText) {
+			t.Errorf("%s does not disclose the streaming bootstrap trust boundary", name)
+		}
+		for _, forbidden := range []string{
+			"| sudo sh",
+			"https://raw.githubusercontent.com/xxvcc/linux-temp-admin/main/scripts/install.sh",
+		} {
+			if strings.Contains(content, forbidden) {
+				t.Errorf("%s contains an unapproved convenience bootstrap form %q", name, forbidden)
+			}
+		}
+	}
+
+	t.Run("curl failure stops invite but cannot retract streamed bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		binDir := filepath.Join(dir, "bin")
+		if err := os.Mkdir(binDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		curlFixture := `#!/bin/sh
+printf '%s\n' '#!/bin/sh' ': > "$TEST_INSTALLER_MARKER"'
+exit 55
+`
+		if err := os.WriteFile(filepath.Join(binDir, "curl"), []byte(curlFixture), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		installerMarker := filepath.Join(dir, "installer-ran")
+		inviteMarker := filepath.Join(dir, "invite-ran")
+		script := strings.Replace(readmeBootstrap, "/usr/bin/sudo /bin/sh", "/bin/sh", 1)
+		script = strings.Replace(script,
+			"/usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo",
+			`: > "$TEST_INVITE_MARKER"`, 1)
+		cmd := exec.Command("/bin/bash", "-c", script)
+		env := make([]string, 0, len(os.Environ())+3)
+		for _, entry := range os.Environ() {
+			if strings.HasPrefix(entry, "PATH=") || strings.HasPrefix(entry, "TEST_") {
+				continue
+			}
+			env = append(env, entry)
+		}
+		cmd.Env = append(env,
+			"PATH="+binDir+":"+os.Getenv("PATH"),
+			"TEST_INSTALLER_MARKER="+installerMarker,
+			"TEST_INVITE_MARKER="+inviteMarker,
+		)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("convenience bootstrap succeeded after curl failure: %s", out)
+		}
+		if _, err := os.Stat(installerMarker); err != nil {
+			t.Fatalf("partial streamed installer did not begin, test no longer exercises the documented risk: %v", err)
+		}
+		if _, err := os.Stat(inviteMarker); !os.IsNotExist(err) {
+			t.Fatalf("invite ran after curl failure: %v", err)
+		}
+	})
+}
+
+func TestReadmesRemainFocusedUserEntrypoints(t *testing.T) {
+	documents := []struct {
+		name      string
+		path      string
+		required  []string
+		forbidden []string
+	}{
+		{
+			name: "README.md",
+			path: "../../README.md",
+			required: []string{
+				"[安装、升级与下载验证](docs/installing.md)",
+				"[管理员指南](docs/operator-guide.md)",
+				"[安全模型](docs/security-model.md)",
+			},
+			forbidden: []string{
+				"## 安装、升级与诊断", "### 写入的文件", "### 关于\"过期\"和\"自动删除\"",
+				"--allow-non-tty-private-key-output", "--url-file", "Match all",
+			},
+		},
+		{
+			name: "README.en.md",
+			path: "../../README.en.md",
+			required: []string{
+				"[Installation, upgrades, and download verification](docs/installing.en.md)",
+				"[Operator guide](docs/operator-guide.en.md)",
+				"[Security model](docs/security-model.en.md)",
+			},
+			forbidden: []string{
+				"## Install, upgrade, and doctor", "### Files written", "### Expiry vs auto-delete",
+				"--allow-non-tty-private-key-output", "--url-file", "Match all",
+			},
+		},
+	}
+	for _, document := range documents {
+		t.Run(document.name, func(t *testing.T) {
+			content := readReleaseFile(t, document.path)
+			lines := strings.Count(content, "\n")
+			if lines > 200 {
+				t.Errorf("%s has %d lines; user entrypoint limit is 200", document.name, lines)
+			}
+			for _, required := range document.required {
+				if !strings.Contains(content, required) {
+					t.Errorf("%s is missing user-guide link %q", document.name, required)
+				}
+			}
+			for _, forbidden := range document.forbidden {
+				if strings.Contains(content, forbidden) {
+					t.Errorf("%s absorbed advanced documentation %q", document.name, forbidden)
+				}
+			}
+		})
+	}
+
+	for _, pair := range []struct {
+		zhPath string
+		enPath string
+		zhLink string
+		enLink string
+	}{
+		{"../../docs/installing.md", "../../docs/installing.en.md", "[English](installing.en.md)", "[中文](installing.md)"},
+		{"../../docs/operator-guide.md", "../../docs/operator-guide.en.md", "[English](operator-guide.en.md)", "[中文](operator-guide.md)"},
+		{"../../docs/security-model.md", "../../docs/security-model.en.md", "[English](security-model.en.md)", "[中文](security-model.md)"},
+	} {
+		zh := readReleaseFile(t, pair.zhPath)
+		en := readReleaseFile(t, pair.enPath)
+		if !strings.Contains(zh, pair.zhLink) || !strings.Contains(en, pair.enLink) {
+			t.Errorf("bilingual document pair %s / %s lacks reciprocal navigation", pair.zhPath, pair.enPath)
+		}
+		zhLines := strings.Count(zh, "\n")
+		enLines := strings.Count(en, "\n")
+		if difference := zhLines - enLines; difference < -5 || difference > 5 {
+			t.Errorf("bilingual document pair %s / %s drifted in structure: %d vs %d lines",
+				pair.zhPath, pair.enPath, zhLines, enLines)
+		}
+	}
+}
+
+func TestUserDocumentationRelativeLinksResolve(t *testing.T) {
+	headingSlugs := func(content string) map[string]bool {
+		result := make(map[string]bool)
+		inFence := false
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, "```") {
+				inFence = !inFence
+				continue
+			}
+			if inFence {
+				continue
+			}
+			if !strings.HasPrefix(line, "#") {
+				continue
+			}
+			heading := strings.TrimSpace(strings.TrimLeft(line, "#"))
+			var slug strings.Builder
+			for _, character := range strings.ToLower(heading) {
+				switch {
+				case unicode.IsLetter(character), unicode.IsNumber(character), character == '-', character == '_':
+					slug.WriteRune(character)
+				case unicode.IsSpace(character):
+					slug.WriteByte('-')
+				}
+			}
+			result[slug.String()] = true
+		}
+		return result
+	}
+	documents := []string{
+		"../../README.md",
+		"../../README.en.md",
+		"../../docs/installing.md",
+		"../../docs/installing.en.md",
+		"../../docs/operator-guide.md",
+		"../../docs/operator-guide.en.md",
+		"../../docs/security-model.md",
+		"../../docs/security-model.en.md",
+		"../../SECURITY.md",
+	}
+	for _, document := range documents {
+		content := readReleaseFile(t, document)
+		for lineNumber, line := range strings.Split(content, "\n") {
+			remaining := line
+			for {
+				start := strings.Index(remaining, "](")
+				if start < 0 {
+					break
+				}
+				remaining = remaining[start+2:]
+				end := strings.IndexByte(remaining, ')')
+				if end < 0 {
+					t.Fatalf("%s:%d has an unterminated Markdown link", document, lineNumber+1)
+				}
+				target := remaining[:end]
+				remaining = remaining[end+1:]
+				if target == "" || strings.HasPrefix(target, "#") ||
+					strings.HasPrefix(target, "https://") || strings.HasPrefix(target, "http://") ||
+					strings.HasPrefix(target, "mailto:") {
+					continue
+				}
+				parts := strings.SplitN(target, "#", 2)
+				path := parts[0]
+				if path == "" {
+					continue
+				}
+				resolved := filepath.Clean(filepath.Join(filepath.Dir(document), path))
+				targetContent, err := os.ReadFile(resolved)
+				if err != nil {
+					t.Errorf("%s:%d link target %q does not resolve: %v", document, lineNumber+1, target, err)
+					continue
+				}
+				if len(parts) == 2 && parts[1] != "" && !headingSlugs(string(targetContent))[parts[1]] {
+					t.Errorf("%s:%d link target %q has no matching heading", document, lineNumber+1, target)
+				}
+			}
+		}
+	}
+}
+
+func TestDocumentedHighAssuranceBootstrapRunsInsideSanitizedRootShell(t *testing.T) {
 	documents := map[string]struct {
 		path           string
 		wantCurlCount  int
 		wantSudoDirect int
 	}{
-		"README.md":    {path: "../../README.md", wantCurlCount: 1, wantSudoDirect: 0},
-		"README.en.md": {path: "../../README.en.md", wantCurlCount: 1, wantSudoDirect: 0},
-		"releasing.md": {path: "../../docs/releasing.md", wantCurlCount: 2, wantSudoDirect: 0},
+		"releasing.md": {path: "../../docs/releasing.md", wantCurlCount: 1, wantSudoDirect: 0},
 	}
 	for name, document := range documents {
 		content := readReleaseFile(t, document.path)
@@ -1803,7 +2065,7 @@ func TestDocumentedBootstrapsRunInsideSanitizedRootShell(t *testing.T) {
 				streamingRootShell = true
 			}
 		}
-		if streamingRootShell || strings.Contains(content, "curl -fsSL") {
+		if streamingRootShell {
 			t.Errorf("%s still documents a streaming root-shell bootstrap", name)
 		}
 		for _, required := range []string{
@@ -1889,8 +2151,7 @@ func TestDocumentedBootstrapsRunInsideSanitizedRootShell(t *testing.T) {
 				continue
 			}
 			block := section[:end]
-			if strings.Contains(block, "raw.githubusercontent.com/xxvcc/linux-temp-admin/") ||
-				strings.Contains(block, "https://dl.ll.cd/linux-temp-admin/install.sh") {
+			if strings.Contains(block, "raw.githubusercontent.com/xxvcc/linux-temp-admin/") {
 				blocks = append(blocks, block)
 			}
 		}
@@ -1915,8 +2176,8 @@ func TestDocumentedBootstrapsRunInsideSanitizedRootShell(t *testing.T) {
 		return block[start : start+endRel], nil
 	}
 	highAssuranceBlocks := bootstrapBlocks(releasing)
-	if len(highAssuranceBlocks) != 2 {
-		t.Fatalf("releasing.md bootstrap block count=%d, want 2", len(highAssuranceBlocks))
+	if len(highAssuranceBlocks) != 1 {
+		t.Fatalf("releasing.md high-assurance bootstrap block count=%d, want 1", len(highAssuranceBlocks))
 	}
 	for name, document := range documents {
 		blocks := bootstrapBlocks(readReleaseFile(t, document.path))
@@ -2031,7 +2292,7 @@ exec "$@"
 		{name: "bash-posix", args: []string{"--posix"}},
 	} {
 		t.Run("high-assurance malformed stat/"+shell.name, func(t *testing.T) {
-			body, err := heredocBody(highAssuranceBlocks[1])
+			body, err := heredocBody(highAssuranceBlocks[0])
 			if err != nil {
 				t.Fatal(err)
 			}
