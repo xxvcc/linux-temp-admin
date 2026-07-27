@@ -92,6 +92,22 @@ func TestReleaseWriterIsSeparatedFromCandidateWorkflow(t *testing.T) {
 	}
 }
 
+func TestReleaseArtifactHandoffUsesAuditedNode24Actions(t *testing.T) {
+	release := readReleaseFile(t, "../../.github/workflows/release.yml")
+	stage := readReleaseFile(t, "../../.github/workflows/stage-release.yml")
+	for name, check := range map[string]struct {
+		content string
+		pin     string
+	}{
+		"upload":   {release, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1"},
+		"download": {stage, "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1"},
+	} {
+		if !strings.Contains(check.content, check.pin) {
+			t.Errorf("release %s action is not pinned to the audited native Node.js 24 version", name)
+		}
+	}
+}
+
 func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *testing.T) {
 	mirror := readReleaseFile(t, "../../.github/workflows/mirror-release.yml")
 	installer := readReleaseFile(t, "../../scripts/install.sh")
