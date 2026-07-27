@@ -77,10 +77,22 @@ jobs:
           GO111MODULE: 'on'
         run: |
           set -Eeuo pipefail
-          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR" \
-            "${RUNNER_TEMP}/lta-root-test-cache" "${RUNNER_TEMP}/lta-root-module-cache" \
-            "${RUNNER_TEMP}/lta-root-go-path" "${RUNNER_TEMP}/lta-root-go-tmp"
+          mkdir -p "$GOCACHE" "$GOMODCACHE" "$GOPATH" "$GOTMPDIR"
+          root_go_root="$(sudo mktemp -d /tmp/lta-release-root-go.XXXXXXXXXX)"
+          [[ "$root_go_root" =~ ^/tmp/lta-release-root-go\.[A-Za-z0-9]{10}$ \
+             && -d "$root_go_root" && ! -L "$root_go_root" \
+             && "$(sudo stat -Lc '%u %g %a' -- "$root_go_root")" == '0 0 700' ]] \
+            || { echo "root Go workspace has unsafe metadata" >&2; exit 1; }
+          readonly root_go_root
+          sudo install -d -o 0 -g 0 -m 0700 \
+            "$root_go_root/gocache" "$root_go_root/gomodcache" \
+            "$root_go_root/gopath" "$root_go_root/gotmp"
           index_file="$(mktemp)"
+          cleanup() {
+            rm -f -- "$index_file" || :
+            sudo rm -rf -- "$root_go_root" || :
+          }
+          trap cleanup EXIT
           git ls-files -s -z > "$index_file"
           while IFS= read -r -d '' index_entry; do
             mode="${index_entry%% *}"
@@ -91,11 +103,12 @@ jobs:
             go vet -mod=readonly -printf.funcs=printf,errorf,warnf ./...
           env GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
             go test -mod=readonly -count=1 -race ./...
-          sudo -E env "PATH=$PATH" GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
+          sudo env "PATH=$PATH" HOME=/root TMPDIR=/tmp \
+            GOROOT= GOENV=off GOTOOLCHAIN=local GOFLAGS= GOWORK=off \
             GO111MODULE=on GOEXPERIMENT= GOFIPS140=off GOTELEMETRY=off GOAUTH=off GOVCS='*:off' \
             GOPROXY="$GOPROXY" GOSUMDB="$GOSUMDB" GONOSUMDB= GOPRIVATE= GONOPROXY= GOINSECURE= \
-            GOCACHE="${RUNNER_TEMP}/lta-root-test-cache" GOMODCACHE="${RUNNER_TEMP}/lta-root-module-cache" \
-            GOPATH="${RUNNER_TEMP}/lta-root-go-path" GOTMPDIR="${RUNNER_TEMP}/lta-root-go-tmp" \
+            GOCACHE="$root_go_root/gocache" GOMODCACHE="$root_go_root/gomodcache" \
+            GOPATH="$root_go_root/gopath" GOTMPDIR="$root_go_root/gotmp" \
             go test -mod=readonly -count=1 -race -tags integration ./...
           test -z "$(gofmt -l .)"
           sh -n scripts/install.sh
