@@ -1,0 +1,568 @@
+name: Mirror signed release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable release tag to mirror, for example v2.8.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-temp-admin-release-mirror-stable
+  cancel-in-progress: false
+
+jobs:
+  verify-and-sync:
+    name: Verify and sync signed release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: release-mirror
+    outputs:
+      stable_updated: ${{ steps.stable.outputs.update_stable }}
+      version: ${{ steps.release.outputs.version }}
+      installer_sha256: ${{ steps.prepare.outputs.installer_sha256 }}
+    env:
+      LC_ALL: C
+      GH_HOST: github.com
+      GH_PROMPT_DISABLED: '1'
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+      MIRROR_BASE_URL: https://dl.ll.cd/linux-temp-admin
+      MIRROR_HOST: ${{ vars.MIRROR_HOST }}
+      MIRROR_PORT: ${{ vars.MIRROR_PORT }}
+      MIRROR_USER: ${{ vars.MIRROR_USER }}
+      MIRROR_ENVIRONMENT_CONFIGURED: ${{ vars.LTA_RELEASE_MIRROR_ENVIRONMENT_CONFIGURED }}
+
+    steps:
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == xxvcc/linux-temp-admin ]]
+          [[ "$DEFAULT_BRANCH" == main ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/mirror-release.yml@refs/heads/$DEFAULT_BRANCH" ]]
+          [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MIRROR_ENVIRONMENT_CONFIGURED" == true ]]
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]]
+          (( ${#BASH_REMATCH[1]} > 1 || 10#${BASH_REMATCH[1]} >= 2 ))
+          [[ "$MIRROR_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]
+          python3 - "$MIRROR_HOST" "$MIRROR_PORT" <<'PY'
+          import ipaddress
+          import re
+          import sys
+
+          host, port = sys.argv[1:]
+          if not host or len(host) > 253 or ":" in host or host.endswith("."):
+              raise SystemExit("invalid MIRROR_HOST")
+          if re.fullmatch(r"[0-9.]+", host):
+              try:
+                  if ipaddress.ip_address(host).version != 4:
+                      raise ValueError
+              except ValueError:
+                  raise SystemExit("invalid MIRROR_HOST")
+          else:
+              labels = host.rstrip(".").split(".")
+              if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                     for label in labels):
+                  raise SystemExit("invalid MIRROR_HOST")
+          if (not re.fullmatch(r"[0-9]{1,5}", port) or
+                  not 1 <= int(port) <= 65535 or port != str(int(port))):
+              raise SystemExit("invalid MIRROR_PORT")
+          PY
+
+      - name: Require an immutable public release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          jq -e --arg tag "$TAG" '
+            .tag_name == $tag and .draft == false and .immutable == true and
+            (.id | type == "number") and (.published_at | type == "string")
+          ' <<<"$release_json" >/dev/null || {
+            echo "release $TAG is not immutable" >&2
+            exit 1
+          }
+          version="${TAG#v}"
+          release_id="$(jq -r '.id' <<<"$release_json")"
+          published_at="$(jq -r '.published_at' <<<"$release_json")"
+          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+          python3 - "$published_at" <<'PY'
+          import datetime
+          import re
+          import sys
+
+          value = sys.argv[1]
+          pattern = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z"
+          if re.fullmatch(pattern, value) is None:
+              raise SystemExit("published_at is not canonical UTC RFC3339")
+          datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+          PY
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          {
+            printf 'VERSION=%s\n' "$version"
+            printf 'RELEASE_ID=%s\n' "$release_id"
+            printf 'PUBLISHED_AT=%s\n' "$published_at"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout trusted mirror workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout released tag as untrusted data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          path: released-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind signed tag and trusted release keyring
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$TRUSTED_WORKFLOW_SHA" ]]
+          released_commit="$(git -C released-source rev-parse --verify 'HEAD^{commit}')"
+          [[ "$released_commit" =~ ^[0-9a-f]{40}$ ]]
+          installer_entry="$(git -C released-source ls-tree --format='%(objectmode) %(objecttype) %(path)' \
+            "$released_commit" -- scripts/install.sh)"
+          [[ "$installer_entry" == '100644 blob scripts/install.sh' || \
+             "$installer_entry" == '100755 blob scripts/install.sh' ]]
+          [[ -f released-source/scripts/install.sh && ! -L released-source/scripts/install.sh ]]
+          [[ "$(grep -Fxc 'MIRROR_ROOT=https://dl.ll.cd/linux-temp-admin' released-source/scripts/install.sh)" -eq 1 ]]
+          [[ "$(grep -Fxc 'GITHUB_RELEASE_ROOT=https://github.com/xxvcc/linux-temp-admin/releases' released-source/scripts/install.sh)" -eq 1 ]]
+          cmp scripts/install.sh released-source/scripts/install.sh
+          ref_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")"
+          tag_object="$(jq -r '.object.sha' <<<"$ref_json")"
+          [[ "$(jq -r '.ref' <<<"$ref_json")" == "refs/tags/$TAG" ]]
+          [[ "$(jq -r '.object.type' <<<"$ref_json")" == tag ]]
+          [[ "$tag_object" =~ ^[0-9a-f]{40}$ ]]
+          tag_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object")"
+          [[ "$(jq -r '.tag' <<<"$tag_json")" == "$TAG" ]]
+          [[ "$(jq -r '.object.type + " " + .object.sha' <<<"$tag_json")" == "commit $released_commit" ]]
+          [[ "$(jq -r '.verification.verified|tostring' <<<"$tag_json")" == true \
+             && "$(jq -r '.verification.reason' <<<"$tag_json")" == valid \
+             && "$(jq -r '.verification.signature' <<<"$tag_json")" == '-----BEGIN PGP SIGNATURE-----'* ]]
+          cmp internal/selfmanage/release_pubkey.hex released-source/internal/selfmanage/release_pubkey.hex
+          ancestry="$(timeout -k 5 60 gh api \
+            "repos/$GITHUB_REPOSITORY/compare/$released_commit...$DEFAULT_BRANCH" --jq .status)"
+          [[ "$ancestry" == identical || "$ancestry" == ahead ]]
+          {
+            printf 'RELEASED_COMMIT=%s\n' "$released_commit"
+            printf 'TAG_OBJECT=%s\n' "$tag_object"
+          } >> "$GITHUB_ENV"
+
+      - name: Download exact signed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          expected=$'SHA256SUMS\nlinux-temp-admin-linux-amd64\nlinux-temp-admin-linux-amd64.sig\nlinux-temp-admin-linux-arm64\nlinux-temp-admin-linux-arm64.sig'
+          release_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          [[ "$(jq -r '.id' <<<"$release_json")" == "$RELEASE_ID" ]]
+          [[ "$(jq -r '.immutable|tostring' <<<"$release_json")" == true ]]
+          actual="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
+          [[ "$actual" == "$expected" ]] || {
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            echo "unexpected release asset set" >&2
+            exit 1
+          }
+          mkdir -m 0700 rel
+          timeout -k 10 300 gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
+          expected_nodes="$(printf '%s\n' "$expected" | sed 's/$/\tf/')"
+          actual_nodes="$(find rel -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)"
+          [[ "$actual_nodes" == "$expected_nodes" ]]
+          while IFS=$'\t' read -r name digest size; do
+            [[ "$digest" =~ ^sha256:([0-9a-f]{64})$ ]]
+            expected_digest="${BASH_REMATCH[1]}"
+            [[ "$size" =~ ^(0|[1-9][0-9]*)$ ]]
+            [[ "$(stat -c %s -- "rel/$name")" == "$size" ]]
+            [[ "$(sha256sum "rel/$name" | awk '{print $1}')" == "$expected_digest" ]]
+          done < <(jq -r '.assets[] | [.name, (.digest // ""), (.size | tostring)] | @tsv' <<<"$release_json")
+
+      - name: Verify checksums and ed25519 signatures
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$(wc -c < rel/SHA256SUMS)" -gt 0 && "$(wc -c < rel/SHA256SUMS)" -le 1048576 ]]
+          python3 - rel/SHA256SUMS <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          expected = [
+              "linux-temp-admin-linux-amd64",
+              "linux-temp-admin-linux-amd64.sig",
+              "linux-temp-admin-linux-arm64",
+              "linux-temp-admin-linux-arm64.sig",
+          ]
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          if not data.endswith(b"\n") or b"\x00" in data:
+              raise SystemExit("SHA256SUMS is not canonical text")
+          try:
+              lines = data.decode("ascii").splitlines()
+          except UnicodeDecodeError as exc:
+              raise SystemExit("SHA256SUMS is not ASCII") from exc
+          parsed = []
+          for line in lines:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
+              if match is None:
+                  raise SystemExit("SHA256SUMS contains a malformed line")
+              parsed.append(match.group(2))
+          if parsed != expected:
+              raise SystemExit("SHA256SUMS does not name the exact signed asset set")
+          PY
+          for arch in amd64 arm64; do
+            binary="rel/linux-temp-admin-linux-$arch"
+            signature="$binary.sig"
+            [[ -f "$binary" && ! -L "$binary" && -s "$binary" && "$(wc -c < "$binary")" -le 67108864 ]]
+            [[ -f "$signature" && ! -L "$signature" && "$(wc -c < "$signature")" -eq 64 ]]
+          done
+          (cd rel && sha256sum -c --strict SHA256SUMS)
+          key_dir="$RUNNER_TEMP/release-keys"
+          install -d -m 0700 "$key_dir"
+          python3 - internal/selfmanage/release_pubkey.hex "$key_dir" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          source, out_dir = map(pathlib.Path, sys.argv[1:])
+          keys = []
+          for raw in source.read_text(encoding="ascii").splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if len(line) != 64 or any(c not in "0123456789abcdefABCDEF" for c in line):
+                  raise SystemExit("invalid release keyring")
+              key = bytes.fromhex(line)
+              if key in keys:
+                  raise SystemExit("duplicate release key")
+              keys.append(key)
+          if not keys:
+              raise SystemExit("empty release keyring")
+          prefix = bytes.fromhex("302a300506032b6570032100")
+          for i, key in enumerate(keys, 1):
+              body = base64.b64encode(prefix + key).decode("ascii")
+              pem = "-----BEGIN PUBLIC KEY-----\n" + body + "\n-----END PUBLIC KEY-----\n"
+              (out_dir / f"key-{i}.pem").write_text(pem, encoding="ascii")
+          PY
+          verify_signature() {
+            local binary=$1 signature=$2 verified=0 count=0 key
+            for key in "$key_dir"/*.pem; do
+              if openssl pkeyutl -verify -pubin -inkey "$key" -rawin \
+                   -in "$binary" -sigfile "$signature" >/dev/null 2>&1; then
+                verified=1
+                count=$((count + 1))
+              fi
+            done
+            [[ "$verified" -eq 1 && "$count" -eq 1 ]]
+          }
+          for arch in amd64 arm64; do
+            verify_signature "rel/linux-temp-admin-linux-$arch" "rel/linux-temp-admin-linux-$arch.sig"
+          done
+          printf 'RELEASE_KEY_DIR=%s\n' "$key_dir" >> "$GITHUB_ENV"
+
+      - name: Verify released binaries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends binutils qemu-user-static
+          probe_dir="$(mktemp -d /tmp/linux-temp-admin-release-probe.XXXXXXXXXX)"
+          chmod 0755 "$probe_dir"
+          for arch in amd64 arm64; do
+            binary="rel/linux-temp-admin-linux-$arch"
+            chmod 0755 "$binary"
+            headers="$(readelf -W -l "$binary")"
+            dynamic="$(readelf -W -d "$binary")"
+            if grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)' <<<"$headers"; then
+              echo "$binary contains a dynamic interpreter" >&2
+              exit 1
+            fi
+            if grep -Fq '(NEEDED)' <<<"$dynamic"; then
+              echo "$binary contains a dynamic dependency" >&2
+              exit 1
+            fi
+            probe_binary="$probe_dir/linux-temp-admin-linux-$arch"
+            install -m 0755 "$binary" "$probe_binary"
+            if [[ "$arch" == amd64 ]]; then
+              command=("$probe_binary")
+            else
+              command=(/usr/bin/qemu-aarch64-static "$probe_binary")
+            fi
+            probe_out="$probe_dir/$arch.out"
+            probe_err="$probe_dir/$arch.err"
+            if ! timeout -k 2 15 sudo --non-interactive --user=nobody \
+              /usr/bin/env -i HOME=/nonexistent PATH=/usr/bin:/bin LC_ALL=C \
+              /bin/bash --noprofile --norc -c \
+              'ulimit -c 0 && ulimit -f 2 && exec "$@"' probe \
+              "${command[@]}" version >"$probe_out" 2>"$probe_err"; then
+              cat "$probe_err" >&2
+              echo "$binary failed its unprivileged version probe" >&2
+              exit 1
+            fi
+            [[ "$(wc -c < "$probe_out")" -le 256 ]]
+            [[ "$(cat "$probe_out")" == "$VERSION" ]]
+          done
+          find "$probe_dir" -mindepth 1 -delete
+          rmdir "$probe_dir"
+
+      - name: Prepare immutable version directory and manifest
+        id: prepare
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sh -n released-source/scripts/install.sh
+          mkdir -p "deploy/$TAG"
+          install -m 0644 rel/SHA256SUMS rel/*.sig "deploy/$TAG/"
+          install -m 0755 rel/linux-temp-admin-linux-amd64 rel/linux-temp-admin-linux-arm64 "deploy/$TAG/"
+          install -m 0644 released-source/scripts/install.sh "deploy/$TAG/install.sh"
+          installer_sha256="$(sha256sum "deploy/$TAG/install.sh" | awk '{print $1}')"
+          [[ "$installer_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'installer_sha256=%s\n' "$installer_sha256" >> "$GITHUB_OUTPUT"
+          python3 - "$VERSION" "$TAG" "$MIRROR_BASE_URL" "$PUBLISHED_AT" > latest.json <<'PY'
+          import json
+          import sys
+
+          version, tag, root, published_at = sys.argv[1:]
+          json.dump({
+              "version": version,
+              "tag": tag,
+              "base_url": f"{root}/{tag}",
+              "published_at": published_at,
+          }, sys.stdout, ensure_ascii=True, separators=(",", ":"))
+          sys.stdout.write("\n")
+          PY
+
+      - name: Configure pinned SSH identity
+        env:
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$MIRROR_SSH_KEY" && -n "$MIRROR_KNOWN_HOSTS" ]]
+          [[ "$MIRROR_SSH_KEY" != *$'\r'* && "$MIRROR_KNOWN_HOSTS" != *$'\r'* ]]
+          [[ -d "$HOME" && ! -L "$HOME" && "$(stat -c %u -- "$HOME")" == "$(id -u)" ]]
+          if [[ -e "$HOME/.ssh" || -L "$HOME/.ssh" ]]; then
+            [[ -d "$HOME/.ssh" && ! -L "$HOME/.ssh" ]]
+            [[ "$(stat -c %u -- "$HOME/.ssh")" == "$(id -u)" ]]
+            chmod 0700 "$HOME/.ssh"
+          else
+            install -d -m 0700 "$HOME/.ssh"
+          fi
+          for ssh_file in "$HOME/.ssh/mirror_key" "$HOME/.ssh/known_hosts"; do
+            [[ ! -e "$ssh_file" && ! -L "$ssh_file" ]]
+          done
+          printf '%s\n' "$MIRROR_SSH_KEY" > "$HOME/.ssh/mirror_key"
+          printf '%s\n' "$MIRROR_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/mirror_key" "$HOME/.ssh/known_hosts"
+          [[ -f "$HOME/.ssh/mirror_key" && ! -L "$HOME/.ssh/mirror_key" ]]
+          [[ -f "$HOME/.ssh/known_hosts" && ! -L "$HOME/.ssh/known_hosts" ]]
+          timeout -k 1 5 ssh-keygen -y -f "$HOME/.ssh/mirror_key" </dev/null >/dev/null
+          known_host="$MIRROR_HOST"
+          [[ "$MIRROR_PORT" == 22 ]] || known_host="[$MIRROR_HOST]:$MIRROR_PORT"
+          timeout -k 1 5 ssh-keygen -F "$known_host" -f "$HOME/.ssh/known_hosts" >/dev/null
+          printf 'RSYNC_RSH=ssh -i %s/.ssh/mirror_key -p %s -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s/.ssh/known_hosts\n' \
+            "$HOME" "$MIRROR_PORT" "$HOME" >> "$GITHUB_ENV"
+
+      - name: Upload immutable version without overwriting existing files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          [[ "$(jq -r '.id' <<<"$release_json")" == "$RELEASE_ID" ]]
+          [[ "$(jq -r '.tag_name' <<<"$release_json")" == "$TAG" ]]
+          [[ "$(jq -r '.draft|tostring' <<<"$release_json")" == false ]]
+          [[ "$(jq -r '.immutable|tostring' <<<"$release_json")" == true ]]
+          ref_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")"
+          [[ "$(jq -r '.object.type + " " + .object.sha' <<<"$ref_json")" == "tag $TAG_OBJECT" ]]
+          tag_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT")"
+          [[ "$(jq -r '.tag' <<<"$tag_json")" == "$TAG" ]]
+          [[ "$(jq -r '.object.type + " " + .object.sha' <<<"$tag_json")" == "commit $RELEASED_COMMIT" ]]
+          [[ "$(jq -r '.verification.verified|tostring' <<<"$tag_json")" == true \
+             && "$(jq -r '.verification.reason' <<<"$tag_json")" == valid ]]
+          timeout -k 10 300 rsync --archive --checksum --delay-updates --ignore-existing --chmod=D755,F644 \
+            "deploy/$TAG/" "$MIRROR_USER@$MIRROR_HOST:$TAG/"
+
+      - name: Verify immutable version through public mirror
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir public-check
+          for asset in SHA256SUMS linux-temp-admin-linux-amd64 linux-temp-admin-linux-amd64.sig \
+            linux-temp-admin-linux-arm64 linux-temp-admin-linux-arm64.sig install.sh; do
+            curl -q --fail --location --max-redirs 0 --retry 3 --retry-all-errors \
+              --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+              --max-filesize 67108864 \
+              --output "public-check/$asset" \
+              "$MIRROR_BASE_URL/$TAG/$asset?run=$GITHUB_RUN_ID"
+            cmp "deploy/$TAG/$asset" "public-check/$asset"
+          done
+          (cd public-check && sha256sum -c --strict SHA256SUMS)
+          for arch in amd64 arm64; do
+            verified=0
+            count=0
+            for key in "$RELEASE_KEY_DIR"/*.pem; do
+              if openssl pkeyutl -verify -pubin -inkey "$key" -rawin \
+                   -in "public-check/linux-temp-admin-linux-$arch" \
+                   -sigfile "public-check/linux-temp-admin-linux-$arch.sig" >/dev/null 2>&1; then
+                verified=1
+                count=$((count + 1))
+              fi
+            done
+            [[ "$verified" -eq 1 && "$count" -eq 1 ]]
+          done
+
+      - name: Confirm GitHub Latest immediately before stable update
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          [[ "$(jq -r '.id' <<<"$release_json")" == "$RELEASE_ID" ]]
+          [[ "$(jq -r '.immutable|tostring' <<<"$release_json")" == true ]]
+          latest_tag="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          update_stable=false
+          if [[ "$TAG" == "$latest_tag" ]]; then
+            update_stable=true
+          else
+            echo "mirrored $TAG without changing stable files; GitHub Latest is $latest_tag"
+          fi
+          printf 'update_stable=%s\n' "$update_stable" >> "$GITHUB_OUTPUT"
+
+      - name: Publish stable installer
+        if: steps.stable.outputs.update_stable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          latest_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/latest")"
+          [[ "$(jq -r '.id' <<<"$latest_json")" == "$RELEASE_ID" ]]
+          [[ "$(jq -r '.tag_name' <<<"$latest_json")" == "$TAG" ]]
+          [[ "$(jq -r '.immutable|tostring' <<<"$latest_json")" == true ]]
+          timeout -k 10 120 rsync --archive --checksum --delay-updates --chmod=F644 \
+            "deploy/$TAG/install.sh" "$MIRROR_USER@$MIRROR_HOST:install.sh"
+          curl -q --fail --location --max-redirs 0 --retry 3 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+            --max-filesize 1048576 \
+            --output public-install.sh "$MIRROR_BASE_URL/install.sh?run=$GITHUB_RUN_ID"
+          cmp "deploy/$TAG/install.sh" public-install.sh
+
+      - name: Publish latest manifest last
+        if: steps.stable.outputs.update_stable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          latest_release="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/latest")"
+          [[ "$(jq -r '.id' <<<"$latest_release")" == "$RELEASE_ID" ]]
+          [[ "$(jq -r '.tag_name' <<<"$latest_release")" == "$TAG" ]]
+          [[ "$(jq -r '.immutable|tostring' <<<"$latest_release")" == true ]]
+          timeout -k 10 120 rsync --archive --checksum --delay-updates --chmod=F644 \
+            latest.json "$MIRROR_USER@$MIRROR_HOST:latest.json"
+          curl -q --fail --location --max-redirs 0 --retry 3 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+            --max-filesize 1048576 \
+            --output public-latest.json "$MIRROR_BASE_URL/latest.json?run=$GITHUB_RUN_ID"
+          cmp latest.json public-latest.json
+
+      - name: Remove SSH identity
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/.ssh/mirror_key" "$HOME/.ssh/known_hosts"
+
+  public-install-canary:
+    name: Public mirror install canary
+    needs: verify-and-sync
+    if: needs.verify-and-sync.outputs.stable_updated == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      MIRROR_BASE_URL: https://dl.ll.cd/linux-temp-admin
+      VERSION: ${{ needs.verify-and-sync.outputs.version }}
+      INSTALLER_SHA256: ${{ needs.verify-and-sync.outputs.installer_sha256 }}
+    steps:
+      - name: Install from the public mirror as a real root client
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          installer="$RUNNER_TEMP/install.sh"
+          destination="/usr/local/lib/linux-temp-admin-mirror-canary-$GITHUB_RUN_ID"
+          managed_destination=/usr/local/sbin/linux-temp-admin
+          managed_marker="$RUNNER_TEMP/linux-temp-admin-mirror-canary-owned-$GITHUB_RUN_ID"
+          curl -q --fail --location --max-redirs 0 --retry 3 --retry-all-errors \
+            --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+            --max-filesize 1048576 \
+            --output "$installer" "$MIRROR_BASE_URL/install.sh?run=$GITHUB_RUN_ID"
+          [[ "$INSTALLER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum "$installer" | awk '{print $1}')" == "$INSTALLER_SHA256" ]]
+          if canary_output="$(sudo /usr/bin/env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+            DEST="$destination" LTA_RELEASE=latest /bin/sh "$installer" 2>&1)"; then
+            printf '%s\n' "$canary_output"
+          else
+            status=$?
+            printf '%s\n' "$canary_output" >&2
+            exit "$status"
+          fi
+          grep -Fqx 'downloaded the complete release set from the official mirror' <<<"$canary_output"
+          if grep -Fq 'falling back to GitHub' <<<"$canary_output"; then
+            echo "mirror canary used the GitHub transport fallback" >&2
+            exit 1
+          fi
+          [[ "$(sudo "$destination" version)" == "$VERSION" ]]
+
+          [[ ! -e "$managed_destination" && ! -L "$managed_destination" ]]
+          [[ ! -e "$managed_marker" && ! -L "$managed_marker" ]]
+          : > "$managed_marker"
+          if upgrade_output="$(sudo /usr/bin/env -i \
+            HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+            "$destination" --lang en upgrade --yes --force 2>&1)"; then
+            printf '%s\n' "$upgrade_output"
+          else
+            status=$?
+            printf '%s\n' "$upgrade_output" >&2
+            exit "$status"
+          fi
+          grep -Fq 'downloaded and verified through the official mirror.' <<<"$upgrade_output"
+          if grep -Fq 'GitHub' <<<"$upgrade_output"; then
+            echo "self-upgrade canary used the GitHub transport fallback" >&2
+            exit 1
+          fi
+          [[ "$(sudo "$managed_destination" version)" == "$VERSION" ]]
+          sudo rm -f -- "$destination"
+
+      - name: Remove canary binary after failure
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          managed_marker="$RUNNER_TEMP/linux-temp-admin-mirror-canary-owned-$GITHUB_RUN_ID"
+          if [[ -f "$managed_marker" && ! -L "$managed_marker" ]]; then
+            sudo rm -f -- /usr/local/sbin/linux-temp-admin
+          fi
+          rm -f -- "$managed_marker"
+          sudo rm -f -- "/usr/local/lib/linux-temp-admin-mirror-canary-$GITHUB_RUN_ID"

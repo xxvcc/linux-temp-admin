@@ -1,12 +1,11 @@
 package cli
 
 import (
-	"context"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/expiry"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sshkey"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
@@ -58,12 +58,27 @@ func (a *App) invite(args []string) int {
 		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
 		return 1
 	}
-	if fNopasswd {
-		fSudo = true
+	if (fSudo || fNopasswd) && fNoSudo {
+		a.errorf("%s", a.P.M("--sudo/--nopasswd-sudo 与 --no-sudo 互斥",
+			"--sudo/--nopasswd-sudo and --no-sudo are mutually exclusive"))
+		return 1
+	}
+	if fAuto && fNoAuto {
+		a.errorf("%s", a.P.M("--auto-revoke 与 --no-auto-revoke 互斥",
+			"--auto-revoke and --no-auto-revoke are mutually exclusive"))
+		return 1
+	}
+	if fInstallDeps && fNoInstallDeps {
+		a.errorf("%s", a.P.M("--install-deps 与 --no-install-deps 互斥",
+			"--install-deps and --no-install-deps are mutually exclusive"))
+		return 1
 	}
 	if fFixSSHD && fNoFixSSHD {
 		a.errorf("%s", a.P.M("--fix-sshd 与 --no-fix-sshd 互斥", "--fix-sshd and --no-fix-sshd are mutually exclusive"))
 		return 1
+	}
+	if fNopasswd {
+		fSudo = true
 	}
 	if fPasswordLogin && fFixSSHD {
 		a.errorf("%s", a.P.M("--password-login 与 --fix-sshd 互斥：密码登录的前提正是不改动 sshd",
@@ -173,6 +188,11 @@ func (a *App) invite(args []string) int {
 			"granting sudo via --sudo --yes also requires --confirm-sudo "+username))
 		return 1
 	}
+	if err := user.CheckPidfd(); err != nil {
+		a.errorf("%s: %v", a.P.M("当前内核或进程沙箱不支持安全的进程撤销，拒绝创建无法可靠清理的账号",
+			"the kernel or process sandbox does not support safe process revocation; refusing to create an account that cannot be reliably removed"), err)
+		return 1
+	}
 
 	// Settle how the invitee will log in FIRST. planLogin only reads (`sshd -T`)
 	// and decides — it changes nothing — and it is the one question that can make
@@ -230,8 +250,11 @@ func (a *App) invite(args []string) int {
 		if fYes {
 			autoRev = "yes"
 		} else {
-			ans := a.prompt(a.P.M("是否到期后自动删除该用户？[Y/n]: ", "Auto-delete this user on expiry? [Y/n]: "))
-			if ans == "" || yesish(ans) {
+			answer, answered := a.promptYesNo(a.P.M("是否到期后自动删除该用户？[Y/n]: ", "Auto-delete this user on expiry? [Y/n]: "), true)
+			if !answered {
+				return 1
+			}
+			if answer {
 				autoRev = "yes"
 			} else {
 				autoRev = "no"
@@ -273,7 +296,7 @@ func (a *App) invite(args []string) int {
 		}
 		a.printf("\n%s\n  user=%s host=%s port=%d %s sudo=%s auto-delete=%s\n  login=%s\n",
 			a.P.M("即将创建一次性临时账号：", "About to create a one-time temporary account:"),
-			username, host, port, lifetime, grantSudo, autoRev, a.loginSummary(plan, username))
+			username, host, port, lifetime, a.choiceDisplay(grantSudo), a.choiceDisplay(autoRev), a.loginSummary(plan, username))
 		if len(depPkgs) > 0 {
 			a.printf("  %s%s", a.P.M("确认后将安装依赖：", "dependencies to install on confirm: "), strings.Join(depPkgs, " "))
 		}
@@ -294,6 +317,17 @@ func (a *App) invite(args []string) int {
 	})
 }
 
+func (a *App) choiceDisplay(value string) string {
+	switch value {
+	case "yes":
+		return a.P.M("是", "yes")
+	case "no":
+		return a.P.M("否", "no")
+	default:
+		return value
+	}
+}
+
 // promptHours asks for the account lifetime, offering current as the default a
 // blank line accepts. It loops until the input is valid or blank. Callers must
 // gate it on a.StdinIsTTY(): a closed stdin reads empty and settles on the
@@ -312,6 +346,33 @@ func (a *App) promptHours(current int) int {
 		}
 		a.warnf("%s", a.P.M(fmt.Sprintf("请输入 1-%d 之间的整数", config.MaxExpireHours),
 			fmt.Sprintf("enter an integer between 1 and %d", config.MaxExpireHours)))
+	}
+}
+
+// promptYesNo accepts only an explicit yes/no spelling (or a blank line for the
+// documented default). A typo at the auto-delete prompt must not silently turn a
+// temporary account into a permanent one.
+func (a *App) promptYesNo(msg string, defaultYes bool) (bool, bool) {
+	for {
+		fmt.Fprint(a.Err, msg)
+		ans, ok := a.readLine()
+		if !ok {
+			a.warnf("%s", a.P.M("输入已结束，已取消", "input ended; cancelled"))
+			return false, false
+		}
+		if ans == "" {
+			return defaultYes, true
+		}
+		if yesish(ans) {
+			return true, true
+		}
+		if noish(ans) {
+			return false, true
+		}
+		a.warnf("%s", a.P.M("请输入 y 或 n", "enter y or n"))
+		if !a.StdinIsTTY() {
+			return false, false
+		}
 	}
 }
 
@@ -375,22 +436,29 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 
 	cfg, err := a.sshdConfig(username)
 	if err != nil {
-		// A probe failure must warn, never refuse: sshd may be absent from PATH (or
-		// unreadable) on a host whose sshd is nonetheless running and perfectly
-		// willing to take the key. Refusing here would break invites that work
-		// today. The invite says plainly that the claim is unverified.
-		a.warnf("%s: %v", a.P.M("无法读取 sshd 有效配置，登录方式未经验证",
-			"cannot read the effective sshd config; the login method is unverified"), err)
-		const reason = "the effective sshd config could not be read"
+		// Password authentication exposes a reusable secret. Never issue one unless
+		// the effective configuration was read successfully and proved that sshd
+		// accepts it. Key-only invitations can remain explicitly UNVERIFIED.
 		if wantPassword {
-			return loginPlan{password: true, unverified: reason}, true
+			a.errorf("%s: %v", a.P.M("无法读取 sshd 有效配置，拒绝创建密码登录",
+				"cannot read the effective sshd config; refusing a password login"), err)
+			return loginPlan{}, false
 		}
+		a.warnf("%s: %v", a.P.M("无法读取 sshd 有效配置，公钥登录方式未经验证",
+			"cannot read the effective sshd config; the key login method is unverified"), err)
+		const reason = "the effective sshd config could not be read"
 		return loginPlan{unverified: reason}, true
 	}
 
 	if wantPassword {
 		rep := a.checkPasswordLogin(cfg, username, predicted)
-		if !rep.OK() {
+		if !rep.Certain() {
+			if rep.OK() {
+				a.errorf("%s", a.P.M("无法证明 sshd 会接受该账号的密码登录，拒绝创建密码登录：",
+					"cannot prove sshd would accept a password login for this account; refusing a password login:"))
+				a.reportUncertainty(rep)
+				return loginPlan{}, false
+			}
 			a.errorf("%s", a.P.M("sshd 不接受该账号的密码登录：", "sshd would not accept a password login for this account:"))
 			a.reportBlockers(rep)
 			return loginPlan{}, false
@@ -398,8 +466,7 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 		a.warnf("%s", a.P.M(
 			"密码登录会削弱本工具的安全模型：密码在账号的整个生命周期内都可被全网爆破，且必须以明文交付。用完请立即撤销。",
 			"password login weakens this tool's security model: the password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear. Revoke as soon as you are done."))
-		a.reportUncertainty(rep)
-		return loginPlan{password: true, verified: rep.Certain(), unverified: uncertainReason(rep), report: rep}, true
+		return loginPlan{password: true, verified: true, report: rep}, true
 	}
 
 	rep := a.checkKeyLogin(cfg, username, predicted)
@@ -464,8 +531,12 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 	a.warnf("%s", a.P.M(
 		"可以只为该账号写一个 sshd 例外（Match User 块），不改动全局策略，撤销时随账号一并删除。",
 		"A per-account sshd exception (a Match User block) can be written instead; it leaves the global policy untouched and is removed together with the account."))
-	if yesish(a.prompt(a.P.M("是否只为该账号开启公钥登录？[y/N]: ",
-		"Enable a public-key login for this account only? [y/N]: "))) {
+	enableKey, answered := a.promptYesNo(a.P.M("是否只为该账号开启公钥登录？[y/N]: ",
+		"Enable a public-key login for this account only? [y/N]: "), false)
+	if !answered {
+		return loginPlan{}, false
+	}
+	if enableKey {
 		return loginPlan{fixSSHD: true, report: rep}, true
 	}
 	// Declined the exception — offer the password before giving up.
@@ -486,9 +557,10 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bool {
 	cfg, err := a.sshdConfig(username)
 	if err != nil {
-		if plan.fixSSHD {
+		if plan.fixSSHD || plan.password {
 			// We were about to modify sshd on the strength of a reading we can no
-			// longer take. Refuse rather than write a change we cannot prove.
+			// longer take, or issue a reusable password whose login path can no
+			// longer be proved. Refuse and let the caller roll the account back.
 			a.errorf("%s: %v", a.P.M("无法重新读取 sshd 有效配置", "cannot re-read the effective sshd config"), err)
 			return false
 		}
@@ -499,6 +571,16 @@ func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bo
 	rep := a.checkKeyLogin(cfg, username, groups)
 	if plan.password {
 		rep = a.checkPasswordLogin(cfg, username, groups)
+		if !rep.Certain() {
+			if rep.OK() {
+				a.errorf("%s", a.P.M("无法证明 sshd 会接受该账号的密码登录，拒绝签发密码：",
+					"cannot prove sshd would accept a password login for this account; refusing to issue a password:"))
+				a.reportUncertainty(rep)
+			} else {
+				a.reportBlockers(rep)
+			}
+			return false
+		}
 	}
 	switch {
 	case rep.OK():
@@ -613,17 +695,22 @@ func (a *App) offerPasswordFallback(cfg *sysinfo.SSHDConfig, username string, in
 		return loginPlan{}, false
 	}
 	rep := a.checkPasswordLogin(cfg, username, []string{username})
-	if !rep.OK() {
+	if !rep.Certain() {
+		if rep.OK() {
+			a.warnf("%s", a.P.M("无法证明 sshd 会接受密码登录，因此不提供密码回退。",
+				"cannot prove sshd would accept a password login, so no password fallback is offered."))
+			a.reportUncertainty(rep)
+		}
 		return loginPlan{}, false
 	}
 	a.warnf("%s", a.P.M(
 		"该账号无法用公钥登录，但 sshd 接受密码登录。密码在账号整个生命周期内可被全网爆破、且必须以明文交付，是本工具最弱的授权方式。",
 		"this account cannot log in with a key, but sshd accepts a password. A password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear — the weakest grant this tool issues."))
-	if !yesish(a.prompt(a.P.M("改用密码登录？[y/N]: ", "Issue a password login instead? [y/N]: "))) {
+	usePassword, answered := a.promptYesNo(a.P.M("改用密码登录？[y/N]: ", "Issue a password login instead? [y/N]: "), false)
+	if !answered || !usePassword {
 		return loginPlan{}, false
 	}
-	a.reportUncertainty(rep)
-	return loginPlan{password: true, verified: rep.Certain(), unverified: uncertainReason(rep), report: rep}, true
+	return loginPlan{password: true, verified: true, report: rep}, true
 }
 
 // reportUncertainty prints the notes and the could-not-evaluate rules that keep
@@ -704,6 +791,12 @@ func (a *App) planDeps(needSudo, installDeps, noInstallDeps, yes bool) ([]string
 			pkgs = append(pkgs, p)
 		}
 	}
+	if pm == "pacman" && len(pkgs) > 0 {
+		a.errorf("%s", a.P.M(
+			"检测到 pacman。Arch 不支持部分升级，本工具也不会在创建账号时无人值守升级整个系统。请先由管理员执行 `pacman -Syu --needed "+strings.Join(pkgs, " ")+"`，再重试。",
+			"pacman was detected. Arch does not support partial upgrades, and this tool will not upgrade the whole system unattended while creating an account. Run `pacman -Syu --needed "+strings.Join(pkgs, " ")+"` deliberately first, then retry."))
+		return nil, false
+	}
 	// We may install when there is a package manager and a resolvable package set,
 	// and permission to proceed: --install-deps outright, or an interactive run
 	// whose YES will be the consent. A --yes/--no-install-deps run that did not opt
@@ -745,8 +838,8 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 
 	// Both secrets are generated before anything is created, so a generation
 	// failure cannot leave a half-made account behind. Exactly one is issued: a
-	// key account has its password locked, and a password account is never given
-	// a key it could not use.
+	// key account has password authentication disabled, and a password account is
+	// never given a key it could not use.
 	var kp *sshkey.KeyPair
 	var password string
 	if plan.password {
@@ -763,6 +856,58 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			return 1
 		}
 		kp = k
+	}
+	generation, err := a.RandHex(16)
+	if err != nil || !validate.Generation(generation) {
+		if err == nil {
+			err = fmt.Errorf("random source returned an invalid generation")
+		}
+		a.errorf("%s: %v", a.P.M("生成账号世代标识失败", "generating account generation failed"), err)
+		return 1
+	}
+	fingerprint := ""
+	if kp != nil {
+		fingerprint = kp.Fingerprint
+	}
+	permanent := !wantAuto
+	expiresDisplay := a.P.M("永久（不会过期，也不会自动删除）", "never (does not expire or auto-delete)")
+	if !permanent {
+		expiresDisplay = expiry.DisplayLocal(a.Now(), hours)
+	}
+	rec := registry.Record{
+		User:          username,
+		Created:       a.Now().Format("2006-01-02 15:04:05 MST"),
+		Expires:       expiresDisplay,
+		Sudo:          wantSudo,
+		Host:          host,
+		Port:          port,
+		Fingerprint:   fingerprint,
+		AutoRevoke:    wantAuto,
+		Generation:    generation,
+		IdentityBound: true,
+		Pending:       true,
+	}
+	registered := false
+	// A failed invite may delete the account only after every name-scoped privilege
+	// grant is confirmed gone. Grant closes its gate before it can write anything;
+	// only Manager.Remove returning success opens it again. Registry cleanup keys on
+	// the same gates so a crash-recovery witness survives even if the account
+	// disappears out of band.
+	sudoRemovalConfirmed := true
+	sshdRemovalConfirmed := true
+	confirmSudoRemoved := func() error {
+		err := a.removeSudoGrant(username)
+		if err == nil {
+			sudoRemovalConfirmed = true
+		}
+		return err
+	}
+	confirmSSHDRemoved := func() error {
+		err := a.removeSSHDException(username)
+		if err == nil {
+			sshdRemovalConfirmed = true
+		}
+		return err
 	}
 
 	var cleanups []func() error
@@ -812,20 +957,86 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
 		return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
 	}
-
-	if err := a.Users.Create(username, resolveShell()); err != nil {
-		a.errorf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
-		return 1
+	// A stale scheduled command is name-keyed, so it must be gone before useradd
+	// makes that name live again. Reading its recorded id before writing the new
+	// intent also preserves the only direct handle to an at job from an older run.
+	staleUnit, err := a.Registry.UnitFor(username)
+	if err != nil {
+		return failf("%s: %v", a.P.M("读取旧自动删除任务失败", "reading stale auto-delete task failed"), err)
 	}
-	cleanups = append(cleanups, func() error { return a.Users.Delete(username) })
+	if err := a.Scheduler.Cancel(username, staleUnit); err != nil {
+		return failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
+	}
 
-	pw, ok, lookupErr := user.Lookup(username)
+	// Persist the account intent before useradd. A kill or power loss after account
+	// creation must leave a registry witness even if no sudo/sshd/schedule artifact
+	// exists. UID 0 means pending and is replaced immediately after lookup.
+	if err := a.Registry.Record(rec); err != nil {
+		return failf("%s: %v", a.P.M("登记账号创建意图失败", "recording account creation intent failed"), err)
+	}
+	registered = true
+	// This cleanup was registered first, so reverse-order rollback runs it last,
+	// after account deletion. If deletion failed, retain the row for recovery.
+	cleanups = append(cleanups, func() error {
+		var unconfirmed []error
+		if !sudoRemovalConfirmed {
+			unconfirmed = append(unconfirmed, fmt.Errorf("sudo removal is unconfirmed; keeping registry record"))
+		}
+		if !sshdRemovalConfirmed {
+			unconfirmed = append(unconfirmed, fmt.Errorf("sshd removal is unconfirmed; keeping registry record"))
+		}
+		if err := errors.Join(unconfirmed...); err != nil {
+			return err
+		}
+		exists, err := user.Exists(username)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("account still exists; keeping registry record")
+		}
+		return a.Registry.Remove(username)
+	})
+
+	if err := a.Users.CreatePending(username, resolveShell(), generation); err != nil {
+		return failf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
+	}
+	cleanups = append(cleanups, func() error {
+		var causes []error
+		if !sudoRemovalConfirmed {
+			causes = append(causes, fmt.Errorf("sudo removal is unconfirmed; account disabled and retained"))
+		}
+		if !sshdRemovalConfirmed {
+			causes = append(causes, fmt.Errorf("sshd removal is unconfirmed; account disabled and retained"))
+		}
+		mayDelete := sudoRemovalConfirmed && sshdRemovalConfirmed
+		return errors.Join(errors.Join(causes...), a.rollbackInviteAccount(username, rec, mayDelete))
+	})
+
+	pw, ok, lookupErr := a.lookupUser(username)
 	if lookupErr != nil {
 		return failf("%s: %v", a.P.M("读取新账号信息失败", "reading the new account failed"), lookupErr)
 	}
 	if !ok {
 		return failf("%s", a.P.M("无法定位新用户家目录", "cannot locate new user's home"))
 	}
+	rec.UID = pw.UID
+	// Persist the UID while the passwd entry still carries PendingGECOS. An older
+	// binary ignores the appended Pending field, but it does understand that this
+	// is not the managed marker and therefore refuses deletion. Once this write is
+	// durable, changing the marker is safe even for that older binary.
+	if err := a.Registry.Record(rec); err != nil {
+		return failf("%s: %v", a.P.M("登记新账号身份失败", "recording the new account identity failed"), err)
+	}
+	if err := a.Users.MarkManaged(username, generation); err != nil {
+		return failf("%s: %v", a.P.M("完成新账号身份标记失败", "finalizing the new account identity marker failed"), err)
+	}
+	completed := rec
+	completed.Pending = false
+	if err := a.Registry.Record(completed); err != nil {
+		return failf("%s: %v", a.P.M("完成新账号身份登记失败", "finalizing the new account identity record failed"), err)
+	}
+	rec = completed
 
 	// The preflight had to PREDICT this account's groups, because it ran before the
 	// account existed. Now they are real — and sshd decides AllowGroups/DenyGroups
@@ -848,8 +1059,8 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			return failf("%s: %v", a.P.M("设置密码失败", "set password failed"), err)
 		}
 	} else {
-		if err := a.Users.LockPassword(username); err != nil {
-			return failf("%s: %v", a.P.M("锁定密码失败", "lock password failed"), err)
+		if err := a.Users.DisablePasswordForKeyLogin(username); err != nil {
+			return failf("%s: %v", a.P.M("禁用密码登录失败", "disable password login failed"), err)
 		}
 		if err := sshkey.WriteAuthorizedKeys(pw.Home, pw.UID, pw.GID, kp.AuthorizedKey); err != nil {
 			return failf("%s: %v", a.P.M("写入 authorized_keys 失败", "write authorized_keys failed"), err)
@@ -862,13 +1073,14 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// independently before account rollback can free the username.
 	sshdDropIn := ""
 	if plan.fixSSHD {
+		sshdRemovalConfirmed = false
 		res, err := a.SSHD.Grant(username, groups, plan.report)
 		if err != nil {
-			cleanupErr := a.removeSSHDException(username)
+			cleanupErr := confirmSSHDRemoved()
 			return failf("%s: %v", a.P.M("为该账号开启 sshd 公钥登录失败", "enabling the sshd public-key login for this account failed"), errors.Join(err, cleanupErr))
 		}
 		sshdDropIn = res.Path
-		cleanups = append(cleanups, func() error { return a.SSHD.Remove(username) })
+		cleanups = append(cleanups, confirmSSHDRemoved)
 		a.success(a.P.M("已为该账号单独开启公钥登录（全局策略未改动）："+res.Path,
 			"public-key login enabled for this account only (the global policy is untouched): "+res.Path))
 		// Two independent things must both hold before the invite may say "verified":
@@ -899,30 +1111,29 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// auto-deleting" now means; the old behaviour (login expires via chage but the
 	// account is never deleted) was neither temporary nor permanent, and surprised
 	// operators who read "no auto-delete" as "keep it".
-	permanent := !wantAuto
-	expiresDisplay := a.P.M("永久（不会过期，也不会自动删除）", "never (does not expire or auto-delete)")
 	if !permanent {
 		if err := a.Users.SetExpiry(username, expiry.Date(a.Now(), hours)); err != nil {
 			return failf("%s: %v", a.P.M("设置到期失败", "set expiry failed"), err)
 		}
-		expiresDisplay = expiry.DisplayLocal(a.Now(), hours)
 	}
 
 	sudoGranted := false
 	if wantSudo {
-		if err := a.Sudoers.Grant(username); err == nil {
-			sudoGranted = true
-			cleanups = append(cleanups, func() error { return a.removeSudoGrant(username) })
-		} else {
+		// Grant can make the drop-in live before a later verification step fails.
+		// Close the deletion gate before calling it so both that partial failure and a
+		// later transaction failure retain the username until removal is confirmed.
+		sudoRemovalConfirmed = false
+		if err := a.Sudoers.Grant(username); err != nil {
 			// Grant may have written a live drop-in before its verification step
 			// failed; remove it unconditionally so a failed grant can never leave an
 			// unregistered NOPASSWD grant behind. Remove only ever touches the
 			// managed-prefixed file for this user, so it is safe to call blindly.
-			if cleanupErr := a.removeSudoGrant(username); cleanupErr != nil {
-				return failf("%s: %v", a.P.M("sudo 授权失败且清理失败", "sudo grant failed and cleanup failed"), cleanupErr)
-			}
-			a.warnf("%s: %v", a.P.M("授予 sudo 失败，创建为普通账号", "sudo grant failed; created as a normal account"), err)
+			cleanupErr := confirmSudoRemoved()
+			return failf("%s: %v", a.P.M("sudo 授权失败，已拒绝创建账号", "sudo grant failed; refusing to create the account"),
+				errors.Join(err, cleanupErr))
 		}
+		sudoGranted = true
+		cleanups = append(cleanups, confirmSudoRemoved)
 	}
 
 	// Whoever revokes this account later runs the binary at InstallPath — the
@@ -937,72 +1148,34 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		}
 	}
 
-	// Clear any stale schedule left by a reused username before scheduling.
-	staleUnit, err := a.Registry.UnitFor(username)
-	if err != nil {
-		return failf("%s: %v", a.P.M("读取旧自动删除任务失败", "reading stale auto-delete task failed"), err)
-	}
-	if err := a.Scheduler.Cancel(username, staleUnit); err != nil {
-		return failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
-	}
-	autoUnit := ""
-	autoScheduled := false
-	generation := ""
-	if wantAuto {
-		generation, err = a.RandHex(16)
-		if err != nil {
-			return failf("%s: %v", a.P.M("生成账号世代标识失败", "generating account generation failed"), err)
-		}
-		// The auto-revoke task's ExecStart runs the installed stable command, so a
-		// binary must be present at InstallPath (ensured just above), otherwise the
-		// timer would fire and fail on a non-installed run.
-		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
-			return failf("%s: %v", a.P.M("稳定命令不安全", "the stable command is unsafe"), err)
-		} else if unit, err := a.Scheduler.Schedule(username, pw.UID, generation, hours); err == nil {
-			autoUnit = unit
-			autoScheduled = true
-			cleanups = append(cleanups, func() error { return a.Scheduler.Cancel(username, unit) })
-		} else {
-			return failf("%s: %v", a.P.M("自动删除任务创建失败，已拒绝创建临时账号", "auto-delete scheduling failed; refusing to create the temporary account"), err)
-		}
-	}
-
-	fingerprint := ""
-	if kp != nil {
-		fingerprint = kp.Fingerprint
-	}
-	rec := registry.Record{
-		User:        username,
-		Created:     a.Now().Format("2006-01-02 15:04:05 MST"),
-		Expires:     expiresDisplay,
-		Sudo:        sudoGranted,
-		Host:        host,
-		Port:        port,
-		Fingerprint: fingerprint,
-		AutoRevoke:  autoScheduled,
-		AutoUnit:    autoUnit,
-		// Pin the UID to detect contradictions during revoke. It is not identity proof
-		// by itself because Linux may reuse a UID after out-of-band account deletion;
-		// the current account must still carry the managed GECOS marker.
-		UID:        pw.UID,
-		Generation: generation,
-	}
+	// Commit the final grant state before creating a scheduler task. For an
+	// auto-revoke account this row is the durable identity intent the task checks.
+	rec.Sudo = sudoGranted
 	if err := a.Registry.Record(rec); err != nil {
 		return failf("%s: %v", a.P.M("登记注册表失败", "registry record failed"), err)
 	}
-	registered := true
-	// Registry cleanup runs last during rollback, after account deletion. If the
-	// account survived, keep the row as the witness needed for manual recovery.
-	cleanups = append([]func() error{func() error {
-		exists, err := user.Exists(username)
+
+	autoUnit := ""
+	autoScheduled := false
+	if wantAuto {
+		// The auto-revoke task's ExecStart runs the installed stable command, so a
+		// binary must be present at InstallPath (ensured above), otherwise the timer
+		// would fire and fail on a non-installed run.
+		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
+			return failf("%s: %v", a.P.M("稳定命令不安全", "the stable command is unsafe"), err)
+		}
+		unit, err := a.Scheduler.Schedule(username, pw.UID, generation, hours)
 		if err != nil {
-			return err
+			return failf("%s: %v", a.P.M("自动删除任务创建失败，已拒绝创建临时账号", "auto-delete scheduling failed; refusing to create the temporary account"), err)
 		}
-		if exists {
-			return fmt.Errorf("account still exists; keeping registry record")
+		autoUnit = unit
+		autoScheduled = true
+		cleanups = append(cleanups, func() error { return a.Scheduler.Cancel(username, unit) })
+		rec.AutoUnit = unit
+		if err := a.Registry.Record(rec); err != nil {
+			return failf("%s: %v", a.P.M("登记自动删除任务失败", "recording the auto-delete task failed"), err)
 		}
-		return a.Registry.Remove(username)
-	}}, cleanups...)
+	}
 
 	if err := a.printInvite(inviteBundle{
 		user: username, host: host, port: port, hours: hours,
@@ -1029,6 +1202,47 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		a.warnf("%s", a.P.M("临时账号已创建但未登记："+username, "temporary account created but not registered: "+username))
 	}
 	return 0
+}
+
+// rollbackInviteAccount tears down an account created by a failed invite. It
+// never deletes by name until the completed registry identity is available, all
+// name-scoped grants are confirmed gone, login is disabled, and every process
+// carrying the UID is confirmed terminated. Any uncertainty retains both the
+// account and the registry witness for manual recovery.
+func (a *App) rollbackInviteAccount(username string, rec registry.Record, mayDelete bool) error {
+	if rec.Pending || rec.UID < 1 || !rec.IdentityBound || !validate.Generation(rec.Generation) {
+		return fmt.Errorf("account identity is still pending; account and registry record retained")
+	}
+	pw, exists, err := a.lookupUser(username)
+	if err != nil {
+		return fmt.Errorf("verify rollback account identity: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	if pw.UID != rec.UID || !user.MatchesManagedGeneration(pw, rec.Generation) {
+		return fmt.Errorf("account identity changed before rollback; account and registry record retained")
+	}
+	if !mayDelete {
+		if err := a.Users.DisableLogin(username); err != nil {
+			return fmt.Errorf("disable retained account: %w", err)
+		}
+		if err := a.accountStillMatches(username, pw); err != nil {
+			return fmt.Errorf("verify retained account before process termination: %w", err)
+		}
+		if err := a.terminateProcesses(rec.UID); err != nil {
+			return fmt.Errorf("terminate retained account processes: %w", err)
+		}
+		if err := a.accountStillMatches(username, pw); err != nil {
+			return fmt.Errorf("verify retained account after process termination: %w", err)
+		}
+		return nil
+	}
+	stage, err := a.teardownLocalAccount(username, pw)
+	if err != nil {
+		return fmt.Errorf("fail-closed account teardown stopped at stage %d: %w", stage, err)
+	}
+	return nil
 }
 
 // ynStr renders a bool as "yes"/"no" for audit fields.
@@ -1090,14 +1304,18 @@ func (b inviteBundle) loginLine() string {
 }
 
 func (a *App) printInvite(b inviteBundle) error {
-	var out strings.Builder
+	var out bytes.Buffer
+	defer func() { clear(out.Bytes()) }()
+	if b.kp != nil {
+		defer clear(b.kp.PrivatePEM)
+	}
 	yesno := func(v bool) string {
 		if v {
 			return "yes"
 		}
 		return "no"
 	}
-	passwordLine := "locked"
+	passwordLine := "disabled"
 	if b.byPassword() {
 		passwordLine = "enabled (this invite's only credential)"
 	}
@@ -1131,7 +1349,7 @@ cat > './%s.key' <<'EOF_KEY'
 %sEOF_KEY
 chmod 600 './%s.key'
 `,
-			a.P.M("保存私钥命令:", "Save private key command:"), b.user, string(b.kp.PrivatePEM), b.user)
+			a.P.M("保存私钥命令:", "Save private key command:"), b.user, b.kp.PrivatePEM, b.user)
 	}
 
 	if b.sshdDropIn != "" {
@@ -1157,7 +1375,7 @@ chmod 600 './%s.key'
 		"安全提醒: "+secret+"只显示这一次、服务器不保存；仅通过可信私聊发送；用完立即撤销。",
 		"Security notes: the "+secret+" is shown only once and not stored on the server; send only via trusted private chat; revoke immediately after use.")+
 		"\n\n----- END LINUX TEMP ADMIN INVITE -----\n")
-	_, err := fmt.Fprint(a.Out, out.String())
+	_, err := a.Out.Write(out.Bytes())
 	return err
 }
 
@@ -1174,7 +1392,9 @@ func triState(yes, no bool) string {
 	}
 }
 
-func yesish(s string) bool { return s == "y" || s == "Y" || s == "yes" || s == "YES" }
+func yesish(s string) bool { return strings.EqualFold(s, "y") || strings.EqualFold(s, "yes") }
+
+func noish(s string) bool { return strings.EqualFold(s, "n") || strings.EqualFold(s, "no") }
 
 func orNone(s string) string {
 	if s == "" {
@@ -1203,14 +1423,8 @@ func (a *App) ensureStableInstalled() error {
 		return fmt.Errorf("self-manager not configured")
 	}
 	force := false
-	if _, err := os.Lstat(a.InstallPath); err == nil {
-		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
-			return fmt.Errorf("installed command is unsafe: %w", err)
-		}
-		installed, err := a.installedVersion()
-		if err != nil {
-			return fmt.Errorf("probe installed command: %w", err)
-		}
+	installed, versionErr := a.Selfmanage.InstalledVersion()
+	if versionErr == nil {
 		if strings.HasSuffix(buildinfo.Version, "-dev") {
 			// A development build is not ordered against releases. Install these exact
 			// bytes so its scheduled cleanup always runs the code creating the account.
@@ -1223,8 +1437,8 @@ func (a *App) ensureStableInstalled() error {
 				installed, buildinfo.Version))
 			force = true
 		}
-	} else if !os.IsNotExist(err) {
-		return err
+	} else if !errors.Is(versionErr, selfmanage.ErrNotInstalled) {
+		return versionErr
 	}
 	bin, err := a.readRunningBinary()
 	if err != nil {
@@ -1233,10 +1447,7 @@ func (a *App) ensureStableInstalled() error {
 	if _, err = a.Selfmanage.Install(bin, force); err != nil {
 		return err
 	}
-	if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
-		return fmt.Errorf("installed command verification: %w", err)
-	}
-	installed, err := a.installedVersion()
+	installed, err = a.Selfmanage.InstalledVersion()
 	if err != nil {
 		return fmt.Errorf("verify installed command version: %w", err)
 	}
@@ -1245,30 +1456,6 @@ func (a *App) ensureStableInstalled() error {
 	}
 	return nil
 }
-
-// installedVersion asks the installed command what version it is.
-//
-// The timeout is not paranoia: this executes a binary at a path the operator
-// controls, as root, at a point where the account already exists. A binary that
-// never returns would hang the invite half-done, with the private key generated
-// and the account created but nothing printed. Failing to read a version is
-// handled (the caller then leaves the installed binary alone); hanging is not.
-func (a *App) installedVersion() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), installedVersionTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, a.InstallPath, "version").Output()
-	if err != nil {
-		return "", err
-	}
-	v := strings.TrimSpace(string(out))
-	if !validate.InstalledVersion(v) {
-		return "", fmt.Errorf("unrecognized version %q", v)
-	}
-	return v, nil
-}
-
-// installedVersionTimeout bounds the `<InstallPath> version` probe.
-const installedVersionTimeout = 5 * time.Second
 
 func resolveShell() string {
 	for _, s := range []string{config.DefaultShell, "/bin/sh"} {
@@ -1297,8 +1484,12 @@ func (a *App) detectOrPromptHost() string {
 			"using the detected public IP: %s (use --host for a domain or a different address)"), ip))
 		return ip
 	}
-	if yesish(a.prompt(a.P.M("本机未探测到公网 IP。是否向外部服务查询？[y/N]: ",
-		"No public IP found locally. Ask an external service? [y/N]: "))) {
+	queryExternal, answered := a.promptYesNo(a.P.M("本机未探测到公网 IP。是否向外部服务查询？[y/N]: ",
+		"No public IP found locally. Ask an external service? [y/N]: "), false)
+	if !answered {
+		return ""
+	}
+	if queryExternal {
 		if ip, ok := a.Detector.PublicIP(5 * time.Second); ok {
 			return a.promptHost(ip)
 		}

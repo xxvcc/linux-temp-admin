@@ -72,3 +72,32 @@ func TestLockRejectsSymlinkAndLooseMode(t *testing.T) {
 		t.Fatalf("loose lock error = %v", err)
 	}
 }
+
+func TestUninstallMarkerRoundTrip(t *testing.T) {
+	l := New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	if stopped, err := l.IsUninstalled(); err != nil || stopped {
+		t.Fatalf("initial marker: stopped=%v err=%v", stopped, err)
+	}
+	if err := l.MarkUninstalled(); err != nil {
+		t.Fatal(err)
+	}
+	if stopped, err := l.IsUninstalled(); err != nil || !stopped {
+		t.Fatalf("marked state: stopped=%v err=%v", stopped, err)
+	}
+	if err := l.ClearUninstalled(); err != nil {
+		t.Fatal(err)
+	}
+	if stopped, err := l.IsUninstalled(); err != nil || stopped {
+		t.Fatalf("cleared marker: stopped=%v err=%v", stopped, err)
+	}
+}
+
+func TestUninstallMarkerRejectsSymlink(t *testing.T) {
+	l := New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	if err := os.Symlink("/etc/passwd", l.tombstonePath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.IsUninstalled(); err == nil {
+		t.Fatal("symlink uninstall marker was accepted")
+	}
+}

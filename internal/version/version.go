@@ -5,14 +5,13 @@ package version
 
 import (
 	"regexp"
-	"strconv"
 	"strings"
 )
 
 var re = regexp.MustCompile(`^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$`)
 
 type parsed struct {
-	major, minor, patch int
+	major, minor, patch string
 	suffix              string
 	ok                  bool
 }
@@ -22,13 +21,7 @@ func parse(v string) parsed {
 	if m == nil {
 		return parsed{}
 	}
-	maj, err1 := strconv.Atoi(m[1])
-	min, err2 := strconv.Atoi(m[2])
-	pat, err3 := strconv.Atoi(m[3])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return parsed{}
-	}
-	return parsed{major: maj, minor: min, patch: pat, suffix: m[4], ok: true}
+	return parsed{major: m[1], minor: m[2], patch: m[3], suffix: m[4], ok: true}
 }
 
 // Greater reports whether newer is strictly greater than older. Either operand
@@ -40,14 +33,10 @@ func Greater(newer, older string) bool {
 	if !n.ok || !o.ok {
 		return false
 	}
-	if n.major != o.major {
-		return n.major > o.major
-	}
-	if n.minor != o.minor {
-		return n.minor > o.minor
-	}
-	if n.patch != o.patch {
-		return n.patch > o.patch
+	for _, pair := range [][2]string{{n.major, o.major}, {n.minor, o.minor}, {n.patch, o.patch}} {
+		if cmp := compareDecimal(pair[0], pair[1]); cmp != 0 {
+			return cmp > 0
+		}
 	}
 	// Equal core version: a final release outranks a prerelease suffix.
 	if n.suffix == "" && o.suffix != "" {
@@ -60,6 +49,33 @@ func Greater(newer, older string) bool {
 	// numerically (rc10 > rc9), not byte-lexicographically (which ranked "rc9" above
 	// "rc10" and would let a signed older prerelease pass the not-newer upgrade gate).
 	return naturalCompare(n.suffix, o.suffix) > 0
+}
+
+// compareDecimal compares arbitrarily long non-negative decimal integers. Tag
+// validation does not impose the host int width, so version ordering must not
+// silently become "unparseable" merely because a component exceeds strconv.Int.
+func compareDecimal(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+	if a == "" {
+		a = "0"
+	}
+	if b == "" {
+		b = "0"
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
 }
 
 // naturalCompare orders two strings so that runs of digits compare by numeric value

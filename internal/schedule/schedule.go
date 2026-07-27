@@ -15,21 +15,25 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
 // System abstracts the external schedulers so orchestration is testable.
 type System interface {
 	HasSystemctl() bool
 	Systemctl(args ...string) error
+	// HasAt reports any installed at-backend footprint. A completely absent
+	// backend is not an inventory error; a partial backend is and must fail closed.
 	HasAt() bool
 	// ScheduleAt queues command to run in `hours` hours and returns the job id.
 	ScheduleAt(command string, hours int) (jobID string, err error)
-	// RemoveAtJobsFor atrm's every queued job whose body contains command.
+	// RemoveAtJobsFor removes queued jobs matching a known standalone revoke
+	// command selected by command's legacy-compatible prefix.
 	RemoveAtJobsFor(command string) error
 	// AtrmJob removes a specific at job by id. An already-absent job is success.
 	AtrmJob(id string) error
 	// AtJobs returns queued job bodies so uninstall can inventory jobs whose
-	// registry row has been lost.
+	// registry row has been lost. Missing inventory commands are an error.
 	AtJobs() ([]AtJob, error)
 }
 
@@ -40,9 +44,10 @@ type AtJob struct {
 
 // Scheduler writes units / queues jobs. Paths and time source are fields for tests.
 type Scheduler struct {
-	SystemdDir  string
-	InstallPath string
-	UnitPrefix  string
+	SystemdDir           string
+	SystemdTimerStateDir string
+	InstallPath          string
+	UnitPrefix           string
 	// LegacyUnitPrefixes are older namespaces whose units this Scheduler must still
 	// be able to FIND (see UnitUsers) though it never writes them. It is a field
 	// rather than a constant so a test can point the whole namespace at a temp dir
@@ -50,41 +55,22 @@ type Scheduler struct {
 	LegacyUnitPrefixes []string
 	Now                func() time.Time
 	Sys                System
-	// UnderUnit reports whether the current process is executing inside the given
-	// systemd service (i.e. the firing auto-revoke run for that unit); when true,
-	// Cancel leaves that .service file in place rather than deleting the file it is
-	// running from. Defaults to a /proc/self/cgroup check; injectable for tests.
-	UnderUnit func(unit string) bool
 }
 
 // New returns a Scheduler backed by real systemctl/at.
 func New() *Scheduler {
 	return &Scheduler{
-		SystemdDir:  config.SystemdDir,
-		InstallPath: config.InstallPath,
-		UnitPrefix:  config.AutoRevokeUnitPrefix,
+		SystemdDir:           config.SystemdDir,
+		SystemdTimerStateDir: config.SystemdTimerStateDir,
+		InstallPath:          config.InstallPath,
+		UnitPrefix:           config.AutoRevokeUnitPrefix,
 		// v1's units are still findable, never written. v1 installed to the same path
 		// this binary occupies, so its timers invoke THIS code and its accounts strand
 		// exactly like v2's would.
 		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
 		Now:                time.Now,
 		Sys:                realSystem{},
-		UnderUnit:          runningUnderFiringUnit,
 	}
-}
-
-// runningUnderFiringUnit reports whether the current process is executing inside
-// the systemd service <unit>.service — i.e. this run is the auto-revoke task
-// firing for this very unit, so Cancel must not delete the .service file it is
-// running from. It reads /proc/self/cgroup, whose path for a service contains
-// "<unit>.service". If that is unavailable it falls back to the coarse "any
-// systemd scope" signal (INVOCATION_ID), erring toward leaving the file rather
-// than risking removal of a live unit.
-func runningUnderFiringUnit(unit string) bool {
-	if b, err := os.ReadFile("/proc/self/cgroup"); err == nil {
-		return strings.Contains(string(b), unit+".service")
-	}
-	return os.Getenv("INVOCATION_ID") != ""
 }
 
 // UnitName is the deterministic systemd unit basename for user (validated
@@ -103,10 +89,9 @@ func (s *Scheduler) RevokeCommand(user string, uid int, generation string) strin
 		s.InstallPath, user, user, uid, generation)
 }
 
-// revokeAtNeedle is the stable substring used to FIND this account's queued at
-// job, as opposed to the full command used to queue it. It must match jobs queued
-// by any version of this tool, so it stops at "--yes" — the part every past and
-// present RevokeCommand shares — and does not include the newer --force tokens.
+// revokeAtNeedle is the stable selector used to find this account's queued at
+// job. The matcher accepts only complete command forms emitted by known releases,
+// but this selector stops at "--yes" so it covers all of those forms.
 func (s *Scheduler) revokeAtNeedle(user string) string {
 	return fmt.Sprintf("%s revoke --user %s --yes", s.InstallPath, user)
 }
@@ -159,6 +144,21 @@ WantedBy=timers.target
 // systemctl or at available", sending the operator to debug a missing tool that
 // was in fact present.
 func (s *Scheduler) Schedule(user string, uid int, generation string, hours int) (string, error) {
+	if !validate.Username(user) {
+		return "", fmt.Errorf("invalid temporary username %q", user)
+	}
+	if !validate.AccountID(uid) {
+		return "", fmt.Errorf("invalid Linux account UID %d", uid)
+	}
+	if !validate.Generation(generation) {
+		return "", fmt.Errorf("invalid account generation %q", generation)
+	}
+	if !validate.Hours(hours) {
+		return "", fmt.Errorf("invalid account lifetime %d hours", hours)
+	}
+	if s == nil || s.Sys == nil {
+		return "", fmt.Errorf("no scheduler backend configured")
+	}
 	var systemdErr error
 	if s.Sys.HasSystemctl() {
 		unit, err := s.scheduleSystemd(user, uid, generation, hours)
@@ -166,6 +166,10 @@ func (s *Scheduler) Schedule(user string, uid int, generation string, hours int)
 			return unit, nil
 		}
 		systemdErr = err
+		var rollbackErr *systemdRollbackError
+		if errors.As(err, &rollbackErr) {
+			return "", fmt.Errorf("systemd: %w", err)
+		}
 	}
 	unit, atErr := s.scheduleAt(user, uid, generation, hours)
 	if atErr != nil && systemdErr != nil {
@@ -182,25 +186,81 @@ func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hou
 	servicePath := filepath.Join(s.SystemdDir, unit+".service")
 	timerPath := filepath.Join(s.SystemdDir, unit+".timer")
 	if err := fsutil.WriteRootFile(servicePath, []byte(s.serviceContent(user, uid, generation)), 0o644); err != nil {
+		var committed *fsutil.DurabilityError
+		if errors.As(err, &committed) {
+			return "", systemdWriteRollback(err, servicePath)
+		}
 		return "", err
 	}
 	oc := OnCalendar(s.Now(), hours)
 	if err := fsutil.WriteRootFile(timerPath, []byte(timerContent(unit, oc)), 0o644); err != nil {
-		_ = os.Remove(servicePath)
-		return "", err
+		var committed *fsutil.DurabilityError
+		if errors.As(err, &committed) {
+			return "", systemdWriteRollback(err, timerPath, servicePath)
+		}
+		return "", systemdWriteRollback(err, servicePath)
 	}
 	if err := s.Sys.Systemctl("daemon-reload"); err != nil {
-		_ = os.Remove(servicePath)
-		_ = os.Remove(timerPath)
-		return "", err
+		return "", systemdWriteRollback(err, timerPath, servicePath)
 	}
 	if err := s.Sys.Systemctl("enable", "--now", unit+".timer"); err != nil {
-		_ = os.Remove(servicePath)
-		_ = os.Remove(timerPath)
-		_ = s.Sys.Systemctl("daemon-reload")
-		return "", err
+		return "", s.rollbackFailedEnable(unit, servicePath, timerPath, err)
 	}
 	return unit, nil
+}
+
+func systemdWriteRollback(cause error, paths ...string) error {
+	errs := []error{cause}
+	rollbackFailed := false
+	for _, path := range paths {
+		if err := fsutil.RemoveFile(path); err != nil {
+			errs = append(errs, fmt.Errorf("remove partially committed file %s: %w", path, err))
+			rollbackFailed = true
+		}
+	}
+	joined := errors.Join(errs...)
+	if rollbackFailed {
+		return &systemdRollbackError{err: joined}
+	}
+	return joined
+}
+
+type systemdRollbackError struct{ err error }
+
+func (e *systemdRollbackError) Error() string { return e.err.Error() }
+func (e *systemdRollbackError) Unwrap() error { return e.err }
+
+func (s *Scheduler) rollbackFailedEnable(unit, servicePath, timerPath string, enableErr error) error {
+	errs := []error{fmt.Errorf("enable systemd timer: %w", enableErr)}
+	rollbackFailed := false
+	timerUnit := unit + ".timer"
+	if err := s.Sys.Systemctl("disable", "--now", timerUnit); err != nil && !systemctlUnitFileMissing(err, timerUnit) {
+		errs = append(errs, fmt.Errorf("rollback disable systemd timer: %w", err))
+		// enable --now may have started the timer before returning its error. If
+		// stopping it cannot be confirmed, keep both files as durable inventory and
+		// retry evidence; deleting them can leave the only surviving timer hidden in
+		// systemd's in-memory state.
+		return &systemdRollbackError{err: errors.Join(errs...)}
+	}
+	if err := s.removeSystemdTimerStamp(timerUnit); err != nil {
+		errs = append(errs, err)
+		rollbackFailed = true
+	}
+	for _, path := range []string{timerPath, servicePath} {
+		if err := fsutil.RemoveFile(path); err != nil {
+			errs = append(errs, fmt.Errorf("rollback remove %s: %w", path, err))
+			rollbackFailed = true
+		}
+	}
+	if err := s.Sys.Systemctl("daemon-reload"); err != nil {
+		errs = append(errs, fmt.Errorf("rollback daemon-reload: %w", err))
+		rollbackFailed = true
+	}
+	joined := errors.Join(errs...)
+	if rollbackFailed {
+		return &systemdRollbackError{err: joined}
+	}
+	return joined
 }
 
 func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours int) (string, error) {
@@ -216,12 +276,14 @@ func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours in
 
 // Cancel removes the auto-revoke task for user. It always sweeps a matching at
 // job AND cleans the systemd units, regardless of which was recorded, so a
-// reused username never leaves a stale task behind. Only when this run is the
-// firing service for THIS unit (UnderUnit) is the .service file left and
-// daemon-reload skipped, so it never deletes the file it is executing from; a
-// manual revoke — even from another systemd scope — cleans the .service up.
+// reused username never leaves a stale task behind. A firing oneshot may unlink
+// its own unit file safely: systemd has already
+// loaded the unit and the file is not the running process image. Removing both
+// files and reloading prevents every successful automatic revoke from leaving a
+// permanent orphaned .service behind.
 func (s *Scheduler) Cancel(user, recordedUnit string) error {
 	var errs []error
+	hasSystemctl := s.Sys.HasSystemctl()
 	// Remove a specifically-recorded at job even where atq is unavailable (so
 	// RemoveAtJobsFor's body sweep can't run).
 	if strings.HasPrefix(recordedUnit, "at:") {
@@ -240,7 +302,6 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 	// the v2 name alone would leave it armed. There is normally at most one unit per
 	// account, so the extra names are no-ops on a pure-v2 host.
 	reloadNeeded := false
-	skipReload := false
 	for _, prefix := range s.unitPrefixes() {
 		unit := prefix + user
 		if strings.ContainsAny(unit, "/ ") {
@@ -248,42 +309,144 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 		}
 		timerPath := filepath.Join(s.SystemdDir, unit+".timer")
 		servicePath := filepath.Join(s.SystemdDir, unit+".service")
-		_, timerErr := os.Lstat(timerPath)
-		_, serviceErr := os.Lstat(servicePath)
-		hadUnit := timerErr == nil || serviceErr == nil
-		if s.Sys.HasSystemctl() {
+		if !hasSystemctl {
+			hasUnitEvidence := recordedUnit == unit
+			for _, path := range []string{timerPath, servicePath} {
+				exists, err := schedulePathExists(path)
+				if err != nil {
+					errs = append(errs, err)
+					hasUnitEvidence = true
+				} else if exists {
+					hasUnitEvidence = true
+				}
+			}
+			if hasUnitEvidence {
+				errs = append(errs, fmt.Errorf("systemctl is unavailable; cannot confirm %s.timer is stopped, preserving its unit files and registry evidence", unit))
+				continue
+			}
+		}
+		if hasSystemctl {
 			timerUnit := unit + ".timer"
 			err := s.Sys.Systemctl("disable", "--now", timerUnit)
-			if err != nil && hadUnit && !systemctlUnitFileMissing(err, timerUnit) {
+			if err != nil && !systemctlUnitFileMissing(err, timerUnit) {
 				errs = append(errs, err)
+				// Preserve both files as retry/inventory evidence. Deleting them after
+				// a stop failure can leave a timer active only in systemd's memory.
+				continue
 			}
 			_ = s.Sys.Systemctl("reset-failed", unit+".timer", unit+".service")
+			if err := s.removeSystemdTimerStamp(timerUnit); err != nil {
+				errs = append(errs, err)
+			}
 		}
 		if removed, err := removeIfNotSymlink(timerPath); err != nil {
 			errs = append(errs, err)
 		} else if removed {
 			reloadNeeded = true
 		}
-		// Never delete the .service this very run is executing from (a firing v2
-		// auto-revoke); a manual revoke, even from another systemd scope, does clean
-		// it. The firing unit is always the v2 one, so this only guards that name.
-		underUnit := s.UnderUnit != nil && s.UnderUnit(unit)
-		if underUnit {
-			skipReload = true
-		} else {
-			if removed, err := removeIfNotSymlink(servicePath); err != nil {
-				errs = append(errs, err)
-			} else if removed {
-				reloadNeeded = true
-			}
+		if removed, err := removeIfNotSymlink(servicePath); err != nil {
+			errs = append(errs, err)
+		} else if removed {
+			reloadNeeded = true
 		}
 	}
-	if reloadNeeded && !skipReload && s.Sys.HasSystemctl() {
+	if reloadNeeded && hasSystemctl {
 		if err := s.Sys.Systemctl("daemon-reload"); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (s *Scheduler) removeSystemdTimerStamp(timerUnit string) error {
+	stateDir, configured, err := s.systemdTimerStateDirectory()
+	if err != nil {
+		return err
+	}
+	if !configured {
+		return nil
+	}
+	if filepath.Base(timerUnit) != timerUnit || !strings.HasSuffix(timerUnit, ".timer") {
+		return fmt.Errorf("invalid systemd timer unit %q", timerUnit)
+	}
+	stampPath := filepath.Join(stateDir, "stamp-"+timerUnit)
+	if err := fsutil.RemoveFile(stampPath); err != nil {
+		return fmt.Errorf("remove systemd timer timestamp %s: %w", stampPath, err)
+	}
+	return nil
+}
+
+// CleanupTimerStamps removes persistent-timer timestamps left by older
+// releases after their unit and registry evidence had already disappeared. It
+// is intended for the final uninstall sweep, after callers have proved no
+// managed timer remains active. Removing a stamp while its timer is live would
+// alter systemd's catch-up behavior after a reboot, so ordinary cleanup uses
+// Cancel instead.
+func (s *Scheduler) CleanupTimerStamps() error {
+	stateDir, configured, err := s.systemdTimerStateDirectory()
+	if err != nil {
+		return err
+	}
+	if !configured {
+		return nil
+	}
+	entries, err := os.ReadDir(stateDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read systemd timer state directory %s: %w", stateDir, err)
+	}
+
+	var errs []error
+	for _, entry := range entries {
+		if !s.managedTimerStamp(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(stateDir, entry.Name())
+		if err := fsutil.RemoveFile(path); err != nil {
+			errs = append(errs, fmt.Errorf("remove systemd timer timestamp %s: %w", path, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (s *Scheduler) systemdTimerStateDirectory() (string, bool, error) {
+	if s == nil || s.SystemdTimerStateDir == "" {
+		return "", false, nil
+	}
+	stateDir := filepath.Clean(s.SystemdTimerStateDir)
+	if !filepath.IsAbs(stateDir) || stateDir == string(filepath.Separator) {
+		return "", false, fmt.Errorf("unsafe systemd timer state directory %q", s.SystemdTimerStateDir)
+	}
+	return stateDir, true, nil
+}
+
+func (s *Scheduler) managedTimerStamp(name string) bool {
+	if !strings.HasSuffix(name, ".timer") {
+		return false
+	}
+	for _, prefix := range s.unitPrefixes() {
+		if prefix == "" || filepath.Base(prefix) != prefix || strings.ContainsAny(prefix, "/ ") {
+			continue
+		}
+		stem := strings.TrimSuffix(strings.TrimPrefix(name, "stamp-"+prefix), ".timer")
+		if strings.HasPrefix(name, "stamp-"+prefix) && stem != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func schedulePathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect schedule file %s: %w", path, err)
 }
 
 func removeIfNotSymlink(path string) (bool, error) {
@@ -297,7 +460,7 @@ func removeIfNotSymlink(path string) (bool, error) {
 	if fi.Mode()&os.ModeSymlink != 0 {
 		return false, fmt.Errorf("refusing to remove symlinked schedule file %s", path)
 	}
-	if err := os.Remove(path); err != nil {
+	if err := fsutil.RemoveFile(path); err != nil {
 		return false, err
 	}
 	return true, nil

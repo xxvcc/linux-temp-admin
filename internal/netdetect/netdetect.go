@@ -39,8 +39,12 @@ type Detector struct {
 
 // New returns a Detector with the default services and a redirect-free client.
 func New() *Detector {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+
 	return &Detector{
 		Client: &http.Client{
+			Transport: transport,
 			// Never auto-follow redirects for a metadata/echo probe.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},

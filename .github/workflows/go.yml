@@ -7,15 +7,24 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: go-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
+    name: Build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
           check-latest: true
+      - name: Mirror receiver policy tests
+        run: python3 -B -m unittest -v scripts/mirror_receiver_test.py
       - name: Vet
         # -printf.funcs also checks our concatenating log helpers (printf/errorf/warnf)
         run: go vet -printf.funcs=printf,errorf,warnf ./...
@@ -29,9 +38,12 @@ jobs:
           fi
 
   integration:
+    name: Root integration
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
@@ -40,12 +52,15 @@ jobs:
         run: sudo -E env "PATH=$PATH" go test -race -tags integration ./...
 
   static-cross-build:
+    name: Static cross-build (${{ matrix.goarch }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
@@ -58,9 +73,12 @@ jobs:
         run: go build -tags osusergo,netgo -ldflags '-s -w' -o /dev/null ./cmd/linux-temp-admin
 
   govulncheck:
+    name: Vulnerability scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.x'
@@ -71,5 +89,5 @@ jobs:
         # 1.26.x, while go.mod pins the current security floor) or by an explicit,
         # documented suppression.
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           "$(go env GOPATH)/bin/govulncheck" ./...

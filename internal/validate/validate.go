@@ -6,6 +6,7 @@ package validate
 
 import (
 	"net"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,7 +25,9 @@ var (
 	dnsLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 	// exactly three numeric components + optional [._+~-]-led suffix
 	installedVersionRe = regexp.MustCompile(`^[0-9]+([.][0-9]+){2}([-_+~][A-Za-z0-9._+~-]+)?$`)
-	generationRe       = regexp.MustCompile(`^[a-f0-9]{32}$`)
+	// Exact release version used by v-tags and the public mirror manifest.
+	releaseVersionRe = regexp.MustCompile(`^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$`)
+	generationRe     = regexp.MustCompile(`^[a-f0-9]{32}$`)
 )
 
 // Username reports whether s is a valid temporary username.
@@ -32,6 +35,17 @@ func Username(s string) bool { return usernameRe.MatchString(s) }
 
 // Generation reports whether s is a 128-bit lowercase hex account-generation token.
 func Generation(s string) bool { return generationRe.MatchString(s) }
+
+// KernelID reports whether id can be represented as a concrete Linux uid_t or
+// gid_t. The all-ones value is deliberately excluded: chown(2) reserves it as
+// the "leave this owner unchanged" sentinel rather than an account identity.
+func KernelID(id int) bool {
+	return id >= 0 && uint64(id) < uint64(^uint32(0))
+}
+
+// AccountID is KernelID restricted to non-root identities. Temporary accounts
+// and every unattended action tied to one require this stronger form.
+func AccountID(id int) bool { return id > 0 && KernelID(id) }
 
 // Prefix reports whether s is a valid username prefix.
 func Prefix(s string) bool {
@@ -101,52 +115,17 @@ func PublicIPv4(ip string) bool {
 	if len(parts) != 4 {
 		return false
 	}
-	o := make([]int, 4)
-	for i, p := range parts {
+	for _, p := range parts {
 		if !validOctet(p) {
 			return false
 		}
-		o[i], _ = strconv.Atoi(p)
 	}
-	switch o[0] {
-	case 0, 10, 127:
-		return false
-	}
-	if o[0] >= 224 { // multicast + reserved (224.0.0.0/3)
-		return false
-	}
-	switch {
-	case o[0] == 100 && o[1] >= 64 && o[1] <= 127: // CGNAT 100.64/10
-		return false
-	case o[0] == 169 && o[1] == 254: // link-local
-		return false
-	case o[0] == 172 && o[1] >= 16 && o[1] <= 31: // 172.16/12
-		return false
-	case o[0] == 192 && o[1] == 0 && o[2] == 0: // 192.0.0.0/24
-		return false
-	case o[0] == 192 && o[1] == 0 && o[2] == 2: // TEST-NET-1
-		return false
-	case o[0] == 192 && o[1] == 88 && o[2] == 99: // 6to4 relay anycast
-		return false
-	case o[0] == 192 && o[1] == 168: // 192.168/16
-		return false
-	case o[0] == 198 && (o[1] == 18 || o[1] == 19): // benchmarking 198.18/15
-		return false
-	case o[0] == 198 && o[1] == 51 && o[2] == 100: // TEST-NET-2
-		return false
-	case o[0] == 203 && o[1] == 0 && o[2] == 113: // TEST-NET-3
-		return false
-	}
-	return true
+	return PublicIP(net.ParseIP(ip))
 }
 
-// PublicIPv6 reports whether ip is a routable global-unicast IPv6 address — the
-// IPv6 counterpart of PublicIPv4, used only to filter auto-detection candidates.
-// It leans on net's classifiers (which already exclude loopback ::1, the
-// unspecified ::, link-local fe80::/10, and every multicast form) and adds the
-// two they do not cover for our purpose: unique-local fc00::/7 (IsPrivate) and
-// the documentation range 2001:db8::/32, which is global-unicast-shaped but not
-// routable. An IPv4 or IPv4-mapped address is rejected here; PublicIPv4 owns it.
+// PublicIPv6 reports whether ip is a routable global-unicast IPv6 address, using
+// the same special-purpose exclusions as the redirect SSRF boundary. An IPv4 or
+// IPv4-mapped address is rejected here; PublicIPv4 owns it.
 func PublicIPv6(ip string) bool {
 	if !strings.Contains(ip, ":") {
 		return false
@@ -155,14 +134,59 @@ func PublicIPv6(ip string) bool {
 	if parsed == nil || parsed.To4() != nil {
 		return false
 	}
-	if !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+	return PublicIP(parsed)
+}
+
+// PublicIP reports whether ip is suitable for either an automatically advertised
+// SSH endpoint or a redirect-time network destination. Keep this one classifier
+// shared so public-IP detection cannot accept a special-use range that the
+// upgrade SSRF boundary rejects (or vice versa).
+func PublicIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return false
 	}
-	// 2001:db8::/32 — RFC 3849 documentation prefix.
-	if parsed[0] == 0x20 && parsed[1] == 0x01 && parsed[2] == 0x0d && parsed[3] == 0xb8 {
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
 		return false
+	}
+	// netip's protocol-level IsGlobalUnicast also accepts deprecated site-local
+	// space and address ranges that IANA has not allocated for global IPv6
+	// unicast. Redirect targets must stay inside the current 2000::/3 allocation.
+	if addr.Is6() && !ipv6GlobalUnicastPrefix.Contains(addr) {
+		return false
+	}
+	for _, prefix := range nonPublicPrefixes {
+		if prefix.Contains(addr) {
+			return false
+		}
 	}
 	return true
+}
+
+var ipv6GlobalUnicastPrefix = netip.MustParsePrefix("2000::/3")
+
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.31.196.0/24"),
+	netip.MustParsePrefix("192.52.193.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.175.48.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
 }
 
 // Port reports whether p is a usable TCP port (1..65535).
@@ -196,3 +220,7 @@ func UpgradeURL(u string) bool {
 // (a suffix reads as a prerelease), so the upgrade gate would silently decline a
 // genuinely newer release. So a 2- or 4-part string cannot slip through.
 func InstalledVersion(v string) bool { return installedVersionRe.MatchString(v) }
+
+// ReleaseVersion reports whether v is the canonical version portion of a
+// supported vX.Y.Z release tag.
+func ReleaseVersion(v string) bool { return releaseVersionRe.MatchString(v) }

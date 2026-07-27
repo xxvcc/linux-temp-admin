@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -61,17 +62,28 @@ type App struct {
 	// teardown against the constants would delete the real ones. CI runs the
 	// integration suite as root, so that is not a hypothetical — it would happen on
 	// every push, to the runner and to whatever box a developer ran it on.
-	StateDir     string
-	AuditLogDir  string
-	Now          func() time.Time
-	RandHex      func(nBytes int) (string, error)
-	RandPassword func(nChars int) (string, error)
-	StdoutIsTTY  func() bool
-	StdinIsTTY   func() bool
-	Geteuid      func() int
+	StateDir      string
+	AuditLogDir   string
+	Now           func() time.Time
+	RandHex       func(nBytes int) (string, error)
+	RandPassword  func(nChars int) (string, error)
+	StdoutIsTTY   func() bool
+	StdinIsTTY    func() bool
+	TerminalWidth func() int
+	Geteuid       func() int
 	// Executable is a test hook. Production leaves it nil and reads /proc/self/exe,
 	// which remains bound to the running inode if its original pathname is replaced.
 	Executable func() (string, error)
+	// RemoveAll is a test hook for recursive teardown. Production uses
+	// os.RemoveAll; nil also falls back to os.RemoveAll for direct test Apps.
+	RemoveAll func(string) error
+	// TerminateProcesses is injectable so revoke's fail-closed handling can be
+	// exercised without signalling real processes in tests.
+	TerminateProcesses func(int) error
+	// LookupUser is the single passwd snapshot source for identity-sensitive CLI
+	// operations. Production uses user.Lookup; tests inject account replacement
+	// sequences without modifying the host account database.
+	LookupUser func(string) (user.Passwd, bool, error)
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -101,8 +113,32 @@ func NewApp(lang i18n.Lang) *App {
 		RandPassword: randPassword,
 		StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
 		StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
-		Geteuid:      os.Geteuid,
+		TerminalWidth: func() int {
+			width, _, err := term.GetSize(int(os.Stdout.Fd()))
+			if err != nil {
+				return 0
+			}
+			return width
+		},
+		Geteuid:            os.Geteuid,
+		RemoveAll:          os.RemoveAll,
+		TerminateProcesses: user.TerminateProcesses,
+		LookupUser:         user.Lookup,
 	}
+}
+
+func (a *App) lookupUser(name string) (user.Passwd, bool, error) {
+	if a.LookupUser != nil {
+		return a.LookupUser(name)
+	}
+	return user.Lookup(name)
+}
+
+func (a *App) terminateProcesses(uid int) error {
+	if a.TerminateProcesses != nil {
+		return a.TerminateProcesses(uid)
+	}
+	return user.TerminateProcesses(uid)
 }
 
 func randHex(nBytes int) (string, error) {
@@ -148,13 +184,37 @@ const EnvLang = "LINUX_TEMP_ADMIN_LANG"
 // Run is the process entry point: it resolves the language, then dispatches.
 func Run(args []string) int {
 	syscall.Umask(0o077)
+	if err := setTrustedRootPath(os.Geteuid, os.Setenv); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot set trusted PATH: %v\n", err)
+		return 1
+	}
 	lang, rest, err := extractLang(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	app := NewApp(resolveLang(lang, os.Getenv(EnvLang), rest))
+	resolved, remember, proceed := resolveLangChoice(lang, os.Getenv(EnvLang), rest)
+	if !proceed {
+		return 0
+	}
+	app := NewApp(resolved)
+	if remember {
+		app.rememberLangChoice(resolved)
+	}
 	return app.Dispatch(rest)
+}
+
+const trustedRootPath = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+// setTrustedRootPath prevents a root invocation from resolving privileged
+// helper commands through a caller-controlled directory. Non-root invocations
+// keep their environment unchanged; their mutating commands are rejected by
+// requireRoot before any helper is run.
+func setTrustedRootPath(geteuid func() int, setenv func(string, string) error) error {
+	if geteuid() != 0 {
+		return nil
+	}
+	return setenv("PATH", trustedRootPath)
 }
 
 // resolveLang picks the UI language: an explicit --lang, then the env override,
@@ -168,45 +228,126 @@ func Run(args []string) int {
 // tool asks that person once and remembers the answer instead of guessing from
 // the environment.
 func resolveLang(flag, env string, rest []string) i18n.Lang {
-	for _, v := range []string{flag, env, prefs.Lang()} {
-		if l, ok := i18n.Parse(v); ok {
-			return l
-		}
-	}
-	if l, ok := askLang(rest); ok {
-		return l
-	}
-	return i18n.ZH
+	lang, _, _ := resolveLangChoice(flag, env, rest)
+	return lang
 }
 
-// askLang puts the language question to an operator who has never answered it,
-// and remembers the answer. It returns ok=false whenever asking would be wrong:
-// no terminal to ask at (a script, a cron-fired auto-revoke), or a run that
-// explicitly asked not to be prompted. Those get the default, and stay silent.
-func askLang(rest []string) (i18n.Lang, bool) {
-	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
-		return "", false
-	}
-	for _, a := range rest {
-		if a == "--yes" || a == "-y" { // an unattended run must not be stopped by a question
-			return "", false
+func resolveLangChoice(flag, env string, rest []string) (i18n.Lang, bool, bool) {
+	return resolveLangChoiceWith(flag, env, rest, askLang)
+}
+
+func resolveLangChoiceWith(flag, env string, rest []string, ask func([]string) (i18n.Lang, bool, bool)) (i18n.Lang, bool, bool) {
+	for _, v := range []string{flag, env, prefs.Lang()} {
+		if l, ok := i18n.Parse(v); ok {
+			return l, false, true
 		}
 	}
-	fmt.Fprint(os.Stderr, "\nLanguage / 语言:\n  1) 中文 (默认)\n  2) English\n选择 / select [1-2]: ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" { // EOF: take the default rather than hang
-		return "", false
+	if l, ok, prompted := ask(rest); prompted {
+		if !ok {
+			return i18n.ZH, false, false
+		}
+		return l, true, true
 	}
-	lang := i18n.ZH
-	if strings.TrimSpace(line) == "2" {
-		lang = i18n.EN
+	return i18n.ZH, false, true
+}
+
+// askLang puts the language question to an operator who has never answered it.
+// Persistence happens later, under the lifecycle lock and uninstall marker gate.
+// prompted is false whenever asking would be wrong:
+// no terminal to ask at (a script, a cron-fired auto-revoke), or a run that
+// explicitly asked not to be prompted. Those get the default and stay silent.
+// When prompted is true but ok is false, the operator ended the prompt with EOF
+// and the whole interactive run should be cancelled.
+func askLang(rest []string) (lang i18n.Lang, ok, prompted bool) {
+	if !shouldAskLang(rest,
+		term.IsTerminal(int(os.Stdin.Fd())),
+		term.IsTerminal(int(os.Stderr.Fd())),
+		term.IsTerminal(int(os.Stdout.Fd()))) {
+		return "", false, false
 	}
-	// Remembering is a convenience: if it cannot be saved the run still proceeds in
-	// the chosen language, it will just ask again next time.
+	lang, ok = askLangInput(os.Stdin, os.Stderr)
+	return lang, ok, true
+}
+
+func shouldAskLang(rest []string, stdinTTY, stderrTTY, stdoutTTY bool) bool {
+	if !stdinTTY || !stderrTTY {
+		return false
+	}
+	for _, arg := range rest {
+		if arg == "--yes" || arg == "-y" { // an unattended run must not be stopped by a question
+			return false
+		}
+	}
+	if len(rest) == 0 || (rest[0] != "invite" && rest[0] != "create") || stdoutTTY {
+		return true
+	}
+	for _, arg := range rest[1:] {
+		if arg == "--allow-non-tty-private-key-output" {
+			return true
+		}
+	}
+	// invite will refuse this run before any of its own prompts. Do not make a
+	// first-run language question the side effect that happens before that refusal.
+	return false
+}
+
+// askLangInput contains the line-oriented part of the first-run language
+// prompt. Keep one buffered reader for the whole exchange: constructing a new
+// reader after invalid input could discard later lines it had already buffered.
+func askLangInput(in io.Reader, out io.Writer) (i18n.Lang, bool) {
+	reader := bufio.NewReader(in)
+	for {
+		fmt.Fprint(out, "\nLanguage / 语言:\n  1) 中文 (默认)\n  2) English\n选择 / select [1-2]: ")
+		line, ok, err := readInteractiveLine(reader)
+		if errors.Is(err, errInteractiveLineTooLong) {
+			fmt.Fprintln(out, "输入过长，请重新输入 / input is too long; try again")
+			continue
+		}
+		if err != nil || !ok { // EOF cancels the interactive run.
+			return "", false
+		}
+		switch strings.TrimSpace(line) {
+		case "", "1":
+			return i18n.ZH, true
+		case "2":
+			return i18n.EN, true
+		default:
+			fmt.Fprintln(out, "无效选择，请输入 1 或 2 / invalid choice; enter 1 or 2")
+		}
+	}
+}
+
+// rememberLangChoice writes a convenience preference only while holding the
+// same lifecycle lock as every privileged mutation. A completed uninstall owns
+// the state namespace; in that state a language prompt must not recreate it.
+func (a *App) rememberLangChoice(lang i18n.Lang) {
+	if a.Lifecycle == nil {
+		if err := prefs.SetLang(string(lang)); err != nil {
+			a.warnf("%s: %v", a.P.M("未能记住语言选择", "could not remember the language choice"), err)
+		}
+		return
+	}
+	release, err := a.Lifecycle.Acquire()
+	if err != nil {
+		a.warnf("%s: %v", a.P.M("未能锁定语言偏好", "could not lock the language preference"), err)
+		return
+	}
+	defer func() {
+		if err := release(); err != nil {
+			a.warnf("%s: %v", a.P.M("无法释放生命周期锁", "cannot release the lifecycle lock"), err)
+		}
+	}()
+	uninstalled, err := a.Lifecycle.IsUninstalled()
+	if err != nil {
+		a.warnf("%s: %v", a.P.M("无法验证卸载状态，未保存语言选择", "could not verify uninstall state; the language choice was not saved"), err)
+		return
+	}
+	if uninstalled {
+		return
+	}
 	if err := prefs.SetLang(string(lang)); err != nil {
-		fmt.Fprintf(os.Stderr, "（未能记住语言选择 / could not remember the language choice: %v）\n", err)
+		a.warnf("%s: %v", a.P.M("未能记住语言选择", "could not remember the language choice"), err)
 	}
-	return lang, true
 }
 
 // extractLang pulls --lang/--lang=VAL from anywhere in args (an explicit flag
@@ -312,6 +453,16 @@ func (a *App) requireRoot() bool {
 // withLifecycleLock serializes complete privileged state transitions. Tests that
 // construct App directly may leave Lifecycle nil; production NewApp never does.
 func (a *App) withLifecycleLock(fn func() int) int {
+	return a.withLifecycleLockMode(false, fn)
+}
+
+// withLifecycleLockAllowUninstalled is reserved for explicit install and
+// uninstall retry. Every other mutation must stop at a completed uninstall.
+func (a *App) withLifecycleLockAllowUninstalled(fn func() int) int {
+	return a.withLifecycleLockMode(true, fn)
+}
+
+func (a *App) withLifecycleLockMode(allowUninstalled bool, fn func() int) int {
 	if a.Lifecycle == nil {
 		return fn()
 	}
@@ -319,6 +470,20 @@ func (a *App) withLifecycleLock(fn func() int) int {
 	if err != nil {
 		a.errorf("%s: %v", a.P.M("无法获取生命周期锁", "cannot acquire the lifecycle lock"), err)
 		return 1
+	}
+	if !allowUninstalled {
+		uninstalled, markerErr := a.Lifecycle.IsUninstalled()
+		if markerErr != nil {
+			_ = release()
+			a.errorf("%s: %v", a.P.M("无法验证卸载状态，拒绝修改主机", "cannot verify uninstall state; refusing to mutate the host"), markerErr)
+			return 1
+		}
+		if uninstalled {
+			_ = release()
+			a.errorf("%s", a.P.M("本工具已卸载；如需重新启用，请先显式运行 install",
+				"this tool is uninstalled; run install explicitly before re-enabling mutations"))
+			return 1
+		}
 	}
 	rc := fn()
 	if err := release(); err != nil {
@@ -328,6 +493,13 @@ func (a *App) withLifecycleLock(fn func() int) int {
 	return rc
 }
 
+const (
+	maxInteractiveLineBytes = 64 << 10
+	rejectedInteractiveLine = "\x00"
+)
+
+var errInteractiveLineTooLong = errors.New("interactive input line is too long")
+
 // prompt reads a single line, printing the message to stderr first.
 // readLine reads one trimmed line. ok is false only at EOF with no data, letting
 // callers tell a blank Enter apart from end-of-input.
@@ -335,11 +507,61 @@ func (a *App) readLine() (line string, ok bool) {
 	if a.inReader == nil {
 		a.inReader = bufio.NewReader(a.In)
 	}
-	s, err := a.inReader.ReadString('\n')
-	if err != nil && s == "" {
-		return "", false
+	s, ok, err := readInteractiveLine(a.inReader)
+	if err != nil {
+		if errors.Is(err, errInteractiveLineTooLong) {
+			a.warnf("%s", a.P.M("输入行过长，已拒绝", "input line is too long and was rejected"))
+		} else {
+			a.warnf("%s: %v", a.P.M("读取输入失败", "reading input failed"), err)
+		}
+		return rejectedInteractiveLine, ok
 	}
-	return strings.TrimSpace(s), true
+	return strings.TrimSpace(s), ok
+}
+
+// readInteractiveLine consumes exactly one line while retaining at most a fixed
+// amount of it. Once the limit is crossed it drains the rest of that same line,
+// so a following answer remains aligned with its next prompt.
+func readInteractiveLine(reader *bufio.Reader) (string, bool, error) {
+	var line strings.Builder
+	gotInput := false
+	tooLong := false
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			gotInput = true
+			if fragment[len(fragment)-1] == '\n' {
+				fragment = fragment[:len(fragment)-1]
+			}
+			if !tooLong {
+				remaining := maxInteractiveLineBytes - line.Len()
+				if len(fragment) > remaining {
+					tooLong = true
+				} else {
+					line.Write(fragment)
+				}
+			}
+		}
+		switch {
+		case err == nil:
+			if tooLong {
+				return "", true, errInteractiveLineTooLong
+			}
+			return line.String(), true, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			if !gotInput {
+				return "", false, nil
+			}
+			if tooLong {
+				return "", true, errInteractiveLineTooLong
+			}
+			return line.String(), true, nil
+		default:
+			return "", gotInput, err
+		}
+	}
 }
 
 func (a *App) prompt(msg string) string {

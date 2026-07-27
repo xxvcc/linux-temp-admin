@@ -1,0 +1,164 @@
+name: Stage Release Draft
+
+# workflow_run uses this workflow's definition from the default branch. The
+# candidate tag can produce data, but cannot rewrite the job that receives the
+# contents:write token.
+on:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- guarded below before any write token is used
+    workflows: [Release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Draft creation is repository-global. Per-tag groups would allow two
+  # contents:write jobs to race on release state.
+  group: stage-release-writer
+  cancel-in-progress: false
+
+jobs:
+  configuration-gate:
+    name: Require protected release configuration
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.path == '.github/workflows/release.yml' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed release-environment configuration
+        env:
+          RELEASE_ENVIRONMENT_CONFIGURED: ${{ vars.LTA_RELEASE_ENVIRONMENT_CONFIGURED }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$RELEASE_ENVIRONMENT_CONFIGURED" == true ]] || {
+            echo "LTA_RELEASE_ENVIRONMENT_CONFIGURED is not true; configure the protected release-staging environment first" >&2
+            exit 1
+          }
+
+  stage-draft:
+    name: Stage unsigned release draft
+    needs: configuration-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: release-staging
+    permissions:
+      actions: read # download only the artifact from the validated Release run
+      contents: write # create the new unsigned draft after all tag gates pass
+    steps:
+      - name: Validate triggering tag and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          GH_PROMPT_DISABLED: '1'
+          GH_PAGER: 'cat'
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]]
+          major="${BASH_REMATCH[1]}"
+          (( ${#major} > 1 || 10#$major >= 2 )) \
+            || { echo "release tags below v2 are not supported" >&2; exit 1; }
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+          ref_json="$(timeout -k 5 60 gh api "repos/${GH_REPO}/git/ref/tags/${TAG}")"
+          tag_object="$(jq -r '.object.sha' <<<"$ref_json")"
+          [[ "$(jq -r '.object.type' <<<"$ref_json")" == tag ]]
+          tag_json="$(timeout -k 5 60 gh api "repos/${GH_REPO}/git/tags/${tag_object}")"
+          [[ "$(jq -r '.tag' <<<"$tag_json")" == "$TAG" ]]
+          [[ "$(jq -r '.object.type + " " + .object.sha' <<<"$tag_json")" == "commit $HEAD_SHA" ]]
+          [[ "$(jq -r '.verification.verified|tostring' <<<"$tag_json")" == true \
+             && "$(jq -r '.verification.reason' <<<"$tag_json")" == valid \
+             && "$(jq -r '.verification.signature' <<<"$tag_json")" == '-----BEGIN PGP SIGNATURE-----'* ]] \
+            || { echo "tag must have a valid GitHub-recognized OpenPGP signature" >&2; exit 1; }
+
+          ancestry="$(timeout -k 5 60 gh api "repos/${GH_REPO}/compare/${HEAD_SHA}...main" --jq '.status')"
+          [[ "$ancestry" == identical || "$ancestry" == ahead ]] \
+            || { echo "tag commit is not contained in main" >&2; exit 1; }
+
+      - name: Download gated unsigned artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-release-${{ github.event.workflow_run.head_branch }}
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate transferred artifact
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          expected=$'SHA256SUMS\tf\nlinux-temp-admin-linux-amd64\tf\nlinux-temp-admin-linux-arm64\tf'
+          got="$(find dist -mindepth 1 -printf '%P\t%y\n' | LC_ALL=C sort)"
+          [[ "$got" == "$expected" ]]
+          [[ -f dist/SHA256SUMS && ! -L dist/SHA256SUMS \
+             && "$(wc -c < dist/SHA256SUMS)" -gt 0 \
+             && "$(wc -c < dist/SHA256SUMS)" -le 1048576 ]] \
+            || { echo "SHA256SUMS is empty, special, or exceeds the 1 MiB metadata limit" >&2; exit 1; }
+          for asset in dist/linux-temp-admin-linux-amd64 dist/linux-temp-admin-linux-arm64; do
+            [[ -f "$asset" && ! -L "$asset" && -s "$asset" && "$(wc -c < "$asset")" -le 67108864 ]] \
+              || { echo "release binary is empty, special, or exceeds the 64 MiB client limit: $asset" >&2; exit 1; }
+          done
+          [[ "$(awk 'NF {print $2}' dist/SHA256SUMS)" == $'linux-temp-admin-linux-amd64\nlinux-temp-admin-linux-arm64' ]]
+          ( cd dist && sha256sum -c --strict SHA256SUMS )
+
+      - name: Create a new unsigned DRAFT release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          GH_PROMPT_DISABLED: '1'
+          GH_PAGER: 'cat'
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          lookup="$(mktemp)"
+          set +e
+          timeout -k 5 60 gh api --include "repos/${GH_REPO}/releases/tags/${TAG}" >"$lookup" 2>&1
+          lookup_status=$?
+          set -e
+          if [[ "$lookup_status" -eq 0 ]]; then
+            echo "release or draft $TAG already exists; refusing to refresh any remote asset" >&2
+            exit 1
+          fi
+          [[ "$lookup_status" -eq 1 ]] \
+            || { echo "release lookup failed with unexpected status $lookup_status" >&2; exit 1; }
+          [[ "$(grep -Ec '^HTTP/[0-9.]+ [0-9]{3}([[:space:]]|$)' "$lookup")" -eq 1 \
+             && "$(grep -Ec '^HTTP/[0-9.]+ 404([[:space:]]|$)' "$lookup")" -eq 1 ]] || {
+            cat "$lookup" >&2
+            echo "could not prove release $TAG is absent" >&2
+            exit 1
+          }
+          rm -f -- "$lookup"
+
+          # Re-resolve the protected tag immediately before the first write so
+          # an approval delay cannot make the earlier validation stale.
+          ref_json="$(timeout -k 5 60 gh api "repos/${GH_REPO}/git/ref/tags/${TAG}")"
+          tag_object="$(jq -r '.object.sha' <<<"$ref_json")"
+          [[ "$(jq -r '.object.type' <<<"$ref_json")" == tag ]]
+          tag_json="$(timeout -k 5 60 gh api "repos/${GH_REPO}/git/tags/${tag_object}")"
+          [[ "$(jq -r '.tag' <<<"$tag_json")" == "$TAG" ]]
+          [[ "$(jq -r '.object.type + " " + .object.sha' <<<"$tag_json")" == "commit $HEAD_SHA" ]]
+          [[ "$(jq -r '.verification.verified|tostring' <<<"$tag_json")" == true \
+             && "$(jq -r '.verification.reason' <<<"$tag_json")" == valid \
+             && "$(jq -r '.verification.signature' <<<"$tag_json")" == '-----BEGIN PGP SIGNATURE-----'* ]] \
+            || { echo "tag signature changed before draft creation" >&2; exit 1; }
+          ancestry="$(timeout -k 5 60 gh api "repos/${GH_REPO}/compare/${HEAD_SHA}...main" --jq '.status')"
+          [[ "$ancestry" == identical || "$ancestry" == ahead ]] \
+            || { echo "tag commit left main before draft creation" >&2; exit 1; }
+          flags=(--draft --verify-tag --title "$TAG" --generate-notes)
+          [[ "$TAG" != *-* ]] || flags+=(--prerelease)
+          timeout -k 5 600 gh release create "$TAG" dist/linux-temp-admin-linux-amd64 \
+            dist/linux-temp-admin-linux-arm64 dist/SHA256SUMS "${flags[@]}"
+          echo "Unsigned draft only. Continue with the trusted three-phase process in docs/releasing.md."

@@ -7,14 +7,34 @@ package sysinfo
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"golang.org/x/sys/unix"
 )
 
 // sshdConfigPath is overridable in tests.
 var sshdConfigPath = "/etc/ssh/sshd_config"
+
+const (
+	maxSSHDConfigLine  = 1 << 20
+	maxSSHDConfigBytes = int64(16 << 20)
+)
+
+var packageCommandOptions = executil.Options{
+	Timeout:   30 * time.Minute,
+	MaxOutput: 8 << 20,
+	ExtraEnv: []string{
+		"DEBIAN_FRONTEND=noninteractive",
+		"LC_ALL=C",
+		"LANG=C",
+	},
+}
 
 func has(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
@@ -115,25 +135,29 @@ func PackageCandidate(label, pm string) string {
 
 // InstallPackages installs pkgs using the given package manager.
 func InstallPackages(pm string, pkgs []string) error {
-	var cmd *exec.Cmd
+	var name string
+	var args []string
 	switch pm {
 	case "apt":
-		_ = exec.Command("apt-get", "update").Run()
-		cmd = exec.Command("apt-get", append([]string{"install", "-y"}, pkgs...)...)
+		_ = executil.Run("apt-get", []string{"update"}, packageCommandOptions)
+		name, args = "apt-get", append([]string{"install", "-y"}, pkgs...)
 	case "dnf":
-		cmd = exec.Command("dnf", append([]string{"install", "-y"}, pkgs...)...)
+		name, args = "dnf", append([]string{"install", "-y"}, pkgs...)
 	case "yum":
-		cmd = exec.Command("yum", append([]string{"install", "-y"}, pkgs...)...)
+		name, args = "yum", append([]string{"install", "-y"}, pkgs...)
 	case "apk":
-		cmd = exec.Command("apk", append([]string{"add", "--no-cache"}, pkgs...)...)
+		name, args = "apk", append([]string{"add", "--no-cache"}, pkgs...)
 	case "pacman":
-		cmd = exec.Command("pacman", append([]string{"-Syu", "--noconfirm", "--needed"}, pkgs...)...)
+		// Arch supports only full system upgrades. `pacman -S` can create a partial
+		// upgrade when the sync database is newer than installed packages, while
+		// `pacman -Syu` would let an account-invite command upgrade the whole host
+		// unattended. Neither is an acceptable implicit dependency action.
+		return fmt.Errorf("automatic pacman installation is disabled because Arch does not support partial upgrades; run a deliberate full system upgrade and install the required packages first")
 	default:
 		return fmt.Errorf("unsupported package manager: %q", pm)
 	}
-	cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	if out, err := executil.CombinedOutput(name, args, packageCommandOptions); err != nil {
+		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -144,7 +168,7 @@ func SSHPort() int {
 	if p, ok := sshPortFromSshdT(); ok {
 		return p
 	}
-	if p, ok := sshPortFromConfig(sshdConfigPath); ok {
+	if p, ok, _ := sshPortFromConfig(sshdConfigPath); ok {
 		return p
 	}
 	return 22
@@ -161,27 +185,47 @@ func sshPortFromSshdT() (int, bool) {
 	return 0, false
 }
 
-func sshPortFromConfig(path string) (int, bool) {
-	f, err := os.Open(path)
+func sshPortFromConfig(path string) (int, bool, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return 0, false
+		return 0, false, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return 0, false, fmt.Errorf("sshd config %s is not a regular non-symlink file", path)
+	}
+	if fi.Size() > maxSSHDConfigBytes {
+		return 0, false, fmt.Errorf("sshd config %s exceeds %d-byte limit", path, maxSSHDConfigBytes)
+	}
+	limited := &io.LimitedReader{R: f, N: maxSSHDConfigBytes + 1}
+	sc := bufio.NewScanner(limited)
+	sc.Buffer(make([]byte, 64<<10), maxSSHDConfigLine)
+	var port int
+	found := false
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
+		if !found && len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
 			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
 				// First Port wins: sshd listens on every Port directive, and
 				// sshPortFromSshdT returns the first, so the config fallback matches it
 				// for a consistent hint (rather than the bash awk's last-wins).
-				return p, true
+				port, found = p, true
 			}
 		}
 	}
-	return 0, false
+	if err := sc.Err(); err != nil {
+		return 0, false, fmt.Errorf("scan sshd config %s: %w", path, err)
+	}
+	if limited.N == 0 {
+		return 0, false, fmt.Errorf("sshd config %s exceeds %d-byte limit", path, maxSSHDConfigBytes)
+	}
+	return port, found, nil
 }

@@ -3,6 +3,7 @@
 package fsutil
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -77,12 +78,51 @@ func TestWriteRootFileRefusesSymlinkParent(t *testing.T) {
 	}
 }
 
+func TestWriteRootFilePinsValidatedParentDirectoryFD(t *testing.T) {
+	requireRoot(t)
+	base := t.TempDir()
+	dir := filepath.Join(base, "safe")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(base, "moved")
+	oldHook := afterRootDirOpen
+	afterRootDirOpen = func() {
+		if err := os.Rename(dir, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { afterRootDirOpen = oldHook })
+
+	if err := WriteRootFile(filepath.Join(dir, "policy"), []byte("safe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "policy")); !os.IsNotExist(err) {
+		t.Fatalf("write escaped into replacement parent: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(moved, "policy")); err != nil || string(b) != "safe\n" {
+		t.Fatalf("pinned parent content=%q err=%v", b, err)
+	}
+}
+
 func TestAtomicWriteChownsToRequestedUID(t *testing.T) {
 	requireRoot(t)
 	dir := t.TempDir()
 	p := filepath.Join(dir, "f")
 	const uid, gid = 12345, 12345
 	if err := AtomicWriteFileAs(p, []byte("x"), 0o600, uid, gid); err != nil {
+		if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EPERM) {
+			t.Skipf("test filesystem cannot represent uid %d: %v", uid, err)
+		}
 		t.Fatal(err)
 	}
 	if u, g := ownerOf(t, p); u != uid || g != gid {

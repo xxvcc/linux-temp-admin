@@ -1,14 +1,59 @@
 package sysinfo
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"golang.org/x/sys/unix"
 )
 
 // The account an invite creates: a fresh name, in no group but its own.
 const acct = "xxvcc-a1b2c3"
 
 var acctGroups = []string{acct}
+
+func TestSSHDEffectiveIsBoundedAndUsesCLocale(t *testing.T) {
+	oldCommand, oldOptions := sshdCommand, sshdProbeOptions
+	t.Cleanup(func() { sshdCommand, sshdProbeOptions = oldCommand, oldOptions })
+
+	t.Run("locale and argv", func(t *testing.T) {
+		sshdProbeOptions = oldOptions
+		sshdCommand = writeSysinfoCommand(t, t.TempDir(), "sshd", `[ "$LC_ALL:$LANG:$*" = "C:C:-T -C user=alice" ] || exit 9
+printf 'port 2222\npubkeyauthentication yes\n'`)
+		cfg, err := SSHDEffective("alice")
+		if err != nil || cfg.First("port") != "2222" {
+			t.Fatalf("SSHDEffective config=%v err=%v; helper did not receive C locale/expected argv", cfg, err)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		sshdCommand = writeSysinfoCommand(t, t.TempDir(), "sshd", `/bin/sleep 30 & wait`)
+		opts := oldOptions
+		opts.Timeout = 50 * time.Millisecond
+		sshdProbeOptions = opts
+		if _, err := SSHDEffective("alice"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("SSHDEffective error = %v, want timeout", err)
+		}
+	})
+
+	t.Run("output limit", func(t *testing.T) {
+		sshdCommand = writeSysinfoCommand(t, t.TempDir(), "sshd", `while :; do printf 0123456789abcdef; done`)
+		opts := oldOptions
+		opts.Timeout = time.Second
+		opts.MaxOutput = 64
+		sshdProbeOptions = opts
+		if _, err := SSHDEffective("alice"); !errors.Is(err, executil.ErrOutputLimit) {
+			t.Fatalf("SSHDEffective error = %v, want output limit", err)
+		}
+	})
+}
 
 func TestParseSSHDAccumulatesRepeatedDirectives(t *testing.T) {
 	c := ParseSSHD("port 22\nallowusers alice\nallowusers bob\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n")
@@ -165,6 +210,48 @@ func TestCheckKeyLogin(t *testing.T) {
 				t.Errorf("Fixable() = %v, want %v", rep.Fixable(), tc.fixable)
 			}
 		})
+	}
+}
+
+func TestParseSSHDDoesNotTruncateAfterLongLine(t *testing.T) {
+	const acct = "xxvcc-a1"
+	longValue := strings.Repeat("x", 70<<10)
+	cfg := ParseSSHD("pubkeyauthentication yes\n" +
+		"authorizedkeysfile .ssh/authorized_keys\n" +
+		"banner " + longValue + "\n" +
+		"denyusers " + acct + "\n")
+	rep := CheckKeyLogin(cfg, acct, []string{acct})
+	if !rep.Has(BlockDenyUsers) {
+		t.Fatalf("long directive hid a later DenyUsers rule: blockers=%v", rep.Blockers)
+	}
+}
+
+func TestConnectionScopedMatchScannerHandlesLongLinesAndFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	main := dir + "/sshd_config"
+	dropins := dir + "/sshd_config.d"
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+
+	content := "Banner " + strings.Repeat("x", 70<<10) + "\nMatch Address 203.0.113.0/24\n"
+	if err := os.WriteFile(main, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("a >64 KiB line hid a later connection-scoped Match")
+	}
+
+	// Lines beyond the explicit cap are malformed for this bounded parser. The
+	// scan must become unverifiable rather than silently returning a clean bill.
+	if err := os.WriteFile(main, []byte(strings.Repeat("x", maxSSHDConfigLine+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("scanner overflow was treated as a complete configuration scan")
 	}
 }
 
@@ -368,6 +455,155 @@ func TestHasConnectionScopedMatch(t *testing.T) {
 	write(main, "Include missing.conf\n")
 	if !HasConnectionScopedMatch() {
 		t.Error("an unreadable explicit Include must make the result unverifiable")
+	}
+}
+
+func TestHasConnectionScopedMatchFailsClosedOnGlobIOError(t *testing.T) {
+	dir := t.TempDir()
+	main := dir + "/sshd_config"
+	dropins := dir + "/sshd_config.d"
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(main, []byte("PubkeyAuthentication yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins, oldReadDir := sshdConfigPath, sshdConfigDropInDir, strictGlobReadDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	strictGlobReadDir = func(path string) ([]os.DirEntry, error) {
+		if path == dropins {
+			return nil, errors.New("injected directory I/O failure")
+		}
+		return os.ReadDir(path)
+	}
+	t.Cleanup(func() {
+		sshdConfigPath, sshdConfigDropInDir, strictGlobReadDir = oldConfig, oldDropins, oldReadDir
+	})
+
+	if !HasConnectionScopedMatch() {
+		t.Fatal("an unreadable drop-in directory was treated as a complete sshd policy scan")
+	}
+}
+
+func TestHasConnectionScopedMatchBoundsAndRejectsSpecialFiles(t *testing.T) {
+	dir := t.TempDir()
+	main := dir + "/sshd_config"
+	dropins := dir + "/sshd_config.d"
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+
+	if err := unix.Mkfifo(main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if !HasConnectionScopedMatch() {
+		t.Fatal("FIFO sshd config was treated as a complete policy scan")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("FIFO sshd config blocked for %s", elapsed)
+	}
+	if err := os.Remove(main); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(main, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(main, maxSSHDConfigBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("oversized sshd config was treated as a complete policy scan")
+	}
+
+	if err := os.Remove(main); err != nil {
+		t.Fatal(err)
+	}
+	real := dir + "/real.conf"
+	if err := os.WriteFile(real, []byte("Match Address 203.0.113.0/24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, main); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("regular symlinked sshd config was not scanned as sshd would scan it")
+	}
+}
+
+func TestHasConnectionScopedMatchBoundsIncludeTraversal(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "sshd_config")
+	dropins := filepath.Join(dir, "sshd_config.d")
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+
+	for i := 0; i <= maxSSHDIncludeDepth; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("depth-%03d.conf", i))
+		content := "PubkeyAuthentication yes\n"
+		if i < maxSSHDIncludeDepth {
+			content = fmt.Sprintf("Include depth-%03d.conf\n", i+1)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(main, []byte("Include depth-000.conf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("over-deep Include traversal was treated as a complete policy scan")
+	}
+
+	includeDir := filepath.Join(dir, "many")
+	if err := os.Mkdir(includeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= maxSSHDIncludeFiles; i++ {
+		path := filepath.Join(includeDir, fmt.Sprintf("%03d.conf", i))
+		if err := os.WriteFile(path, []byte("PubkeyAuthentication yes\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(main, []byte("Include many/*.conf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("over-wide Include traversal was treated as a complete policy scan")
+	}
+
+	var patterns strings.Builder
+	for i := 0; i <= maxSSHDIncludeGlobs; i++ {
+		fmt.Fprintf(&patterns, "Include missing-%04d-*.conf\n", i)
+	}
+	if err := os.WriteFile(main, []byte(patterns.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !HasConnectionScopedMatch() {
+		t.Fatal("too many Include patterns were treated as a complete policy scan")
+	}
+
+	for i := 0; i < 17; i++ {
+		wideDir := filepath.Join(dir, fmt.Sprintf("wide-%02d", i))
+		if err := os.Mkdir(wideDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < 16; j++ {
+			path := filepath.Join(wideDir, fmt.Sprintf("%02d.conf", j))
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := strictGlob(filepath.Join(dir, "wide-*", "*.conf")); !errors.Is(err, errSSHDGlobLimit) {
+		t.Fatalf("wide glob error = %v, want traversal-limit refusal", err)
 	}
 }
 

@@ -2,6 +2,86 @@
 
 All notable changes to this project are documented here.
 
+## v2.8.0 - 2026-07-27
+
+- Make account creation and revocation fail closed across UID reuse and process
+  races. New users remain explicitly pending until their UID is durably
+  registered, all four Linux process credential UIDs are checked, and pidfds
+  bind termination to the inspected process generation. `doctor` reports pidfd
+  availability and `invite` refuses to create an account when safe revocation
+  is unavailable.
+- Keep interactive confirmation, release downloads, signature verification, and
+  candidate probing outside the global lifecycle lock. Destructive operations
+  rebuild and compare their complete inventory under the lock, while upgrades
+  recheck the installed version immediately before the atomic commit.
+- Bound every privileged helper command by time and output, terminate its whole
+  process group on failure, use stable locale output where diagnostics are
+  classified, and cap registry, SSH configuration, installed-binary reads,
+  registry rewrites, individual audit records, and the retained audit log.
+- Upgrade the registry to schema v3 with locked v2 migration, a 16 MiB file
+  ceiling, strict row width, and rejection of duplicate headers, usernames, and
+  malformed comments. Every new account, including one without auto-revoke, is
+  bound to a per-account generation in its GECOS marker; migrated fixed-marker
+  accounts remain legacy-unverified and are never auto- or bulk-deleted. Status
+  distinguishes pending, missing, marker-mismatch, UID-mismatch, untrusted-UID,
+  legacy-unverified, and active identities.
+- Harden filesystem durability and uninstall behavior. Atomic writes and
+  removals fsync the required metadata, uncertain durability is reported,
+  recursive deletion refuses live mount boundaries, uninstall records its
+  fail-closed tombstone before removable state is deleted, and changed
+  inventories require a fresh operator confirmation.
+- Validate interactive yes/no answers instead of treating typos as permanent
+  accounts, and treat EOF at the first-run language prompt as a clean
+  cancellation instead of entering a second blocking prompt. Validate stored
+  systemd/at schedules before reporting them healthy, recognize Alpine/musl's
+  exact GNU `id` missing-user diagnostic, keep key-only accounts usable on
+  Alpine while password authentication remains impossible, and tighten orphan,
+  preferences, audit, sudoers, sshd, and SSH-key cleanup. Successful account
+  deletion helpers are rechecked against the local passwd database, `at`
+  validation fails closed without a backend, sshd Include traversal has depth,
+  inode, and aggregate-byte budgets; pacman dependency installation is refused
+  because Arch requires a deliberate full-system upgrade. Cancelling a persistent
+  systemd timer also removes its per-unit timestamp under
+  `/var/lib/systemd/timers`, including during partial-enable rollback; uninstall
+  also sweeps timestamps stranded by older releases after their accounts and
+  unit files were already gone.
+- Harden self-install and self-upgrade with HTTPS dial-point filtering, bounded
+  retries and probes, strict signature keyrings, missing-install repair, exact
+  target metadata checks, and explicit reporting when replacement is visible
+  but directory durability cannot be proven. Sensitive custom URLs can be read
+  from a root-only file instead of argv, GitHub-only cache recovery no longer
+  rewrites signed mirror queries, and the main process disables core dumps
+  before it handles one-time private keys or passwords. The bootstrap now
+  requires curl's HTTPS redirect policy, disables core dumps, enforces exact
+  byte limits across Bash/dash/BusyBox, can pin an exact `LTA_RELEASE` tag, and
+  refuses to run child commands when a kernel limit cannot be installed. A
+  verified bootstrap reinstall now delegates the managed-path activation to the
+  candidate so lifecycle locking and the uninstall tombstone protocol remain
+  authoritative.
+- Make `https://dl.ll.cd/linux-temp-admin` the built-in official source for
+  normal installation and self-upgrade, with GitHub retained only as a
+  transport-failure fallback. Each attempted source must provide the complete
+  `SHA256SUMS`, binary, and detached-signature set; invalid mirror metadata,
+  checksums, signatures, or candidate versions fail closed without fallback,
+  and explicit `--url` or `--url-file` upgrades never switch sources. Mirror
+  endpoints must return canonical files directly without redirects, while the
+  GitHub fallback retains public HTTPS Release-CDN redirects.
+- Replace the online one-step release signer with reproducible online
+  preparation, descriptor-pinned air-gapped ed25519 signing, and separately
+  protected publication. Candidate workflows are read-only; a default-branch
+  receiver stages immutable unsigned drafts, and publication verifies signed
+  tags, exact signer identities, manifests, remote assets, public downloads, and
+  monotonic Latest behavior. Trusted phases disable core dumps; clear inherited
+  proxy, TLS, Git, archive, and GitHub configuration; validate signer, source,
+  and output ancestry; hash exported source back to its Git blobs; and bound
+  final removable-media copies, permission changes, hashing, cleanup, and
+  verification. Exact REST status and command-exit parsing prevents mixed,
+  timed-out, or killed requests from becoming an empty Latest, while a read-only
+  resume can no longer demote a release that was already Latest before the run.
+  Draft staging and manual Latest recovery now accept a REST 404 only with the
+  GitHub CLI's exact HTTP-error status, and the staging pre-write recheck pins
+  the tag to a GitHub-recognized OpenPGP signature again.
+
 ## v2.7.3 - Idempotent orphan schedule cleanup
 
 - Treat the exact `systemctl disable --now` "unit file does not exist" result as
@@ -771,7 +851,7 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   `Manager.Install` returns whether it wrote, mirroring `Upgrade`'s `("", nil)`.
 - **The interactive menu drops `install`.** Reaching the menu means a binary is
   already running as root, so `install` there was either the no-op above or a
-  one-time bootstrap better done as `sudo ./linux-temp-admin install`. That made
+  one-time bootstrap better done as `/usr/bin/sudo ./linux-temp-admin install`. That made
   it look like a duplicate of `upgrade`, which its old label ("Install/update the
   current binary...") reinforced. `upgrade` is now the menu's single,
   signature-verified update path; the prompt range follows the table, so entries

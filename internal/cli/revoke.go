@@ -15,38 +15,97 @@ func (a *App) revoke(args []string) int {
 	if !a.requireRoot() {
 		return 1
 	}
-	return a.withLifecycleLock(func() int { return a.revokeLocked(args) })
+	opts, ok := a.parseRevokeArgs(args)
+	if !ok {
+		return 1
+	}
+	opts.manualInvocation = true
+	if opts.username == "" {
+		opts.username = a.selectUser()
+	}
+	if !validate.Username(opts.username) {
+		a.errorf("%s", a.P.M("用户名不合法，拒绝删除："+opts.username, "invalid username; refusing deletion: "+opts.username))
+		return 1
+	}
+	if !opts.yes {
+		_, registered, err := a.Registry.Lookup(opts.username)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取注册表失败，拒绝继续", "reading registry failed; refusing to continue"), err)
+			return 1
+		}
+		_, exists, err := a.lookupUser(opts.username)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝继续", "reading account database failed; refusing to continue"), err)
+			return 1
+		}
+		if exists {
+			if opts.force && !registered {
+				a.warnf("%s", a.P.M("危险：用户 "+opts.username+" 未登记，--force 将删除真实系统用户及其家目录。",
+					"DANGER: "+opts.username+" is not registered; --force will delete a real system user and its home directory."))
+			}
+			if a.prompt(a.P.M("请输入完整用户名 "+opts.username+" 以确认删除: ",
+				"type the full username "+opts.username+" to confirm deletion: ")) != opts.username {
+				a.warnf("%s", a.P.M("确认不匹配，已取消", "confirmation mismatch; cancelled"))
+				return 0
+			}
+			opts.liveConfirmed = true
+		}
+	}
+	return a.withLifecycleLock(func() int { return a.revokeOptionsLocked(opts) })
 }
 
-// revokeLocked performs one complete revoke while the process-wide lifecycle
-// lock is held. uninstall calls this form because it already holds that lock.
-func (a *App) revokeLocked(args []string) int {
+type revokeOptions struct {
+	username         string
+	confirmForce     string
+	expectedUID      int
+	generation       string
+	yes              bool
+	force            bool
+	liveConfirmed    bool
+	manualInvocation bool
+}
+
+func (a *App) parseRevokeArgs(args []string) (revokeOptions, bool) {
 	fs := flag.NewFlagSet("revoke", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	userFlag := fs.String("user", "", "")
-	confirmForce := fs.String("confirm-force", "", "")
-	expectedUID := fs.Int("expected-uid", 0, "")
-	generation := fs.String("generation", "", "")
-	var fYes, fForce bool
-	fs.BoolVar(&fYes, "yes", false, "")
-	fs.BoolVar(&fYes, "y", false, "")
-	fs.BoolVar(&fForce, "force", false, "")
+	var opts revokeOptions
+	fs.StringVar(&opts.username, "user", "", "")
+	fs.StringVar(&opts.confirmForce, "confirm-force", "", "")
+	fs.IntVar(&opts.expectedUID, "expected-uid", 0, "")
+	fs.StringVar(&opts.generation, "generation", "", "")
+	fs.BoolVar(&opts.yes, "yes", false, "")
+	fs.BoolVar(&opts.yes, "y", false, "")
+	fs.BoolVar(&opts.force, "force", false, "")
 	if err := fs.Parse(args); err != nil {
-		return 1
+		return revokeOptions{}, false
 	}
 	if fs.NArg() > 0 {
 		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
-		return 1
+		return revokeOptions{}, false
 	}
+	return opts, true
+}
 
-	username := *userFlag
-	if username == "" {
-		username = a.selectUser()
-	}
-	if !validate.Username(username) {
-		a.errorf("%s", a.P.M("用户名不合法，拒绝删除："+username, "invalid username; refusing deletion: "+username))
+// revokeLocked is the non-interactive form used by uninstall while it already
+// owns the lifecycle lock. The caller must supply --user and --yes.
+func (a *App) revokeLocked(args []string) int {
+	opts, ok := a.parseRevokeArgs(args)
+	if !ok {
 		return 1
 	}
+	if !opts.yes || !validate.Username(opts.username) {
+		a.errorf("%s", a.P.M("内部撤销必须提供合法用户名并禁用交互", "internal revoke requires a valid username and non-interactive confirmation"))
+		return 1
+	}
+	opts.liveConfirmed = true
+	return a.revokeOptionsLocked(opts)
+}
+
+// revokeOptionsLocked performs one complete revoke while the process-wide
+// lifecycle lock is held. Every identity and registry fact is read again here;
+// the lock-free preparation only collects operator intent.
+func (a *App) revokeOptionsLocked(opts revokeOptions) int {
+	username := opts.username
 
 	// One read gives every registry fact this path acts on: registration, the
 	// creation UID used to detect replacement/tampering, the generation token, and
@@ -59,30 +118,30 @@ func (a *App) revokeLocked(args []string) int {
 
 	// New scheduled jobs are bound to one account generation. A stale job exits
 	// successfully so systemd does not retry it against a replacement account.
-	if *generation != "" || *expectedUID != 0 {
-		if !validate.Generation(*generation) || *expectedUID < 1 {
+	if opts.generation != "" || opts.expectedUID != 0 {
+		if !validate.Generation(opts.generation) || !validate.AccountID(opts.expectedUID) {
 			a.errorf("%s", a.P.M("自动撤销身份参数不完整或不合法", "invalid or incomplete auto-revoke identity"))
 			return 1
 		}
-		if !registered || rec.Generation != *generation || rec.UID != *expectedUID {
+		if !registered || rec.Generation != opts.generation || rec.UID != opts.expectedUID {
 			a.warnf("%s", a.P.M("陈旧的自动撤销任务已忽略：账号世代不再匹配", "ignored stale auto-revoke task: account generation no longer matches"))
 			a.audit("account.delete", username, "skip", "stale scheduled generation", nil)
 			return 0
 		}
 	}
 
-	if !fForce && !registered {
+	if !opts.force && !registered {
 		a.errorf("%s", a.P.M("拒绝删除未登记用户："+username+"（如确需删除请加 --force）",
 			"refusing to delete an unregistered user: "+username+" (use --force if intended)"))
 		return 1
 	}
-	if fForce && !registered && fYes && *confirmForce != username {
+	if opts.force && !registered && opts.yes && opts.confirmForce != username {
 		a.errorf("%s", a.P.M("通过 --force --yes 删除未登记用户需同时传入 --confirm-force "+username,
 			"deleting an unregistered user via --force --yes also requires --confirm-force "+username))
 		return 1
 	}
 
-	pw, exists, err := user.Lookup(username)
+	pw, exists, err := a.lookupUser(username)
 	if err != nil {
 		a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝清理状态", "reading account database failed; refusing state cleanup"), err)
 		return 1
@@ -111,17 +170,31 @@ func (a *App) revokeLocked(args []string) int {
 		a.audit("account.cleanup", username, "ok", "user absent; cleaned registry/sudoers/sshd/schedule", nil)
 		return 0
 	}
+	if !opts.yes && !opts.liveConfirmed {
+		a.errorf("%s", a.P.M("确认后账号状态发生变化；拒绝删除，请重新运行并确认",
+			"the account appeared after confirmation; refusing deletion; rerun and confirm the current state"))
+		return 1
+	}
 
-	if !fYes {
-		if fForce && !registered {
-			a.warnf("%s", a.P.M("危险：用户 "+username+" 未登记，--force 将删除真实系统用户及其家目录。",
-				"DANGER: "+username+" is not registered; --force will delete a real system user and its home directory."))
+	// A pending row was written before useradd and never completed with a durable
+	// UID. The current account may be the half-created account, or an unrelated
+	// account that later reused the name; neither can be proved. Strip any
+	// name-scoped leftovers, but never turn this incomplete intent into authority to
+	// delete a live account and its home directory.
+	if registered && rec.Pending {
+		cleanupErr := errors.Join(
+			a.removeSudoGrant(username),
+			a.removeSSHDException(username),
+			a.Scheduler.Cancel(username, rec.AutoUnit),
+		)
+		a.errorf("%s", a.P.M(
+			"该登记仍处于创建中的 pending 状态，无法证明当前同名账号的身份；已保留账号和登记，请人工核查后处理。",
+			"the registry row is still a pending creation intent, so the current account's identity cannot be proved; the account and registry record were retained for manual recovery."))
+		if cleanupErr != nil {
+			a.errorf("%s: %v", a.P.M("清理 pending 账号的遗留授权或任务未完整完成", "cleanup of grants or schedules for the pending account did not complete"), cleanupErr)
 		}
-		if a.prompt(a.P.M("请输入完整用户名 "+username+" 以确认删除: ",
-			"type the full username "+username+" to confirm deletion: ")) != username {
-			a.warnf("%s", a.P.M("确认不匹配，已取消", "confirmation mismatch; cancelled"))
-			return 0
-		}
+		a.audit("account.delete", username, "fail", "pending creation identity is unverified", nil)
+		return 1
 	}
 
 	// Strip the privilege grants FIRST — before the protection gate can refuse and
@@ -134,14 +207,23 @@ func (a *App) revokeLocked(args []string) int {
 	// NOPASSWD sudo and an sshd exception.
 	grantErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 
-	protected, protectErr := user.IsProtectedRevokeTarget(username, registered, rec.UID)
-	if protectErr != nil {
-		a.errorf("%s: %v", a.P.M("无法确认目标账号身份，拒绝删除", "cannot verify target account identity; refusing deletion"), protectErr)
-		return 1
-	}
+	// Released v2 rows used one fixed GECOS marker, so username+UID+marker still
+	// cannot distinguish the original account from a same-name/same-UID replacement.
+	// Only a direct operator invocation with --force and an explicit full-name
+	// confirmation may recover such an account. Scheduled and uninstall-internal
+	// invocations never receive this exception even though they carry --force.
+	allowLegacy := registered && !rec.IdentityBound && opts.manualInvocation && opts.force &&
+		opts.generation == "" && opts.expectedUID == 0 &&
+		((!opts.yes && opts.liveConfirmed) || (opts.yes && opts.confirmForce == username))
+	protected := user.IsProtectedRevokeEntry(username, pw, true, registered, rec.UID, rec.Generation, allowLegacy)
 	if protected {
 		a.errorf("%s", a.P.M("拒绝删除受保护或系统用户："+username,
 			"refusing to delete a protected or system user: "+username))
+		if registered && !rec.IdentityBound && user.IsLegacyManagedEntry(pw) {
+			a.errorf("%s", a.P.M(
+				"该账号使用旧版固定身份标记，无法证明它仍是原账号。请人工核查后直接运行 revoke --user "+username+" --force，并输入完整用户名确认；非交互调用还必须传入 --yes --confirm-force "+username+"。",
+				"this account uses a legacy fixed identity marker and cannot be proved to be the original account. After manual inspection, invoke revoke --user "+username+" --force directly and type the full username; a non-interactive invocation must also pass --yes --confirm-force "+username+"."))
+		}
 		// Name the tamper if that is why: an account that rewrote its own UID (most
 		// dangerously to 0) is now protected by the very check meant to shield real
 		// accounts, and the operator has to clean it up by hand.
@@ -153,19 +235,44 @@ func (a *App) revokeLocked(args []string) int {
 		if grantErr != nil {
 			a.errorf("%s: %v", a.P.M("账号受保护且授权未完全移除", "the account is protected and its grants were not fully removed"), grantErr)
 		}
-		a.warnf("%s", a.P.M("自动删除任务保留；请人工核查，旧的一次性任务不会自动重试。",
-			"the auto-delete task is retained; inspect manually because legacy one-shot jobs do not retry."))
+		a.warnf("%s", a.P.M("自动删除任务保留；systemd 任务会按策略重试，at 和旧的一次性任务需人工核查。",
+			"the auto-delete task is retained; systemd jobs retry by policy, while at and legacy one-shot jobs require manual inspection."))
 		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
 		return 1
 	}
+
+	// Removing grants and reloading sshd can take long enough for an out-of-band
+	// administrator to replace the account. Do not disable one generation, signal
+	// another UID, and then userdel a third: require the complete passwd entry to be
+	// unchanged immediately before the destructive teardown.
+	current, stillExists, identityErr := a.lookupUser(username)
+	if identityErr != nil || !stillExists || current != pw {
+		if identityErr == nil {
+			identityErr = fmt.Errorf("account identity changed during revoke")
+		}
+		a.errorf("%s: %v", a.P.M("撤销期间账号身份发生变化，已移除可确认的授权但拒绝禁用、清场或删除账号",
+			"the account identity changed during revoke; confirmed grants were stripped, but login disable, process termination, and deletion were refused"), identityErr)
+		a.audit("account.delete", username, "fail", identityErr.Error(), nil)
+		return 1
+	}
+	pw = current
 
 	if grantErr != nil {
 		// Do not free the username while a name-scoped privilege file survives.
 		disableErr := a.Users.DisableLogin(username)
 		if disableErr == nil {
-			user.TerminateProcesses(pw.UID)
+			identityErr := a.accountStillMatches(username, pw)
+			if identityErr != nil {
+				a.errorf("%s: %v", a.P.M("授权未完全移除；账号身份在禁用登录后发生变化，拒绝按旧 UID 终止进程",
+					"grants were not fully removed; the account identity changed after login disable, so processes were not terminated under the old UID"), errors.Join(grantErr, identityErr))
+				return 1
+			}
+			terminateErr := a.terminateProcesses(pw.UID)
+			if terminateErr == nil {
+				terminateErr = a.accountStillMatches(username, pw)
+			}
 			a.errorf("%s: %v", a.P.M("授权未完全移除；账号已禁用但不会删除，以免残留授权在用户名复用时重新生效",
-				"grants were not fully removed; the account was disabled but not deleted so a surviving name-scoped grant cannot re-arm on reuse"), grantErr)
+				"grants were not fully removed; the account was disabled but not deleted so a surviving name-scoped grant cannot re-arm on reuse"), errors.Join(grantErr, terminateErr))
 		} else {
 			a.errorf("%s: %v", a.P.M("授权未完全移除，且禁用登录也失败；账号和登记均已保留，请立即人工处理",
 				"grants were not fully removed and disabling login also failed; the account and registry were retained for immediate manual recovery"), errors.Join(grantErr, disableErr))
@@ -173,23 +280,33 @@ func (a *App) revokeLocked(args []string) int {
 		return 1
 	}
 
-	// Shut the door before taking the account apart. Until this lands the account
-	// is still SSH-reachable, and a reconnect landing between the kill and the
-	// delete is exactly what used to make the delete fail.
-	if err := a.Users.DisableLogin(username); err != nil {
-		a.warnf("%s: %v", a.P.M("禁用登录失败，仍继续删除", "could not disable the login; continuing to delete anyway"), err)
-	}
-	user.TerminateProcesses(pw.UID)
-	if err := a.Users.Delete(username); err != nil {
-		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), err)
+	// Shut the door before taking the account apart. Until both expiry and password
+	// locking land, the account may still be SSH-reachable: in particular, a failed
+	// chage leaves public-key login open even when usermod -L succeeded. Never create
+	// a scan-then-delete race by continuing from a partial disable.
+	stage, teardownErr := a.teardownLocalAccount(username, pw)
+	switch stage {
+	case revokeDisableLogin:
+		a.errorf("%s: %v", a.P.M("无法完整禁用登录；保留账号、登记和自动删除任务，未终止进程或删除账号，请立即人工处理",
+			"could not fully disable the login; the account, registry record, and auto-delete task were retained, and no processes were terminated or account deleted; inspect immediately"), teardownErr)
+		a.audit("account.delete", username, "fail", "disable login incomplete: "+teardownErr.Error(), nil)
+		return 1
+	case revokeTerminateProcesses:
+		a.errorf("%s: %v", a.P.M("无法确认该 UID 的所有进程已终止；账号已禁用，保留账号、登记和自动删除任务，避免 UID 复用继承残留进程",
+			"could not confirm that every process for this UID was terminated; the account is disabled and its account, registry record, and auto-delete task were retained to prevent residual processes crossing a UID reuse"), teardownErr)
+		a.audit("account.delete", username, "fail", "process termination incomplete: "+teardownErr.Error(), nil)
+		return 1
+	case revokeDeleteAccount:
+		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), teardownErr)
 		// The auto-revoke task is deliberately still armed: it is the fallback that
 		// retries this deletion, and tearing it down on the way to a failure would
 		// leave the account with nothing coming for it. The login is already
 		// disabled, so the account cannot be used in the meantime.
 		a.warnf("%s", a.P.M("登录已禁用；systemd 任务会按策略重试，at/旧任务需手动重试。",
 			"the login is disabled; systemd jobs retry by policy, while at/legacy jobs require a manual retry."))
-		a.audit("account.delete", username, "fail", err.Error(), nil)
+		a.audit("account.delete", username, "fail", teardownErr.Error(), nil)
 		return 1
+	case revokeAccountRemoved:
 	}
 
 	// Only now that the account is provably gone is the fallback safe to remove.
@@ -201,9 +318,54 @@ func (a *App) revokeLocked(args []string) int {
 		a.errorf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
 		return 1
 	}
-	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(fForce), "registered": ynStr(registered)})
+	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(opts.force), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
 	return 0
+}
+
+type revokeAccountStage uint8
+
+const (
+	revokeDisableLogin revokeAccountStage = iota
+	revokeTerminateProcesses
+	revokeDeleteAccount
+	revokeAccountRemoved
+)
+
+// teardownLocalAccount preserves the ordering that makes UID reuse safe. A
+// stage is returned with the error so revoke can explain precisely which recovery
+// state was retained without repeating these security-sensitive calls.
+func (a *App) teardownLocalAccount(username string, expected user.Passwd) (revokeAccountStage, error) {
+	if err := a.Users.DisableLogin(username); err != nil {
+		return revokeDisableLogin, err
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return revokeTerminateProcesses, err
+	}
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		return revokeTerminateProcesses, err
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return revokeDeleteAccount, err
+	}
+	if err := a.Users.Delete(username); err != nil {
+		return revokeDeleteAccount, err
+	}
+	return revokeAccountRemoved, nil
+}
+
+// accountStillMatches prevents a multi-stage teardown from carrying facts from
+// the invited account across an out-of-band delete/recreate. userdel itself is
+// name-based, so re-check immediately before it as well as before the UID sweep.
+func (a *App) accountStillMatches(username string, expected user.Passwd) error {
+	current, exists, err := a.lookupUser(username)
+	if err != nil {
+		return fmt.Errorf("re-read account identity: %w", err)
+	}
+	if !exists || current != expected {
+		return fmt.Errorf("account identity changed during teardown")
+	}
+	return nil
 }
 
 // removeSudoGrant deletes any NOPASSWD drop-in this tool wrote for username. Like

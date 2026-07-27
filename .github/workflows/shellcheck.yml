@@ -7,12 +7,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: shellcheck-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   shellcheck:
+    name: ShellCheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install ShellCheck
         run: |
@@ -22,7 +29,7 @@ jobs:
       - name: Shell syntax
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/release.sh scripts/sign-release.sh
+          bash -n scripts/*.sh
 
       - name: ShellCheck
         run: shellcheck -S warning scripts/*.sh

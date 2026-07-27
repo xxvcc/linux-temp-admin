@@ -1,7 +1,8 @@
 package schedule
 
 import (
-	"path/filepath"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -28,13 +29,19 @@ import (
 // Globbing only the v2 prefix walks straight past it.
 func (s *Scheduler) UnitUsers() ([]string, error) {
 	seen := map[string]bool{}
-	for _, prefix := range s.unitPrefixes() {
-		matches, err := filepath.Glob(filepath.Join(s.SystemdDir, prefix+"*"))
-		if err != nil {
-			return nil, err
-		}
-		for _, path := range matches {
-			base := filepath.Base(path)
+	entries, err := readSystemdDir(s.SystemdDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read systemd unit directory %s: %w", s.SystemdDir, err)
+	}
+	for _, entry := range entries {
+		for _, prefix := range s.unitPrefixes() {
+			base := entry.Name()
+			if !strings.HasPrefix(base, prefix) {
+				continue
+			}
 			// Units come in .service/.timer pairs; both name the same account.
 			base = strings.TrimSuffix(strings.TrimSuffix(base, ".timer"), ".service")
 			user := strings.TrimPrefix(base, prefix)
@@ -53,6 +60,8 @@ func (s *Scheduler) UnitUsers() ([]string, error) {
 	return users, nil
 }
 
+var readSystemdDir = os.ReadDir
+
 // ScheduledUsers returns accounts named by either systemd units or queued at
 // jobs. This is the complete uninstall inventory even when registry rows vanish.
 func (s *Scheduler) ScheduledUsers() ([]string, error) {
@@ -64,19 +73,22 @@ func (s *Scheduler) ScheduledUsers() ([]string, error) {
 	for _, user := range users {
 		seen[user] = true
 	}
+	// `at` is optional. No installed backend footprint means there cannot be a
+	// runnable queue to inventory; a partial installation still calls AtJobs and
+	// fails closed below because it may leave live jobs hidden from teardown.
+	if !s.Sys.HasAt() {
+		return users, nil
+	}
 	jobs, err := s.Sys.AtJobs()
 	if err != nil {
 		return nil, err
 	}
-	prefix := s.InstallPath + " revoke --user "
 	for _, job := range jobs {
-		i := strings.Index(job.Body, prefix)
-		if i < 0 {
-			continue
-		}
-		fields := strings.Fields(job.Body[i+len(prefix):])
-		if len(fields) > 0 && validate.Username(fields[0]) {
-			seen[fields[0]] = true
+		for _, line := range strings.Split(job.Body, "\n") {
+			command, ok := parseAtRevokeCommand(line, s.InstallPath)
+			if ok {
+				seen[command.user] = true
+			}
 		}
 	}
 	users = users[:0]

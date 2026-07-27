@@ -7,6 +7,17 @@ import (
 	"time"
 )
 
+func TestNewDisablesEnvironmentProxy(t *testing.T) {
+	d := New()
+	transport, ok := d.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Client.Transport = %T; want *http.Transport", d.Client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("default detector must not route probes through environment proxies")
+	}
+}
+
 func TestPublicIPReturnsPublicAndSkipsPrivate(t *testing.T) {
 	// A service echoing a private IP must be skipped (it is not a public IP), even
 	// though it is a syntactically valid host; detection falls through to the next

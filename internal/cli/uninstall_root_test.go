@@ -3,14 +3,18 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/audit"
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
@@ -56,9 +60,9 @@ func uninstallApp(t *testing.T, in string, users ...string) (*App, *strings.Buil
 	a.Selfmanage = selfmanage.New(a.InstallPath, 0)
 	a.SSHD = nil // no sshd is touched by these tests
 	a.Scheduler = &schedule.Scheduler{
-		SystemdDir: mk("systemd", 0o755), InstallPath: a.InstallPath,
+		SystemdDir: mk("systemd", 0o755), SystemdTimerStateDir: mk("systemd-timer-state", 0o755), InstallPath: a.InstallPath,
 		UnitPrefix: config.AutoRevokeUnitPrefix, LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
-		Now: a.Now, Sys: fakeSys{}, UnderUnit: func(string) bool { return false },
+		Now: a.Now, Sys: fakeUninstallSystem{},
 	}
 	// Re-point the registry inside the state dir, so removing the state dir is the
 	// same act it is in production.
@@ -76,6 +80,20 @@ func mustWrite(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+type failingCancelSystem struct{ fakeSys }
+
+func (failingCancelSystem) RemoveAtJobsFor(string) error {
+	return errors.New("injected schedule cleanup failure")
+}
+
+// uninstallApp gives every systemd path a private temporary directory and every
+// systemctl operation a no-op implementation. Report systemctl as available so
+// Cancel can prove the fake timer stopped before deleting its files, matching the
+// production safety contract without ever contacting the host's PID 1.
+type fakeUninstallSystem struct{ fakeSys }
+
+func (fakeUninstallSystem) HasSystemctl() bool { return true }
 
 // TestTeardownNeverReadsTheRealPaths is the guard for every other test in this
 // file. If uninstall.go ever reaches for config.StateDir/config.AuditLogDir
@@ -97,6 +115,67 @@ func TestTeardownNeverReadsTheRealPaths(t *testing.T) {
 	}
 	if plan.binaryPath != a.InstallPath {
 		t.Errorf("plan.binaryPath = %q, want the injected %q", plan.binaryPath, a.InstallPath)
+	}
+}
+
+func TestTeardownRemovesLegacyPersistentTimerStamps(t *testing.T) {
+	a, _, _ := uninstallApp(t, "")
+	managed := filepath.Join(a.Scheduler.SystemdTimerStateDir,
+		"stamp-"+config.AutoRevokeUnitPrefix+"oldgone.timer")
+	legacy := filepath.Join(a.Scheduler.SystemdTimerStateDir,
+		"stamp-"+config.V1AutoRevokeUnitPrefix+"oldergone.timer")
+	unrelated := filepath.Join(a.Scheduler.SystemdTimerStateDir, "stamp-apt-daily.timer")
+	for _, path := range []string{managed, legacy, unrelated} {
+		mustWrite(t, path, "")
+	}
+
+	plan := a.teardownPlan(false, false)
+	if rc := a.teardown(plan, false, false); rc != 0 {
+		t.Fatal("teardown failed while removing legacy timer timestamps")
+	}
+	for _, path := range []string{managed, legacy} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("managed timer timestamp survived uninstall: %s", path)
+		}
+	}
+	if _, err := os.Lstat(unrelated); err != nil {
+		t.Fatalf("unrelated systemd timer timestamp was removed: %v", err)
+	}
+}
+
+func TestTeardownKeepsCommandAndStateWhenTimerStampCleanupFails(t *testing.T) {
+	a, _, _ := uninstallApp(t, "")
+	blocked := filepath.Join(a.Scheduler.SystemdTimerStateDir,
+		"stamp-"+config.AutoRevokeUnitPrefix+"blocked.timer")
+	if err := os.Mkdir(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := a.teardownPlan(false, false)
+	if rc := a.teardown(plan, false, false); rc != 1 {
+		t.Fatalf("teardown rc=%d, want timer timestamp cleanup failure", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("binary was removed after timer timestamp cleanup failed")
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatal("state was removed after timer timestamp cleanup failed")
+	}
+}
+
+func TestTeardownStopsWhenRevokeFailsWithoutDiskResidue(t *testing.T) {
+	a, _, _ := uninstallApp(t, "", "ltafailedrevoke1")
+	a.Scheduler.Sys = failingCancelSystem{}
+	plan := a.teardownPlan(false, false)
+
+	if rc := a.teardown(plan, false, false); rc != 1 {
+		t.Fatalf("teardown rc=%d, want failure after revoke failed", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("binary was removed after a failed revoke with no disk artifact")
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatal("state was removed after a failed revoke")
 	}
 }
 
@@ -218,8 +297,9 @@ func TestUninstallRemovesEverythingItNamed(t *testing.T) {
 	unit := filepath.Join(a.Scheduler.SystemdDir, config.AutoRevokeUnitPrefix+"ltafull-a1.timer")
 	mustWrite(t, unit, "[Timer]\n")
 
-	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 0 {
-		t.Fatalf("rc=%d, want 0 (stdout: %s)", rc, out.String())
+	result := a.uninstallResult([]string{"--yes", "--remove-users"})
+	if result.status != 0 || !result.applied {
+		t.Fatalf("result=%+v, want a successful applied uninstall (stdout: %s)", result, out.String())
 	}
 	for _, p := range []string{a.InstallPath, a.StateDir, a.Sudoers.FilePath("ltafull-a1"), unit} {
 		if _, err := os.Lstat(p); !os.IsNotExist(err) {
@@ -250,6 +330,123 @@ func TestUninstallKeepsTheAuditLogUnlessAskedTwice(t *testing.T) {
 	}
 	if _, err := os.Stat(b.AuditLogDir); !os.IsNotExist(err) {
 		t.Error("--purge-audit left the audit log behind")
+	}
+}
+
+func TestPurgeAuditFailureIsNonzeroAndKeepsLogger(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	logPath := filepath.Join(a.AuditLogDir, "audit.log")
+	a.Audit = &audit.Logger{
+		Dir: a.AuditLogDir, File: logPath, Now: a.Now,
+		Actor: func() (string, int) { return "integration", 0 },
+	}
+	logger := a.Audit
+	wantErr := errors.New("injected audit purge failure")
+	a.RemoveAll = func(path string) error {
+		if path == a.AuditLogDir {
+			return wantErr
+		}
+		return os.RemoveAll(path)
+	}
+
+	if rc := a.uninstall([]string{"--yes", "--purge-audit"}); rc != 1 {
+		t.Fatalf("rc=%d, want 1 when audit purge fails", rc)
+	}
+	if a.Audit != logger {
+		t.Fatal("audit logger was disabled after a failed purge")
+	}
+	if _, err := os.Lstat(a.InstallPath); !os.IsNotExist(err) {
+		t.Fatalf("binary should already be removed when purge fails: %v", err)
+	}
+	if !strings.Contains(errb.String(), wantErr.Error()) {
+		t.Fatalf("purge failure was not reported: %q", errb.String())
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(b), "audit purge failed") {
+		t.Fatalf("live logger did not retain the purge failure: err=%v log=%q", err, b)
+	}
+}
+
+func TestStateCleanupFailureIsNonzeroAndKeepsBinary(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	a.Lifecycle = lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	logPath := filepath.Join(a.AuditLogDir, "audit.log")
+	a.Audit = &audit.Logger{
+		Dir: a.AuditLogDir, File: logPath, Now: a.Now,
+		Actor: func() (string, int) { return "integration", 0 },
+	}
+	wantErr := errors.New("injected state cleanup failure")
+	a.RemoveAll = func(path string) error {
+		if path == a.StateDir {
+			return wantErr
+		}
+		return os.RemoveAll(path)
+	}
+
+	if rc := a.uninstall([]string{"--yes"}); rc != 1 {
+		t.Fatalf("rc=%d, want 1 when state cleanup is incomplete", rc)
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatalf("binary must remain available to retry state cleanup: %v", err)
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatalf("failed state directory should remain for manual recovery: %v", err)
+	}
+	if stopped, err := a.Lifecycle.IsUninstalled(); err != nil || !stopped {
+		t.Fatalf("state cleanup failure did not leave the fail-closed uninstall marker: stopped=%v err=%v", stopped, err)
+	}
+	if !strings.Contains(errb.String(), wantErr.Error()) {
+		t.Fatalf("state cleanup failure was not reported: %q", errb.String())
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(b), `"result":"fail"`) || !strings.Contains(string(b), "state directory cleanup failed") {
+		t.Fatalf("audit did not record the partial uninstall as failure: err=%v log=%q", err, b)
+	}
+}
+
+func TestUninstallRefusesIfInventoryChangesAfterConfirmation(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	lock := lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	release, err := lock.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Lifecycle = lock
+	shown := newNotifyingBuffer("The uninstall will remove")
+	a.Out = shown
+	done := make(chan int, 1)
+	go func() { done <- a.uninstall([]string{"--yes"}) }()
+	select {
+	case <-shown.seen:
+	case <-time.After(2 * time.Second):
+		_ = release()
+		t.Fatal("uninstall did not show its pre-lock inventory")
+	}
+
+	const name = "ltaplanchange1"
+	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rc := <-done:
+		if rc != 1 {
+			t.Fatalf("uninstall rc=%d, want changed-inventory refusal", rc)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("uninstall did not finish after the lifecycle lock was released")
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatalf("binary changed after inventory mismatch: %v", err)
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatalf("state changed after inventory mismatch: %v", err)
+	}
+	if _, err := os.Stat(a.Sudoers.FilePath(name)); err != nil {
+		t.Fatalf("new witness was touched despite inventory mismatch: %v", err)
+	}
+	if !strings.Contains(errb.String(), "inventory changed after confirmation") {
+		t.Fatalf("inventory mismatch was not explained: %q", errb.String())
 	}
 }
 
@@ -321,16 +518,15 @@ func TestUninstallRefusesFromTheAccountItWouldDelete(t *testing.T) {
 	}
 }
 
-// TestUninstallRemovesAWitnessOnlyAccount is the case the whole "union of
-// witnesses" idea exists for, and the one revoke's own guard turns away. An
-// account can be real and live yet have no registry row — the row was lost, or it
-// is a v1 account, or only its sudo grant still names it. teardown must delete it.
+// TestUninstallRemovesAWitnessOnlyArtifact is the case the whole "union of
+// witnesses" idea exists for: the registry row and account are gone, but a
+// passwordless sudo grant still names them. The stale grant must be found and
+// removed before the installed command can safely disappear.
 //
-// Bare `revoke --user X --yes` REFUSES an unregistered account ("use --force"),
-// so a teardown that reuses revoke without --force strands exactly the account
-// the inventory worked hardest to find, and the uninstall can then never complete
-// (the survivor blocks the binary, correctly, forever).
-func TestUninstallRemovesAWitnessOnlyAccount(t *testing.T) {
+// A live account with only a name-scoped artifact is deliberately a different
+// case: the name may have been reused, so only a completed v2 UID record can
+// authorize deleting that account (see TestUninstallDoesNotDeleteLiveAccountNamedOnlyByArtifact).
+func TestUninstallRemovesAWitnessOnlyArtifact(t *testing.T) {
 	const name = "ltawitness1"
 	a, _, _ := uninstallApp(t, "")
 	a.Users = user.New()
@@ -338,18 +534,11 @@ func TestUninstallRemovesAWitnessOnlyAccount(t *testing.T) {
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
-		t.Fatalf("useradd: %v: %s", err, out)
-	}
-	// No registry row. The account exists only because a sudo grant names it — the
-	// witness an account cannot drop without dropping the root it is keeping.
+	// No registry row or account. Only the durable privilege artifact remains.
 	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
 
 	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 0 {
-		t.Fatalf("rc=%d, want 0: a witness-only account must be removable, not a permanent blocker", rc)
-	}
-	if mustUserExists(t, name) {
-		t.Error("the witness-only account survived the uninstall")
+		t.Fatalf("rc=%d, want 0: a witness-only artifact must be removable, not a permanent blocker", rc)
 	}
 	if _, err := os.Stat(a.Sudoers.FilePath(name)); !os.IsNotExist(err) {
 		t.Error("its NOPASSWD grant survived")
@@ -397,6 +586,42 @@ func TestUninstallRefusesMalformedV1Registry(t *testing.T) {
 	if !strings.Contains(errb.String(), "invalid username") {
 		t.Errorf("malformed row was not reported: %q", errb.String())
 	}
+}
+
+func TestV1RegistryRefusesSymlinkAndOversizedInput(t *testing.T) {
+	t.Run("symlink", func(t *testing.T) {
+		a, _, _ := uninstallApp(t, "")
+		target := filepath.Join(t.TempDir(), "registry")
+		if err := os.WriteFile(target, []byte("xxvcc-a1\tdata\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile))
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.v1RegistryUsers(); err == nil {
+			t.Fatal("symlinked v1 registry was accepted")
+		}
+	})
+
+	t.Run("oversized", func(t *testing.T) {
+		a, _, _ := uninstallApp(t, "")
+		path := filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile))
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(maxV1RegistryBytes + 1); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.v1RegistryUsers(); err == nil || !strings.Contains(err.Error(), "byte limit") {
+			t.Fatalf("oversized v1 registry error = %v, want bounded-read refusal", err)
+		}
+	})
 }
 
 // TestUninstallBlocksOnAnUnremovableGrant is HIGH #2. The survivor check used to
@@ -488,6 +713,27 @@ func TestUninstallRefusesEarlyOnAnUnremovableBinary(t *testing.T) {
 	}
 }
 
+func TestUninstallForceRefusesDirectoryBeforeTeardown(t *testing.T) {
+	a, _, errb := uninstallApp(t, "")
+	if err := os.Remove(a.InstallPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(a.InstallPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(a.InstallPath, "unrelated"), "keep\n")
+
+	if rc := a.uninstall([]string{"--yes", "--force"}); rc != 1 {
+		t.Fatalf("rc=%d, want early refusal for a directory at the install path", rc)
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatal("state directory was removed before the install-path directory refusal")
+	}
+	if !strings.Contains(errb.String(), "is a directory") {
+		t.Fatalf("stderr did not explain the directory blocker: %q", errb.String())
+	}
+}
+
 // TestCompactSweepsOrphanedUnits is HIGH #5. Scheduler.Orphans mirrors the
 // sudoers/sshd sweeps, but until now nothing called it: doctor reported an
 // orphaned auto-revoke unit as clean and cleanup-expired --compact never removed
@@ -516,6 +762,26 @@ func TestCompactSweepsOrphanedUnits(t *testing.T) {
 	}
 }
 
+func TestCompactRetainsRegistryWhenOrphanScanFails(t *testing.T) {
+	const name = "ltacompactwitness"
+	a, _, errb := uninstallApp(t, "", name)
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.Sudoers.Dir = blocked
+
+	if rc := a.compact(); rc != 1 {
+		t.Fatalf("compact rc=%d, want 1 when an orphan inventory is unreadable", rc)
+	}
+	if found, err := a.Registry.Contains(name); err != nil || !found {
+		t.Fatalf("registry witness was compacted after a failed scan: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(errb.String(), "registry was not compacted") {
+		t.Fatalf("compact did not explain that it retained recovery evidence: %q", errb.String())
+	}
+}
+
 // TestCompactSweepsAGrantWhoseNameARealAccountReused is the MEDIUM name-reuse
 // detection gap. The orphan sweeps used a bare user.Exists, so a managed grant
 // whose temp account is gone but whose NAME a real, unmanaged account later took
@@ -530,9 +796,9 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	// A REAL, unmanaged account that happens to carry a temp-shaped name — no
-	// managed GECOS, no registry row vouching for it.
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "Real Person", name).CombinedOutput(); err != nil {
+	// A real replacement can set its own GECOS full-name field. Without a current
+	// registry identity, even an exact managed marker must not hide the stale grant.
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
 	grant := a.Sudoers.FilePath(name)
@@ -545,6 +811,46 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 	}
 	if !mustUserExists(t, name) {
 		t.Error("compact must strip the grant but never delete the real account")
+	}
+}
+
+func TestCompactPreservesArtifactsForLiveLegacyIdentity(t *testing.T) {
+	const name = "ltalegacycompact1"
+	a, out, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	pw, ok := mustUserLookup(t, name)
+	if !ok {
+		t.Fatal("legacy account was not found")
+	}
+	if err := a.Registry.Record(registry.Record{User: name, Host: "203.0.113.5", Port: 22, UID: pw.UID}); err != nil {
+		t.Fatal(err)
+	}
+	grant := a.Sudoers.FilePath(name)
+	mustWrite(t, grant, name+" ALL=(ALL) NOPASSWD:ALL\n")
+	if rc := a.status([]string{"--user", name}); rc != 0 {
+		t.Fatalf("status rc=%d", rc)
+	}
+	if !strings.Contains(out.String(), "managed=false identity=legacy-unverified") {
+		t.Fatalf("status hid the weak legacy identity: %q", out.String())
+	}
+	_ = a.doctor(nil)
+	if !strings.Contains(errb.String(), "legacy fixed identity marker") {
+		t.Fatalf("doctor hid the weak legacy identity: %q", errb.String())
+	}
+	if rc := a.compact(); rc != 0 {
+		t.Fatalf("compact rc=%d, want legacy account preserved", rc)
+	}
+	if _, err := os.Stat(grant); err != nil {
+		t.Fatalf("compact removed a live legacy account's grant: %v", err)
+	}
+	if found, err := a.Registry.Contains(name); err != nil || !found {
+		t.Fatalf("compact removed a live legacy registry row: found=%v err=%v", found, err)
 	}
 }
 
@@ -573,7 +879,7 @@ func TestDoctorReportsAutoDeleteAccountsWithNoTaskLeft(t *testing.T) {
 	if rc := a.doctor(nil); rc != 1 {
 		t.Errorf("doctor rc=%d, want 1", rc)
 	}
-	if !strings.Contains(errb.String(), "no task left") {
+	if !strings.Contains(errb.String(), "no valid task left") {
 		t.Errorf("doctor did not surface the taskless auto-delete account: %q", errb.String())
 	}
 	for _, name := range []string{systemdName, atName} {
@@ -624,7 +930,9 @@ func TestDoctorShowsVersions(t *testing.T) {
 	t.Run("installed version mismatch is warned", func(t *testing.T) {
 		a, _, errb := uninstallApp(t, "")
 		writeStub(t, a.InstallPath, "0.0.1-stale")
-		a.doctor(nil)
+		if rc := a.doctor(nil); rc != 1 {
+			t.Errorf("doctor rc=%d, want 1 for a version mismatch", rc)
+		}
 		if !strings.Contains(errb.String(), "differs from the running") {
 			t.Errorf("doctor did not flag the version mismatch: %q", errb.String())
 		}
@@ -633,11 +941,59 @@ func TestDoctorShowsVersions(t *testing.T) {
 	t.Run("no installed command is warned", func(t *testing.T) {
 		a, _, errb := uninstallApp(t, "")
 		writeStub(t, a.InstallPath, "") // remove it
-		a.doctor(nil)
+		if rc := a.doctor(nil); rc != 1 {
+			t.Errorf("doctor rc=%d, want 1 for a missing installed command", rc)
+		}
 		if !strings.Contains(errb.String(), "not installed") {
 			t.Errorf("doctor did not report the missing installed command: %q", errb.String())
 		}
 	})
+}
+
+func TestDoctorReportsUntrustedRegistryIdentities(t *testing.T) {
+	const (
+		pendingName = "ltadocpending"
+		markerName  = "ltadocmarker"
+		legacyName  = "ltadoclegacy"
+	)
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+
+	newRealAccount(t, a, pendingName)
+	rec, _, err := a.Registry.Lookup(pendingName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Pending = true
+	if err := a.Registry.Record(rec); err != nil {
+		t.Fatal(err)
+	}
+
+	newRealAccount(t, a, markerName)
+	if out, err := exec.Command("usermod", "-c", "Real Person", markerName).CombinedOutput(); err != nil {
+		t.Fatalf("usermod: %v: %s", err, out)
+	}
+
+	newRealAccount(t, a, legacyName)
+	legacy, _, err := a.Registry.Lookup(legacyName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy.UID = 0
+	legacy.IdentityBound = false
+	if err := a.Registry.Record(legacy); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc=%d, want 1 for untrusted registry identities", rc)
+	}
+	got := errb.String()
+	for _, want := range []string{pendingName, markerName, legacyName, "pending creation", "managed identity marker", "no trusted UID"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("doctor output missing %q: %q", want, got)
+		}
+	}
 }
 
 func buildinfoVersion() string { return buildinfo.Version }
@@ -664,5 +1020,166 @@ func TestUninstallCompletesWithAStaleV1RegistryRow(t *testing.T) {
 	}
 	if _, err := os.Lstat(a.StateDir); !os.IsNotExist(err) {
 		t.Error("the state dir (with the stale v1 row) should have been removed")
+	}
+}
+
+func TestUninstallDoesNotDeleteLiveAccountNamedOnlyByStaleV1Row(t *testing.T) {
+	const name = "ltav1reuse1"
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	mustWrite(t, filepath.Join(a.StateDir, filepath.Base(config.V1RegistryFile)),
+		name+"\t2020-01-01\tstale\n")
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+		t.Fatalf("uninstall rc=%d, want refusal for an identity-unverified live v1 name", rc)
+	}
+	if !mustUserExists(t, name) {
+		t.Fatal("live account was deleted solely because a stale v1 row reused its name")
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("binary was removed while the identity-unverified account remained")
+	}
+	if !strings.Contains(errb.String(), "without a current generation-bound identity record") {
+		t.Fatalf("refusal did not explain the v1 identity gap: %q", errb.String())
+	}
+}
+
+func TestUninstallDoesNotBulkDeleteLegacyV2Identity(t *testing.T) {
+	const (
+		name       = "ltalegacyuninst1"
+		generation = "cccccccccccccccccccccccccccccccc"
+	)
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	pw, ok := mustUserLookup(t, name)
+	if !ok {
+		t.Fatal("legacy account was not found")
+	}
+	if err := a.Registry.Record(registry.Record{
+		User: name, Host: "203.0.113.5", Port: 22, UID: pw.UID, Generation: generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+		t.Fatalf("uninstall rc=%d, want legacy identity refusal", rc)
+	}
+	if !mustUserExists(t, name) {
+		t.Fatal("bulk uninstall deleted a legacy fixed-marker account")
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("binary was removed while a legacy account required manual recovery")
+	}
+	if !strings.Contains(errb.String(), "identity") {
+		t.Fatalf("uninstall did not explain the legacy identity blocker: %q", errb.String())
+	}
+}
+
+func TestUninstallDoesNotDeleteLiveAccountNamedOnlyByArtifact(t *testing.T) {
+	const name = "ltaartifact1"
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+		t.Fatalf("uninstall rc=%d, want refusal for an artifact-only live name", rc)
+	}
+	if !mustUserExists(t, name) {
+		t.Fatal("live account was deleted solely because an old artifact reused its name")
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("binary was removed while the identity-unverified account remained")
+	}
+	if !strings.Contains(errb.String(), "without a current generation-bound identity record") {
+		t.Fatalf("refusal did not explain the missing identity record: %q", errb.String())
+	}
+}
+
+func TestRevokeDoesNotDeleteLiveAccountNamedByPendingIntent(t *testing.T) {
+	const name = "ltapending1"
+	a, _, errb := uninstallApp(t, "")
+	a.Users = user.New()
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	if err := a.Registry.Record(registry.Record{User: name, Port: 22, Pending: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if rc := a.revoke([]string{"--user", name, "--yes"}); rc != 1 {
+		t.Fatalf("revoke rc=%d, want refusal for pending identity", rc)
+	}
+	if !mustUserExists(t, name) {
+		t.Fatal("pending creation intent authorized deletion of a live account")
+	}
+	if _, found, err := a.Registry.Lookup(name); err != nil || !found {
+		t.Fatalf("pending recovery witness was not retained: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(errb.String(), "pending creation intent") {
+		t.Fatalf("refusal did not explain pending identity: %q", errb.String())
+	}
+}
+
+func TestUninstallRequiresCompletedMatchingV2IdentityForLiveAccounts(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pending bool
+		uid     func(actual int) int
+	}{
+		{name: "ltalowid1", uid: func(int) int { return 0 }},
+		{name: "ltapending2", pending: true, uid: func(actual int) int { return actual }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, errb := uninstallApp(t, "")
+			a.Users = user.New()
+			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
+			rm()
+			t.Cleanup(rm)
+			if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, tc.name).CombinedOutput(); err != nil {
+				t.Fatalf("useradd: %v: %s", err, out)
+			}
+			pw, exists := mustUserLookup(t, tc.name)
+			if !exists {
+				t.Fatal("fixture account was not found")
+			}
+			if err := a.Registry.Record(registry.Record{
+				User: tc.name, Port: 22, UID: tc.uid(pw.UID), Pending: tc.pending,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if rc := a.uninstall([]string{"--yes", "--remove-users"}); rc != 1 {
+				t.Fatalf("uninstall rc=%d, want identity refusal", rc)
+			}
+			if !mustUserExists(t, tc.name) {
+				t.Fatal("incomplete v2 row authorized deletion of a live account")
+			}
+			if _, err := os.Stat(a.InstallPath); err != nil {
+				t.Fatal("binary was removed while an identity-unverified account remained")
+			}
+			if !strings.Contains(errb.String(), "without a current generation-bound identity record") {
+				t.Fatalf("identity refusal was not explained: %q", errb.String())
+			}
+		})
 	}
 }

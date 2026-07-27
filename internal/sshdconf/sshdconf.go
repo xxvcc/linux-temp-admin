@@ -1,11 +1,14 @@
 // Package sshdconf grants and removes a per-account sshd exception, so an invite
 // can work on a server that does not accept public-key logins by default.
 //
-// The exception is a drop-in file of its own, containing nothing but a
-// `Match User <account>` block. That shape is the whole design:
+// The exception is a drop-in file of its own, containing a
+// `Match User <account>` block followed by an empty `Match all` scope reset.
+// That shape is the whole design:
 //
 //   - The global policy is never edited. Every other account on the host keeps
-//     the operator's baseline, byte for byte.
+//     the operator's baseline, byte for byte. The final scope reset is required
+//     because Match state persists between files expanded by one Include glob;
+//     without it, this early-sorting drop-in would capture later global entries.
 //   - "Restoring" is deleting our own file. There is no backup to keep, so the
 //     tool can never clobber a change the operator (or their config management)
 //     made in the days between the invite and its expiry, and it can never
@@ -30,6 +33,7 @@ package sshdconf
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,11 +41,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"golang.org/x/sys/unix"
 )
 
 // filePrefix namespaces the drop-in files this tool manages. The "10-" sorts the
@@ -49,6 +56,21 @@ import (
 // host already had: for a directive set in more than one matching Match block,
 // sshd keeps the first value it obtained.
 const filePrefix = "10-" + config.ManagedTag + "-"
+
+const removePendingSuffix = ".remove-pending"
+
+var (
+	sshdCheckOptions = executil.Options{
+		Timeout:   10 * time.Second,
+		MaxOutput: 256 << 10,
+		ExtraEnv:  []string{"LC_ALL=C", "LANG=C"},
+	}
+	sshdReloadOptions = executil.Options{
+		Timeout:   30 * time.Second,
+		MaxOutput: 256 << 10,
+		ExtraEnv:  []string{"LC_ALL=C", "LANG=C"},
+	}
+)
 
 // DefaultDir is where sshd's per-file configuration drop-ins live.
 const DefaultDir = "/etc/ssh/sshd_config.d"
@@ -60,10 +82,11 @@ const DefaultLock = "/run/" + config.ManagedTag + "-sshd.lock"
 // ErrNoReloadMechanism means there was no running sshd to notify: no init system
 // took the reload, and no live sshd process could be found to signal.
 //
-// It is not a failure. A socket-activated sshd (and one that simply is not
-// running) starts a fresh process per connection and reads the new configuration
-// then. But it is not a success either: we cannot say the running daemon adopted
-// the change, so a caller must not go on to claim the login is verified.
+// A socket-activated sshd (and one that simply is not running) starts a fresh
+// process per connection and reads the new configuration then, so a grant may
+// remain on disk as explicitly unverified. A removal is different: this error
+// cannot prove that an undiscovered long-running daemon stopped using the old
+// name-scoped exception, so the pending removal must be retained for retry.
 var ErrNoReloadMechanism = errors.New("no running sshd could be asked to re-read its configuration")
 
 // GrantResult describes what a grant actually achieved.
@@ -85,7 +108,7 @@ type Manager struct {
 	Validate   func() error                                   // syntax check (default: sshd -t)
 	Effective  func(user string) (*sysinfo.SSHDConfig, error) // effective config (default: sshd -T -C user=)
 	Reload     func() error                                   // ask sshd to re-read its config
-	RemoveFile func(path string) error                        // defaults to os.Remove; injectable for rollback tests
+	RemoveFile func(path string) error                        // defaults to durable unlink; injectable for rollback tests
 }
 
 // New returns a Manager for the real /etc/ssh/sshd_config.d.
@@ -96,7 +119,7 @@ func New() *Manager {
 		Validate:   sshdSyntaxCheck,
 		Effective:  sysinfo.SSHDEffective,
 		Reload:     reload,
-		RemoveFile: os.Remove,
+		RemoveFile: fsutil.RemoveFile,
 	}
 }
 
@@ -142,23 +165,38 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			}
 		}
 		path := m.FilePath(user)
+		rollback := func(cause error, restoreDaemon bool) error {
+			pendingExisted, staged, err := m.stageRemovalLocked(path)
+			if err != nil {
+				return errors.Join(cause, fmt.Errorf("stage failed sshd grant removal: %w", err))
+			}
+			if !staged {
+				return cause
+			}
+			// Before the first reload attempt, a newly-created drop-in cannot be in
+			// daemon memory. Its unlink still goes through the durable marker protocol,
+			// but no reload is needed unless this call inherited older pending state.
+			if !restoreDaemon && !pendingExisted {
+				if err := clearPending(path + removePendingSuffix); err != nil {
+					return errors.Join(cause, fmt.Errorf("complete failed sshd grant removal: %w", err))
+				}
+				return cause
+			}
+			if err := m.finishRemovalLocked(path); err != nil {
+				return errors.Join(cause, fmt.Errorf("restore sshd after failed grant: %w", err))
+			}
+			return cause
+		}
 		if err := fsutil.WriteRootFile(path, content, 0o644); err != nil {
+			var committed *fsutil.DurabilityError
+			if errors.As(err, &committed) {
+				return rollback(err, false)
+			}
 			return err
 		}
 		// Everything below reads the config from disk, so the grant is proved correct
 		// before the running sshd is asked to adopt it. Until the reload, the running
 		// daemon has not seen this file at all, so removing it fully undoes the grant.
-		rollback := func(cause error, restoreDaemon bool) error {
-			var rollbackErrs []error
-			if err := m.removeFile(path); err != nil {
-				rollbackErrs = append(rollbackErrs, fmt.Errorf("remove failed sshd drop-in %s: %w", path, err))
-			} else if restoreDaemon && m.Reload != nil {
-				if err := m.Reload(); err != nil {
-					rollbackErrs = append(rollbackErrs, fmt.Errorf("restore sshd after failed reload: %w", err))
-				}
-			}
-			return errors.Join(append([]error{cause}, rollbackErrs...)...)
-		}
 		if m.Validate != nil {
 			if err := m.Validate(); err != nil {
 				return rollback(fmt.Errorf("sshd rejected the configuration this grant produced: %w", err), false)
@@ -206,7 +244,8 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 // blindly — like the sudoers drop-in next to it, it only ever removes the
 // managed file for this one account — so revoke need not know whether a grant
 // was ever made. Removing a file that is not there is not an error and does not
-// disturb sshd.
+// disturb sshd unless a pending marker says an earlier removal still needs to
+// be adopted by the running daemon.
 func (m *Manager) Remove(user string) error {
 	if !validate.Username(user) {
 		return fmt.Errorf("refusing to remove an sshd drop-in for invalid username %q", user)
@@ -216,90 +255,213 @@ func (m *Manager) Remove(user string) error {
 		return fmt.Errorf("refusing to remove an unmanaged file: %s", path)
 	}
 	return m.withLock(func() error {
-		if _, err := os.Lstat(path); err != nil {
-			if os.IsNotExist(err) {
-				return nil // nothing was granted; do not disturb sshd
-			}
+		_, staged, err := m.stageRemovalLocked(path)
+		if err != nil {
 			return err
 		}
-		if err := m.removeFile(path); err != nil {
-			return err
+		if !staged {
+			return nil // nothing was granted; do not disturb sshd
 		}
-		// The exception is gone from disk — the removal itself has succeeded, and the
-		// caller must not be told otherwise. What remains is whether the running sshd
-		// can safely be asked to notice.
-		//
-		// It must NOT be asked if the host's config is invalid, and the invalid part
-		// is very unlikely to be ours (we just deleted our only file). A reload
-		// re-execs sshd against what is on disk: if an operator left a typo in
-		// sshd_config this afternoon and never reloaded, the running daemon is still
-		// happily serving its old in-memory config — and this reload, fired at 3am by
-		// an unattended auto-revoke timer, would be the thing that finally takes SSH
-		// off the machine. A missed reload is recoverable. A dead sshd on a remote
-		// box is not.
-		if m.Validate != nil {
-			if err := m.Validate(); err != nil {
-				return fmt.Errorf("the sshd exception was removed, but sshd was NOT reloaded: the host's sshd configuration is invalid and a reload would take sshd down: %w", err)
-			}
-		}
-		if m.Reload != nil {
-			if err := m.Reload(); err != nil && !errors.Is(err, ErrNoReloadMechanism) {
-				return fmt.Errorf("the sshd exception was removed, but the reload failed: %w", err)
-			}
-		}
-		return nil
+		return m.finishRemovalLocked(path)
 	})
+}
+
+// stageRemovalLocked records durable retry state, then durably removes path.
+// It returns whether a marker predated this call and whether there was any state
+// to remove. The caller must hold m's lock through the eventual finish/clear.
+func (m *Manager) stageRemovalLocked(path string) (pendingExisted, staged bool, err error) {
+	pending := path + removePendingSuffix
+	dropInExists, err := pathExists(path)
+	if err != nil {
+		return false, false, err
+	}
+	pendingExists, err := pathExists(pending)
+	if err != nil {
+		return false, false, err
+	}
+	if !dropInExists && !pendingExists {
+		return false, false, nil
+	}
+	if pendingExists {
+		if err := validatePending(pending); err != nil {
+			return true, true, fmt.Errorf("unsafe pending sshd removal: %w", err)
+		}
+	}
+	if !dropInExists {
+		return pendingExists, true, nil
+	}
+	// The marker is empty, so even an unusually broad Include cannot turn it into
+	// an sshd directive; its non-.conf suffix also keeps it out of the normal glob.
+	// WriteRootFile syncs the directory before the policy file is unlinked.
+	if !pendingExists {
+		if err := fsutil.WriteRootFile(pending, nil, 0o600); err != nil {
+			return false, true, fmt.Errorf("record pending sshd reload: %w", err)
+		}
+	}
+	if err := m.removeFile(path); err != nil {
+		return pendingExists, true, fmt.Errorf("remove failed sshd drop-in %s: %w", path, err)
+	}
+	if stillExists, err := pathExists(path); err != nil {
+		return pendingExists, true, err
+	} else if stillExists {
+		return pendingExists, true, fmt.Errorf("remove reported success but sshd exception still exists: %s", path)
+	}
+	if err := syncParent(path); err != nil {
+		return pendingExists, true, fmt.Errorf("sync removed sshd exception: %w", err)
+	}
+	return pendingExists, true, nil
+}
+
+// finishRemovalLocked validates the post-removal host config, requires a
+// confirmed reload, and only then clears the retry marker.
+func (m *Manager) finishRemovalLocked(path string) error {
+	if m.Validate == nil {
+		return fmt.Errorf("the sshd exception was removed, but no configuration validator is available")
+	}
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("the sshd exception was removed, but sshd was NOT reloaded: the host's sshd configuration is invalid and a reload would take sshd down: %w", err)
+	}
+	if m.Reload == nil {
+		return fmt.Errorf("the sshd exception was removed, but its removal could not be confirmed: %w", ErrNoReloadMechanism)
+	}
+	if err := m.Reload(); err != nil {
+		if errors.Is(err, ErrNoReloadMechanism) {
+			return fmt.Errorf("the sshd exception was removed, but its removal could not be confirmed: %w", err)
+		}
+		return fmt.Errorf("the sshd exception was removed, but the reload failed: %w", err)
+	}
+	return clearPending(path + removePendingSuffix)
+}
+
+func clearPending(pending string) error {
+	if err := fsutil.RemoveFile(pending); err != nil {
+		return fmt.Errorf("clear pending sshd reload: %w", err)
+	}
+	return nil
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Lstat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func syncParent(path string) error {
+	dir, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+func validatePending(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot stat %s", path)
+	}
+	if st.Uid != 0 || st.Gid != 0 {
+		return fmt.Errorf("%s is not owned by root:root (owner %d:%d)", path, st.Uid, st.Gid)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		return fmt.Errorf("%s has mode %o, want 600", path, fi.Mode().Perm())
+	}
+	if fi.Size() != 0 {
+		return fmt.Errorf("%s is not empty", path)
+	}
+	return nil
 }
 
 func (m *Manager) removeFile(path string) error {
 	if m.RemoveFile != nil {
 		return m.RemoveFile(path)
 	}
-	return os.Remove(path)
+	return fsutil.RemoveFile(path)
 }
 
-// Orphans returns the accounts whose managed drop-in is still on disk although
-// the account itself is gone. A grant
-// outlives its account only if something went wrong (a revoke run by an older
-// binary that did not know about these files, or an account deleted out of
-// band), and an orphan is a standing loosening of sshd policy that re-arms the
-// moment the username is reused — so something has to be able to find them.
 // All returns every account this tool has an sshd exception for, whether or not
-// the account still exists. Orphans answers "which exceptions outlived their
-// account", which is the wrong question for a teardown: an exception whose
-// account is alive is precisely what has to go.
+// the account still exists. A pending removal is included too: its drop-in is
+// already gone, but the running daemon may still hold the exception until a
+// retry validates and reloads sshd.
 func (m *Manager) All() ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*.conf"))
+	entries, err := readDir(m.Dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan sshd drop-in directory %s: %w", m.Dir, err)
+	}
+	users := make(map[string]struct{})
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, filePrefix) {
+			continue
+		}
+		var suffix string
+		switch {
+		case strings.HasSuffix(name, ".conf"+removePendingSuffix):
+			suffix = ".conf" + removePendingSuffix
+		case strings.HasSuffix(name, ".conf"):
+			suffix = ".conf"
+		default:
+			continue
+		}
+		user := strings.TrimSuffix(strings.TrimPrefix(name, filePrefix), suffix)
+		if user == "" || !validate.Username(user) {
+			return nil, fmt.Errorf("managed sshd artifact has an invalid account name: %s", filepath.Join(m.Dir, name))
+		}
+		users[user] = struct{}{}
+	}
+	out := make([]string, 0, len(users))
+	for user := range users {
+		out = append(out, user)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+var readDir = readDirectory
+
+func readDirectory(path string) ([]os.DirEntry, error) {
+	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, err
 	}
-	var users []string
-	for _, path := range matches {
-		user := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), filePrefix), ".conf")
-		if user != "" && validate.Username(user) {
-			users = append(users, user)
-		}
-	}
-	sort.Strings(users)
-	return users, nil
+	entries, readErr := dir.ReadDir(-1)
+	closeErr := dir.Close()
+	return entries, errors.Join(readErr, closeErr)
 }
 
+// Orphans returns the accounts whose managed drop-in or pending daemon reload
+// outlived the account itself. A grant outlives its account only if something
+// went wrong (a revoke run by an older binary that did not know about these
+// files, or an account deleted out of band), and the exception can re-arm the
+// moment the username is reused — so cleanup must be able to find it.
 func (m *Manager) Orphans(exists func(string) (bool, error)) ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(m.Dir, filePrefix+"*.conf"))
+	users, err := m.All()
 	if err != nil {
 		return nil, err
 	}
 	var orphans []string
-	for _, path := range matches {
-		user := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(path), filePrefix), ".conf")
-		if user != "" && validate.Username(user) {
-			live, err := exists(user)
-			if err != nil {
-				return nil, err
-			}
-			if !live {
-				orphans = append(orphans, user)
-			}
+	for _, user := range users {
+		live, err := exists(user)
+		if err != nil {
+			return nil, err
+		}
+		if !live {
+			orphans = append(orphans, user)
 		}
 	}
 	return orphans, nil
@@ -310,19 +472,32 @@ func (m *Manager) Orphans(exists func(string) (bool, error)) ([]string, error) {
 // concurrent invites are not independent: without this, one grant's reload could
 // push the other's not-yet-validated file live.
 //
-// A host with no usable lock path still gets the feature, just unserialized —
-// losing the ability to invite would be the worse failure.
+// Lock acquisition fails closed. Continuing without serialization would let one
+// caller reload another caller's not-yet-validated file and defeat the transaction
+// this lock exists to protect.
 func (m *Manager) withLock(fn func() error) error {
 	if m.Lock == "" {
 		return fn()
 	}
-	f, err := os.OpenFile(m.Lock, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.OpenFile(m.Lock, os.O_CREATE|os.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
-		return fn()
+		return fmt.Errorf("open sshd transaction lock %s: %w", m.Lock, err)
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat sshd transaction lock %s: %w", m.Lock, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || !fi.Mode().IsRegular() {
+		return fmt.Errorf("sshd transaction lock %s is not a regular file", m.Lock)
+	}
+	if int(st.Uid) != os.Geteuid() || int(st.Gid) != os.Getegid() || fi.Mode().Perm() != 0o600 {
+		return fmt.Errorf("sshd transaction lock %s has unsafe metadata: owner %d:%d mode %o, want %d:%d mode 600",
+			m.Lock, st.Uid, st.Gid, fi.Mode().Perm(), os.Geteuid(), os.Getegid())
+	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fn()
+		return fmt.Errorf("lock sshd transaction %s: %w", m.Lock, err)
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
 	return fn()
@@ -404,6 +579,11 @@ func dropIn(user string, groups []string, report sysinfo.LoginReport) ([]byte, e
 		}
 		fmt.Fprintf(&b, "    AllowGroups %s\n", g)
 	}
+	// OpenSSH restores the caller's Match state after an Include directive, but
+	// files expanded by the same Include glob share state with each other. Since
+	// this file deliberately sorts first, leave the include stream in global scope
+	// so later drop-ins keep their intended host-wide meaning.
+	b.WriteString("Match all\n")
 	return []byte(b.String()), nil
 }
 
@@ -428,9 +608,9 @@ func unfixable(report sysinfo.LoginReport) []string {
 
 // sshdSyntaxCheck runs `sshd -t`, surfacing sshd's own complaint on failure.
 func sshdSyntaxCheck() error {
-	out, err := exec.Command("sshd", "-t").CombinedOutput()
+	out, err := executil.CombinedOutput("sshd", []string{"-t"}, sshdCheckOptions)
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("sshd -t: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -447,61 +627,202 @@ func reload() error {
 		// The unit is "ssh" on Debian/Ubuntu and "sshd" on RHEL/Arch; one is usually
 		// an alias of the other, so trying both is how we stay distro-neutral.
 		for _, unit := range []string{"sshd", "ssh"} {
-			if exec.Command("systemctl", "reload", unit).Run() == nil {
+			if executil.Run("systemctl", []string{"reload", unit}, sshdReloadOptions) == nil {
 				return nil
 			}
 		}
 	}
 	if _, err := exec.LookPath("rc-service"); err == nil {
-		if exec.Command("rc-service", "sshd", "reload").Run() == nil {
+		if executil.Run("rc-service", []string{"sshd", "reload"}, sshdReloadOptions) == nil {
 			return nil
 		}
 	}
 	if _, err := exec.LookPath("service"); err == nil {
 		for _, unit := range []string{"sshd", "ssh"} {
-			if exec.Command("service", unit, "reload").Run() == nil {
+			if executil.Run("service", []string{unit, "reload"}, sshdReloadOptions) == nil {
 				return nil
 			}
 		}
 	}
-	if pid, ok := sshdPID(); ok {
-		return syscall.Kill(pid, syscall.SIGHUP)
+	return signalSSHDMaster()
+}
+
+var (
+	sshdPIDFiles    = []string{"/run/sshd.pid", "/var/run/sshd.pid"}
+	sshdPIDOwnerUID = uint32(0)
+	sshdProcessUID  = uint32(0)
+	sshdProcRoot    = "/proc"
+	pidfdOpen       = unix.PidfdOpen
+	pidfdSendSignal = unix.PidfdSendSignal
+	closeFD         = unix.Close
+)
+
+const maxSSHDMasterPIDBytes = int64(64)
+
+// signalSSHDMaster opens a pidfd, proves the referenced process is a current sshd
+// listener from the pid file's generation, then sends SIGHUP through that
+// descriptor. The descriptor keeps that identity stable during validation and
+// signalling; stale pid files fail closed.
+func signalSSHDMaster() error {
+	for _, p := range sshdPIDFiles {
+		pid, pidFileTime, err := readSSHDMasterPID(p)
+		if err != nil {
+			continue
+		}
+		fd, err := pidfdOpen(pid, 0)
+		if err == unix.ESRCH || err == unix.ENOENT {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("open pidfd for sshd pid %d: %w", pid, err)
+		}
+		if !isSSHDMaster(pid, pidFileTime) {
+			_ = closeFD(fd)
+			continue
+		}
+		signalErr := pidfdSendSignal(fd, unix.SIGHUP, nil, 0)
+		closeErr := closeFD(fd)
+		if signalErr == unix.ESRCH {
+			if closeErr != nil {
+				return fmt.Errorf("close pidfd for exited sshd pid %d: %w", pid, closeErr)
+			}
+			continue
+		}
+		if signalErr != nil {
+			return errors.Join(fmt.Errorf("signal sshd pid %d: %w", pid, signalErr), closeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close pidfd for sshd pid %d: %w", pid, closeErr)
+		}
+		return nil
 	}
 	return ErrNoReloadMechanism
 }
 
-// sshdPID returns the master sshd's pid, but only after confirming the process
-// it names really is sshd.
-//
-// SIGHUP's default action is to TERMINATE. A pid file outlives its process (that
-// is precisely what "stale" means), and pids are recycled — so signalling the
-// number on faith is not a no-op that might miss, it is a root-privileged kill
-// aimed at whatever inherited the number. That risk lands exactly where this
-// fallback is reached: hosts with no working init integration, which are the
-// stripped-down images most likely to be carrying a stale pid file.
-func sshdPID() (int, bool) {
-	for _, p := range []string{"/run/sshd.pid", "/var/run/sshd.pid"} {
-		b, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-		if err != nil || pid <= 0 {
-			continue
-		}
-		if !isSSHD(pid) {
-			continue
-		}
-		return pid, true
+// readSSHDMasterPID treats the runtime pid file as untrusted filesystem input.
+// O_NONBLOCK prevents a planted FIFO from hanging a privileged reload forever;
+// the descriptor checks and hard read limit reject every non-regular, writable,
+// symlinked, or oversized substitute before its content is parsed.
+func readSSHDMasterPID(path string) (int, time.Time, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return 0, time.Time{}, err
 	}
-	return 0, false
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = unix.Close(fd)
+		return 0, time.Time{}, fmt.Errorf("open sshd pid file %s", path)
+	}
+	defer f.Close()
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return 0, time.Time{}, fmt.Errorf("stat sshd pid file %s: %w", path, err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Uid != sshdPIDOwnerUID || stat.Mode&0o022 != 0 {
+		return 0, time.Time{}, fmt.Errorf("sshd pid file %s has unsafe metadata", path)
+	}
+	if stat.Size > maxSSHDMasterPIDBytes {
+		return 0, time.Time{}, fmt.Errorf("sshd pid file %s exceeds %d-byte limit", path, maxSSHDMasterPIDBytes)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxSSHDMasterPIDBytes+1))
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("read sshd pid file %s: %w", path, err)
+	}
+	if int64(len(b)) > maxSSHDMasterPIDBytes {
+		return 0, time.Time{}, fmt.Errorf("sshd pid file %s exceeds %d-byte limit", path, maxSSHDMasterPIDBytes)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, time.Time{}, fmt.Errorf("sshd pid file %s has invalid pid", path)
+	}
+	return pid, time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec), nil
 }
 
-// isSSHD reports whether pid is a live process whose executable is sshd.
-func isSSHD(pid int) bool {
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
-	if err != nil {
-		return false // no such process, or no /proc: signalling it is not safe
+// isSSHDMaster proves that pid is a root sshd listener from the same process
+// generation that wrote the pid file. A pidfd prevents reuse after it is opened;
+// this timestamp check closes the remaining stale-pidfile window before open.
+func isSSHDMaster(pid int, pidFileTime time.Time) bool {
+	procDir := filepath.Join(sshdProcRoot, strconv.Itoa(pid))
+	var stat unix.Stat_t
+	if err := unix.Stat(procDir, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != sshdProcessUID {
+		return false
 	}
-	return strings.TrimSpace(string(comm)) == "sshd"
+	comm, err := readBoundedSSHDProcFile(filepath.Join(procDir, "comm"), 64)
+	if err != nil || strings.TrimSpace(string(comm)) != "sshd" {
+		return false
+	}
+	cmdline, err := readBoundedSSHDProcFile(filepath.Join(procDir, "cmdline"), 4<<10)
+	if err != nil || !strings.Contains(string(cmdline), "[listener]") {
+		return false
+	}
+	started, err := sshdProcessStartTime(pid)
+	if err != nil {
+		return false
+	}
+	// btime has one-second precision. Comparing whole seconds accepts a genuine
+	// pid file written in the same second as process start while rejecting a stale
+	// file from every earlier process generation.
+	return pidFileTime.Unix() >= started.Unix()
+}
+
+func readBoundedSSHDProcFile(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > maxBytes {
+		return nil, fmt.Errorf("%s exceeds %d-byte limit", path, maxBytes)
+	}
+	return b, nil
+}
+
+func sshdProcessStartTime(pid int) (time.Time, error) {
+	data, err := readBoundedSSHDProcFile(filepath.Join(sshdProcRoot, strconv.Itoa(pid), "stat"), 4<<10)
+	if err != nil {
+		return time.Time{}, err
+	}
+	// comm is parenthesized and may itself contain spaces or ')', so split after
+	// the final closing parenthesis. starttime is field 22, index 19 from state.
+	closeParen := strings.LastIndexByte(string(data), ')')
+	if closeParen < 0 {
+		return time.Time{}, fmt.Errorf("malformed process stat")
+	}
+	fields := strings.Fields(string(data[closeParen+1:]))
+	if len(fields) <= 19 {
+		return time.Time{}, fmt.Errorf("process stat has too few fields")
+	}
+	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("malformed process start time: %w", err)
+	}
+	procStat, err := readBoundedSSHDProcFile(filepath.Join(sshdProcRoot, "stat"), 1<<20)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var bootSeconds int64 = -1
+	for _, line := range strings.Split(string(procStat), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "btime" {
+			bootSeconds, err = strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("malformed kernel boot time: %w", err)
+			}
+			break
+		}
+	}
+	if bootSeconds < 0 {
+		return time.Time{}, fmt.Errorf("kernel stat has no boot time")
+	}
+	// Linux exposes process starttime in USER_HZ ticks. The supported Linux
+	// amd64/arm64 ABIs both define USER_HZ as 100 regardless of CONFIG_HZ.
+	const linuxUserHZ = uint64(100)
+	seconds := startTicks / linuxUserHZ
+	nanos := (startTicks % linuxUserHZ) * uint64(time.Second) / linuxUserHZ
+	return time.Unix(bootSeconds, 0).Add(time.Duration(seconds)*time.Second + time.Duration(nanos)), nil
 }

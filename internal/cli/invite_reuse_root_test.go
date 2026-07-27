@@ -45,7 +45,7 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 	now := func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) }
 	auditFile := filepath.Join(rootDir(t, 0o700), "audit.log")
 
-	sudoMgr := &sudoers.Manager{Dir: sudoDir, Validate: func(string) error { return nil }, Verify: func(string) error { return nil }}
+	sudoMgr := &sudoers.Manager{Dir: sudoDir, Validate: func([]byte) error { return nil }, Verify: func(string) error { return nil }}
 	sshdMgr := &sshdconf.Manager{
 		Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
 		Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
@@ -82,6 +82,23 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 		Geteuid:      func() int { return 0 },
 	}
 	return a, sudoMgr, sshdMgr, installPath
+}
+
+func unusedHighIntegrationUID(t *testing.T) int {
+	t.Helper()
+	for uid := 59000; uid >= 58000; uid-- {
+		err := exec.Command("getent", "passwd", strconv.Itoa(uid)).Run()
+		if err == nil {
+			continue
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 {
+			return uid
+		}
+		t.Fatalf("probe integration-test UID %d: %v", uid, err)
+	}
+	t.Fatal("no unused high UID available for integration test")
+	return 0
 }
 
 // TestInviteNoSudoDoesNotInheritAStaleGrant is the CRITICAL. invite unconditionally
@@ -172,6 +189,86 @@ func TestInviteRetriesSSHDGrantCleanupBeforeAccountRollback(t *testing.T) {
 	}
 }
 
+func TestInviteRetainsAccountAndRegistryWhenLaterSSHDRemovalIsUnconfirmed(t *testing.T) {
+	a, _, sshdMgr, _ := inviteApp(t)
+	const name = "xxvcc-sshhold1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	// Grant succeeds and reaches the running daemon. Scheduling then fails, forcing
+	// invite rollback; that rollback must not free the username when its removal
+	// reload fails.
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdNoPubkey), nil }
+	a.Scheduler.Sys = unavailableSched{}
+	reloads := 0
+	sshdMgr.Reload = func() error {
+		reloads++
+		if reloads == 1 {
+			return nil
+		}
+		return errors.New("rollback reload failed")
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--no-sudo", "--auto-revoke", "--fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want scheduling failure", rc)
+	}
+	if reloads != 2 {
+		t.Fatalf("reload calls = %d, want grant plus failed rollback", reloads)
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("account was deleted while sshd removal was unconfirmed")
+	}
+	if ok, err := a.Registry.Contains(name); err != nil || !ok {
+		t.Fatalf("registry witness was cleared while sshd removal was unconfirmed: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Lstat(sshdMgr.FilePath(name)); !os.IsNotExist(err) {
+		t.Fatalf("rollback left active drop-in on disk: %v", err)
+	}
+	if _, err := os.Lstat(sshdMgr.FilePath(name) + ".remove-pending"); err != nil {
+		t.Fatalf("rollback lost pending daemon-reload evidence: %v", err)
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "account disabled and retained") {
+		t.Fatalf("rollback did not report retained account:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
+func TestRevokeRetainsAccountAndRegistryWithoutReloadMechanism(t *testing.T) {
+	a, _, sshdMgr, _ := inviteApp(t)
+	const name = "xxvcc-sshnoreload1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--no-sudo", "--no-auto-revoke", "--no-fix-sshd", "--yes"}); rc != 0 {
+		t.Fatalf("fixture invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	dropIn := sshdMgr.FilePath(name)
+	if err := os.WriteFile(dropIn, []byte("Match User "+name+"\n    PubkeyAuthentication yes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sshdMgr.Reload = func() error { return sshdconf.ErrNoReloadMechanism }
+
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes"}); rc != 1 {
+		t.Fatalf("revoke rc=%d, want unconfirmed sshd removal failure", rc)
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("revoke released the username without confirming daemon reload")
+	}
+	if ok, err := a.Registry.Contains(name); err != nil || !ok {
+		t.Fatalf("revoke cleared registry without confirming daemon reload: ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Lstat(dropIn); !os.IsNotExist(err) {
+		t.Fatalf("revoke left the disk drop-in active: %v", err)
+	}
+	if _, err := os.Lstat(dropIn + ".remove-pending"); err != nil {
+		t.Fatalf("revoke lost pending reload evidence: %v", err)
+	}
+}
+
 // A scheduled deletion has no trustworthy identity when its registry row is
 // gone. It must exit successfully without touching either the account or its
 // name-scoped grant; chage expiry still blocks future login.
@@ -211,47 +308,118 @@ func TestAutoRevokeSkipsWhenRegistryRowIsLost(t *testing.T) {
 	}
 }
 
-// A matching username and UID do not prove identity because Linux can reuse both
-// after out-of-band deletion. The current account must still carry the managed
-// marker even when the scheduled generation matches the stale registry row.
-func TestAutoRevokeProtectsSameUIDUnmanagedReplacement(t *testing.T) {
+// A matching username and UID do not prove identity because Linux can reuse both.
+// The dynamic GECOS marker must match the exact registry generation; copying the
+// released fixed marker or another valid generation must not authorize userdel.
+func TestAutoRevokeProtectsSameUIDMarkerReplacement(t *testing.T) {
+	const generation = "22222222222222222222222222222222"
+	for _, tc := range []struct {
+		name              string
+		replacementMarker string
+	}{
+		{name: "ltarealacct1", replacementMarker: config.ManagedGECOS},
+		{name: "ltarealacct2", replacementMarker: config.ManagedGenerationGECOSPrefix + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, _, installPath := inviteApp(t)
+			testUID := unusedHighIntegrationUID(t)
+			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
+			rm()
+			t.Cleanup(rm)
+			originalMarker := config.ManagedGenerationGECOSPrefix + generation
+			if out, err := exec.Command("useradd", "-m", "-u", strconv.Itoa(testUID), "-s", "/bin/bash", "-c", originalMarker, tc.name).CombinedOutput(); err != nil {
+				t.Fatalf("useradd: %v: %s", err, out)
+			}
+			original, ok := mustExternalUserLookup(t, tc.name)
+			if !ok || original.UID != testUID {
+				t.Fatalf("created account = %+v found=%v, want UID %d", original, ok, testUID)
+			}
+			if err := a.Registry.Init(); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Registry.Record(registry.Record{
+				User: tc.name, Port: 22, UID: original.UID, Generation: generation,
+				IdentityBound: true, AutoRevoke: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("userdel", "-r", "--", tc.name).CombinedOutput(); err != nil {
+				t.Fatalf("userdel: %v: %s", err, out)
+			}
+			if out, err := exec.Command("useradd", "-m", "-u", strconv.Itoa(original.UID), "-s", "/bin/bash", "-c", tc.replacementMarker, tc.name).CombinedOutput(); err != nil {
+				t.Fatalf("replacement useradd: %v: %s", err, out)
+			}
+			replacement, ok := mustExternalUserLookup(t, tc.name)
+			if !ok {
+				t.Fatal("replacement account was not found")
+			}
+			sentinel := filepath.Join(replacement.Home, "replacement-data")
+			if err := os.WriteFile(sentinel, []byte("keep\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a.TerminateProcesses = func(int) error {
+				t.Fatal("auto-revoke attempted to terminate replacement processes")
+				return nil
+			}
+			args := strings.Fields((&schedule.Scheduler{InstallPath: installPath}).RevokeCommand(tc.name, original.UID, generation))[1:]
+			if rc := a.Dispatch(args); rc == 0 {
+				t.Error("auto-revoke accepted a same-UID marker replacement")
+			}
+			if !mustExternalUserExists(t, tc.name) {
+				t.Error("auto-revoke deleted the replacement account")
+			}
+			if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep\n" {
+				t.Errorf("replacement home data changed: content=%q err=%v", got, err)
+			}
+			if ok, err := a.Registry.Contains(tc.name); err != nil || !ok {
+				t.Errorf("recovery registry row was not preserved: present=%v err=%v", ok, err)
+			}
+		})
+	}
+}
+
+func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 	a, _, _, installPath := inviteApp(t)
-	const name = "ltarealacct1"
+	const (
+		name       = "ltalegacyacct1"
+		generation = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
-	original, ok := mustExternalUserLookup(t, name)
+	pw, ok := mustExternalUserLookup(t, name)
 	if !ok {
-		t.Fatal("created account was not found")
+		t.Fatal("legacy account was not found")
 	}
-	const generation = "22222222222222222222222222222222"
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Registry.Record(registry.Record{User: name, Port: 22, UID: original.UID, Generation: generation, AutoRevoke: true}); err != nil {
+	if err := a.Registry.Record(registry.Record{
+		User: name, Port: 22, UID: pw.UID, Generation: generation, AutoRevoke: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("userdel", "-r", "--", name).CombinedOutput(); err != nil {
-		t.Fatalf("userdel: %v: %s", err, out)
-	}
-	// Recreate the same name with the exact same UID, but as a real unmanaged user.
-	if out, err := exec.Command("useradd", "-m", "-u", strconv.Itoa(original.UID), "-s", "/bin/bash", "-c", "Real Person", name).CombinedOutput(); err != nil {
-		t.Fatalf("replacement useradd: %v: %s", err, out)
-	}
-	sched := &schedule.Scheduler{InstallPath: installPath}
-	args := strings.Fields(sched.RevokeCommand(name, original.UID, generation))[1:]
-
-	if rc := a.Dispatch(args); rc == 0 {
-		t.Error("auto-revoke accepted an unmanaged replacement with the same UID")
+	scheduled := strings.Fields((&schedule.Scheduler{InstallPath: installPath}).RevokeCommand(name, pw.UID, generation))[1:]
+	if rc := a.Dispatch(scheduled); rc == 0 {
+		t.Fatal("scheduled revoke accepted a legacy fixed identity")
 	}
 	if !mustExternalUserExists(t, name) {
-		t.Error("auto-revoke deleted an unmanaged replacement account")
+		t.Fatal("scheduled revoke deleted a legacy account")
 	}
-	if ok, err := a.Registry.Contains(name); err != nil || !ok {
-		t.Errorf("recovery registry row was not preserved: present=%v err=%v", ok, err)
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force"}); rc == 0 {
+		t.Fatal("legacy revoke without --confirm-force succeeded")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("unconfirmed legacy revoke deleted the account")
+	}
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force", "--confirm-force", name}); rc != 0 {
+		t.Fatalf("direct confirmed legacy revoke rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("direct confirmed legacy revoke did not delete the account")
 	}
 }
 
@@ -328,6 +496,137 @@ func TestInviteOutputFailureRollsBackAllState(t *testing.T) {
 	}
 }
 
+func TestInviteOutputFailureRetainsAccountWhenProcessCleanupIsUncertain(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	const name = "xxvcc-outputhold1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	partial := &partialFailingWriter{}
+	a.Out = partial
+	a.TerminateProcesses = func(int) error { return errors.New("injected rollback process uncertainty") }
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--no-sudo", "--no-fix-sshd", "--no-auto-revoke", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want output/rollback failure", rc)
+	}
+	if partial.wrote == 0 {
+		t.Fatal("fixture did not expose any credential bytes before the output failure")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("rollback freed the UID even though process cleanup was uncertain")
+	}
+	if expires := passwdExpiryField(t, name); expires == "" {
+		t.Fatal("retained account was not disabled before rollback stopped")
+	}
+	if rec, found, err := a.Registry.Lookup(name); err != nil || !found || rec.Pending || rec.UID < 1 {
+		t.Fatalf("completed recovery identity was not retained: found=%v rec=%+v err=%v", found, rec, err)
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "injected rollback process uncertainty") {
+		t.Fatalf("rollback uncertainty was not reported:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
+func TestInviteRetainsAccountWhenFailedSudoGrantCannotBeRemoved(t *testing.T) {
+	a, sudoMgr, _, _ := inviteApp(t)
+	const name = "xxvcc-sudograntfail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	// The preflight removal must still see an ordinary absent file. Once Grant has
+	// written the live drop-in, make both its own rollback and the CLI's independent
+	// retry fail. The username and registry witness must then remain reserved.
+	grantReachedVerify := false
+	removeCalls := 0
+	sudoMgr.Verify = func(string) error {
+		grantReachedVerify = true
+		return errors.New("injected effective sudo policy failure")
+	}
+	sudoMgr.RemoveFile = func(path string) error {
+		if !grantReachedVerify {
+			return os.Remove(path)
+		}
+		removeCalls++
+		return errors.New("injected read-only sudoers filesystem")
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--sudo", "--confirm-sudo", name, "--no-auto-revoke", "--no-fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want failed sudo grant rollback\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if removeCalls != 2 {
+		t.Fatalf("sudo removal attempts=%d, want Grant rollback plus CLI retry\nstderr:\n%s", removeCalls, a.Err.(*bytes.Buffer).String())
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("invite freed the username while the sudo grant removal was unconfirmed")
+	}
+	if expires := passwdExpiryField(t, name); expires == "" {
+		t.Error("retained account was not disabled")
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found || !rec.Sudo {
+		t.Fatalf("sudo recovery witness missing: found=%v record=%+v err=%v", found, rec, err)
+	}
+	if _, err := os.Lstat(sudoMgr.FilePath(name)); err != nil {
+		t.Fatalf("test did not retain the live sudo drop-in: %v", err)
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "sudo removal is unconfirmed; account disabled and retained") {
+		t.Fatalf("rollback did not report the retained account:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
+func TestInviteRetainsAccountWhenLaterSudoRollbackCannotRemoveGrant(t *testing.T) {
+	a, sudoMgr, _, _ := inviteApp(t)
+	a.Scheduler.Sys = unavailableSched{}
+	const name = "xxvcc-sudolaterfail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	// Grant succeeds, then scheduling fails. Fail removal only after Verify proves
+	// that the drop-in was live, so preflight remains unaffected.
+	grantVerified := false
+	sudoMgr.Verify = func(string) error {
+		grantVerified = true
+		return nil
+	}
+	sudoMgr.RemoveFile = func(path string) error {
+		if !grantVerified {
+			return os.Remove(path)
+		}
+		return errors.New("injected sudo rollback failure")
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--sudo", "--confirm-sudo", name, "--auto-revoke", "--no-fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want scheduling failure\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatalf("invite freed the username after its sudo rollback failed\nstderr:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+	if expires := passwdExpiryField(t, name); expires == "" {
+		t.Error("retained account was not disabled")
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found || !rec.Sudo {
+		t.Fatalf("sudo recovery witness missing: found=%v record=%+v err=%v", found, rec, err)
+	}
+	if _, err := os.Lstat(sudoMgr.FilePath(name)); err != nil {
+		t.Fatalf("test did not retain the live sudo drop-in: %v", err)
+	}
+	if strings.Contains(a.Out.(*bytes.Buffer).String(), "BEGIN LINUX TEMP ADMIN INVITE") {
+		t.Fatal("credentials were printed for the failed invite")
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "sudo removal is unconfirmed; account disabled and retained") {
+		t.Fatalf("rollback did not report the retained account:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
 func TestRevokeSudoCleanupFailureKeepsDisabledAccountAndRecoveryState(t *testing.T) {
 	a, sudoMgr, _, _ := inviteApp(t)
 	tracker := newTrackingSched()
@@ -388,6 +687,41 @@ func TestRevokeScheduleCleanupFailureReturnsNonzeroAndKeepsRegistry(t *testing.T
 	}
 	if present, err := a.Registry.Contains(name); err != nil || !present {
 		t.Errorf("registry row needed for recovery was removed: present=%v err=%v", present, err)
+	}
+}
+
+func TestRevokeKeepsDisabledAccountWhenProcessesCannotBeCleared(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	const name = "xxvcc-procfail1"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+
+	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "24", "--no-sudo", "--no-fix-sshd", "--auto-revoke", "--yes"}); rc != 0 {
+		t.Fatalf("invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	a.TerminateProcesses = func(int) error { return errors.New("injected survivor") }
+
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes"}); rc != 1 {
+		t.Fatalf("revoke rc=%d, want failure when process termination is uncertain", rc)
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("revoke freed the UID despite an unresolved process")
+	}
+	if expires := passwdExpiryField(t, name); expires == "" {
+		t.Error("retained account was not disabled with an expiry in the past")
+	}
+	if present, err := a.Registry.Contains(name); err != nil || !present {
+		t.Errorf("recovery registry row missing: present=%v err=%v", present, err)
+	}
+	if len(tracker.jobs) == 0 {
+		t.Error("auto-delete retry was removed despite incomplete process termination")
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "injected survivor") {
+		t.Errorf("termination failure was not reported: %s", a.Err.(*bytes.Buffer).String())
 	}
 }
 

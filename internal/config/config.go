@@ -19,8 +19,18 @@ const (
 	// ManagedTag marks tool-managed accounts.
 	ManagedTag = "linux-temp-admin"
 	// ManagedGECOS is the exact GECOS an invite sets; user.IsManaged requires this
-	// full string, not a bare ManagedTag substring.
+	// full string for legacy accounts, not a bare ManagedTag substring.
 	ManagedGECOS = ManagedTag + " temporary admin"
+	// ManagedGenerationGECOSPrefix begins the generation-bound marker written for
+	// every newly completed account. The 128-bit generation follows immediately.
+	ManagedGenerationGECOSPrefix = ManagedGECOS + " generation="
+	// PendingGECOS is used only between useradd and durable UID registration. It
+	// deliberately does not match ManagedGECOS, so an older binary that ignores a
+	// newer registry Pending field still treats the incomplete account as protected.
+	PendingGECOS = ManagedTag + " pending account"
+	// PendingGenerationGECOSPrefix binds even the incomplete passwd entry to the
+	// creation intent that preceded it.
+	PendingGenerationGECOSPrefix = PendingGECOS + " generation="
 
 	// --- owned paths and namespaces ---
 
@@ -62,7 +72,7 @@ const (
 	// expected to hand-edit or ship in a config-management repo.
 	PrefsFile = RegistryDir + "/prefs"
 	// RegistrySchema is written as the registry header's version marker.
-	RegistrySchema = 2
+	RegistrySchema = 3
 
 	// AuditLogDir holds the append-only operation audit log (root:root, 0700).
 	AuditLogDir = "/var/log/" + ManagedTag
@@ -76,14 +86,21 @@ const (
 	LifecycleLockFile = "/run/" + ManagedTag + ".lock"
 	// SystemdDir holds generated auto-revoke units.
 	SystemdDir = "/etc/systemd/system"
+	// SystemdTimerStateDir holds Persistent=true timer timestamps. systemd does
+	// not remove these when a timer unit is disabled or deleted.
+	SystemdTimerStateDir = "/var/lib/systemd/timers"
 	// AutoRevokeUnitPrefix namespaces generated systemd units. The "-v2-" infix is
 	// load-bearing: it is baked into the unit filenames already written on
 	// deployed hosts, so changing it would orphan their auto-revoke timers.
 	AutoRevokeUnitPrefix = ManagedTag + "-v2-revoke-"
 
-	// ReleaseBaseURL is where signed release binaries are published; the upgrade
-	// binary is ReleaseBaseURL + BinaryAssetPrefix + GOARCH and its detached
-	// signature is that URL + ".sig".
-	ReleaseBaseURL    = "https://github.com/xxvcc/linux-temp-admin/releases/latest/download/"
-	BinaryAssetPrefix = ManagedTag + "-linux-"
+	// ReleaseMirrorBaseURL is the official mirror used for normal installation and
+	// upgrades. latest.json selects one immutable version directory below it.
+	ReleaseMirrorBaseURL     = "https://dl.ll.cd/linux-temp-admin"
+	ReleaseMirrorManifestURL = ReleaseMirrorBaseURL + "/latest.json"
+	// GitHub remains a transport-only fallback. A valid mirror manifest pins the
+	// fallback to the same tag instead of consulting a potentially newer Latest.
+	GitHubReleaseRoot          = "https://github.com/xxvcc/linux-temp-admin/releases"
+	GitHubLatestReleaseBaseURL = GitHubReleaseRoot + "/latest/download"
+	BinaryAssetPrefix          = ManagedTag + "-linux-"
 )

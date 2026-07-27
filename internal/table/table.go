@@ -46,9 +46,9 @@ func (t *Table) Empty() bool { return len(t.rows) == 0 }
 
 // Render writes the table. Every column is as wide as its widest cell (header
 // included), measured in terminal columns.
-func (t *Table) Render(w io.Writer) {
+func (t *Table) Render(w io.Writer) error {
 	if len(t.headers) == 0 {
-		return
+		return nil
 	}
 	widths := make([]int, len(t.headers))
 	for i, h := range t.headers {
@@ -62,19 +62,22 @@ func (t *Table) Render(w io.Writer) {
 		}
 	}
 
-	io.WriteString(w, rule(widths, "┌", "┬", "┐"))
-	io.WriteString(w, line(t.headers, widths))
-	io.WriteString(w, rule(widths, "├", "┼", "┤"))
+	var rendered strings.Builder
+	rendered.WriteString(rule(widths, "┌", "┬", "┐"))
+	rendered.WriteString(line(t.headers, widths))
+	rendered.WriteString(rule(widths, "├", "┼", "┤"))
 	for _, row := range t.rows {
-		io.WriteString(w, line(row, widths))
+		rendered.WriteString(line(row, widths))
 	}
-	io.WriteString(w, rule(widths, "└", "┴", "┘"))
+	rendered.WriteString(rule(widths, "└", "┴", "┘"))
+	_, err := io.WriteString(w, rendered.String())
+	return err
 }
 
 // String renders the table into a string.
 func (t *Table) String() string {
 	var b strings.Builder
-	t.Render(&b)
+	_ = t.Render(&b) // strings.Builder.Write never returns an error
 	return b.String()
 }
 
