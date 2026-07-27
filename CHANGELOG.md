@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Run mirror synchronization only from an explicit protected-`main` dispatch.
+  GitHub binds a `release` event workflow to the released tag, so the automatic
+  trigger could not satisfy the default-branch trust check and must not receive
+  the mirror deployment credential.
+
 ## v2.8.3 - 2026-07-27
 
 - Run the release artifact handoff on the official actions' native Node.js 24
