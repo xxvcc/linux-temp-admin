@@ -75,14 +75,15 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 	var out, errb bytes.Buffer
 	a := &App{
 		Out: &out, Err: &errb, In: strings.NewReader(in),
-		P:           i18n.Printer{Lang: i18n.EN},
-		Registry:    &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
-		InstallPath: filepath.Join(dir, "lta"),
-		Now:         func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
-		RandHex:     func(int) (string, error) { return "abcdef0123", nil },
-		StdoutIsTTY: func() bool { return true },
-		StdinIsTTY:  func() bool { return false },
-		Geteuid:     func() int { return 0 },
+		P:                            i18n.Printer{Lang: i18n.EN},
+		Registry:                     &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
+		InstallPath:                  filepath.Join(dir, "lta"),
+		Now:                          func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
+		RandHex:                      func(int) (string, error) { return "abcdef0123", nil },
+		StdoutIsTTY:                  func() bool { return true },
+		StdinIsTTY:                   func() bool { return false },
+		Geteuid:                      func() int { return 0 },
+		SSHDHasConnectionScopedMatch: func() bool { return false },
 	}
 	return a, &out, &errb
 }
@@ -1189,6 +1190,23 @@ func TestPasswordFallbackIsNotOfferedForUnverifiablePolicy(t *testing.T) {
 	}
 	if !strings.Contains(errb.String(), "no password fallback") {
 		t.Fatalf("password fallback refusal did not explain the unverifiable policy: %q", errb.String())
+	}
+}
+
+func TestLoginChecksUseInjectedConnectionScopedMatchProbe(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	probes := 0
+	a.SSHDHasConnectionScopedMatch = func() bool {
+		probes++
+		return true
+	}
+	cfg := sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n")
+	rep := a.checkKeyLogin(cfg, "xxvcc-a1", []string{"xxvcc-a1"})
+	if rep.Certain() || len(rep.Unverifiable) != 1 {
+		t.Fatalf("connection-scoped Match probe did not downgrade the report: %+v", rep)
+	}
+	if probes != 1 {
+		t.Fatalf("connection-scoped Match probes = %d, want 1", probes)
 	}
 }
 

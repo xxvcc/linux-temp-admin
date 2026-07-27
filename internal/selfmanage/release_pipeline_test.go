@@ -623,8 +623,21 @@ fi
 			if err := os.Mkdir(binDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			fakeTimeout := "#!/bin/sh\nprintf payload > \"$TEST_FETCH_OUT\"\nmkdir \"$TEST_TIMEOUT_MARKER\"\nexit 0\n"
-			if err := os.WriteFile(filepath.Join(binDir, "timeout"), []byte(fakeTimeout), 0o700); err != nil {
+			fakeCurl := `#!/bin/sh
+set -eu
+curl_out=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o | --output) shift; curl_out=$1 ;;
+  esac
+  shift
+done
+[ -n "$curl_out" ]
+printf payload > "$curl_out"
+mkdir "$TEST_CURL_MARKER"
+printf '200\n\n'
+`
+			if err := os.WriteFile(filepath.Join(binDir, "curl"), []byte(fakeCurl), 0o700); err != nil {
 				t.Fatal(err)
 			}
 			outPath := filepath.Join(dir, "out")
@@ -635,18 +648,32 @@ FSIZE_BLOCK_BYTES=512
 FETCH_TIMEOUT_SECONDS=1
 CONNECT_TIMEOUT_SECONDS=1
 ` + fetchFunction + `
-wc() { return 1; }
+wc() {
+  mkdir "$TEST_WC_MARKER"
+  return 1
+}
 if fetch_once "https://example.invalid/bin" "$TEST_FETCH_OUT" 1024 "$FETCH_TIMEOUT_SECONDS"; then
   echo "fetch unexpectedly succeeded" >&2
   exit 1
 fi
-[ -d "$TEST_TIMEOUT_MARKER" ]
-[ ! -e "$TEST_FETCH_OUT" ]
+if [ ! -d "$TEST_CURL_MARKER" ]; then
+  echo "curl fixture was not invoked" >&2
+  exit 92
+fi
+if [ ! -d "$TEST_WC_MARKER" ]; then
+  echo "wc failure fixture was not invoked" >&2
+  exit 93
+fi
+if [ -e "$TEST_FETCH_OUT" ]; then
+  echo "download output survived failed size inspection" >&2
+  exit 94
+fi
 `
 			runShellFixture(t, shell.path, shell.args, source,
 				"TEST_BIN="+binDir,
 				"TEST_FETCH_OUT="+outPath,
-				"TEST_TIMEOUT_MARKER="+filepath.Join(dir, "timeout-ran"),
+				"TEST_CURL_MARKER="+filepath.Join(dir, "curl-ran"),
+				"TEST_WC_MARKER="+filepath.Join(dir, "wc-ran"),
 			)
 		})
 
@@ -1287,6 +1314,26 @@ func TestInstallerGitHubRedirectsResolveBeforeRequestAcrossShells(t *testing.T) 
 	}
 	networkFunctions := installer[networkStart : networkStart+networkEnd]
 	fetchFunction := installer[fetchStart : fetchStart+fetchEnd+2]
+	if got := strings.Count(networkFunctions, "command -v nslookup"); got != 1 {
+		t.Fatalf("installer nslookup availability probe count=%d, want 1", got)
+	}
+	if got := strings.Count(networkFunctions, " nslookup -type="); got != 2 {
+		t.Fatalf("installer nslookup invocation count=%d, want 2", got)
+	}
+	// BusyBox builds with FEATURE_PREFER_APPLETS ignore PATH fixtures when an
+	// applet invokes another applet. Point only the external resolver dependency
+	// at an absolute fixture while retaining the installer's parser and policy.
+	fixtureNetworkFunctions := strings.Replace(
+		networkFunctions,
+		"command -v nslookup",
+		`command -v "$TEST_NSLOOKUP_COMMAND"`,
+		1,
+	)
+	fixtureNetworkFunctions = strings.ReplaceAll(
+		fixtureNetworkFunctions,
+		" nslookup -type=",
+		` "$TEST_NSLOOKUP_COMMAND" -type=`,
+	)
 
 	type shellCase struct {
 		name       string
@@ -1436,6 +1483,7 @@ fi
 					}
 				case "nslookup":
 					fixture := `#!/bin/sh
+printf '%s\n' "$*" >> "$TEST_NSLOOKUP_MARKER"
 if [ "$TEST_NSLOOKUP_OLD" = 1 ]; then
   printf 'Server: resolver.invalid\nAddress 1: 10.0.0.53 resolver.invalid\n\n'
   printf 'Name: redirect.example\nAddress 1: %s redirect.example\n' "$TEST_RESOLVER_OUTPUT"
@@ -1455,7 +1503,7 @@ PATH="$TEST_BIN"
 export PATH
 FSIZE_BLOCK_BYTES=512
 CONNECT_TIMEOUT_SECONDS=2
-` + networkFunctions + "\n" + fetchFunction + `
+` + fixtureNetworkFunctions + "\n" + fetchFunction + `
 if fetch_once 'https://github.example/asset' "$TEST_OUT" 4096 "$TEST_FETCH_TIMEOUT" 1; then
   fetch_rc=0
 else
@@ -1469,6 +1517,7 @@ printf 'rc=%s\n' "$fetch_rc"
 				args := append(append([]string(nil), shell.args...), script)
 				cmd := exec.Command(shell.path, args...)
 				marker := filepath.Join(dir, "curl-requests")
+				nslookupMarker := filepath.Join(dir, "nslookup-requests")
 				nslookupOld := "0"
 				if tc.nslookupOld {
 					nslookupOld = "1"
@@ -1488,6 +1537,8 @@ printf 'rc=%s\n' "$fetch_rc"
 				cmd.Env = []string{
 					"TEST_BIN=" + binDir,
 					"TEST_CURL_MARKER=" + marker,
+					"TEST_NSLOOKUP_COMMAND=" + filepath.Join(binDir, "nslookup"),
+					"TEST_NSLOOKUP_MARKER=" + nslookupMarker,
 					"TEST_OUT=" + filepath.Join(dir, "out"),
 					"TEST_RESOLVER_OUTPUT=" + tc.resolverOutput,
 					"TEST_NSLOOKUP_OLD=" + nslookupOld,
@@ -1503,6 +1554,16 @@ printf 'rc=%s\n' "$fetch_rc"
 				elapsed := time.Since(started)
 				if err != nil {
 					t.Fatalf("redirect fixture failed: %v\n%s", err, out)
+				}
+				if tc.resolver == "nslookup" {
+					calls, err := os.ReadFile(nslookupMarker)
+					if err != nil {
+						t.Fatalf("nslookup fixture was not invoked: %v", err)
+					}
+					const wantCalls = "-type=A redirect.example\n-type=AAAA redirect.example\n"
+					if string(calls) != wantCalls {
+						t.Fatalf("nslookup calls=%q, want %q", calls, wantCalls)
+					}
 				}
 				if string(out) != fmt.Sprintf("rc=%d\n", tc.wantRC) {
 					t.Fatalf("fetch result=%q, want rc=%d", out, tc.wantRC)
@@ -2745,13 +2806,13 @@ func TestReleaseOutputPathAllowsStickyParentButRejectsNoncanonicalPath(t *testin
 	}
 	guards := offline[start : start+end]
 	dir := t.TempDir()
-	stickyParent := filepath.Join(dir, "sticky")
-	if err := os.Mkdir(stickyParent, 0o700); err != nil {
-		t.Fatal(err)
+	const stickyParent = "/tmp"
+	outputLeaf := filepath.Base(filepath.Dir(dir)) + "-output"
+	outputPath := filepath.Join(stickyParent, outputLeaf)
+	if _, err := os.Lstat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("test output path must begin nonexistent: %v", err)
 	}
-	if err := os.Chmod(stickyParent, 0o777|os.ModeSticky); err != nil {
-		t.Fatal(err)
-	}
+	noncanonicalOutputPath := stickyParent + "//" + outputLeaf + "-other"
 
 	script := filepath.Join(dir, "output-path.sh")
 	body := `#!/bin/bash
@@ -2759,12 +2820,12 @@ set -Eeuo pipefail
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 local_with_timeout() { timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" "$@"; }
 ` + guards + `
-require_safe_new_output_path "$TEST_STICKY_PARENT/out" "test output"
+require_safe_new_output_path "$TEST_OUTPUT_PATH" "test output"
 if require_safe_directory_path "$TEST_STICKY_PARENT" "test leaf"; then
   echo "sticky leaf unexpectedly passed" >&2
   exit 90
 fi
-if require_safe_new_output_path "$TEST_STICKY_PARENT//other" "test output"; then
+if require_safe_new_output_path "$TEST_NONCANONICAL_OUTPUT_PATH" "test output"; then
   echo "noncanonical output unexpectedly passed" >&2
   exit 91
 fi
@@ -2773,9 +2834,16 @@ fi
 		t.Fatal(err)
 	}
 	cmd := exec.Command("/bin/bash", script)
-	cmd.Env = append(os.Environ(), "TEST_STICKY_PARENT="+stickyParent)
+	cmd.Env = append(os.Environ(),
+		"TEST_STICKY_PARENT="+stickyParent,
+		"TEST_OUTPUT_PATH="+outputPath,
+		"TEST_NONCANONICAL_OUTPUT_PATH="+noncanonicalOutputPath,
+	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("sticky-parent/noncanonical output guard failed: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("output path guard created its target: %v", err)
 	}
 }
 

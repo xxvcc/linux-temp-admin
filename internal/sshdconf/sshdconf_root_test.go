@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
@@ -27,6 +28,112 @@ func rootDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func verifySSHDPrivilegeSeparationDir(path string, info os.FileInfo) error {
+	if !info.IsDir() {
+		return fmt.Errorf("%s is %s, want a directory", path, info.Mode().Type())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine owner of %s", path)
+	}
+	if stat.Uid != 0 {
+		return fmt.Errorf("%s is owned by uid %d, want root", path, stat.Uid)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s has unsafe mode %04o: group/other write bits must be clear", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+// ensureSSHDPrivilegeSeparationDir supplies the runtime prerequisite that
+// distro packages normally create before starting sshd. Minimal CI images can
+// contain the real sshd binary without that directory.
+func ensureSSHDPrivilegeSeparationDir(t *testing.T, path string) {
+	t.Helper()
+
+	info, err := os.Lstat(path)
+	if err == nil {
+		if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspect sshd privilege separation directory: %v", err)
+	}
+
+	if err := os.Mkdir(path, 0o755); err != nil {
+		// Another process may have created the directory after Lstat. In that
+		// case it owns the lifecycle, so validate it without registering cleanup.
+		if errors.Is(err, os.ErrExist) {
+			info, statErr := os.Lstat(path)
+			if statErr != nil {
+				t.Fatalf("inspect concurrently created sshd privilege separation directory: %v", statErr)
+			}
+			if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		t.Fatalf("create sshd privilege separation directory: %v", err)
+	}
+
+	created, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("inspect created sshd privilege separation directory: %v", err)
+	}
+	t.Cleanup(func() {
+		current, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Errorf("inspect sshd privilege separation directory during cleanup: %v", err)
+			return
+		}
+		if !os.SameFile(created, current) {
+			return
+		}
+		if err := os.Remove(path); err != nil {
+			t.Errorf("remove test-created sshd privilege separation directory: %v", err)
+		}
+	})
+
+	dir, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open created sshd privilege separation directory: %v", err)
+	}
+	opened, err := dir.Stat()
+	if err != nil {
+		dir.Close()
+		t.Fatalf("inspect opened sshd privilege separation directory: %v", err)
+	}
+	if !os.SameFile(created, opened) {
+		dir.Close()
+		t.Fatal("sshd privilege separation directory was replaced while being opened")
+	}
+	if err := dir.Chmod(0o755); err != nil {
+		dir.Close()
+		t.Fatalf("set sshd privilege separation directory mode: %v", err)
+	}
+	if err := dir.Close(); err != nil {
+		t.Fatalf("close sshd privilege separation directory: %v", err)
+	}
+	info, err = os.Lstat(path)
+	if err != nil {
+		t.Fatalf("verify created sshd privilege separation directory: %v", err)
+	}
+	if !os.SameFile(created, info) {
+		t.Fatal("sshd privilege separation directory was replaced while being configured")
+	}
+	if err := verifySSHDPrivilegeSeparationDir(path, info); err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("created sshd privilege separation directory mode = %04o, want 0755", got)
+	}
 }
 
 // blocked is a host that refuses public-key logins; fixed is the same host once
@@ -100,6 +207,7 @@ func TestDropInRestoresScopeForLaterIncludedFiles(t *testing.T) {
 	if err := os.WriteFile(main, []byte("Include "+dir+"/*.conf\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	ensureSSHDPrivilegeSeparationDir(t, "/run/sshd")
 	out, err := exec.Command(sshd, "-T", "-f", main, "-C", "user=xxvcc-other,host=localhost,addr=127.0.0.1").CombinedOutput()
 	if err != nil {
 		t.Fatalf("sshd -T: %v: %s", err, strings.TrimSpace(string(out)))
@@ -107,6 +215,69 @@ func TestDropInRestoresScopeForLaterIncludedFiles(t *testing.T) {
 	if got := sysinfo.ParseSSHD(string(out)).First("passwordauthentication"); got != "no" {
 		t.Fatalf("later global drop-in was captured by the managed Match block: PasswordAuthentication=%q, want no", got)
 	}
+}
+
+func TestEnsureSSHDPrivilegeSeparationDirLifecycle(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	t.Run("creates and cleans", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd")
+		t.Run("create", func(t *testing.T) {
+			ensureSSHDPrivilegeSeparationDir(t, path)
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("created directory: %v", err)
+			}
+			if got := info.Mode().Perm(); got != 0o755 {
+				t.Fatalf("created directory mode = %04o, want 0755", got)
+			}
+		})
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("test-created directory was not cleaned up: %v", err)
+		}
+	})
+
+	t.Run("leaves existing directory unchanged", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		ensureSSHDPrivilegeSeparationDir(t, path)
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("existing directory was removed: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("existing directory mode = %04o, want unchanged 0700", got)
+		}
+	})
+
+	t.Run("preserves replacement inode", func(t *testing.T) {
+		parent := t.TempDir()
+		path := filepath.Join(parent, "sshd")
+		displaced := filepath.Join(parent, "sshd-created-by-test")
+		t.Run("replace", func(t *testing.T) {
+			ensureSSHDPrivilegeSeparationDir(t, path)
+			if err := os.Rename(path, displaced); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		})
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("replacement directory was removed: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("replacement directory mode = %04o, want 0700", got)
+		}
+	})
 }
 
 func TestRemoveNeverReloadsOntoABrokenConfig(t *testing.T) {

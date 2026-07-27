@@ -55,6 +55,10 @@ type App struct {
 	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
 	// test's verdict comes from a fixture, not from the test host's own sshd.
 	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
+	// SSHDHasConnectionScopedMatch covers the part of sshd policy that a user-only
+	// effective-config probe cannot evaluate. Keep it beside SSHDConfig so tests
+	// can source the complete policy verdict from fixtures instead of the host.
+	SSHDHasConnectionScopedMatch func() bool
 
 	InstallPath string
 	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
@@ -91,28 +95,29 @@ type App struct {
 // NewApp builds an App with real collaborators and the resolved language.
 func NewApp(lang i18n.Lang) *App {
 	return &App{
-		Out:          os.Stdout,
-		Err:          os.Stderr,
-		In:           os.Stdin,
-		P:            i18n.Printer{Lang: lang},
-		Users:        user.New(),
-		Sudoers:      sudoers.New(),
-		SSHD:         sshdconf.New(),
-		Scheduler:    schedule.New(),
-		Registry:     registry.Default(),
-		Detector:     netdetect.New(),
-		Selfmanage:   selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
-		Audit:        audit.Default(),
-		Lifecycle:    lifecycle.New(config.LifecycleLockFile),
-		SSHDConfig:   sysinfo.SSHDEffective,
-		InstallPath:  config.InstallPath,
-		StateDir:     config.StateDir,
-		AuditLogDir:  config.AuditLogDir,
-		Now:          time.Now,
-		RandHex:      randHex,
-		RandPassword: randPassword,
-		StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
-		StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
+		Out:                          os.Stdout,
+		Err:                          os.Stderr,
+		In:                           os.Stdin,
+		P:                            i18n.Printer{Lang: lang},
+		Users:                        user.New(),
+		Sudoers:                      sudoers.New(),
+		SSHD:                         sshdconf.New(),
+		Scheduler:                    schedule.New(),
+		Registry:                     registry.Default(),
+		Detector:                     netdetect.New(),
+		Selfmanage:                   selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
+		Audit:                        audit.Default(),
+		Lifecycle:                    lifecycle.New(config.LifecycleLockFile),
+		SSHDConfig:                   sysinfo.SSHDEffective,
+		SSHDHasConnectionScopedMatch: sysinfo.HasConnectionScopedMatch,
+		InstallPath:                  config.InstallPath,
+		StateDir:                     config.StateDir,
+		AuditLogDir:                  config.AuditLogDir,
+		Now:                          time.Now,
+		RandHex:                      randHex,
+		RandPassword:                 randPassword,
+		StdoutIsTTY:                  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
+		StdinIsTTY:                   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
 		TerminalWidth: func() int {
 			width, _, err := term.GetSize(int(os.Stdout.Fd()))
 			if err != nil {

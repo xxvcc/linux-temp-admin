@@ -663,15 +663,19 @@ func (a *App) reportBlockers(rep sysinfo.LoginReport) {
 // blocker, so it neither refuses the invite nor triggers a fix, only downgrades a
 // "verified" claim to an honest UNVERIFIED.
 func (a *App) checkKeyLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return withConnectionScopedMatch(sysinfo.CheckKeyLogin(cfg, user, groups))
+	return a.withConnectionScopedMatch(sysinfo.CheckKeyLogin(cfg, user, groups))
 }
 
 func (a *App) checkPasswordLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return withConnectionScopedMatch(sysinfo.CheckPasswordLogin(cfg, user, groups))
+	return a.withConnectionScopedMatch(sysinfo.CheckPasswordLogin(cfg, user, groups))
 }
 
-func withConnectionScopedMatch(rep sysinfo.LoginReport) sysinfo.LoginReport {
-	if sysinfo.HasConnectionScopedMatch() {
+func (a *App) withConnectionScopedMatch(rep sysinfo.LoginReport) sysinfo.LoginReport {
+	hasConnectionScopedMatch := sysinfo.HasConnectionScopedMatch
+	if a.SSHDHasConnectionScopedMatch != nil {
+		hasConnectionScopedMatch = a.SSHDHasConnectionScopedMatch
+	}
+	if hasConnectionScopedMatch() {
 		rep.Unverifiable = append(rep.Unverifiable,
 			"sshd has a connection-scoped Match rule; whether this account is admitted depends on address, port, or routing attributes that cannot be checked here")
 	}

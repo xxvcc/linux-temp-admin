@@ -184,9 +184,10 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
 			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		},
-		SSHDConfig: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		Detector:   netdetect.New(),
-		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
+		SSHDConfig:                   func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		SSHDHasConnectionScopedMatch: func() bool { return false },
+		Detector:                     netdetect.New(),
+		Selfmanage:                   &selfmanage.Manager{InstallPath: installPath},
 		Audit: &audit.Logger{
 			Dir: filepath.Dir(auditFile), File: auditFile, Now: now,
 			Actor: func() (string, int) { return "e2e", 0 },
@@ -490,7 +491,8 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Effective: effective,
 			Reload: func() error { reloads++; return nil },
 		},
-		SSHDConfig: effective,
+		SSHDConfig:                   effective,
+		SSHDHasConnectionScopedMatch: func() bool { return false },
 		Scheduler: &schedule.Scheduler{
 			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
