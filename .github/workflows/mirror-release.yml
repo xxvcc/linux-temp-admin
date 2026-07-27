@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Immutable release tag to mirror, for example v2.8.1
+        description: Immutable release tag to mirror, for example v2.8.2
         required: true
         type: string
 

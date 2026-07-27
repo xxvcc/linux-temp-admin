@@ -1,9 +1,12 @@
 # Releasing linux-temp-admin v2
 
-Release binaries are reproducibly rebuilt and signed with ed25519. The release
-private key is never present on a networked machine, candidate source is never
-executed on the signing machine, and CI output is never signed merely because
-its own checksum file matches.
+Release binaries are reproducibly rebuilt and signed with ed25519. The target
+release boundary keeps the private key off networked machines, never executes
+candidate source on the signing machine, and never signs CI output merely
+because its own checksum file matches. The current v1 ed25519 key predates that
+custody boundary and has historical exposure on a networked maintainer host;
+releases using it must retain that residual-risk record until the planned key
+rotation completes.
 
 ## Maintainer model
 
@@ -419,10 +422,10 @@ git -c user.name='XXV.CC' \
     -c user.signingkey="${TAG_SIGNING_FPR}!" \
     -c gpg.format=openpgp \
     -c gpg.program=/usr/bin/gpg \
-    tag -s v2.8.1 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.1'
+    tag -s v2.8.2 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.2'
 git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg \
-    verify-tag --raw v2.8.1
-git push origin v2.8.1
+    verify-tag --raw v2.8.2
+git push origin v2.8.2
 ```
 
 Before pushing, the `VALIDSIG` record from `verify-tag --raw` must identify the
@@ -432,7 +435,8 @@ an armored OpenPGP signature before continuing. Use that same fingerprint as
 `LTA_EXPECTED_TAG_SIGNER_FINGERPRINT` during preparation and publication.
 
 The `Release` workflow uses exactly Go 1.26.5. Its read-only `gate-build` job
-runs vet, uncached race tests, root integration tests, formatting, shell checks,
+runs vet, uncached race tests, package-serialized root integration tests,
+formatting, shell checks,
 the mirror receiver policy tests, a clean-worktree check, and
 `govulncheck v1.6.0`, then builds static
 amd64/arm64 binaries with fixed tuning, `GOWORK=off`, `-mod=readonly`, and
@@ -485,7 +489,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/prepare-release.sh \
-  v2.8.1 /srv/linux-temp-admin /srv/release-transfer/v2.8.1-prepared
+  v2.8.2 /srv/linux-temp-admin /srv/release-transfer/v2.8.2-prepared
 LTA_PREPARE_RELEASE
 ```
 
@@ -505,7 +509,7 @@ the candidate or transfer media:
 LTA_SIGN_KEY=/offline/keys/release-v1.key
 LTA_TRUSTED_SIGNER=/opt/lta-release-tools/lta-release
 LTA_TRUSTED_SIGNER_SHA256='<offline-recorded signer sha256>'
-LTA_EXPECTED_TAG=v2.8.1
+LTA_EXPECTED_TAG=v2.8.2
 LTA_EXPECTED_COMMIT='<independently recorded 40-hex commit>'
 LTA_EXPECTED_PREPARED_MANIFEST_SHA256='<independently recorded sha256>'
 LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public key>'
@@ -517,7 +521,7 @@ LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public ke
   LTA_EXPECTED_PREPARED_MANIFEST_SHA256="$LTA_EXPECTED_PREPARED_MANIFEST_SHA256" \
   LTA_EXPECTED_RELEASE_SIGNER_PUBKEY="$LTA_EXPECTED_RELEASE_SIGNER_PUBKEY" \
   /opt/lta-release-tools/offline-sign-release.sh \
-  /media/in/v2.8.1-prepared /media/out/v2.8.1-signed
+  /media/in/v2.8.2-prepared /media/out/v2.8.2-signed
 ```
 
 The script copies the removable input into a size-bounded private local snapshot
@@ -568,7 +572,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/publish-release.sh \
-  /srv/release-transfer/v2.8.1-signed /srv/linux-temp-admin
+  /srv/release-transfer/v2.8.2-signed /srv/linux-temp-admin
 LTA_PUBLISH_RELEASE
 ```
 
@@ -633,7 +637,7 @@ noncanonical published stable tag, excludes the failed `TAG`, and verifies the
 exact resulting Latest state:
 
 ```bash
-TAG=v2.8.1  # the failed release; verify this value before running
+TAG=v2.8.2  # the failed release; verify this value before running
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   TAG="$TAG" /bin/bash -p <<'LTA_LATEST_RECOVERY'
@@ -992,7 +996,7 @@ the release audit/signing record and a separate authenticated channel, then run:
 ```bash
 INSTALLER_COMMIT='replace-with-the-audited-40-hex-commit'
 INSTALLER_SHA256='replace-with-the-independent-64-hex-script-hash'
-LTA_RELEASE_TAG='v2.8.1'
+LTA_RELEASE_TAG='v2.8.2'
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   INSTALLER_COMMIT="$INSTALLER_COMMIT" INSTALLER_SHA256="$INSTALLER_SHA256" \
@@ -1136,9 +1140,13 @@ metadata are already safe; otherwise it is atomically repaired.
 
 ## Trust boundaries and residual risk
 
-- The private key is protected from candidate code, CI, GitHub, and networked
-  preparation/publication. The air-gapped OS, fixed signer binary, trusted
-  offline script, and physical transfer procedure remain trusted.
+- The signing phase protects the private key from candidate code, CI, GitHub,
+  and networked preparation/publication. The current v1 key was historically
+  stored on a networked maintainer host, so its past confidentiality cannot be
+  inferred from the isolated signing ceremony. Complete the planned overlap
+  rotation before claiming an air-gapped custody history for the active key.
+  The air-gapped OS, fixed signer binary, trusted offline script, and physical
+  transfer procedure remain trusted for keys that actually follow that model.
 - Reproducible comparison binds CI bytes to the audited tag under the fixed Go
   toolchain. The audited source, signed-tag identity, trusted preparation copy,
   Go distribution, and preparation workstation remain trusted.

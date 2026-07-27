@@ -50,7 +50,9 @@ jobs:
           go-version: '1.26.x'
           check-latest: true
       - name: Integration tests (root)
-        run: sudo -E env "PATH=$PATH" go test -race -tags integration ./...
+        # Root integration packages share the host account databases and must
+        # not run useradd/userdel concurrently across package processes.
+        run: sudo -E env "PATH=$PATH" go test -race -p 1 -tags integration ./...
 
   static-cross-build:
     name: Static cross-build (${{ matrix.goarch }})
