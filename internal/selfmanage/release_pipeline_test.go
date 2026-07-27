@@ -112,12 +112,16 @@ func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *tes
 	mirror := readReleaseFile(t, "../../.github/workflows/mirror-release.yml")
 	installer := readReleaseFile(t, "../../scripts/install.sh")
 	for _, required := range []string{
-		"types: [published]",
+		"workflow_dispatch:",
 		"group: linux-temp-admin-release-mirror-stable",
 		"cancel-in-progress: false",
 		"environment: release-mirror",
 		"LTA_RELEASE_MIRROR_ENVIRONMENT_CONFIGURED",
+		`TAG: ${{ inputs.tag }}`,
+		`[[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]`,
+		`[[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]`,
 		`$GITHUB_REPOSITORY/.github/workflows/mirror-release.yml@refs/heads/$DEFAULT_BRANCH`,
+		`[[ "$GITHUB_SHA" == "$TRUSTED_WORKFLOW_SHA" ]]`,
 		"GH_HOST: github.com",
 		"GH_PROMPT_DISABLED: '1'",
 		"timeout -k 5 60 gh api",
@@ -149,6 +153,8 @@ func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *tes
 		}
 	}
 	for _, prohibited := range []string{
+		"\n  release:",
+		"github.event.release.tag_name",
 		"types: [published, edited]",
 		"contents: write",
 		"--clobber",

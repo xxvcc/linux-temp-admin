@@ -744,7 +744,20 @@ timeout and uses a private, transient configuration directory.
 
 Publishing the GitHub Release is not the end of the release. The
 [`Mirror signed release`](../.github/workflows/mirror-release.yml) workflow must
-finish before announcement. It accepts only an immutable public GitHub Release
+be explicitly dispatched from the protected default branch and finish before
+announcement:
+
+```bash
+gh workflow run mirror-release.yml --repo xxvcc/linux-temp-admin \
+  --ref main -f tag=v2.8.3
+gh run list --repo xxvcc/linux-temp-admin \
+  --workflow mirror-release.yml --event workflow_dispatch --limit 1
+```
+
+The explicit default-branch dispatch is a credential boundary: a GitHub
+`release` event runs with the released tag as its workflow ref, so it must not
+receive the `release-mirror` Environment credential. The workflow accepts only
+an immutable public GitHub Release
 with the exact five-asset release set, rechecks the checksum manifest and both
 ed25519 signatures against the trusted keyring, verifies the released binaries,
 and copies one complete release into
@@ -758,8 +771,8 @@ verifies the stable installer hash and fails if either client reports that it
 used the GitHub fallback.
 
 Create a protected GitHub Environment named `release-mirror` with no required
-reviewers. Disable administrator bypass, and allow only protected `v*` tags plus
-the protected default branch used for an explicit recovery dispatch. Enable
+reviewers. Disable administrator bypass, and allow only the protected default
+branch used for normal publication and recovery dispatches. Enable
 immutable Releases for the repository; synchronization fails closed when the
 selected GitHub Release is mutable. Configure exactly these environment values:
 
