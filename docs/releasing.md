@@ -989,17 +989,19 @@ sudo install -o root -g root -m 0755 -- scripts/mirror-receiver.py "$receiver_tm
 [[ "$(sudo stat -Lc '%F %U %G %a' -- "$receiver_tmp")" == 'regular file root root 755' ]]
 sudo -u ltamirror -- python3 -B - "$receiver_tmp" "$project_root" <<'PY'
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import os
 from pathlib import Path
 import sys
 import tempfile
 
 source_path, project_path = sys.argv[1:]
-spec = importlib.util.spec_from_file_location("mirror_receiver_probe", source_path)
-if spec is None or spec.loader is None:
+loader = SourceFileLoader("mirror_receiver_probe", source_path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+if spec is None:
     raise SystemExit("cannot load candidate mirror receiver")
 receiver = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(receiver)
+loader.exec_module(receiver)
 project = Path(project_path)
 with receiver.unmasked_creation():
     probe = Path(tempfile.mkdtemp(prefix=".renameat2-probe-", dir=project))
