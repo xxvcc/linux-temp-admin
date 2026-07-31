@@ -100,8 +100,16 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 	return a, &out, &errb
 }
 
+func requireRootRegistryFixture(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned Registry fixtures are covered by required Root integration")
+	}
+}
+
 func setTestRegistryRecord(t *testing.T, a *App, rec registry.Record) {
 	t.Helper()
+	requireRootRegistryFixture(t)
 	dir := t.TempDir()
 	a.Registry = &registry.Store{
 		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),

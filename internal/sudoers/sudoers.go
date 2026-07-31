@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -247,11 +248,10 @@ func verifyNopasswdOutput(out []byte) error {
 		if endRunas < 2 {
 			continue
 		}
-		includesRoot, ambiguous := runasRootScope(line[1:endRunas])
-		if ambiguous {
-			return fmt.Errorf("effective policy has an ambiguous negated RunAs list while verifying root NOPASSWD: ALL")
-		}
-		if !includesRoot {
+		switch runasRootScope(line[1:endRunas]) {
+		case runasRootAmbiguous:
+			return fmt.Errorf("effective policy has an ambiguous RunAs user list while verifying root NOPASSWD: ALL")
+		case runasRootExcluded:
 			continue
 		}
 		mode, exactAll := allAuthenticationMode(strings.TrimSpace(line[endRunas+1:]))
@@ -277,35 +277,60 @@ func verifyNopasswdOutput(out []byte) error {
 	return fmt.Errorf("effective policy has no root NOPASSWD: ALL grant")
 }
 
-func runasIncludesRoot(runas string) bool {
-	includesRoot, ambiguous := runasRootScope(runas)
-	return includesRoot && !ambiguous
-}
+type rootRunasScope uint8
 
-// runasRootScope reports whether the literal RunAs user list includes root and
-// whether it is too ambiguous to use as policy proof. A positive root/ALL token
-// combined with any exclusion may or may not still apply to root depending on
-// sudoers ordering and alias semantics. The verifier deliberately refuses the
-// complete proof instead of skipping that line and accidentally preserving an
-// earlier NOPASSWD verdict.
-func runasRootScope(runas string) (includesRoot, ambiguous bool) {
+const (
+	runasRootExcluded rootRunasScope = iota
+	runasRootIncluded
+	runasRootAmbiguous
+)
+
+// runasRootScope classifies whether the RunAs user list applies to root. Only
+// literal users and numeric UIDs are decidable without evaluating sudoers
+// aliases, Unix groups, or netgroups. Any dynamic or negated item invalidates
+// the complete policy proof instead of letting an earlier NOPASSWD verdict
+// survive a rule that may apply to root.
+func runasRootScope(runas string) rootRunasScope {
 	users := runas
 	if colon := strings.IndexByte(users, ':'); colon >= 0 {
 		users = users[:colon]
 	}
-	hasExclusion := false
-	for _, user := range strings.Split(users, ",") {
-		user = strings.TrimSpace(user)
-		if strings.HasPrefix(user, "!") {
-			hasExclusion = true
-			continue
+	if strings.TrimSpace(users) == "" {
+		return runasRootAmbiguous
+	}
+
+	includesRoot := false
+	for _, raw := range strings.Split(users, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" || strings.HasPrefix(entry, "!") {
+			return runasRootAmbiguous
 		}
-		switch user {
+		switch entry {
 		case "root", "ALL":
 			includesRoot = true
+			continue
 		}
+		if strings.HasPrefix(entry, "#") {
+			uid, err := strconv.ParseUint(strings.TrimPrefix(entry, "#"), 10, 32)
+			if err != nil {
+				return runasRootAmbiguous
+			}
+			if uid == 0 {
+				includesRoot = true
+			}
+			continue
+		}
+		if validate.Username(entry) {
+			continue
+		}
+		// User aliases, groups, netgroups, escaped names, and any syntax this
+		// verifier does not fully understand can resolve to root at runtime.
+		return runasRootAmbiguous
 	}
-	return includesRoot, includesRoot && hasExclusion
+	if includesRoot {
+		return runasRootIncluded
+	}
+	return runasRootExcluded
 }
 
 // allAuthenticationMode reports the authentication mode of an exact ALL

@@ -13,6 +13,7 @@ import (
 )
 
 func TestDoctorReportsUnsafeLiveAccountGID(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const (
 		name       = "xxvcc-a1"
 		generation = "0123456789abcdef0123456789abcdef"
@@ -45,6 +46,7 @@ func TestDoctorReportsUnsafeLiveAccountGID(t *testing.T) {
 }
 
 func TestCompletedAccountIdentityRejectsUnsafeLiveAccountGID(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const (
 		name       = "xxvcc-a1"
 		generation = "0123456789abcdef0123456789abcdef"
@@ -148,6 +150,7 @@ func TestStatusReportsAbsentDeletionRecovery(t *testing.T) {
 }
 
 func TestDoctorReportsLifecycleMarkerWithoutRegistryRow(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const (
 		registered = "xxvcc-registered"
 		markerOnly = "xxvcc-marker-only"

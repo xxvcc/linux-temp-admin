@@ -223,6 +223,7 @@ func TestInteractiveRevokeBindsConfirmationToAccountGeneration(t *testing.T) {
 }
 
 func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const generation = "0123456789abcdef0123456789abcdef"
 	for _, tc := range []struct {
 		name       string
@@ -296,6 +297,7 @@ func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(
 }
 
 func TestUnregisteredDeletionWitnessWriteFailureBlocksUserdel(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const username = "xxvcc-recovery2"
 	pw := user.Passwd{
 		Name: username, UID: 1001, GID: 1001,
@@ -332,6 +334,7 @@ func TestUnregisteredDeletionWitnessWriteFailureBlocksUserdel(t *testing.T) {
 }
 
 func TestRevokeUnsafeHomeAndGrantFailureStillDisableAndRetainAccount(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const (
 		name       = "xxvcc-a1"
 		generation = "0123456789abcdef0123456789abcdef"

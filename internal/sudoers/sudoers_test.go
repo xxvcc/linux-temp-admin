@@ -210,6 +210,7 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 		ok   bool
 	}{
 		{"root", "User alice may run the following commands:\n    (root) NOPASSWD: ALL\n", true},
+		{"numeric root", "    (#0) NOPASSWD: ALL\n", true},
 		{"all runas", "    (ALL : ALL) NOPASSWD: ALL\n", true},
 		{"all except root", "    (ALL, !root) NOPASSWD: ALL\n", false},
 		{"root exclusion before all", "    (!root, ALL) NOPASSWD: ALL\n", false},
@@ -224,10 +225,15 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 		{"later root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: ALL\n", false},
 		{"restricted root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", false},
 		{"later restricted passwd invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n", false},
+		{"numeric root restricted passwd invalidates full grant", "    (root) NOPASSWD: ALL\n    (#0) PASSWD: /bin/true\n", false},
 		{"later command-list passwd all invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) NOPASSWD: /bin/false, PASSWD: ALL\n", false},
 		{"exact later grant restores after command list", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", true},
 		{"later nopasswd all restores", "    (root) PASSWD: ALL\n    (root) NOPASSWD: ALL\n", true},
 		{"later non-root rule does not override", "    (root) NOPASSWD: ALL\n    (daemon) PASSWD: ALL\n", true},
+		{"later non-root uid rule does not override", "    (root) NOPASSWD: ALL\n    (#1) PASSWD: ALL\n", true},
+		{"dynamic group is ambiguous", "    (root) NOPASSWD: ALL\n    (%wheel) PASSWD: /bin/true\n", false},
+		{"netgroup is ambiguous", "    (root) NOPASSWD: ALL\n    (+operators) PASSWD: /bin/true\n", false},
+		{"user alias is ambiguous", "    (root) NOPASSWD: ALL\n    (OPERATORS) PASSWD: /bin/true\n", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -242,24 +248,33 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 	}
 }
 
-func TestRunasIncludesRootFailsClosedOnExclusions(t *testing.T) {
+func TestRunasRootScopeFailsClosedOnDynamicOrNegatedEntries(t *testing.T) {
 	tests := []struct {
+		name  string
 		runas string
-		want  bool
+		want  rootRunasScope
 	}{
-		{runas: "root", want: true},
-		{runas: "ALL : ALL", want: true},
-		{runas: "daemon, root", want: true},
-		{runas: "daemon"},
-		{runas: "ALL, !root"},
-		{runas: "!root, ALL"},
-		{runas: "root, !ALL"},
-		{runas: "ALL, !daemon"},
+		{name: "root", runas: "root", want: runasRootIncluded},
+		{name: "numeric root", runas: "#0", want: runasRootIncluded},
+		{name: "numeric root with leading zeroes", runas: "#000", want: runasRootIncluded},
+		{name: "all users", runas: "ALL : ALL", want: runasRootIncluded},
+		{name: "mixed literal users", runas: "daemon, root", want: runasRootIncluded},
+		{name: "non-root user", runas: "daemon", want: runasRootExcluded},
+		{name: "non-root uid", runas: "#1", want: runasRootExcluded},
+		{name: "root exclusion", runas: "ALL, !root", want: runasRootAmbiguous},
+		{name: "leading exclusion", runas: "!root, ALL", want: runasRootAmbiguous},
+		{name: "all exclusion", runas: "root, !ALL", want: runasRootAmbiguous},
+		{name: "other exclusion", runas: "ALL, !daemon", want: runasRootAmbiguous},
+		{name: "unix group", runas: "%wheel", want: runasRootAmbiguous},
+		{name: "netgroup", runas: "+operators", want: runasRootAmbiguous},
+		{name: "user alias", runas: "OPERATORS", want: runasRootAmbiguous},
+		{name: "malformed uid", runas: "#root", want: runasRootAmbiguous},
+		{name: "empty user list", runas: ": wheel", want: runasRootAmbiguous},
 	}
 	for _, tt := range tests {
-		t.Run(tt.runas, func(t *testing.T) {
-			if got := runasIncludesRoot(tt.runas); got != tt.want {
-				t.Fatalf("runasIncludesRoot(%q) = %t, want %t", tt.runas, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runasRootScope(tt.runas); got != tt.want {
+				t.Fatalf("runasRootScope(%q) = %d, want %d", tt.runas, got, tt.want)
 			}
 		})
 	}

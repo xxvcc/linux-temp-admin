@@ -1861,14 +1861,24 @@ func TestDeleteExpectedRejectsUnboundHomeBeforeHelper(t *testing.T) {
 }
 
 func TestValidateHomeRemovalRequiresDedicatedOwnedRealDirectory(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned Home fixtures are covered by required Root integration")
+	}
+	const testUID, testGID = 2345, 2346
 	oldRoot := managedHomeRoot
 	managedHomeRoot = t.TempDir()
 	t.Cleanup(func() { managedHomeRoot = oldRoot })
+	if err := os.Chown(managedHomeRoot, 0, 0); err != nil {
+		t.Fatal(err)
+	}
 	home := managedHome("xxvcc-u")
 	if err := os.Mkdir(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	expected := Passwd{Name: "xxvcc-u", UID: os.Getuid(), GID: os.Getgid(), Home: home}
+	if err := os.Chown(home, testUID, testGID); err != nil {
+		t.Fatal(err)
+	}
+	expected := Passwd{Name: "xxvcc-u", UID: testUID, GID: testGID, Home: home}
 	if err := validateHomeRemoval(expected); err != nil {
 		t.Fatalf("safe dedicated home rejected: %v", err)
 	}

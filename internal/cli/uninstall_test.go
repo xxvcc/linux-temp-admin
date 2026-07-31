@@ -73,6 +73,7 @@ func TestUninstallMarkerOnlyPermanentAccountBlocksWithoutDeleteAuthority(t *test
 }
 
 func TestUninstallRefusesLiveUIDOnlyRecoveryBeforeAnyMutation(t *testing.T) {
+	requireRootRegistryFixture(t)
 	const name = "xxvcc-live-recovery"
 	a, _, errb := newTestApp(t, "")
 	root := t.TempDir()

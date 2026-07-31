@@ -116,7 +116,9 @@ All notable changes to this project are documented here.
   Honor sudoers' last-match ordering when checking `sudo -l` output, so a later
   `PASSWD: ALL`, restricted PASSWD command, or unparsed command list cannot be
   hidden by an earlier `NOPASSWD: ALL` match; only a later exact NOPASSWD grant
-  restores the full-policy proof.
+  restores the full-policy proof. Treat numeric UID `#0` as root as sudoers does,
+  and fail closed on dynamic RunAs groups, netgroups, aliases, or malformed
+  entries whose root membership cannot be proven locally.
 - Require `chpasswd` during dependency planning only for password-login invites,
   so a missing password helper is reported or installed before account creation;
   keep it optional for key-only invites and the base `doctor` verdict.
