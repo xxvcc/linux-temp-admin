@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.1 - 2026-08-01
+
+- Accept the exact C-locale diagnostic emitted by systemd 256 and later when
+  `systemctl disable --now` targets an already-absent timer, then retain the
+  existing explicit stop and inactive confirmation before treating cleanup as
+  complete. This restores invitation creation on Debian 13 without hiding
+  permission, D-Bus, wrong-unit, or otherwise non-exact systemctl failures.
+
 ## v2.9.0 - 2026-08-01
 
 - Repair an incomplete audit-log tail before the next append so a crash cannot

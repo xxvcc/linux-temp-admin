@@ -255,6 +255,20 @@ func TestScheduleRollsBackPartiallyEnabledSystemdTimerBeforeAtFallback(t *testin
 		if len(args) == 3 && args[0] == "enable" {
 			return errors.New("enable failed after starting timer")
 		}
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit " + args[2] + " does not exist",
+			}
+		}
+		if len(args) == 2 && args[0] == "stop" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 5"),
+				output: "Failed to stop " + args[1] + ": Unit " + args[1] + " not loaded.",
+			}
+		}
 		return nil
 	}
 	s := newScheduler(dir, sys)
@@ -282,6 +296,7 @@ func TestScheduleRollsBackPartiallyEnabledSystemdTimerBeforeAtFallback(t *testin
 		"daemon-reload",
 		"enable --now " + unit + ".timer",
 		"disable --now " + unit + ".timer",
+		"stop " + unit + ".timer",
 		"daemon-reload",
 	}
 	if gotCalls := joinedSystemctlCalls(sys.calls); strings.Join(gotCalls, "|") != strings.Join(wantCalls, "|") {
@@ -480,7 +495,7 @@ func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
 			return &systemctlError{
 				args:   append([]string(nil), args...),
 				err:    errors.New("exit status 1"),
-				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+				output: "Failed to disable unit: Unit " + unit + ".timer does not exist",
 			}
 		}
 		if len(args) == 2 && args[0] == "stop" {
@@ -504,6 +519,45 @@ func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
 	}
 }
 
+func TestCancelTreatsModernMissingTimersInCurrentAndLegacyNamespacesAsSuccess(t *testing.T) {
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(t.TempDir(), sys)
+	s.LegacyUnitPrefixes = []string{"linux-temp-admin-revoke-"}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit " + args[2] + " does not exist",
+			}
+		}
+		if len(args) == 2 && args[0] == "stop" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 5"),
+				output: "Failed to stop " + args[1] + ": Unit " + args[1] + " not loaded.",
+			}
+		}
+		return nil
+	}
+
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatalf("empty current and legacy namespaces should be idempotent success: %v", err)
+	}
+	want := []string{
+		"disable --now linux-temp-admin-v2-revoke-xxvcc-a1.timer",
+		"stop linux-temp-admin-v2-revoke-xxvcc-a1.timer",
+		"disable --now linux-temp-admin-revoke-xxvcc-a1.timer",
+		"stop linux-temp-admin-revoke-xxvcc-a1.timer",
+	}
+	got := strings.Join(joinedSystemctlCalls(sys.calls), "|")
+	for _, call := range want {
+		if !strings.Contains(got, call) {
+			t.Errorf("missing systemctl call %q; calls=%v", call, sys.calls)
+		}
+	}
+}
+
 func TestCancelExplicitlyStopsActiveTimerWhoseUnitFileIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true}
@@ -520,7 +574,7 @@ func TestCancelExplicitlyStopsActiveTimerWhoseUnitFileIsMissing(t *testing.T) {
 			return &systemctlError{
 				args:   append([]string(nil), args...),
 				err:    errors.New("exit status 1"),
-				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+				output: "Failed to disable unit: Unit " + unit + ".timer does not exist",
 			}
 		case len(args) == 2 && args[0] == "stop":
 			active = false
@@ -560,7 +614,7 @@ func TestCancelPreservesEvidenceWhenMissingTimerStateIsUncertain(t *testing.T) {
 			return &systemctlError{
 				args:   append([]string(nil), args...),
 				err:    errors.New("exit status 1"),
-				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+				output: "Failed to disable unit: Unit " + unit + ".timer does not exist",
 			}
 		}
 		if len(args) == 2 && args[0] == "stop" {
@@ -594,7 +648,7 @@ func TestScheduleDoesNotFallbackWhenMissingFileRollbackCannotStopTimer(t *testin
 			return &systemctlError{
 				args:   append([]string(nil), args...),
 				err:    errors.New("exit status 1"),
-				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+				output: "Failed to disable unit: Unit " + unit + ".timer does not exist",
 			}
 		case len(args) == 3 && args[0] == "is-active":
 			return nil
