@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.2 - 2026-08-01
+
+- Validate conventional mail-pool roots before `useradd`, then reopen and
+  revalidate them during cleanup bound to the newly selected UID. Accept the
+  root-owned layouts used by supported systems, including `root:mail 3777` and
+  Arch Linux's `root:root 1777`; a world-writable root now requires sticky-bit
+  protection. Continue to reject a non-root owner, setuid, world-write without
+  sticky, and a `/var/mail` or `/var/spool/mail` alias that escapes those two
+  accepted locations. Mail cleanup remains limited to a non-symlink regular mbox
+  file whose owner matches the captured UID.
+- Return a proved post-`useradd` passwd identity with mail or Home preparation
+  failures so invite rollback can safely use it, while classifying failures that
+  occur before the helper runs so a confirmed-absent account does not leave a
+  stale creation-intent row. Persist the deletion-recovery witness before
+  controlled mail/Home cleanup, preserving narrow post-disappearance recovery
+  when an account vanishes during teardown.
+- Permit manual recovery of a live pending creation row retained by a release
+  before v2.9.2 only through a direct interactive `revoke --user <name> --force`
+  and full-name confirmation. Require the row's random generation to match the
+  pending GECOS marker plus the exact safe account shape, then convert it to a
+  generation-less UID-only `DeletionStarted` witness before artifact cleanup.
+  `--yes`, automatic tasks, uninstall bulk removal, non-TTY input, and every
+  mismatched or incomplete pending identity remain fail-closed.
+- Recheck both the local passwd database and NSS between absent-account mail
+  sweeps, and recheck mailbox absence after syncing its parent directory. A
+  same-name NSS identity or a mailbox recreated during durability confirmation
+  now stops cleanup and retains the recovery witness instead of being reported as
+  a completed deletion.
+
 ## v2.9.1 - 2026-08-01
 
 - Accept the exact C-locale diagnostic emitted by systemd 256 and later when

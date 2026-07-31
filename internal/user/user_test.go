@@ -448,18 +448,21 @@ func (f *fakeRunner) Look(name string) bool { return f.available[name] }
 
 func managerWithStubbedHomeChecks(r Runner) *Manager {
 	return &Manager{
-		Runner:              r,
-		PrepareManagedHome:  func(string) error { return nil },
-		CreateManagedHome:   func(Passwd) error { return nil },
-		ValidateManagedHome: func(Passwd) error { return nil },
-		RemoveManagedMail:   func(Passwd) error { return nil },
-		RemoveManagedHome:   func(Passwd) error { return nil },
+		Runner:                   r,
+		NameInUse:                func(string) (bool, error) { return false, nil },
+		ValidateManagedMailRoots: func() error { return nil },
+		PrepareManagedHome:       func(string) error { return nil },
+		CreateManagedHome:        func(Passwd) error { return nil },
+		ValidateManagedHome:      func(Passwd) error { return nil },
+		RemoveManagedMail:        func(Passwd) error { return nil },
+		RemoveManagedHome:        func(Passwd) error { return nil },
 	}
 }
 
 func managerWithStubbedHomeRemoval(r Runner) *Manager {
 	return &Manager{
 		Runner:            r,
+		NameInUse:         func(string) (bool, error) { return false, nil },
 		RemoveManagedMail: func(Passwd) error { return nil },
 		RemoveManagedHome: func(Passwd) error { return nil },
 	}
@@ -904,6 +907,7 @@ func TestReconcileManagedMailAfterDeletionRequiresContinuousAbsence(t *testing.T
 		mailCalls := 0
 		m := &Manager{
 			LookupUser: func(string) (Passwd, bool, error) { return Passwd{}, false, nil },
+			NameInUse:  func(string) (bool, error) { return false, nil },
 			RemoveManagedMail: func(got Passwd) error {
 				mailCalls++
 				if got.Name != name || got.UID != 1001 || got.GID != 0 || got.Home != "" {
@@ -934,11 +938,44 @@ func TestReconcileManagedMailAfterDeletionRequiresContinuousAbsence(t *testing.T
 				}
 				return replacement, true, nil
 			},
+			NameInUse:         func(string) (bool, error) { return false, nil },
 			RemoveManagedMail: func(Passwd) error { return nil },
 		}
 		err := m.ReconcileManagedMailAfterDeletion(name, 1001)
 		if err == nil || !strings.Contains(err.Error(), "reappeared") {
 			t.Fatalf("reconciliation error = %v, want replacement refusal", err)
+		}
+	})
+
+	t.Run("NSS identity blocks local-absence cleanup", func(t *testing.T) {
+		mailCalls := 0
+		m := &Manager{
+			LookupUser:        func(string) (Passwd, bool, error) { return Passwd{}, false, nil },
+			NameInUse:         func(string) (bool, error) { return true, nil },
+			RemoveManagedMail: func(Passwd) error { mailCalls++; return nil },
+		}
+		err := m.ReconcileManagedMailAfterDeletion(name, 1001)
+		if err == nil || !strings.Contains(err.Error(), "remains present through NSS") {
+			t.Fatalf("NSS replacement error = %v, want fail-closed refusal", err)
+		}
+		if mailCalls != 0 {
+			t.Fatalf("NSS identity reached mail cleanup %d time(s)", mailCalls)
+		}
+	})
+
+	t.Run("NSS lookup failure is not absence", func(t *testing.T) {
+		wantErr := errors.New("NSS unavailable")
+		m := &Manager{
+			LookupUser: func(string) (Passwd, bool, error) { return Passwd{}, false, nil },
+			NameInUse:  func(string) (bool, error) { return false, wantErr },
+			RemoveManagedMail: func(Passwd) error {
+				t.Fatal("failed NSS lookup reached mail cleanup")
+				return nil
+			},
+		}
+		err := m.ReconcileManagedMailAfterDeletion(name, 1001)
+		if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "confirm account absence through NSS") {
+			t.Fatalf("NSS lookup error = %v, want %v", err, wantErr)
 		}
 	})
 }
@@ -982,6 +1019,92 @@ func TestCreateRequiresUseradd(t *testing.T) {
 				t.Fatalf("unapproved account helper was invoked: %v", f.calls)
 			}
 		})
+	}
+}
+
+func TestCreateValidatesManagedMailRootsBeforeUseradd(t *testing.T) {
+	wantErr := errors.New("unsafe mail root")
+	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	m := managerWithStubbedHomeChecks(f)
+	m.ValidateManagedMailRoots = func() error { return wantErr }
+	m.PrepareManagedHome = func(string) error {
+		t.Fatal("managed Home preflight ran after mail-root preflight failed")
+		return nil
+	}
+
+	err := m.Create("xxvcc-a1", "/bin/sh", testGeneration)
+	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "before account creation") {
+		t.Fatalf("Create error = %v, want pre-useradd mail-root refusal", err)
+	}
+	if !errors.Is(err, ErrAccountCreationNotStarted) {
+		t.Fatalf("Create error = %v, want creation-not-started classification", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("unsafe mail root reached useradd: %v", f.calls)
+	}
+}
+
+func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mail-root ownership and mode transition requires root")
+	}
+	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	expected := Passwd{
+		Name: "xxvcc-a1", UID: 2345, GID: 2345, GECOS: pendingMarker,
+		Home: "/home/xxvcc-a1", Shell: "/bin/sh",
+	}
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
+	setProcRoot(t, map[int]string{})
+	root := t.TempDir()
+	if err := os.Chown(root, 0, 2346); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o775|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	oldRoots := managedMailRoots
+	managedMailRoots = []string{root}
+	t.Cleanup(func() { managedMailRoots = oldRoots })
+
+	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f.onRun = func(name string) {
+		if name == "useradd" {
+			if err := os.Chmod(root, 0o777|os.ModeSetgid); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	preflightCalls := 0
+	mailCleanupCalls := 0
+	m := &Manager{
+		Runner:     f,
+		LookupUser: Lookup,
+		NameInUse:  func(string) (bool, error) { return false, nil },
+		ValidateManagedMailRoots: func() error {
+			preflightCalls++
+			return validateManagedMailRoots()
+		},
+		PrepareManagedHome: func(string) error { return nil },
+		RemoveManagedMail: func(got Passwd) error {
+			mailCleanupCalls++
+			if got != expected {
+				t.Fatalf("post-useradd mail identity = %+v, want %+v", got, expected)
+			}
+			return removeManagedMail(got)
+		},
+	}
+	got, err := m.CreatePendingIdentity(expected.Name, expected.Shell, testGeneration)
+	if err == nil || !strings.Contains(err.Error(), "world-writable roots require sticky") {
+		t.Fatalf("CreatePendingIdentity error = %v, want post-useradd mode refusal", err)
+	}
+	if got != expected {
+		t.Fatalf("captured rollback identity = %+v, want %+v", got, expected)
+	}
+	if len(f.calls) != 1 || f.calls[0][0] != "useradd" {
+		t.Fatalf("post-preflight mode change helper calls = %v", f.calls)
+	}
+	if preflightCalls != 1 || mailCleanupCalls != 1 {
+		t.Fatalf("mail-root preflight/UID cleanup calls = %d/%d, want 1/1", preflightCalls, mailCleanupCalls)
 	}
 }
 
@@ -1904,10 +2027,12 @@ func TestRemoveManagedMailRequiresOwnedRegularSpool(t *testing.T) {
 		t.Skip("mail-spool ownership checks require root")
 	}
 	root := t.TempDir()
-	if err := os.Chown(root, 0, 0); err != nil {
+	if err := os.Chown(root, 0, 2346); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(root, 0o2775); err != nil {
+	// The target host that exposed this regression uses the traditional shared
+	// sticky mail-spool layout: root:mail 3777.
+	if err := os.Chmod(root, 0o777|os.ModeSetgid|os.ModeSticky); err != nil {
 		t.Fatal(err)
 	}
 	alias := filepath.Join(t.TempDir(), "mail-alias")
@@ -1955,6 +2080,45 @@ func TestRemoveManagedMailRequiresOwnedRegularSpool(t *testing.T) {
 	}
 }
 
+func TestManagedMailRootModePolicy(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mail-root ownership and special-mode checks require root")
+	}
+	expected := Passwd{Name: "xxvcc-u", UID: 2345, GID: 2346, Home: "/home/xxvcc-u"}
+	tests := []struct {
+		name   string
+		uid    int
+		gid    int
+		mode   os.FileMode
+		wantOK bool
+	}{
+		{name: "Debian root mail setgid", uid: 0, gid: 2346, mode: 0o775 | os.ModeSetgid, wantOK: true},
+		{name: "Arch root sticky shared", uid: 0, gid: 0, mode: 0o777 | os.ModeSticky, wantOK: true},
+		{name: "target root mail setgid sticky", uid: 0, gid: 2346, mode: 0o777 | os.ModeSetgid | os.ModeSticky, wantOK: true},
+		{name: "world-writable without sticky", uid: 0, gid: 2346, mode: 0o777 | os.ModeSetgid},
+		{name: "setuid sticky", uid: 0, gid: 2346, mode: 0o777 | os.ModeSetuid | os.ModeSticky},
+		{name: "non-root sticky owner", uid: 1234, gid: 2346, mode: 0o777 | os.ModeSticky},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.Chown(root, tc.uid, tc.gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(root, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			err := removeManagedMailAt(root, expected)
+			if tc.wantOK && err != nil {
+				t.Fatalf("safe mail-root mode %v rejected: %v", tc.mode, err)
+			}
+			if !tc.wantOK && (err == nil || !strings.Contains(err.Error(), "not a safe root-owned directory")) {
+				t.Fatalf("unsafe mail-root mode %v/owner %d:%d error = %v", tc.mode, tc.uid, tc.gid, err)
+			}
+		})
+	}
+}
+
 func TestRemoveManagedMailSyncsParentWhenSpoolDisappearsBeforeUnlink(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("mail-spool ownership checks require root")
@@ -1997,6 +2161,44 @@ func TestRemoveManagedMailSyncsParentWhenSpoolDisappearsBeforeUnlink(t *testing.
 	}
 	if syncs != 1 {
 		t.Fatalf("mail parent sync calls = %d, want one absence confirmation", syncs)
+	}
+}
+
+func TestRemoveManagedMailRejectsSpoolRecreatedDuringDirectorySync(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("mail-spool ownership checks require root")
+	}
+	root := t.TempDir()
+	if err := os.Chown(root, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	expected := Passwd{Name: "xxvcc-u", UID: 2345, GID: 2346, Home: "/home/xxvcc-u"}
+	spool := filepath.Join(root, expected.Name)
+	if err := os.WriteFile(spool, []byte("old mail\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(spool, expected.UID, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	oldSync := syncRemovalDirectory
+	syncRemovalDirectory = func(dir *os.File) error {
+		if err := os.WriteFile(spool, []byte("new mail\n"), 0o600); err != nil {
+			return err
+		}
+		if err := os.Chown(spool, expected.UID, 8); err != nil {
+			return err
+		}
+		return dir.Sync()
+	}
+	t.Cleanup(func() { syncRemovalDirectory = oldSync })
+
+	err := removeManagedMailAt(root, expected)
+	if err == nil || !strings.Contains(err.Error(), "reappeared during cleanup") {
+		t.Fatalf("mail recreation error = %v, want fail-closed refusal", err)
+	}
+	if _, err := os.Lstat(spool); err != nil {
+		t.Fatalf("recreated spool was not retained for recovery: %v", err)
 	}
 }
 
@@ -2137,6 +2339,7 @@ func TestDeleteExpectedAbsentAccountOnlyCleansOwnerCheckedMail(t *testing.T) {
 	var order []string
 	m := &Manager{
 		LookupUser: func(string) (Passwd, bool, error) { return Passwd{}, false, nil },
+		NameInUse:  func(string) (bool, error) { return false, nil },
 		RemoveManagedMail: func(Passwd) error {
 			order = append(order, "mail")
 			return nil
@@ -2151,6 +2354,32 @@ func TestDeleteExpectedAbsentAccountOnlyCleansOwnerCheckedMail(t *testing.T) {
 	}
 	if !reflect.DeepEqual(order, []string{"mail", "mail"}) {
 		t.Fatalf("absent-account cleanup order = %v, want two mail sweeps and no Home removal", order)
+	}
+}
+
+func TestDeleteExpectedRechecksAbsenceBetweenMailSweeps(t *testing.T) {
+	expected := Passwd{Name: "xxvcc-u", UID: 1001, GID: 1001, Home: "/home/xxvcc-u", Shell: "/bin/sh"}
+	var events []string
+	m := &Manager{
+		LookupUser: func(string) (Passwd, bool, error) {
+			events = append(events, "local")
+			return Passwd{}, false, nil
+		},
+		NameInUse: func(string) (bool, error) {
+			events = append(events, "nss")
+			return false, nil
+		},
+		RemoveManagedMail: func(Passwd) error {
+			events = append(events, "mail")
+			return nil
+		},
+	}
+	if err := m.DeleteExpected(expected.Name, expected, noOpBeforeDelete); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"local", "nss", "mail", "local", "nss", "mail", "local", "nss"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("absent-account sweep sequence = %v, want %v", events, want)
 	}
 }
 

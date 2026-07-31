@@ -33,7 +33,11 @@ var passwdPath = "/etc/passwd"
 const maxLocalPasswdBytes = 64 << 20
 
 var (
-	nssCommandOptions = executil.Options{
+	// ErrAccountCreationNotStarted marks failures that happened before useradd was
+	// invoked. A transaction may release its creation-intent witness for this
+	// class after independently confirming that the account name is still absent.
+	ErrAccountCreationNotStarted = errors.New("account creation was not started")
+	nssCommandOptions            = executil.Options{
 		Timeout:   10 * time.Second,
 		MaxOutput: 256 << 10,
 		ExtraEnv:  []string{"LC_ALL=C", "LANG=C"},
@@ -453,25 +457,29 @@ func (execRunner) Look(name string) bool { _, err := exec.LookPath(name); return
 
 // Manager performs account mutations via its Runner.
 type Manager struct {
-	Runner              Runner
-	LookupUser          func(string) (Passwd, bool, error)
-	PrepareManagedHome  func(string) error
-	CreateManagedHome   func(Passwd) error
-	ValidateManagedHome func(Passwd) error
-	RemoveManagedMail   func(Passwd) error
-	RemoveManagedHome   func(Passwd) error
+	Runner                   Runner
+	LookupUser               func(string) (Passwd, bool, error)
+	NameInUse                func(string) (bool, error)
+	ValidateManagedMailRoots func() error
+	PrepareManagedHome       func(string) error
+	CreateManagedHome        func(Passwd) error
+	ValidateManagedHome      func(Passwd) error
+	RemoveManagedMail        func(Passwd) error
+	RemoveManagedHome        func(Passwd) error
 }
 
 // New returns a Manager using real command execution.
 func New() *Manager {
 	return &Manager{
-		Runner:              execRunner{},
-		LookupUser:          Lookup,
-		PrepareManagedHome:  prepareManagedHome,
-		CreateManagedHome:   createManagedHome,
-		ValidateManagedHome: validateCreatedHome,
-		RemoveManagedMail:   removeManagedMail,
-		RemoveManagedHome:   removeManagedHome,
+		Runner:                   execRunner{},
+		LookupUser:               Lookup,
+		NameInUse:                NameInUse,
+		ValidateManagedMailRoots: validateManagedMailRoots,
+		PrepareManagedHome:       prepareManagedHome,
+		CreateManagedHome:        createManagedHome,
+		ValidateManagedHome:      validateCreatedHome,
+		RemoveManagedMail:        removeManagedMail,
+		RemoveManagedHome:        removeManagedHome,
 	}
 }
 
@@ -530,7 +538,17 @@ func DefaultHome(name string) (string, error) {
 
 func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Passwd, error) {
 	if err := validateMutationName(name); err != nil {
-		return Passwd{}, err
+		return Passwd{}, fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
+	}
+	validateMailRoots := m.ValidateManagedMailRoots
+	if validateMailRoots == nil {
+		validateMailRoots = validateManagedMailRoots
+	}
+	// Mail-root metadata does not depend on the UID selected by useradd. Reject a
+	// persistently unsafe layout before creating a pending account, then repeat the
+	// same validation while doing the UID-bound cleanup below to close path races.
+	if err := validateMailRoots(); err != nil {
+		return Passwd{}, fmt.Errorf("%w: validate managed mail roots before account creation: %w", ErrAccountCreationNotStarted, err)
 	}
 	home := managedHome(name)
 	prepare := m.PrepareManagedHome
@@ -538,7 +556,7 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Pass
 		prepare = prepareManagedHome
 	}
 	if err := prepare(name); err != nil {
-		return Passwd{}, fmt.Errorf("prepare managed home: %w", err)
+		return Passwd{}, fmt.Errorf("%w: prepare managed home: %w", ErrAccountCreationNotStarted, err)
 	}
 	var err error
 	switch {
@@ -551,7 +569,7 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Pass
 		err = m.Runner.Run("useradd", "-M", "-d", home, "-s", shell, "-c", gecos,
 			"-e", expiredDate, "-p", initialLockedPasswordHash, name)
 	default:
-		return Passwd{}, fmt.Errorf("useradd not available")
+		return Passwd{}, fmt.Errorf("%w: useradd not available", ErrAccountCreationNotStarted)
 	}
 	if err != nil {
 		return Passwd{}, err
@@ -595,13 +613,13 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Pass
 	// credential. A different owner or special file fails closed and retains the
 	// pending account to keep the name and UID occupied.
 	if err := m.ClearManagedMailExpected(name, pw); err != nil {
-		return Passwd{}, fmt.Errorf("clear mail spool before using account identity: %w; account retained for manual recovery", err)
+		return pw, fmt.Errorf("clear mail spool before using account identity: %w; account retained for rollback or manual recovery", err)
 	}
 	if !shouldCreateHome {
 		return pw, nil
 	}
 	if err := m.CreateManagedHomeExpected(name, pw); err != nil {
-		return Passwd{}, fmt.Errorf("%w; account retained for manual recovery", err)
+		return pw, fmt.Errorf("%w; account retained for rollback or manual recovery", err)
 	}
 	return pw, nil
 }
@@ -852,18 +870,17 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 		// narrower and independently owner-checked, so it remains recoverable. Sweep
 		// twice around an absence recheck to catch an in-flight delivery without ever
 		// touching Home, jobs, processes, or an account helper.
-		if err := m.removeManagedMail(*expected); err != nil {
-			return err
-		}
-		if err := m.removeManagedMail(*expected); err != nil {
-			return err
-		}
-		absent, err = m.deletionState(name, expected)
-		if err != nil {
-			return fmt.Errorf("verify account remained absent after artifact cleanup: %w", err)
-		}
-		if !absent {
-			return fmt.Errorf("account %s reappeared during artifact cleanup", name)
+		for sweep := 1; sweep <= 2; sweep++ {
+			if err := m.removeManagedMail(*expected); err != nil {
+				return err
+			}
+			absent, err = m.deletionState(name, expected)
+			if err != nil {
+				return fmt.Errorf("verify account remained absent after artifact cleanup sweep %d: %w", sweep, err)
+			}
+			if !absent {
+				return fmt.Errorf("account %s reappeared during artifact cleanup sweep %d", name, sweep)
+			}
 		}
 		return nil
 	}
@@ -1009,17 +1026,21 @@ func (m *Manager) ReconcileManagedMailAfterDeletion(name string, uid int) error 
 	if !validate.AccountID(uid) {
 		return fmt.Errorf("invalid expected account UID for post-deletion mail cleanup")
 	}
-	if _, exists, err := m.lookup(name); err != nil {
+	absent, err := m.deletionState(name, nil)
+	if err != nil {
 		return fmt.Errorf("verify account absence before managed mail cleanup: %w", err)
-	} else if exists {
+	}
+	if !absent {
 		return fmt.Errorf("account %s exists; refusing post-deletion mail cleanup", name)
 	}
 	if err := m.removeManagedMail(Passwd{Name: name, UID: uid}); err != nil {
 		return err
 	}
-	if _, exists, err := m.lookup(name); err != nil {
+	absent, err = m.deletionState(name, nil)
+	if err != nil {
 		return fmt.Errorf("verify account absence after managed mail cleanup: %w", err)
-	} else if exists {
+	}
+	if !absent {
 		return fmt.Errorf("account %s reappeared during post-deletion mail cleanup", name)
 	}
 	return nil
@@ -1199,6 +1220,20 @@ func syncRemovalParent(dir *os.File, operation string) error {
 	return nil
 }
 
+func syncAndConfirmManagedMailAbsent(dir *os.File, root, name, operation string) error {
+	if err := syncRemovalParent(dir, operation); err != nil {
+		return err
+	}
+	var spool unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &spool, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		if err == nil {
+			return fmt.Errorf("managed mail spool %s/%s reappeared during cleanup", root, name)
+		}
+		return fmt.Errorf("verify managed mail spool absence after directory sync %s/%s: %w", root, name, err)
+	}
+	return nil
+}
+
 // removeManagedMail removes only a conventional single-file system mailbox
 // still owned by the captured account UID. Account helpers are intentionally
 // invoked without recursive-home flags, so this preserves the mail-spool part of
@@ -1207,6 +1242,24 @@ func removeManagedMail(expected Passwd) error {
 	if !validate.Username(expected.Name) || !validate.AccountID(expected.UID) {
 		return fmt.Errorf("invalid expected account identity for mail cleanup")
 	}
+	return visitManagedMailRoots(func(root string) error {
+		return removeManagedMailAt(root, expected)
+	})
+}
+
+// validateManagedMailRoots checks directory metadata before useradd. The real
+// cleanup opens and validates each root again while the selected UID is bound.
+func validateManagedMailRoots() error {
+	return visitManagedMailRoots(func(root string) error {
+		dir, err := openManagedMailRoot(root)
+		if err != nil {
+			return err
+		}
+		return dir.Close()
+	})
+}
+
+func visitManagedMailRoots(visit func(string) error) error {
 	allowed := make(map[string]bool, len(managedMailRoots))
 	for _, root := range managedMailRoots {
 		clean := filepath.Clean(root)
@@ -1234,34 +1287,46 @@ func removeManagedMail(expected Passwd) error {
 			continue
 		}
 		seen[resolved] = true
-		if err := removeManagedMailAt(resolved, expected); err != nil {
+		if err := visit(resolved); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func removeManagedMailAt(root string, expected Passwd) error {
+func openManagedMailRoot(root string) (*os.File, error) {
 	dir, err := os.OpenFile(root, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 	if err != nil {
-		return fmt.Errorf("open managed mail root %s: %w", root, err)
+		return nil, fmt.Errorf("open managed mail root %s: %w", root, err)
 	}
-	defer dir.Close()
 	fi, err := dir.Stat()
 	if err != nil {
-		return fmt.Errorf("stat managed mail root %s: %w", root, err)
+		dir.Close()
+		return nil, fmt.Errorf("stat managed mail root %s: %w", root, err)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || !fi.IsDir() || st.Uid != 0 || fi.Mode().Perm()&0o002 != 0 {
-		return fmt.Errorf("managed mail root %s is not a root-owned, non-world-writable directory", root)
+	mode := fi.Mode()
+	worldWritableWithoutSticky := mode.Perm()&0o002 != 0 && mode&os.ModeSticky == 0
+	if !ok || !fi.IsDir() || st.Uid != 0 || mode&os.ModeSetuid != 0 || worldWritableWithoutSticky {
+		dir.Close()
+		return nil, fmt.Errorf("managed mail root %s is not a safe root-owned directory (world-writable roots require sticky protection and setuid is forbidden)", root)
 	}
+	return dir, nil
+}
+
+func removeManagedMailAt(root string, expected Passwd) error {
+	dir, err := openManagedMailRoot(root)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
 
 	var spool unix.Stat_t
 	err = unix.Fstatat(int(dir.Fd()), expected.Name, &spool, unix.AT_SYMLINK_NOFOLLOW)
 	if errors.Is(err, unix.ENOENT) {
 		// This can be a retry after unlink succeeded but the previous directory sync
 		// failed. Re-sync the observed absence before allowing the UID to be released.
-		return syncRemovalParent(dir, "managed mail spool absence confirmation")
+		return syncAndConfirmManagedMailAbsent(dir, root, expected.Name, "managed mail spool absence confirmation")
 	}
 	if err != nil {
 		return fmt.Errorf("inspect managed mail spool %s/%s: %w", root, expected.Name, err)
@@ -1274,7 +1339,7 @@ func removeManagedMailAt(root string, expected Passwd) error {
 	}
 	if err := unlinkManagedMailAt(int(dir.Fd()), expected.Name, 0); err != nil {
 		if errors.Is(err, unix.ENOENT) {
-			return syncRemovalParent(dir, "managed mail spool absence confirmation")
+			return syncAndConfirmManagedMailAbsent(dir, root, expected.Name, "managed mail spool absence confirmation")
 		}
 		return fmt.Errorf("remove managed mail spool %s/%s: %w", root, expected.Name, err)
 	}
@@ -1284,7 +1349,7 @@ func removeManagedMailAt(root string, expected Passwd) error {
 		}
 		return fmt.Errorf("verify managed mail spool removal %s/%s: %w", root, expected.Name, err)
 	}
-	return syncRemovalParent(dir, "managed mail spool removal")
+	return syncAndConfirmManagedMailAbsent(dir, root, expected.Name, "managed mail spool removal")
 }
 
 const (
@@ -1488,6 +1553,17 @@ func (m *Manager) deletionState(name string, expected *Passwd) (absent bool, err
 		return false, err
 	}
 	if !exists {
+		nameInUse := m.NameInUse
+		if nameInUse == nil {
+			nameInUse = NameInUse
+		}
+		inUse, err := nameInUse(name)
+		if err != nil {
+			return false, fmt.Errorf("confirm account absence through NSS: %w", err)
+		}
+		if inUse {
+			return false, fmt.Errorf("account name %s remains present through NSS after local account disappearance", name)
+		}
 		return true, nil
 	}
 	if expected != nil && current != *expected {

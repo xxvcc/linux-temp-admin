@@ -1385,6 +1385,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			},
 			LookupUser: lookup,
 		}
+		setTestRegistryRecord(t, a, rec)
 		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true); err != nil {
 			t.Fatal(err)
 		}
@@ -1393,6 +1394,11 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 		}
 		if homeTouched || mailCalls != 2 {
 			t.Fatalf("absent cleanup touched Home=%v or mail calls=%d, want Home=false mail=2", homeTouched, mailCalls)
+		}
+		stored, found, err := a.Registry.Lookup(rec.User)
+		if err != nil || !found || !stored.DeletionStarted || stored.UID != pw.UID ||
+			stored.Generation != generation || !stored.IdentityBound {
+			t.Fatalf("absent rollback recovery witness = found %v record %+v err %v", found, stored, err)
 		}
 	})
 

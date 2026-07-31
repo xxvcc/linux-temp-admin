@@ -61,10 +61,11 @@ type Record struct {
 	// authorize unattended deletion; the creating process separately retains its
 	// complete passwd snapshot for an immediate rollback.
 	Pending bool
-	// DeletionStarted is written after the destructive identity policy and final
-	// quiescence checks, immediately before userdel. If the helper removes the
-	// account but the final mail-spool sweep fails, this root-owned phase witness
-	// authorizes a later retry of that narrow cleanup. A generation-bound row keeps
+	// DeletionStarted is written after the destructive identity policy and the
+	// pre-artifact quiescence checks, before controlled mail/Home cleanup and
+	// userdel. If the helper removes the account but the final mail-spool sweep
+	// fails, this root-owned phase witness authorizes a later retry of that narrow
+	// cleanup. A generation-bound row keeps
 	// its exact identity; legacy, unregistered, and rollback-pending paths become
 	// non-pending UID-only recovery rows. An ordinary stale row for an account
 	// removed outside the tool leaves this false.
