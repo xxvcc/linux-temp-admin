@@ -81,6 +81,7 @@ func newOrderedTeardownApp(t *testing.T, pw user.Passwd, failClearCall int, clea
 		Users: &user.Manager{
 			Runner:            &orderedTeardownRunner{events: &events, present: &present},
 			LookupUser:        lookup,
+			NameInUse:         func(string) (bool, error) { return false, nil },
 			RemoveManagedMail: appendArtifact("mail"),
 			RemoveManagedHome: appendArtifact("home"),
 		},
@@ -156,6 +157,85 @@ func TestLegacyRecoveryAuthorizationRequiresInteractiveConfirmation(t *testing.T
 			}
 			if got := legacyRecoveryAuthorized(tc.identityBound, opts, tc.stdinTTY); got != tc.wantAuthorized {
 				t.Fatalf("legacyRecoveryAuthorized = %v, want %v", got, tc.wantAuthorized)
+			}
+		})
+	}
+}
+
+func TestPendingRecoveryAuthorizationRequiresInteractiveConfirmation(t *testing.T) {
+	base := revokeOptions{
+		username:         "xxvcc-pending1",
+		force:            true,
+		manualInvocation: true,
+		liveConfirmed:    true,
+	}
+	tests := []struct {
+		name           string
+		stdinTTY       bool
+		mutate         func(*revokeOptions)
+		wantAuthorized bool
+	}{
+		{name: "interactive direct recovery", stdinTTY: true, wantAuthorized: true},
+		{name: "piped full-name confirmation"},
+		{name: "noninteractive yes", stdinTTY: true, mutate: func(o *revokeOptions) { o.yes = true }},
+		{name: "uninstall internal", stdinTTY: true, mutate: func(o *revokeOptions) { o.manualInvocation = false }},
+		{name: "without force", stdinTTY: true, mutate: func(o *revokeOptions) { o.force = false }},
+		{name: "without full-name confirmation", stdinTTY: true, mutate: func(o *revokeOptions) { o.liveConfirmed = false }},
+		{name: "generation-bound task", stdinTTY: true, mutate: func(o *revokeOptions) {
+			o.expectedUID = 1001
+			o.generation = "0123456789abcdef0123456789abcdef"
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := base
+			if tc.mutate != nil {
+				tc.mutate(&opts)
+			}
+			if got := pendingRecoveryAuthorized(opts, tc.stdinTTY); got != tc.wantAuthorized {
+				t.Fatalf("pendingRecoveryAuthorized = %v, want %v", got, tc.wantAuthorized)
+			}
+		})
+	}
+}
+
+func TestPendingCreationRecordRequiresExactBoundShape(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{
+		Name: "xxvcc-pending1", UID: 1001, GID: 1001,
+		GECOS: config.PendingGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-pending1", Shell: "/bin/sh",
+	}
+	base := registry.Record{
+		User: pw.Name, Generation: generation, IdentityBound: true, Pending: true, Port: 22,
+	}
+	if !pendingCreationRecordMatchesPasswd(base, pw) {
+		t.Fatal("exact UID-zero pending identity was rejected")
+	}
+	withUID := base
+	withUID.UID = pw.UID
+	if !pendingCreationRecordMatchesPasswd(withUID, pw) {
+		t.Fatal("exact UID-bound pending identity was rejected")
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*registry.Record, *user.Passwd)
+	}{
+		{name: "wrong recorded UID", mutate: func(r *registry.Record, _ *user.Passwd) { r.UID = 1002 }},
+		{name: "not pending", mutate: func(r *registry.Record, _ *user.Passwd) { r.Pending = false }},
+		{name: "unbound row", mutate: func(r *registry.Record, _ *user.Passwd) { r.IdentityBound = false }},
+		{name: "deletion already started", mutate: func(r *registry.Record, _ *user.Passwd) { r.DeletionStarted = true }},
+		{name: "wrong marker", mutate: func(_ *registry.Record, p *user.Passwd) { p.GECOS = config.ManagedGenerationGECOSPrefix + generation }},
+		{name: "wrong home", mutate: func(_ *registry.Record, p *user.Passwd) { p.Home = "/srv/pending" }},
+		{name: "root UID", mutate: func(_ *registry.Record, p *user.Passwd) { p.UID = 0 }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, gotPW := base, pw
+			tc.mutate(&rec, &gotPW)
+			if pendingCreationRecordMatchesPasswd(rec, gotPW) {
+				t.Fatal("unsafe pending identity was accepted")
 			}
 		})
 	}
@@ -296,6 +376,68 @@ func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(
 	}
 }
 
+func TestInteractivePendingCreationRecoveryPersistsUIDWitnessBeforeUserdel(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-pending2"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	pw := user.Passwd{
+		Name: username, UID: 1001, GID: 1001,
+		GECOS: config.PendingGenerationGECOSPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+	rec := registry.Record{
+		User: username, Generation: generation, IdentityBound: true, Pending: true, Port: 22,
+	}
+	a, _, _ := newTestApp(t, "")
+	a.StdinIsTTY = func() bool { return true }
+	setTestRegistryRecord(t, a, rec)
+
+	present := true
+	events := []string{}
+	lookup := func(string) (user.Passwd, bool, error) {
+		if !present {
+			return user.Passwd{}, false, nil
+		}
+		return pw, true, nil
+	}
+	runner := &orderedTeardownRunner{events: &events, present: &present}
+	runner.beforeUserdel = func() {
+		got, found, err := a.Registry.Lookup(username)
+		if err != nil || !found || !got.DeletionStarted || got.UID != pw.UID ||
+			got.IdentityBound || got.Generation != "" || got.Pending {
+			t.Fatalf("pending recovery pre-userdel witness: found=%v rec=%+v err=%v", found, got, err)
+		}
+	}
+	a.Users = &user.Manager{
+		Runner: runner, LookupUser: lookup,
+		NameInUse:         func(string) (bool, error) { return false, nil },
+		RemoveManagedMail: func(user.Passwd) error { events = append(events, "mail"); return nil },
+		RemoveManagedHome: func(user.Passwd) error { events = append(events, "home"); return nil },
+	}
+	a.LookupUser = lookup
+	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
+	a.ClearScheduledJobs = func(string, int) error { events = append(events, "clear"); return nil }
+	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: t.TempDir() + "/linux-temp-admin",
+		UnitPrefix: config.AutoRevokeUnitPrefix, Sys: revokeTestScheduleSystem{},
+	}
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, force: true, manualInvocation: true, liveConfirmed: true,
+	}); rc != 0 {
+		t.Fatalf("interactive pending recovery rc = %d", rc)
+	}
+	if present || !strings.Contains(strings.Join(events, ","), "userdel") {
+		t.Fatalf("pending recovery account state: present=%v events=%v", present, events)
+	}
+	if found, err := a.Registry.Contains(username); err != nil || found {
+		t.Fatalf("completed pending recovery witness: found=%v err=%v", found, err)
+	}
+}
+
 func TestUnregisteredDeletionWitnessWriteFailureBlocksUserdel(t *testing.T) {
 	requireRootRegistryFixture(t)
 	const username = "xxvcc-recovery2"
@@ -415,8 +557,9 @@ func TestTeardownLocalAccountOrdersFinalCleanupBeforeUserdel(t *testing.T) {
 	requireTeardownEvents(t, *events,
 		"chage", "usermod",
 		"kill", "clear", "drain", "kill", "clear",
+		"persist",
 		"mail", "home",
-		"kill", "clear", "persist",
+		"kill", "clear",
 		"userdel", "mail",
 	)
 }
@@ -507,8 +650,67 @@ func TestTeardownLocalAccountPersistsDeletionPhaseBeforeUserdel(t *testing.T) {
 	requireTeardownEvents(t, *events,
 		"chage", "usermod",
 		"kill", "clear", "drain", "kill", "clear",
-		"mail", "home", "kill", "clear", "persist", "userdel", "mail",
+		"persist", "mail", "home", "kill", "clear", "userdel", "mail",
 	)
+}
+
+func TestAccountDisappearanceDuringTeardownRetainsMailRecoveryWitness(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{
+		Name: "xxvcc-a1", UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-a1", Shell: "/bin/sh",
+	}
+	rec := registry.Record{
+		User: pw.Name, UID: pw.UID, Generation: generation, IdentityBound: true, Port: 22,
+	}
+	a, events, present := newOrderedTeardownApp(t, pw, 0, nil)
+	setTestRegistryRecord(t, a, rec)
+	wantErr := errors.New("mail absence fsync failed")
+	mailCalls := 0
+	a.Users.RemoveManagedMail = func(got user.Passwd) error {
+		if got.Name != pw.Name || got.UID != pw.UID {
+			t.Fatalf("mail recovery identity = %+v, want %+v", got, pw)
+		}
+		mailCalls++
+		*events = append(*events, "mail")
+		if mailCalls == 2 {
+			return wantErr
+		}
+		return nil
+	}
+
+	stage, err := a.teardownLocalAccount(pw.Name, pw, func() error {
+		if err := a.persistDeletionStarted(rec, true, pw); err != nil {
+			return err
+		}
+		*events = append(*events, "persist")
+		*present = false
+		return nil
+	})
+	if stage != revokeDeleteAccount || !errors.Is(err, wantErr) {
+		t.Fatalf("teardownLocalAccount = stage %v, err %v; want retained mail failure", stage, err)
+	}
+	stored, found, lookupErr := a.Registry.Lookup(pw.Name)
+	if lookupErr != nil || !found || !stored.DeletionStarted || stored.UID != pw.UID || stored.Generation != generation {
+		t.Fatalf("mail recovery witness = found %v record %+v err %v", found, stored, lookupErr)
+	}
+	requireTeardownEvents(t, *events,
+		"chage", "usermod",
+		"kill", "clear", "drain", "kill", "clear",
+		"persist", "mail", "mail",
+	)
+
+	a.Users.RemoveManagedMail = func(user.Passwd) error { return nil }
+	if err := a.reconcileDeletionStarted(stored); err != nil {
+		t.Fatalf("retry post-deletion mail recovery: %v", err)
+	}
+	if err := a.releaseRegistryAfterCleanup(pw.Name); err != nil {
+		t.Fatalf("release recovered registry witness: %v", err)
+	}
+	if found, err := a.Registry.Contains(pw.Name); err != nil || found {
+		t.Fatalf("recovered registry witness remains: found=%v err=%v", found, err)
+	}
 }
 
 func TestDeletionPhaseRegistryWriteFailureBlocksUserdel(t *testing.T) {

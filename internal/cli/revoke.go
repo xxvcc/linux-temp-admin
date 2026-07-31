@@ -109,6 +109,11 @@ func legacyRecoveryAuthorized(identityBound bool, opts revokeOptions, stdinTTY b
 		opts.generation == "" && opts.expectedUID == 0 && !opts.yes && opts.liveConfirmed
 }
 
+func pendingRecoveryAuthorized(opts revokeOptions, stdinTTY bool) bool {
+	return stdinTTY && opts.manualInvocation && opts.force &&
+		opts.generation == "" && opts.expectedUID == 0 && !opts.yes && opts.liveConfirmed
+}
+
 func (a *App) parseRevokeArgs(args []string) (revokeOptions, bool) {
 	fs := flag.NewFlagSet("revoke", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
@@ -236,17 +241,22 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		return 1
 	}
 
-	// A pending row was written before useradd and never became an active account
-	// record, so it cannot authorize deletion. Failed-invite rollback converts the
-	// row to a non-pending UID-only deletion witness immediately before userdel; if
-	// that attempt crashes while the account is still live, recovery deliberately
-	// comes back through the interactive --force path below rather than this branch.
-	if registered && rec.Pending {
+	stdinTTY := a.StdinIsTTY != nil && a.StdinIsTTY()
+	// A pending row was written before useradd and is not ordinary deletion
+	// authority; it may still carry the initial UID 0 or a later captured UID.
+	// Releases before v2.9.2 could nevertheless retain that row
+	// after capturing an exact pending-generation passwd identity. Permit recovery
+	// only after a direct interactive --force/full-name confirmation and a complete
+	// marker/Home/UID/GID shape match. The deletion transition below then strips the
+	// generation and persists only a UID recovery witness before artifact cleanup.
+	pendingRecovery := registered && rec.Pending && pendingRecoveryAuthorized(opts, stdinTTY) &&
+		pendingCreationRecordMatchesPasswd(rec, pw)
+	if registered && rec.Pending && !pendingRecovery {
 		grantCleanupErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 		cleanupErr := errors.Join(grantCleanupErr, a.Scheduler.Cancel(username, rec.AutoUnit))
 		a.errorf("%s", a.P.M(
-			"该登记仍处于创建中的 pending 状态，无法证明当前同名账号的身份；已保留账号和登记，请人工核查后处理。",
-			"the registry row is still a pending creation intent, so the current account's identity cannot be proved; the account and registry record were retained for manual recovery."))
+			"该登记仍处于创建中的 pending 状态，不能直接证明当前同名账号的身份；已保留账号和登记。人工核查后，只能在交互终端运行 revoke --user "+username+" --force，并输入完整用户名；程序还会严格核对 pending 世代与账号形状。",
+			"the registry row is still a pending creation intent and does not directly prove the current same-name identity; the account and registry record were retained. After manual inspection, recovery requires revoke --user "+username+" --force in an interactive terminal, the full username confirmation, and an exact pending-generation account-shape match."))
 		if cleanupErr != nil {
 			a.errorf("%s: %v", a.P.M("清理 pending 账号的遗留授权或任务未完整完成", "cleanup of grants or schedules for the pending account did not complete"), cleanupErr)
 		}
@@ -271,9 +281,11 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	// timers used the same --yes --force --confirm-force argv that an operator could
 	// type, so no non-interactive invocation receives this exception. Scheduled and
 	// uninstall-internal invocations remain blocked even though they carry --force.
-	stdinTTY := a.StdinIsTTY != nil && a.StdinIsTTY()
 	allowLegacy := legacyRecoveryAuthorized(rec.IdentityBound, opts, stdinTTY)
 	protected := user.IsProtectedRevokeEntry(username, pw, true, registered, rec.UID, rec.Generation, allowLegacy)
+	if pendingRecovery {
+		protected = false
+	}
 	manualOnlyRecovery := registered && rec.DeletionStarted &&
 		(!rec.IdentityBound || !deletionRecordMatchesPasswd(rec, pw))
 	if registered && rec.DeletionStarted && rec.IdentityBound && !deletionRecordMatchesPasswd(rec, pw) {
@@ -451,17 +463,18 @@ func (a *App) teardownLocalAccount(username string, expected user.Passwd, persis
 	if err := a.accountStillMatches(username, expected); err != nil {
 		return revokeDeleteAccount, err
 	}
+	// Persist recovery authority before controlled mail/Home cleanup begins. The
+	// account can disappear out of band at any later syscall boundary; without this
+	// witness, a failed post-disappearance mail fsync could be mistaken on retry for
+	// an ordinary stale row and discarded without completing the narrow cleanup.
+	if persistDeletion == nil {
+		return revokeDeleteAccount, fmt.Errorf("deletion recovery persistence is not configured")
+	}
+	if err := persistDeletion(); err != nil {
+		return revokeDeleteAccount, fmt.Errorf("persist deletion-started recovery state: %w", err)
+	}
 	if err := a.Users.DeleteExpected(username, expected, func() error {
-		if err := a.finalScheduledAccountCheck(username, expected); err != nil {
-			return err
-		}
-		if persistDeletion == nil {
-			return fmt.Errorf("deletion recovery persistence is not configured")
-		}
-		if err := persistDeletion(); err != nil {
-			return fmt.Errorf("persist deletion-started recovery state: %w", err)
-		}
-		return nil
+		return a.finalScheduledAccountCheck(username, expected)
 	}); err != nil {
 		return revokeDeleteAccount, err
 	}
@@ -504,11 +517,21 @@ func deletionRecordMatchesPasswd(rec registry.Record, pw user.Passwd) bool {
 	return marker == wantPrefix+rec.Generation
 }
 
-// persistDeletionStarted writes the mandatory pre-userdel witness. Completed
-// generation-bound accounts retain that exact generation; legacy, unregistered,
-// and pending rollback paths deliberately receive only a UID witness. Any change
-// between the policy decision and this final transition stops before userdel can
-// release the name or UID.
+func pendingCreationRecordMatchesPasswd(rec registry.Record, pw user.Passwd) bool {
+	if !rec.Pending || rec.DeletionStarted || !rec.IdentityBound ||
+		(rec.UID != 0 && rec.UID != pw.UID) {
+		return false
+	}
+	check := rec
+	check.UID = pw.UID
+	return deletionRecordMatchesPasswd(check, pw)
+}
+
+// persistDeletionStarted writes the mandatory pre-artifact-cleanup witness.
+// Completed generation-bound accounts retain that exact generation; legacy,
+// unregistered, and pending rollback paths deliberately receive only a UID
+// witness. Any change between the policy decision and this transition stops
+// before controlled mail/Home cleanup or userdel can release the name or UID.
 func (a *App) persistDeletionStarted(rec registry.Record, registered bool, expected user.Passwd) error {
 	if a.Registry == nil {
 		return fmt.Errorf("registry is not configured")

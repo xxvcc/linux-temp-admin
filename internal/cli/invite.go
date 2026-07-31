@@ -1107,13 +1107,18 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		return a.releaseRegistryAfterCleanup(username)
 	})
 
-	// useradd can create the account (and Home) before reporting an
-	// error. Close the registry-removal gate before invoking the helper: until a
-	// complete passwd identity is captured, rollback cannot prove which artifacts
-	// are safe to delete, so the pending row must remain as the recovery witness.
+	// useradd can create the account before reporting an error. Close the
+	// registry-removal gate before invoking it. CreatePendingIdentity returns a
+	// nonzero passwd snapshot with errors that happen after it has proved the full
+	// pending identity, allowing this transaction to attempt the same fail-closed
+	// rollback instead of discarding evidence it already captured.
 	accountCleanupConfirmed = false
 	pw, err := a.Users.CreatePendingIdentity(username, resolveShell(), generation)
-	if err != nil {
+	if err != nil && errors.Is(err, user.ErrAccountCreationNotStarted) {
+		// No account helper ran, so there is no ambiguous partial account identity to
+		// recover. The last registry cleanup still confirms local absence before it
+		// releases the creation-intent row.
+		accountCleanupConfirmed = true
 		return failf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
 	}
 	// Keep a separately named rollback witness. A failed MarkManagedExpected call
@@ -1135,6 +1140,9 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		}
 		return cleanupErr
 	})
+	if err != nil {
+		return failf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
+	}
 
 	rec.UID = pw.UID
 	// Persist the UID while the passwd entry still carries PendingGECOS. An older
@@ -1443,9 +1451,13 @@ func (a *App) rollbackInviteAccount(username string, rec registry.Record, expect
 			return a.reconcileDeletionStarted(rec)
 		}
 		if mayDelete {
-			return a.Users.DeleteExpected(username, expected, func() error {
-				return a.finalScheduledAccountCheck(username, expected)
-			})
+			// The account vanished after this process captured its complete identity.
+			// Enter UID-only recovery before the narrow mail sweep so an unlink/fsync
+			// failure cannot leave an ordinary pending row that a later revoke drops.
+			if err := a.persistDeletionStarted(rec, true, expected); err != nil {
+				return fmt.Errorf("persist rollback deletion recovery: %w", err)
+			}
+			return a.Users.DeleteExpected(username, expected, func() error { return nil })
 		}
 		return nil
 	}

@@ -15,6 +15,21 @@ This guide is for administrators who install and maintain `linux-temp-admin`. Se
 
 The binary has no dynamic-library or language-runtime dependency. Account lifecycle operations still use the system's `id`, `useradd`, `userdel`, `usermod`, and `chage`; password login additionally requires `chpasswd`, while granting sudo requires `sudo` and `visudo` for pre-commit policy validation. The tool does not fall back to a distro `adduser`/`deluser` or an arbitrary BusyBox account applet: command names alone cannot prove equivalent arguments, configuration, or compile-time shadow/group semantics. Missing tools can be installed through apt, dnf, yum, or apk after interactive confirmation.
 
+### Conventional mail-spool compatibility boundary
+
+Account creation and revocation inspect the actual metadata of `/var/mail` and `/var/spool/mail` instead of allowing a layout by distribution name alone. The FHS does not specify an owner or mode for these directories. The following layouts were checked for this change; they do not make every custom layout automatically supported:
+
+| Distribution/family | Actual mail spool | Other path | Verified owner and mode |
+| --- | --- | --- | --- |
+| Debian 12/13, Ubuntu 22.04/24.04 | `/var/mail` | `/var/spool/mail -> ../mail` | `root:mail 2775` |
+| RHEL, Rocky, Alma, Oracle Linux, Fedora, CentOS, and Amazon Linux families | `/var/spool/mail` | `/var/mail -> spool/mail` | `root:mail 0775` |
+| Alpine | `/var/mail` | depends on the installation | `root:root 0755` |
+| current Arch Linux `filesystem` package | `/var/spool/mail` | `/var/mail -> spool/mail` | `root:root 1777` |
+
+The product policy accepts only a real root-owned mail-spool directory. It may belong to group `mail` and carry setgid; if it is world-writable it must have sticky protection, and any setuid bit is refused. The observed `root:mail 3777` and Arch's `root:root 1777` therefore work, while mode `0777`/`2777` without sticky, a non-root owner such as `mail:mail`, or a symlink escaping the two paths fails closed before `useradd`. Mail-delivery services and local identities authorized to write this directory are inside the trust boundary.
+
+This compatibility covers only the traditional single-file mbox at `/var/mail/<username>` or `/var/spool/mail/<username>`. The tool does not traverse Maildir or treat aaPanel's `/www/vmail` as a mail spool. A complete revoke still removes the whole tool-managed Home under its separate Home-safety rules.
+
 Arch Linux has no safe partial-upgrade mode, while `pacman -Syu` upgrades the whole system. The tool therefore never runs pacman automatically while creating an account. Complete the prompted upgrade and dependency installation deliberately first.
 
 ## Convenience install

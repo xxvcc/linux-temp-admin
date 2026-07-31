@@ -150,6 +150,51 @@ func mustUserManaged(t *testing.T, name string) bool {
 	return managed
 }
 
+func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
+	dir := rootOwnedDir(t)
+	username := "ltapreflight"
+	if inUse, err := user.NameInUse(username); err != nil {
+		t.Fatal(err)
+	} else if inUse {
+		t.Skipf("test username %s is already in use", username)
+	}
+
+	a, _, errb := newTestApp(t, "")
+	regDir := filepath.Join(dir, "registry")
+	a.Registry = &registry.Store{
+		Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+	}
+	wantErr := errors.New("unsafe mail root")
+	a.Users = &user.Manager{
+		Runner:                   failedCreateRunner{},
+		ValidateManagedMailRoots: func() error { return wantErr },
+		PrepareManagedHome: func(string) error {
+			t.Fatal("managed Home preflight ran after mail-root preflight failed")
+			return nil
+		},
+	}
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: filepath.Join(dir, "systemd"), InstallPath: filepath.Join(dir, "linux-temp-admin"),
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now, Sys: fakeSys{},
+	}
+	a.RandHex = func(n int) (string, error) {
+		if n == 16 {
+			return "0123456789abcdef0123456789abcdef", nil
+		}
+		return "abcdef0123", nil
+	}
+
+	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}); rc != 1 {
+		t.Fatalf("runInvite rc=%d, want preflight failure", rc)
+	}
+	if found, err := a.Registry.Contains(username); err != nil || found {
+		t.Fatalf("creation intent after preflight failure: found=%v err=%v", found, err)
+	}
+	if !strings.Contains(errb.String(), wantErr.Error()) || strings.Contains(errb.String(), "account artifact cleanup is unconfirmed") {
+		t.Fatalf("preflight rollback output = %q", errb.String())
+	}
+}
+
 func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testing.T) {
 	dir := rootOwnedDir(t)
 	username := ""
