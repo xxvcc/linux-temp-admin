@@ -55,7 +55,8 @@ func TestWriteAuthorizedKeysRejectsIDsOutsideKernelRange(t *testing.T) {
 	if strconv.IntSize < 64 {
 		t.Skip("int cannot represent a uid above uint32")
 	}
-	reserved := int(uint64(^uint32(0)))
+	reservedKernelID := uint64(^uint32(0))
+	reserved := int(reservedKernelID)
 	tooLarge := reserved + 1
 	for _, ids := range [][2]int{{reserved, 1}, {1, reserved}, {tooLarge, 1}, {1, tooLarge}} {
 		if err := WriteAuthorizedKeys("/unused", ids[0], ids[1], nil); err == nil || !strings.Contains(err.Error(), "refusing non-user uid/gid") {

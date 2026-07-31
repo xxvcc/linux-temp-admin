@@ -21,6 +21,16 @@ func TestUnitUsersPropagatesDirectoryReadFailure(t *testing.T) {
 	}
 }
 
+func TestUnitUsersRejectsUnsafePrefixBeforeReadingEmptyDirectory(t *testing.T) {
+	for _, prefix := range []string{"", "unsafe/prefix", "unsafe prefix", "unsafe\tprefix", "unsafe\nprefix"} {
+		s := newFinder(t)
+		s.UnitPrefix = prefix
+		if _, err := s.UnitUsers(); err == nil || !strings.Contains(err.Error(), "unsafe managed systemd unit prefix") {
+			t.Fatalf("UnitUsers(%q) error = %v, want unsafe-prefix refusal", prefix, err)
+		}
+	}
+}
+
 func newFinder(t *testing.T, files ...string) *Scheduler {
 	t.Helper()
 	dir := t.TempDir()
@@ -93,14 +103,10 @@ func TestUnitUsersFindsTheV1UnitTheV2GlobWalksPast(t *testing.T) {
 	}
 }
 
-// TestUnitUsersIgnoresFilesItDidNotWrite: the prefix is a namespace, not a
-// licence to act on anything sharing it.
-func TestUnitUsersIgnoresFilesItDidNotWrite(t *testing.T) {
+func TestUnitUsersIgnoresFilesOutsideManagedUnitShape(t *testing.T) {
 	s := newFinder(t,
-		"linux-temp-admin-v2-revoke-.service",       // no username
-		"linux-temp-admin-v2-revoke-BadName!.timer", // not a legal username
-		"linux-temp-admin-v2-revoke-UPPER.timer",    // usernames are lower-case here
-		"linux-temp-admin-v2-revoke-has space.timer",
+		"linux-temp-admin-v2-revoke-no-suffix",
+		"linux-temp-admin-v2-revoke-wrong.socket",
 		"unrelated.service",
 		"linux-temp-admin-v2-revoke-good.timer",
 	)
@@ -109,6 +115,40 @@ func TestUnitUsersIgnoresFilesItDidNotWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	eq(t, users, "good")
+}
+
+func TestUnitUsersFailsClosedOnMalformedManagedUnitName(t *testing.T) {
+	for _, name := range []string{
+		"linux-temp-admin-v2-revoke-.service",
+		"linux-temp-admin-v2-revoke-BadName!.timer",
+		"linux-temp-admin-v2-revoke-UPPER.timer",
+		"linux-temp-admin-v2-revoke-has space.timer",
+		"linux-temp-admin-revoke-.timer",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newFinder(t, name)
+			if _, err := s.UnitUsers(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("UnitUsers error = %v, want malformed managed-unit refusal", err)
+			}
+		})
+	}
+}
+
+func TestUnitUsersInventoriesManagedNamesRegardlessOfEntryType(t *testing.T) {
+	s := newFinder(t)
+	service := "linux-temp-admin-v2-revoke-special.service"
+	timer := "linux-temp-admin-v2-revoke-special.timer"
+	if err := os.Mkdir(filepath.Join(s.SystemdDir, service), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-target", filepath.Join(s.SystemdDir, timer)); err != nil {
+		t.Fatal(err)
+	}
+	users, err := s.UnitUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, users, "special")
 }
 
 // TestOrphansAreUnitsWhoseAccountIsGone mirrors sudoers.Orphans/sshdconf.Orphans,
@@ -139,13 +179,56 @@ func TestScheduledUsersIncludesAtJobsWithoutRegistry(t *testing.T) {
 	eq(t, users, "queueduser")
 }
 
+func TestScheduledUsersIgnoresNonRootAtMimics(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = &fakeSystem{hasAt: true, atJobs: []AtJob{
+		{ID: "7", OwnerUID: 1001, Body: "/usr/local/sbin/linux-temp-admin revoke --user forged --yes --unknown\n"},
+		{ID: "8", Body: "/usr/local/sbin/linux-temp-admin revoke --user owned --yes\n"},
+	}}
+	users, err := s.ScheduledUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, users, "owned")
+}
+
+func TestScheduledUsersIncludesUnitsLoadedOnlyInSystemdManager(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = &fakeSystem{hasSystemctl: true, loadedUnits: []string{
+		"linux-temp-admin-v2-revoke-loaded.timer",
+		"linux-temp-admin-revoke-legacy.service",
+		"unrelated.timer",
+	}}
+	users, err := s.ScheduledUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, users, "legacy", "loaded")
+}
+
+func TestScheduledUsersFailsClosedOnMalformedOrUnreadableLoadedUnitInventory(t *testing.T) {
+	t.Run("malformed managed name", func(t *testing.T) {
+		s := newFinder(t)
+		s.Sys = &fakeSystem{hasSystemctl: true, loadedUnits: []string{"linux-temp-admin-v2-revoke-Bad!.timer"}}
+		if _, err := s.ScheduledUsers(); err == nil || !strings.Contains(err.Error(), "invalid account suffix") {
+			t.Fatalf("ScheduledUsers error = %v, want malformed loaded-unit refusal", err)
+		}
+	})
+	t.Run("manager query", func(t *testing.T) {
+		s := newFinder(t)
+		s.Sys = &fakeSystem{hasSystemctl: true, loadedErr: errors.New("D-Bus unavailable")}
+		if _, err := s.ScheduledUsers(); err == nil || !strings.Contains(err.Error(), "D-Bus unavailable") {
+			t.Fatalf("ScheduledUsers error = %v, want manager inventory failure", err)
+		}
+	})
+}
+
 func TestScheduledUsersOnlyAcceptsKnownStandaloneRevokeCommands(t *testing.T) {
 	s := newFinder(t)
 	s.Sys = &fakeSystem{hasAt: true, atJobs: []AtJob{
 		{ID: "1", Body: "# /usr/local/sbin/linux-temp-admin revoke --user comment --yes\n"},
 		{ID: "2", Body: "echo /usr/local/sbin/linux-temp-admin revoke --user echoed --yes\n"},
 		{ID: "3", Body: "/tmp/usr/local/sbin/linux-temp-admin revoke --user wrongpath --yes\n"},
-		{ID: "4", Body: "/usr/local/sbin/linux-temp-admin revoke --user badsuffix --yes --unknown\n"},
 		{ID: "5", Body: "/usr/local/sbin/linux-temp-admin revoke --user legacy --yes\n"},
 		{ID: "6", Body: "/usr/local/sbin/linux-temp-admin revoke --user forced --yes --force --confirm-force forced\n"},
 		{ID: "7", Body: "/usr/local/sbin/linux-temp-admin revoke --user current --yes --force --confirm-force current --expected-uid 1001 --generation 0123456789abcdef0123456789abcdef\n"},
@@ -158,6 +241,17 @@ func TestScheduledUsersOnlyAcceptsKnownStandaloneRevokeCommands(t *testing.T) {
 	eq(t, users, "current", "forced", "legacy")
 }
 
+func TestScheduledUsersFailsClosedOnMalformedOwnedAtCommand(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = &fakeSystem{hasAt: true, atJobs: []AtJob{{
+		ID:   "4",
+		Body: "/usr/local/sbin/linux-temp-admin revoke --user future --yes --unknown\n",
+	}}}
+	if _, err := s.ScheduledUsers(); err == nil || !strings.Contains(err.Error(), "at job 4") {
+		t.Fatalf("ScheduledUsers error = %v, want malformed owned-job refusal", err)
+	}
+}
+
 func TestScheduledUsersAllowsCompletelyAbsentAtBackend(t *testing.T) {
 	s := newFinder(t, "linux-temp-admin-v2-revoke-unituser.timer")
 	s.Sys = &fakeSystem{atJobsErr: os.ErrNotExist}
@@ -167,4 +261,12 @@ func TestScheduledUsersAllowsCompletelyAbsentAtBackend(t *testing.T) {
 		t.Fatalf("systemd-only inventory failed because optional at is absent: %v", err)
 	}
 	eq(t, users, "unituser")
+}
+
+func TestScheduledUsersRejectsMissingBackend(t *testing.T) {
+	s := newFinder(t)
+	s.Sys = nil
+	if _, err := s.ScheduledUsers(); err == nil || !strings.Contains(err.Error(), "no scheduler backend") {
+		t.Fatalf("ScheduledUsers missing-backend error = %v", err)
+	}
 }

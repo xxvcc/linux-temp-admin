@@ -6,9 +6,9 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> 一条命令，为可信协作者创建一个有时限、用完自动删除的临时 SSH 管理员账号。
+> 一条命令，为可信协作者创建一个有时限、安排到期自动撤销的临时 SSH 管理员账号。
 
-**linux-temp-admin** 不需要分享 root 密码，也不会在服务器保存邀请私钥。它会创建临时账号、输出可私聊转发的邀请包，并在到期时自动撤销账号、SSH key 和 sudo 授权。
+**linux-temp-admin** 不需要分享 root 密码，也不会在服务器保存邀请私钥。它会创建临时账号、输出可私聊转发的邀请包，并安排在到期时撤销受管账号、SSH key 和 sudo 授权。
 
 程序是一个支持 glibc 和 musl 的静态二进制，适用于 amd64 和 arm64 Linux。账号、SSH 和定时任务操作仍会调用系统已有的标准管理工具。
 
@@ -28,7 +28,7 @@ curl -fsSL https://dl.ll.cd/linux-temp-admin/install.sh | /usr/bin/sudo /bin/sh 
 
 1. 创建一个随机命名的临时账号；
 2. 生成一次性 SSH key，并在终端显示邀请包；
-3. 默认授予免密 sudo，并在 24 小时后自动删除账号；
+3. 默认授予免密 sudo，并安排在 24 小时后自动撤销；
 4. 在创建前检查当前 sshd 配置：明确阻止登录就拒绝，无法完整判断则如实标记 `UNVERIFIED`。
 
 快速入口从官方镜像取得安装脚本并交给 root shell。`set -o pipefail` 会传播 curl 失败，因此安装失败后不会继续创建邀请；它**不认证脚本本身，也不能阻止已经收到的部分脚本开始执行**。安装器启动后，下载的二进制仍会经过 SHA-256 和 ed25519 签名验证。需要在执行前认证安装脚本时，请使用[高保证首次安装流程](docs/installing.md#高保证首次安装)。
@@ -70,7 +70,7 @@ ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
 ## 查看和撤销
 
 ```bash
-# 查看全部临时账号
+# 查看全部已登记临时账号
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin status
 
 # 从列表选择并撤销
@@ -80,7 +80,7 @@ ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-默认会在 24 小时后自动删除账号、家目录、SSH key、sudo 授权和本工具创建的 sshd 例外。即使启用了自动删除，用完后也应立即手动撤销。
+默认会安排在 24 小时后自动撤销。对于仍可用完整身份核对的账号，撤销成功会删除个人 crontab、UID 匹配的 `at`/`batch` 任务、账号、家目录、SSH key、sudo 授权和本工具创建的 sshd 例外；若账号已在程序外消失，只清理可安全识别的登记、按用户名授权和任务，不会猜测删除失去身份见证的 Home/mail。若安全检查或清理失败，程序会返回非零，保留账号（若仍存在）和登记，并尽力禁用仍存在的账号，供 systemd 重试或人工处理。即使启用了自动撤销，用完后也应立即手动撤销。
 
 ## 常用命令
 
@@ -121,7 +121,7 @@ ssh -i ./xxvcc-a1b2c3d4e5.key -p 22 xxvcc-a1b2c3d4e5@203.0.113.10
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo --fix-sshd
 ```
 
-该操作不会修改 sshd 全局策略，并会在撤销账号时删除对应例外。自动化调用、密码登录、永久账号和完整故障处理见[管理员指南](docs/operator-guide.md)。
+该操作不会修改 sshd 全局策略；成功撤销账号时会删除对应例外。自动化调用、密码登录、永久账号和完整故障处理见[管理员指南](docs/operator-guide.md)。
 
 ## 安全要点
 

@@ -3,6 +3,7 @@ package schedule
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -28,6 +29,15 @@ import (
 // v2's, so a v1 unit on an upgraded host invokes the binary running this code.
 // Globbing only the v2 prefix walks straight past it.
 func (s *Scheduler) UnitUsers() ([]string, error) {
+	if s == nil {
+		return nil, fmt.Errorf("no scheduler configured")
+	}
+	prefixes := s.unitPrefixes()
+	for _, prefix := range prefixes {
+		if !validManagedUnitPrefix(prefix) {
+			return nil, fmt.Errorf("unsafe managed systemd unit prefix %q", prefix)
+		}
+	}
 	seen := map[string]bool{}
 	entries, err := readSystemdDir(s.SystemdDir)
 	if os.IsNotExist(err) {
@@ -37,19 +47,12 @@ func (s *Scheduler) UnitUsers() ([]string, error) {
 		return nil, fmt.Errorf("read systemd unit directory %s: %w", s.SystemdDir, err)
 	}
 	for _, entry := range entries {
-		for _, prefix := range s.unitPrefixes() {
-			base := entry.Name()
-			if !strings.HasPrefix(base, prefix) {
-				continue
-			}
-			// Units come in .service/.timer pairs; both name the same account.
-			base = strings.TrimSuffix(strings.TrimSuffix(base, ".timer"), ".service")
-			user := strings.TrimPrefix(base, prefix)
-			// validate.Username keeps a hand-made file with a strange name from being
-			// reported — and later acted on — as if this tool had written it.
-			if user != "" && validate.Username(user) {
-				seen[user] = true
-			}
+		user, managed, err := managedUnitUser(entry.Name(), prefixes)
+		if err != nil {
+			return nil, err
+		}
+		if managed {
+			seen[user] = true
 		}
 	}
 	users := make([]string, 0, len(seen))
@@ -65,6 +68,9 @@ var readSystemdDir = os.ReadDir
 // ScheduledUsers returns accounts named by either systemd units or queued at
 // jobs. This is the complete uninstall inventory even when registry rows vanish.
 func (s *Scheduler) ScheduledUsers() ([]string, error) {
+	if s == nil || s.Sys == nil {
+		return nil, fmt.Errorf("no scheduler backend configured")
+	}
 	users, err := s.UnitUsers()
 	if err != nil {
 		return nil, err
@@ -73,30 +79,110 @@ func (s *Scheduler) ScheduledUsers() ([]string, error) {
 	for _, user := range users {
 		seen[user] = true
 	}
+	// A failed earlier cleanup can remove the files before daemon-reload. Active or
+	// otherwise loaded units then exist only in PID 1's manager state, so supplement
+	// the disk inventory whenever the backend exposes the production capability.
+	if s.Sys.HasSystemctl() {
+		if lister, ok := s.Sys.(loadedSystemdUnitLister); ok {
+			loaded, err := lister.loadedSystemdUnits()
+			if err != nil {
+				return nil, err
+			}
+			prefixes := s.unitPrefixes()
+			for _, unit := range loaded {
+				user, managed, err := managedUnitUser(unit, prefixes)
+				if err != nil {
+					return nil, err
+				}
+				if managed {
+					seen[user] = true
+				}
+			}
+		}
+	}
 	// `at` is optional. No installed backend footprint means there cannot be a
 	// runnable queue to inventory; a partial installation still calls AtJobs and
 	// fails closed below because it may leave live jobs hidden from teardown.
 	if !s.Sys.HasAt() {
-		return users, nil
+		return sortedScheduledUsers(seen), nil
 	}
 	jobs, err := s.Sys.AtJobs()
 	if err != nil {
 		return nil, err
 	}
 	for _, job := range jobs {
+		// Invites run as root, so only a root-owned at job can be this tool's
+		// schedule. A local user may submit an identical command line; treating it as
+		// inventory would let that user block cleanup or have root remove their job.
+		if job.OwnerUID != 0 {
+			continue
+		}
 		for _, line := range strings.Split(job.Body, "\n") {
 			command, ok := parseAtRevokeCommand(line, s.InstallPath)
 			if ok {
 				seen[command.user] = true
+			} else if atLineTargetsRevoke(line, s.InstallPath, "") {
+				return nil, fmt.Errorf("at job %s contains an unsupported or corrupt owned revoke command", job.ID)
 			}
 		}
 	}
-	users = users[:0]
+	return sortedScheduledUsers(seen), nil
+}
+
+func sortedScheduledUsers(seen map[string]bool) []string {
+	users := make([]string, 0, len(seen))
 	for user := range seen {
 		users = append(users, user)
 	}
 	sort.Strings(users)
-	return users, nil
+	return users
+}
+
+func validManagedUnitPrefix(prefix string) bool {
+	if prefix == "" || filepath.Base(prefix) != prefix || len(prefix) > 200 {
+		return false
+	}
+	for _, r := range prefix {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '@':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// loadedSystemdUnitLister is an optional production capability so injected
+// System test doubles outside this package do not need to contact the host's PID
+// 1. realSystem implements it; ScheduledUsers uses it whenever available.
+type loadedSystemdUnitLister interface {
+	loadedSystemdUnits() ([]string, error)
+}
+
+func managedUnitUser(name string, prefixes []string) (string, bool, error) {
+	for _, prefix := range prefixes {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		base := name
+		switch {
+		case strings.HasSuffix(base, ".timer"):
+			base = strings.TrimSuffix(base, ".timer")
+		case strings.HasSuffix(base, ".service"):
+			base = strings.TrimSuffix(base, ".service")
+		default:
+			continue
+		}
+		user := strings.TrimPrefix(base, prefix)
+		// A malformed suffix cannot be acted on safely because Cancel is keyed by a
+		// validated username. It is still evidence inside this tool's owned namespace.
+		if user == "" || !validate.Username(user) {
+			return "", true, fmt.Errorf("managed systemd unit %q has an invalid account suffix", name)
+		}
+		return user, true, nil
+	}
+	return "", false, nil
 }
 
 // Orphans returns the accounts whose auto-revoke unit is still on disk although

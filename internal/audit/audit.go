@@ -1,8 +1,8 @@
-// Package audit appends a root-owned, append-only record of every privileged
+// Package audit attempts to append a root-owned record of each privileged
 // mutating operation (account create/delete, sudo grant, install/uninstall/
-// upgrade) to a log file. Each entry is one JSON object per line and records
-// when, who (the invoking user under sudo, plus the effective uid), what, the
-// target, and the result — giving an operator-attributable trail.
+// upgrade) to a log file. Each completed entry is one JSON object per line and
+// records when, who (the invoking user under sudo, plus the effective uid), what,
+// the target, and the result — giving an operator-attributable trail.
 //
 // The log lives in a root-owned 0700 directory and is written 0600 with
 // O_NOFOLLOW, so an unprivileged local user can neither read nor redirect it.
@@ -11,6 +11,7 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,8 +53,9 @@ type record struct {
 	Fields map[string]string `json:"fields,omitempty"`
 }
 
-// Logger appends events to a file. Fields are injectable so tests can point at a
-// temporary path and supply a fixed clock/actor.
+// Logger appends events to File, which must be a direct child of the absolute
+// Dir. Fields are injectable so tests can point the complete layout at a
+// temporary directory and supply a fixed clock/actor.
 type Logger struct {
 	Dir   string
 	File  string
@@ -84,13 +86,17 @@ func realActor() (string, int) {
 // Log appends one event. It is best-effort from the caller's perspective (it
 // returns any error so the caller can warn). New writers serialize with flock;
 // a failed write is truncated back to its locked starting size and the completed
-// line is synced before success. This sharply limits partial tails, but an on-host
-// log cannot promise atomicity across a kernel/filesystem crash or a concurrent
-// writer from an older build that does not honor the lock. A nil/empty-path Logger
-// is a no-op, which disables auditing (e.g. in tests).
+// line is synced before success. After a crash, the next writer truncates an
+// incomplete tail back to the last newline before appending, preserving JSONL
+// framing. A concurrent writer from an older build that does not honor the lock
+// can still violate this protocol. A nil/empty-path Logger is a no-op, which
+// disables auditing (e.g. in tests).
 func (l *Logger) Log(ev Event) error {
 	if l == nil || l.Dir == "" || l.File == "" {
 		return nil
+	}
+	if err := l.validateLayout(); err != nil {
+		return err
 	}
 	if err := fsutil.EnsureDir(l.Dir, 0o700, 0, 0); err != nil {
 		return fmt.Errorf("audit dir: %w", err)
@@ -128,10 +134,10 @@ func (l *Logger) Log(ev Event) error {
 	if len(line) > maxAuditRecordBytes {
 		return fmt.Errorf("audit record exceeds %d bytes", maxAuditRecordBytes)
 	}
-	// Append-only, refusing to follow a symlink planted at the path. Existing logs
-	// are repaired to the required metadata through the descriptor and then
-	// re-checked before any event is written.
-	f, created, err := openAuditFile(l.File)
+	// Open the append-oriented log without following a symlink planted at the path.
+	// Existing logs are repaired to the required metadata through the descriptor
+	// and then re-checked before any event is written.
+	f, _, err := openAuditFile(l.File)
 	if err != nil {
 		return fmt.Errorf("open audit log: %w", err)
 	}
@@ -145,7 +151,13 @@ func (l *Logger) Log(ev Event) error {
 	if err != nil {
 		return fmt.Errorf("stat locked audit log: %w", err)
 	}
-	start := fi.Size()
+	if fi.Size() > maxAuditLogBytes {
+		return fmt.Errorf("audit log reached its %d-byte limit; archive or rotate it before retrying", maxAuditLogBytes)
+	}
+	start, err := l.repairIncompleteTail(f, fi.Size())
+	if err != nil {
+		return fmt.Errorf("repair incomplete audit record: %w", err)
+	}
 	if start < 0 || start > maxAuditLogBytes-int64(len(line)) {
 		return fmt.Errorf("audit log reached its %d-byte limit; archive or rotate it before retrying", maxAuditLogBytes)
 	}
@@ -166,12 +178,68 @@ func (l *Logger) Log(ev Event) error {
 		// durable either, and a complete possibly-durable record is the safer state.
 		return fmt.Errorf("sync audit record: %w", err)
 	}
-	if created {
-		if err := syncAuditDirectory(filepath.Dir(l.File)); err != nil {
-			return fmt.Errorf("sync new audit log directory entry: %w", err)
-		}
+	// Sync the parent even for an existing path. It may be the visible result of a
+	// previous append whose new-file directory sync failed; retrying only the file
+	// sync would otherwise report success without finishing that durability step.
+	if err := syncAuditDirectory(filepath.Dir(l.File)); err != nil {
+		return fmt.Errorf("sync audit log directory: %w", err)
 	}
 	return nil
+}
+
+func (l *Logger) validateLayout() error {
+	dir := filepath.Clean(l.Dir)
+	file := filepath.Clean(l.File)
+	if !filepath.IsAbs(l.Dir) || dir != l.Dir || dir == string(filepath.Separator) {
+		return fmt.Errorf("unsafe audit directory %q", l.Dir)
+	}
+	if !filepath.IsAbs(l.File) || file != l.File || filepath.Dir(file) != dir || file == dir {
+		return fmt.Errorf("audit file %q must be a direct child of %s", l.File, dir)
+	}
+	return nil
+}
+
+func (l *Logger) repairIncompleteTail(f *os.File, size int64) (int64, error) {
+	if size <= 0 {
+		return size, nil
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], size-1); err != nil {
+		return 0, err
+	}
+	if last[0] == '\n' {
+		return size, nil
+	}
+
+	const blockSize = 64 << 10
+	buf := make([]byte, blockSize)
+	newSize := int64(0)
+	for end := size; end > 0; {
+		start := end - int64(len(buf))
+		if start < 0 {
+			start = 0
+		}
+		want := int(end - start)
+		n, err := f.ReadAt(buf[:want], start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+		if n != want {
+			return 0, io.ErrUnexpectedEOF
+		}
+		if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
+			newSize = start + int64(i) + 1
+			break
+		}
+		end = start
+	}
+	if err := f.Truncate(newSize); err != nil {
+		return 0, err
+	}
+	if err := l.syncFile(f); err != nil {
+		return 0, err
+	}
+	return newSize, nil
 }
 
 func (l *Logger) syncFile(f *os.File) error {
@@ -205,7 +273,7 @@ func wrapIfErr(prefix string, err error) error {
 	return fmt.Errorf("%s: %w", prefix, err)
 }
 
-func syncAuditDirectory(path string) error {
+var syncAuditDirectory = func(path string) error {
 	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return err
@@ -224,13 +292,16 @@ func openAuditFile(path string) (*os.File, bool, error) {
 		if !ok {
 			return nil, false, fmt.Errorf("cannot determine inode of %s", path)
 		}
+		if st.Nlink != 1 {
+			return nil, false, fmt.Errorf("%s has %d hard links; refusing to mutate a shared inode", path, st.Nlink)
+		}
 		copy := *st
 		before = &copy
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
 	}
 	created := before == nil
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, false, err
 	}
@@ -249,6 +320,9 @@ func openAuditFile(path string) (*os.File, bool, error) {
 	if !ok {
 		return fail(fmt.Errorf("cannot determine owner of %s", path))
 	}
+	if st.Nlink != 1 {
+		return fail(fmt.Errorf("%s has %d hard links; refusing to mutate a shared inode", path, st.Nlink))
+	}
 	if before != nil && (before.Dev != st.Dev || before.Ino != st.Ino) {
 		return fail(fmt.Errorf("%s was replaced while opening it", path))
 	}
@@ -263,7 +337,7 @@ func openAuditFile(path string) (*os.File, bool, error) {
 		return fail(err)
 	}
 	st, ok = fi.Sys().(*syscall.Stat_t)
-	if !ok || !fi.Mode().IsRegular() || st.Uid != 0 || st.Gid != 0 || fi.Mode().Perm() != 0o600 {
+	if !ok || !fi.Mode().IsRegular() || st.Nlink != 1 || st.Uid != 0 || st.Gid != 0 || fi.Mode().Perm() != 0o600 {
 		return fail(fmt.Errorf("%s metadata remains unsafe after repair", path))
 	}
 	return f, created, nil

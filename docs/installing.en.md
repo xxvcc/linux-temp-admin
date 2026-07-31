@@ -13,7 +13,7 @@ This guide is for administrators who install and maintain `linux-temp-admin`. Se
 - root access plus curl, OpenSSL 3, sha256sum, and timeout for installation;
 - `getent` or `nslookup` for GitHub CDN fallback, so every redirect target can be validated and pinned to a public address.
 
-The binary has no dynamic-library or language-runtime dependency. Account lifecycle operations still use the system's `id`, `useradd`/`adduser`, `userdel`/`deluser`, `usermod`, and `chage`; granting sudo also requires `sudo`. Missing tools can be installed through apt, dnf, yum, or apk after interactive confirmation.
+The binary has no dynamic-library or language-runtime dependency. Account lifecycle operations still use the system's `id`, `useradd`, `userdel`, `usermod`, and `chage`; password login additionally requires `chpasswd`, while granting sudo requires `sudo` and `visudo` for pre-commit policy validation. The tool does not fall back to a distro `adduser`/`deluser` or an arbitrary BusyBox account applet: command names alone cannot prove equivalent arguments, configuration, or compile-time shadow/group semantics. Missing tools can be installed through apt, dnf, yum, or apk after interactive confirmation.
 
 Arch Linux has no safe partial-upgrade mode, while `pacman -Syu` upgrades the whole system. The tool therefore never runs pacman automatically while creating an account. Complete the prompted upgrade and dependency installation deliberately first.
 

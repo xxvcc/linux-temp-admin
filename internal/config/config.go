@@ -72,9 +72,9 @@ const (
 	// expected to hand-edit or ship in a config-management repo.
 	PrefsFile = RegistryDir + "/prefs"
 	// RegistrySchema is written as the registry header's version marker.
-	RegistrySchema = 3
+	RegistrySchema = 4
 
-	// AuditLogDir holds the append-only operation audit log (root:root, 0700).
+	// AuditLogDir holds the best-effort JSONL operation audit log (root:root, 0700).
 	AuditLogDir = "/var/log/" + ManagedTag
 	// AuditLogFile is the audit log; one JSON object per line.
 	AuditLogFile = AuditLogDir + "/audit.log"

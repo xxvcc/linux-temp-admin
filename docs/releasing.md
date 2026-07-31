@@ -341,11 +341,16 @@ repository:
    disable administrator bypass, and restrict deployments to the protected
    `main` branch. A `workflow_run` receiver executes from the default branch even
    though it validates and stages the triggering `v*` tag.
-4. Only after verifying those controls, set the repository Actions variable
+4. Enable immutable Releases for the repository before staging any draft. GitHub
+   applies this setting only to releases created after it is enabled, so enabling
+   it after CI has staged the candidate is too late. Re-check the setting before
+   every release ceremony; the publisher deliberately fails closed if the bound
+   release becomes public without becoming immutable.
+5. Only after verifying those controls, set the repository Actions variable
    `LTA_RELEASE_ENVIRONMENT_CONFIGURED` to the exact value `true`. Missing or
    different values fail closed before the write-capable job can run. Remove the
    variable immediately if the environment or rulesets are weakened.
-5. Keep the repository's default Actions token permission read-only and do not
+6. Keep the repository's default Actions token permission read-only and do not
    allow Actions to approve pull requests.
 
 The staging workflow uses one fixed repository-wide concurrency group, so only
@@ -354,7 +359,11 @@ not provide an atomic compare-and-set operation spanning release enumeration and
 the Latest pointer. The release coordinator must therefore also hold one
 organization-wide publication lock for the entire preparation, offline signing,
 and publication ceremony. Do not prepare or publish two tags concurrently from
-different workstations or workflow runs.
+different workstations or workflow runs. This repository does not provision,
+acquire, or verify that cross-workstation lock: the release organization must
+supply a durable exclusive lock that records its owner and tag and has an
+explicit stale-lock recovery policy. Workflow concurrency and a workstation-local
+`flock` do not satisfy this requirement.
 
 The OpenPGP tag-signing key is separate from the offline ed25519 release key.
 Before the first release under this process, generate or import a dedicated
@@ -422,10 +431,10 @@ git -c user.name='XXV.CC' \
     -c user.signingkey="${TAG_SIGNING_FPR}!" \
     -c gpg.format=openpgp \
     -c gpg.program=/usr/bin/gpg \
-    tag -s v2.8.4 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.8.4'
+    tag -s v2.9.0 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.9.0'
 git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg \
-    verify-tag --raw v2.8.4
-git push origin v2.8.4
+    verify-tag --raw v2.9.0
+git push origin v2.9.0
 ```
 
 Before pushing, the `VALIDSIG` record from `verify-tag --raw` must identify the
@@ -448,7 +457,10 @@ uses its narrowly scoped write token to create a new unsigned draft. Candidate
 tag workflows never receive a write token. The stage job requires GitHub to
 recognize the annotated tag's OpenPGP signature; the online trusted phases still
 pin and verify the exact signer fingerprint independently. Both workflows
-enforce the clients' 64 MiB binary limit before staging. CI refuses to refresh any existing draft;
+enforce the clients' 64 MiB binary limit before staging. The authenticated staging
+job enumerates every Release page because GitHub's tag-specific REST endpoint does
+not expose drafts; CI refuses to create or refresh any tag already used by a draft
+or published Release;
 investigate and deliberately remove a bad draft before rerunning instead of
 overwriting bytes that an offline ceremony may already have signed.
 
@@ -489,7 +501,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/prepare-release.sh \
-  v2.8.4 /srv/linux-temp-admin /srv/release-transfer/v2.8.4-prepared
+  v2.9.0 /srv/linux-temp-admin /srv/release-transfer/v2.9.0-prepared
 LTA_PREPARE_RELEASE
 ```
 
@@ -509,7 +521,7 @@ the candidate or transfer media:
 LTA_SIGN_KEY=/offline/keys/release-v1.key
 LTA_TRUSTED_SIGNER=/opt/lta-release-tools/lta-release
 LTA_TRUSTED_SIGNER_SHA256='<offline-recorded signer sha256>'
-LTA_EXPECTED_TAG=v2.8.4
+LTA_EXPECTED_TAG=v2.9.0
 LTA_EXPECTED_COMMIT='<independently recorded 40-hex commit>'
 LTA_EXPECTED_PREPARED_MANIFEST_SHA256='<independently recorded sha256>'
 LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public key>'
@@ -521,7 +533,7 @@ LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public ke
   LTA_EXPECTED_PREPARED_MANIFEST_SHA256="$LTA_EXPECTED_PREPARED_MANIFEST_SHA256" \
   LTA_EXPECTED_RELEASE_SIGNER_PUBKEY="$LTA_EXPECTED_RELEASE_SIGNER_PUBKEY" \
   /opt/lta-release-tools/offline-sign-release.sh \
-  /media/in/v2.8.4-prepared /media/out/v2.8.4-signed
+  /media/in/v2.9.0-prepared /media/out/v2.9.0-signed
 ```
 
 The script copies the removable input into a size-bounded private local snapshot
@@ -572,7 +584,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/publish-release.sh \
-  /srv/release-transfer/v2.8.4-signed /srv/linux-temp-admin
+  /srv/release-transfer/v2.9.0-signed /srv/linux-temp-admin
 LTA_PUBLISH_RELEASE
 ```
 
@@ -581,16 +593,39 @@ under a hard copy timeout and binds that private copy to the independently
 recorded signed-bundle manifest hash, then verifies the manifest, pinned tag
 signer, self-contained source tree, GitHub `main` ancestry, successful CI run,
 keyring, checksums, and both
-signatures. While the
-release is still a draft it rejects any missing or extra assets, replaces all
-expected assets with the exact signed bytes, checks the complete asset list
+signatures. While the release is still a draft it accepts the exact three
+unsigned CI assets, the complete five-asset signed set left by an ambiguous
+response, or a prior replacement interrupted with exactly one of those five
+assets absent; duplicate, unexpected, and other partial states fail before any
+write. It uploads every missing signed asset first, then replaces each old
+asset immediately before re-uploading its exact signed bytes through asset IDs
+belonging to the bound Release ID. Once replacement starts, an interruption can
+therefore leave at most one of the five assets absent, and the identical command
+can safely resume. It checks the
+complete asset list
 again, downloads the draft, compares every byte, and checks GitHub's SHA-256
 digest for every asset immediately before publication. Stable versions must be
 strictly newer than every published stable release, and the current Latest must
 already equal that maximum and remain unchanged during preparation; prereleases
-never become Latest. It publishes every release initially with `--latest=false`,
-downloads and verifies the public versioned assets with bounded retries and hard
-file limits, and only then promotes a stable tag to Latest. Before the first
+never become Latest. It publishes every release initially with
+`make_latest=false`. Before any remote mutation, it enumerates GitHub's
+authenticated Release list, which includes drafts for a caller with push access,
+and requires exactly one visible Release whose tag equals `TAG`; only then does
+it pin that Release's numeric ID. It deliberately does not use the
+published-only `/releases/tags/{tag}` REST route to discover a draft. That
+initial state must be either the expected mutable draft or the expected immutable
+published release. Every later asset read, asset replacement, publish operation,
+Latest update, draft rollback, and state gate concerning that Release is
+addressed only by the pinned numeric ID; the publisher never re-resolves the
+candidate tag and therefore cannot follow a replacement mapping to another
+Release. Separate tag-addressed reads may bind other immutable stable Releases
+considered for Latest restoration, but tag-addressed routes are never mutation
+endpoints.
+After publishing, it also
+requires GitHub to report the exact tag, expected prerelease flag, and a non-draft
+immutable state. It downloads and verifies the public versioned assets with
+bounded retries and hard file limits, and only then promotes a stable tag to
+Latest. Before the first
 remote mutation it preflights every command needed by the remaining publication
 and verification path, including `curl` and `timeout`. A final enumeration
 detects a concurrently published higher stable tag and restores Latest to the
@@ -599,17 +634,29 @@ stable release, it clears Latest and confirms the REST Latest route is exactly a
 404; authentication or transport errors never count as that empty state. The
 Latest route is then independently compared, checksummed, and
 signature-verified for both architectures, followed by another highest-version
-check. An EXIT trap performs the same exact restoration after
-any error or signal following a possibly applied promotion. These checks narrow
-the race window but cannot make the GitHub API transactional; the mandatory
-global publication lock above remains the control that prevents two authorized
-publishers from overlapping.
+check and a final immutable-Release check. An EXIT trap performs the same exact
+restoration after any error or catchable terminating signal following a possibly
+applied promotion.
+If a publish request fails or returns an ambiguous response while the same bound
+Release is public but still mutable, the publisher returns that exact numeric ID
+to draft and verifies the rollback. It never follows a replaced tag to another
+Release; inability to classify or secure the bound ID is a fail-closed incident
+that must remain unannounced.
+These checks narrow the race window but cannot make the GitHub API transactional;
+the mandatory global publication lock above remains the control that prevents
+two authorized publishers from overlapping.
 
 The publication command is deliberately resumable after the release has become
-public. It accepts that state only when the tag, draft/prerelease flags, complete
-asset-name set, sizes, GitHub SHA-256 digests, signed-bundle bytes, versioned
-public downloads, checksums, and ed25519 signatures all still match exactly. It
-does not clobber assets on a published release. This covers interruption after
+public. It accepts that state only when the tag and draft/prerelease/immutable
+flags are exact, the asset-name set is complete, and sizes, GitHub SHA-256
+digests, signed-bundle bytes, versioned public downloads, checksums, and ed25519
+signatures all still match. Within that invocation, the pinned numeric Release
+ID must also remain unchanged. A new process necessarily establishes a fresh ID
+pin from the then-current immutable Release; it does not prove that an earlier
+interrupted process observed the same numeric ID. The retained signed bundle,
+immutable state, exact asset checks, and the rule below forbidding deletion or
+replacement are therefore still required across retries. The publisher does not
+clobber assets on a published release. This covers interruption after
 publication, after Latest promotion, or during final CDN verification without
 weakening the signed-bundle binding. If the release is already Latest when a
 read-only resume begins, a later verification or transport failure leaves that
@@ -633,11 +680,11 @@ release unannounced and retain the organization-wide publication lock. Restore
 network/API access, rerun the same publisher first, and inspect its exact result.
 For manual incident recovery only, use the following fail-closed procedure. It
 uses decimal-string comparison rather than machine-sized arithmetic, rejects a
-noncanonical published stable tag, excludes the failed `TAG`, and verifies the
-exact resulting Latest state:
+noncanonical stable tag or mutable recovery target, excludes the failed `TAG`,
+and binds both the mutation and resulting Latest state to one numeric Release ID:
 
 ```bash
-TAG=v2.8.4  # the failed release; verify this value before running
+TAG=v2.9.0  # the failed release; verify this value before running
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   TAG="$TAG" /bin/bash -p <<'LTA_LATEST_RECOVERY'
@@ -694,26 +741,79 @@ stable_gt() {
   return 1
 }
 
-release_tags="$(gh_with_timeout api --paginate "repos/${REPO}/releases?per_page=100" \
-  --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')"
-fallback=
-while IFS= read -r candidate; do
-  [[ -n "$candidate" ]] || continue
-  [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || { echo "noncanonical stable tag: $candidate" >&2; exit 1; }
-  [[ "$candidate" != "$TAG" ]] || continue
-  if [[ -z "$fallback" ]] || stable_gt "$candidate" "$fallback"; then
-    fallback=$candidate
-  fi
-done <<<"$release_tags"
+enumerate_recovery_target() {
+  local release_records candidate candidate_id candidate_immutable extra
+  local -A seen_release_tags=() seen_release_ids=()
+  fallback=
+  fallback_id=
+  fallback_immutable=
+  failed_id=
+  failed_immutable=
+  release_records="$(gh_with_timeout api --paginate "repos/${REPO}/releases?per_page=100" \
+    --jq '.[] | select(.draft == false and .prerelease == false) | [.tag_name, (.id|tostring), (.immutable|tostring)] | @tsv')"
+  while IFS=$'\t' read -r candidate candidate_id candidate_immutable extra; do
+    [[ -n "$candidate" ]] || continue
+    [[ -z "$extra" && "$candidate_id" =~ ^[1-9][0-9]*$ \
+       && ( "$candidate_immutable" == true || "$candidate_immutable" == false ) ]] \
+      || fail "stable release has no unambiguous identity or immutable state"
+    [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+      || fail "noncanonical stable tag: $candidate"
+    [[ -z "${seen_release_tags[$candidate]+present}" \
+       && -z "${seen_release_ids[$candidate_id]+present}" ]] \
+      || fail "duplicate stable Release tag or identity"
+    seen_release_tags[$candidate]=1
+    seen_release_ids[$candidate_id]=1
+    if [[ "$candidate" == "$TAG" ]]; then
+      failed_id=$candidate_id
+      failed_immutable=$candidate_immutable
+      continue
+    fi
+    if [[ -z "$fallback" ]] || stable_gt "$candidate" "$fallback"; then
+      fallback=$candidate
+      fallback_id=$candidate_id
+      fallback_immutable=$candidate_immutable
+    fi
+  done <<<"$release_records"
+}
+
+enumerate_recovery_target
+[[ "$failed_id" =~ ^[1-9][0-9]*$ && "$failed_immutable" == true ]] \
+  || fail "failed tag has no bound immutable published Release ID"
+expected_fallback=$fallback
+expected_fallback_id=$fallback_id
+expected_fallback_immutable=$fallback_immutable
+expected_failed_id=$failed_id
+expected_failed_immutable=$failed_immutable
 
 if [[ -n "$fallback" ]]; then
-  gh_with_timeout release edit "$fallback" --repo "$REPO" --latest
-  actual="$(gh_with_timeout release view --repo "$REPO" --json tagName --jq '.tagName')"
-  [[ "$actual" == "$fallback" ]] \
-    || { echo "Latest is $actual, expected $fallback" >&2; exit 1; }
+  [[ "$fallback_immutable" == true ]] \
+    || { echo "highest stable fallback is mutable: $fallback ($fallback_id)" >&2; exit 1; }
+  state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${fallback_id}" \
+    -f make_latest=true \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')"
+  [[ "$state" == "$fallback false false true $fallback_id" ]] \
+    || { echo "unexpected fallback Release state: $state" >&2; exit 1; }
 else
-  gh_with_timeout release edit "$TAG" --repo "$REPO" --latest=false
+  state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${failed_id}" \
+    -f make_latest=false \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')"
+  [[ "$state" == "$TAG false false true $failed_id" ]] \
+    || { echo "unexpected failed Release state: $state" >&2; exit 1; }
+fi
+
+enumerate_recovery_target
+[[ "$failed_id" == "$expected_failed_id" && "$failed_immutable" == "$expected_failed_immutable" ]] \
+  || fail "failed Release identity or immutable state changed during Latest recovery"
+[[ "$fallback" == "$expected_fallback" && "$fallback_id" == "$expected_fallback_id" \
+   && "$fallback_immutable" == "$expected_fallback_immutable" ]] \
+  || fail "highest stable fallback changed during Latest recovery"
+
+if [[ -n "$expected_fallback" ]]; then
+  actual="$(gh_with_timeout api "repos/${REPO}/releases/latest" \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')"
+  [[ "$actual" == "$expected_fallback false false true $expected_fallback_id" ]] \
+    || fail "Latest is $actual, expected immutable Release $expected_fallback ($expected_fallback_id)"
+else
   response="$work/latest-response"
   set +e
   gh_with_timeout api --include "repos/${REPO}/releases/latest" >"$response" 2>&1
@@ -749,7 +849,7 @@ announcement:
 
 ```bash
 gh workflow run mirror-release.yml --repo xxvcc/linux-temp-admin \
-  --ref main -f tag=v2.8.4
+  --ref main -f tag=v2.9.0
 gh run list --repo xxvcc/linux-temp-admin \
   --workflow mirror-release.yml --event workflow_dispatch --limit 1
 ```
@@ -849,8 +949,28 @@ SSH session may continue using the old inode, so wait for it to finish before
 declaring the rollout complete:
 
 ```bash
+(
+set -Eeuo pipefail
 python3 -B -m unittest -v scripts/mirror_receiver_test.py
+receiver_dir=/usr/local/libexec
+receiver_path="$receiver_dir/linux-temp-admin-mirror-receiver"
+[[ "$(sudo stat -Lc '%F %U %G %a' -- "$receiver_dir")" == 'directory root root 755' ]]
+receiver_tmp="$(sudo mktemp "$receiver_dir/.linux-temp-admin-mirror-receiver.XXXXXXXXXX")"
+cleanup_receiver_tmp() {
+  if [[ -n "$receiver_tmp" ]] && sudo test -e "$receiver_tmp"; then
+    sudo unlink -- "$receiver_tmp"
+  fi
+}
+trap cleanup_receiver_tmp EXIT
+sudo install -o root -g root -m 0755 -- scripts/mirror-receiver.py "$receiver_tmp"
+[[ "$(sudo stat -Lc '%F %U %G %a' -- "$receiver_tmp")" == 'regular file root root 755' ]]
+sudo sync -f "$receiver_tmp"
+sudo mv -fT -- "$receiver_tmp" "$receiver_path"
+receiver_tmp=
+sudo sync -d "$receiver_dir"
 cmp scripts/mirror-receiver.py /usr/local/libexec/linux-temp-admin-mirror-receiver
+trap - EXIT
+)
 ```
 
 The final `cmp` is a post-install drift check and must succeed. For an Nginx
@@ -960,7 +1080,7 @@ the release audit/signing record and a separate authenticated channel, then run:
 ```bash
 INSTALLER_COMMIT='replace-with-the-audited-40-hex-commit'
 INSTALLER_SHA256='replace-with-the-independent-64-hex-script-hash'
-LTA_RELEASE_TAG='v2.8.4'
+LTA_RELEASE_TAG='v2.9.0'
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   INSTALLER_COMMIT="$INSTALLER_COMMIT" INSTALLER_SHA256="$INSTALLER_SHA256" \

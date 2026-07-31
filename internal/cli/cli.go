@@ -30,6 +30,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
+	"github.com/xxvcc/linux-temp-admin/internal/userjobs"
 	"golang.org/x/term"
 )
 
@@ -55,10 +56,11 @@ type App struct {
 	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
 	// test's verdict comes from a fixture, not from the test host's own sshd.
 	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
-	// SSHDHasConnectionScopedMatch covers the part of sshd policy that a user-only
-	// effective-config probe cannot evaluate. Keep it beside SSHDConfig so tests
-	// can source the complete policy verdict from fixtures instead of the host.
-	SSHDHasConnectionScopedMatch func() bool
+	// SSHDHasUnverifiableMatch covers the part of sshd policy that a user-only
+	// effective-config probe cannot evaluate in the current account phase. Keep it
+	// beside SSHDConfig so tests can source the complete policy verdict from
+	// fixtures instead of the host.
+	SSHDHasUnverifiableMatch func(accountExists bool) bool
 
 	InstallPath string
 	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
@@ -84,10 +86,24 @@ type App struct {
 	// TerminateProcesses is injectable so revoke's fail-closed handling can be
 	// exercised without signalling real processes in tests.
 	TerminateProcesses func(int) error
+	// ClearScheduledJobs removes personal cron and at/batch work before an account
+	// identity can be released. DrainScheduledJobs waits out a daemon that may have
+	// read a due job before its spool entry disappeared. Both are injected together
+	// in tests so no host queue is inspected or delayed accidentally.
+	ClearScheduledJobs func(string, int) error
+	DrainScheduledJobs func() error
 	// LookupUser is the single passwd snapshot source for identity-sensitive CLI
 	// operations. Production uses user.Lookup; tests inject account replacement
 	// sequences without modifying the host account database.
 	LookupUser func(string) (user.Passwd, bool, error)
+	// ListMarkerAccounts discovers exact pending/legacy/generation passwd markers
+	// for uninstall's fail-closed inventory. Marker presence is only a blocker and
+	// must never be used as identity proof for automatic deletion.
+	ListMarkerAccounts func() ([]string, error)
+	// RunningLegacyRevoke detects an already-started name-only revoke command from
+	// an older release before invite reuses the username. Production scans /proc;
+	// tests inject the process inventory they intend to exercise.
+	RunningLegacyRevoke func(installPath, username string) (bool, error)
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -95,29 +111,29 @@ type App struct {
 // NewApp builds an App with real collaborators and the resolved language.
 func NewApp(lang i18n.Lang) *App {
 	return &App{
-		Out:                          os.Stdout,
-		Err:                          os.Stderr,
-		In:                           os.Stdin,
-		P:                            i18n.Printer{Lang: lang},
-		Users:                        user.New(),
-		Sudoers:                      sudoers.New(),
-		SSHD:                         sshdconf.New(),
-		Scheduler:                    schedule.New(),
-		Registry:                     registry.Default(),
-		Detector:                     netdetect.New(),
-		Selfmanage:                   selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
-		Audit:                        audit.Default(),
-		Lifecycle:                    lifecycle.New(config.LifecycleLockFile),
-		SSHDConfig:                   sysinfo.SSHDEffective,
-		SSHDHasConnectionScopedMatch: sysinfo.HasConnectionScopedMatch,
-		InstallPath:                  config.InstallPath,
-		StateDir:                     config.StateDir,
-		AuditLogDir:                  config.AuditLogDir,
-		Now:                          time.Now,
-		RandHex:                      randHex,
-		RandPassword:                 randPassword,
-		StdoutIsTTY:                  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
-		StdinIsTTY:                   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
+		Out:                      os.Stdout,
+		Err:                      os.Stderr,
+		In:                       os.Stdin,
+		P:                        i18n.Printer{Lang: lang},
+		Users:                    user.New(),
+		Sudoers:                  sudoers.New(),
+		SSHD:                     sshdconf.New(),
+		Scheduler:                schedule.New(),
+		Registry:                 registry.Default(),
+		Detector:                 netdetect.New(),
+		Selfmanage:               selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
+		Audit:                    audit.Default(),
+		Lifecycle:                lifecycle.New(config.LifecycleLockFile),
+		SSHDConfig:               sysinfo.SSHDEffective,
+		SSHDHasUnverifiableMatch: sysinfo.HasUnverifiableMatch,
+		InstallPath:              config.InstallPath,
+		StateDir:                 config.StateDir,
+		AuditLogDir:              config.AuditLogDir,
+		Now:                      time.Now,
+		RandHex:                  randHex,
+		RandPassword:             randPassword,
+		StdoutIsTTY:              func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
+		StdinIsTTY:               func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
 		TerminalWidth: func() int {
 			width, _, err := term.GetSize(int(os.Stdout.Fd()))
 			if err != nil {
@@ -128,7 +144,13 @@ func NewApp(lang i18n.Lang) *App {
 		Geteuid:            os.Geteuid,
 		RemoveAll:          os.RemoveAll,
 		TerminateProcesses: user.TerminateProcesses,
+		ClearScheduledJobs: userjobs.Clear,
+		DrainScheduledJobs: userjobs.WaitForDrain,
 		LookupUser:         user.Lookup,
+		ListMarkerAccounts: user.LifecycleMarkerAccounts,
+		RunningLegacyRevoke: func(installPath, username string) (bool, error) {
+			return runningLegacyRevokeProcess("/proc", installPath, username)
+		},
 	}
 }
 
@@ -139,11 +161,39 @@ func (a *App) lookupUser(name string) (user.Passwd, bool, error) {
 	return user.Lookup(name)
 }
 
+func (a *App) listMarkerAccounts() ([]string, error) {
+	if a.ListMarkerAccounts != nil {
+		return a.ListMarkerAccounts()
+	}
+	return user.LifecycleMarkerAccounts()
+}
+
+func (a *App) runningLegacyRevoke(username string) (bool, error) {
+	if a.RunningLegacyRevoke != nil {
+		return a.RunningLegacyRevoke(a.InstallPath, username)
+	}
+	return runningLegacyRevokeProcess("/proc", a.InstallPath, username)
+}
+
 func (a *App) terminateProcesses(uid int) error {
 	if a.TerminateProcesses != nil {
 		return a.TerminateProcesses(uid)
 	}
 	return user.TerminateProcesses(uid)
+}
+
+func (a *App) clearScheduledJobs(name string, uid int) error {
+	if a.ClearScheduledJobs == nil {
+		return fmt.Errorf("scheduled-job cleanup is not configured")
+	}
+	return a.ClearScheduledJobs(name, uid)
+}
+
+func (a *App) drainScheduledJobs() error {
+	if a.DrainScheduledJobs == nil {
+		return fmt.Errorf("scheduled-job drain is not configured")
+	}
+	return a.DrainScheduledJobs()
 }
 
 func randHex(nBytes int) (string, error) {
@@ -476,6 +526,10 @@ func (a *App) withLifecycleLockMode(allowUninstalled bool, fn func() int) int {
 		a.errorf("%s: %v", a.P.M("无法获取生命周期锁", "cannot acquire the lifecycle lock"), err)
 		return 1
 	}
+	return a.withAcquiredLifecycleLock(allowUninstalled, release, fn)
+}
+
+func (a *App) withAcquiredLifecycleLock(allowUninstalled bool, release func() error, fn func() int) int {
 	if !allowUninstalled {
 		uninstalled, markerErr := a.Lifecycle.IsUninstalled()
 		if markerErr != nil {
@@ -493,6 +547,72 @@ func (a *App) withLifecycleLockMode(allowUninstalled bool, fn func() int) int {
 	rc := fn()
 	if err := release(); err != nil {
 		a.errorf("%s: %v", a.P.M("无法释放生命周期锁", "cannot release the lifecycle lock"), err)
+		return 1
+	}
+	return rc
+}
+
+// accountLifecycleLock is a per-username reader/writer barrier adjacent to the
+// global lifecycle lock. Account locks are always acquired before the global
+// lock: invite is the exclusive writer, while revoke is a shared reader whose
+// actual mutation remains serialized by the global lock.
+func (a *App) accountLifecycleLock(username string) *lifecycle.Lock {
+	if a.Lifecycle == nil || a.Lifecycle.Path == "" {
+		return nil
+	}
+	return lifecycle.New(a.Lifecycle.Path + ".account-" + username)
+}
+
+func (a *App) withAccountExclusiveLock(username string, fn func() int) int {
+	lock := a.accountLifecycleLock(username)
+	if lock == nil {
+		return fn()
+	}
+	release, err := lock.Acquire()
+	if err != nil {
+		a.errorf("%s: %v", a.P.M("无法获取账号生命周期锁", "cannot acquire the account lifecycle lock"), err)
+		return 1
+	}
+	return a.withAcquiredAccountLock(release, fn)
+}
+
+func (a *App) withAccountSharedLock(username string, fn func() int) int {
+	lock := a.accountLifecycleLock(username)
+	if lock == nil {
+		return fn()
+	}
+	release, err := lock.AcquireShared()
+	if err != nil {
+		a.errorf("%s: %v", a.P.M("无法获取账号生命周期锁", "cannot acquire the account lifecycle lock"), err)
+		return 1
+	}
+	return a.withAcquiredAccountLock(release, fn)
+}
+
+// withAccountTrySharedLock distinguishes contention from an acquisition error.
+// A legacy name-only revoke may be abandoned only when an invite already owns
+// the exclusive barrier for that same username; unrelated lifecycle work still
+// queues normally under the global lock.
+func (a *App) withAccountTrySharedLock(username string, fn func() int) (rc int, busy bool) {
+	lock := a.accountLifecycleLock(username)
+	if lock == nil {
+		return fn(), false
+	}
+	release, err := lock.TryAcquireShared()
+	if errors.Is(err, lifecycle.ErrBusy) {
+		return 0, true
+	}
+	if err != nil {
+		a.errorf("%s: %v", a.P.M("无法获取账号生命周期锁", "cannot acquire the account lifecycle lock"), err)
+		return 1, false
+	}
+	return a.withAcquiredAccountLock(release, fn), false
+}
+
+func (a *App) withAcquiredAccountLock(release func() error, fn func() int) int {
+	rc := fn()
+	if err := release(); err != nil {
+		a.errorf("%s: %v", a.P.M("无法释放账号生命周期锁", "cannot release the account lifecycle lock"), err)
 		return 1
 	}
 	return rc

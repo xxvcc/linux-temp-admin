@@ -4,17 +4,21 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"golang.org/x/sys/unix"
 )
 
 const maxRegistryBytes = int64(16 << 20)
 
-// Store is the flock-guarded, root-owned registry of managed accounts. Paths are
-// fields so tests can point them at a temporary directory.
+// Store is the flock-guarded, root-owned registry of managed accounts. Dir must
+// be absolute; File and Lock must be distinct direct children. Paths are fields
+// so tests can point the complete layout at a temporary directory.
 type Store struct {
 	Dir  string
 	File string
@@ -29,6 +33,9 @@ func Default() *Store {
 // Init creates the registry directory (0700 root), the registry file (with the
 // schema header if new), and the lock file, refusing any symlinked component.
 func (s *Store) Init() error {
+	if err := s.validateLayout(); err != nil {
+		return err
+	}
 	if fi, err := os.Lstat(s.Dir); err == nil {
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("registry dir %s is a symlink", s.Dir)
@@ -42,28 +49,88 @@ func (s *Store) Init() error {
 	if err := fsutil.EnsureDir(s.Dir, 0o700, 0, 0); err != nil {
 		return err
 	}
-	if err := fsutil.RootSafeDir(s.Dir); err != nil {
+	dir, err := os.OpenFile(s.Dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open registry dir: %w", err)
+	}
+	defer dir.Close()
+	if err := requireRootDirFD(s.Dir, dir, 0o700); err != nil {
 		return fmt.Errorf("registry dir unsafe: %w", err)
 	}
+
+	// The lock must be created in place. An atomic-write helper would rename a
+	// different inode over the pathname, allowing concurrent first-time Init calls
+	// to lock different files and enter the critical section together.
+	lock, err := openOrCreateLockAt(dir, filepath.Base(s.Lock), s.Lock)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := requireRegularFD(s.Lock, lock); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock registry: %w", err)
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	if err := repairRootFileFD(s.Lock, lock); err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		return &fsutil.DurabilityError{Operation: "registry lock directory entry", Err: err}
+	}
+
+	// Upgrade deployed registries only while holding their lock. New writes use a
+	// v4 header that older binaries reject, preventing them from dropping the
+	// deletion recovery phase during a delayed rewrite.
 	if err := ensureFile(s.File, []byte(Header+"\n")); err != nil {
 		return err
 	}
-	if err := ensureFile(s.Lock, nil); err != nil {
+	recs, header, err := s.readAllWithHeader()
+	if err != nil {
 		return err
 	}
-	// Upgrade a deployed v2 registry only while holding its lock. New writes use a
-	// v3 header that old binaries reject, preventing them from dropping UID,
-	// generation, or pending state during a delayed rewrite.
-	return s.withLock(func() error {
-		recs, header, err := s.readAllWithHeader()
-		if err != nil {
-			return err
+	if header == legacyHeaderV2 || header == legacyHeaderV3 {
+		return s.writeAll(recs)
+	}
+	return nil
+}
+
+func (s *Store) validateLayout() error {
+	if s == nil {
+		return fmt.Errorf("nil registry store")
+	}
+	dir := filepath.Clean(s.Dir)
+	if s.Dir == "" || !filepath.IsAbs(s.Dir) || dir != s.Dir || dir == string(filepath.Separator) {
+		return fmt.Errorf("unsafe registry directory %q", s.Dir)
+	}
+	for label, path := range map[string]string{"file": s.File, "lock": s.Lock} {
+		clean := filepath.Clean(path)
+		if path == "" || !filepath.IsAbs(path) || clean != path || filepath.Dir(clean) != dir || clean == dir {
+			return fmt.Errorf("registry %s %q must be a direct child of %s", label, path, dir)
 		}
-		if header == legacyHeaderV2 {
-			return s.writeAll(recs)
-		}
-		return nil
-	})
+	}
+	if s.File == s.Lock {
+		return fmt.Errorf("registry file and lock must be different paths")
+	}
+	return nil
+}
+
+func openOrCreateLockAt(dir *os.File, name, path string) (*os.File, error) {
+	if dir == nil || name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, fmt.Errorf("unsafe registry lock name %q", name)
+	}
+	fd, err := unix.Openat(int(dir.Fd()), name,
+		unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open or create registry lock: %w", err)
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open or create registry lock: invalid file descriptor")
+	}
+	return f, nil
 }
 
 func ensureFile(path string, initial []byte) error {
@@ -75,6 +142,10 @@ func ensureFile(path string, initial []byte) error {
 		return err
 	}
 	defer f.Close()
+	return repairRootFileFD(path, f)
+}
+
+func repairRootFileFD(path string, f *os.File) error {
 	if err := requireRegularFD(path, f); err != nil {
 		return err
 	}
@@ -136,7 +207,7 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 		return nil, "", fmt.Errorf("registry exceeds %d bytes", maxRegistryBytes)
 	}
 	lines := strings.Split(string(b), "\n")
-	if len(lines) == 0 || (lines[0] != Header && lines[0] != legacyHeaderV2) {
+	if len(lines) == 0 || (lines[0] != Header && lines[0] != legacyHeaderV3 && lines[0] != legacyHeaderV2) {
 		return nil, "", fmt.Errorf("registry header is missing or unsupported")
 	}
 	header := lines[0]
@@ -144,15 +215,18 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 	seenUsers := make(map[string]int)
 	for i, line := range lines[1:] {
 		lineNumber := i + 2
-		if line == Header || line == legacyHeaderV2 {
+		if line == Header || line == legacyHeaderV3 || line == legacyHeaderV2 {
 			return nil, "", fmt.Errorf("registry line %d: duplicate schema header", lineNumber)
 		}
 		var r Record
 		var ok bool
 		var err error
-		if header == Header {
+		switch header {
+		case Header:
 			r, ok, err = ParseLine(line)
-		} else {
+		case legacyHeaderV3:
+			r, ok, err = parseLegacyV3Line(line)
+		case legacyHeaderV2:
 			r, ok, err = parseLegacyV2Line(line)
 		}
 		if err != nil {
@@ -176,6 +250,25 @@ func requireRegularFD(path string, f *os.File) error {
 	}
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a safe regular file", path)
+	}
+	return nil
+}
+
+func requireRootDirFD(path string, f *os.File, mode os.FileMode) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot determine owner of %s", path)
+	}
+	if st.Uid != 0 || st.Gid != 0 || fi.Mode().Perm() != mode.Perm() {
+		return fmt.Errorf("%s metadata is unsafe: owner %d:%d mode %o, want root:root %o",
+			path, st.Uid, st.Gid, fi.Mode().Perm(), mode.Perm())
 	}
 	return nil
 }
@@ -216,13 +309,19 @@ func (s *Store) writeAll(recs []Record) error {
 	return fsutil.WriteRootFile(s.File, []byte(b.String()), 0o600)
 }
 
-// Record upserts rec (replacing any existing entry for the same user).
+// Record upserts an ordinary creation/active record. A deletion recovery row is
+// immutable through this general API: callers must use BeginDeletion and
+// FinishDeletionRecovery so a new invite or routine update cannot erase the only
+// durable authority for post-userdel cleanup.
 func (s *Store) Record(rec Record) error {
 	if _, ok, err := ParseLine(rec.TSV()); err != nil || !ok {
 		if err == nil {
 			err = fmt.Errorf("record did not produce a data row")
 		}
 		return fmt.Errorf("invalid registry record: %w", err)
+	}
+	if rec.DeletionStarted {
+		return fmt.Errorf("deletion-started state requires BeginDeletion")
 	}
 	return s.withLock(func() error {
 		recs, err := s.readAll()
@@ -231,16 +330,168 @@ func (s *Store) Record(rec Record) error {
 		}
 		out := recs[:0:0]
 		for _, r := range recs {
-			if r.User != rec.User {
-				out = append(out, r)
+			if r.User == rec.User {
+				if r.DeletionStarted {
+					return fmt.Errorf("registry record for %s is in deletion recovery", rec.User)
+				}
+				continue
 			}
+			out = append(out, r)
 		}
 		out = append(out, rec)
 		return s.writeAll(out)
 	})
 }
 
-// Remove deletes the entry for user (no error if absent).
+// BeginDeletion durably enters the phase immediately before userdel. A non-empty
+// generation can only mark an existing, completed identity-bound row with the
+// same user, UID, and generation. An empty generation requests a UID-only
+// recovery witness: an existing legacy row is converted, an unregistered name is
+// inserted, and a rollback-pending row is deliberately stripped of pending and
+// generation authority. Repeating the exact same transition is harmless.
+func (s *Store) BeginDeletion(user string, uid int, generation string) error {
+	if err := validateDeletionIdentity(user, uid, generation); err != nil {
+		return err
+	}
+	return s.withLock(func() error {
+		recs, err := s.readAll()
+		if err != nil {
+			return err
+		}
+		out, changed, err := beginDeletionRecords(recs, user, uid, generation)
+		if err != nil || !changed {
+			return err
+		}
+		return s.writeAll(out)
+	})
+}
+
+func validateDeletionIdentity(user string, uid int, generation string) error {
+	if !validate.Username(user) || !validate.AccountID(uid) ||
+		(generation != "" && !validate.Generation(generation)) {
+		return fmt.Errorf("invalid deletion identity")
+	}
+	return nil
+}
+
+// beginDeletionRecords contains the state transition independently of filesystem
+// ownership and locking. The Store method above supplies both; keeping the
+// transition pure makes every identity mismatch testable without root.
+func beginDeletionRecords(recs []Record, user string, uid int, generation string) ([]Record, bool, error) {
+	if err := validateDeletionIdentity(user, uid, generation); err != nil {
+		return nil, false, err
+	}
+	out := append([]Record(nil), recs...)
+	for i := range out {
+		if out[i].User != user {
+			continue
+		}
+		current := out[i]
+		if current.DeletionStarted {
+			boundMatches := generation != "" && current.IdentityBound && current.Generation == generation
+			uidOnlyMatches := generation == "" && !current.IdentityBound && current.Generation == ""
+			if current.UID != uid || (!boundMatches && !uidOnlyMatches) {
+				return nil, false, fmt.Errorf("registry deletion recovery identity changed")
+			}
+			return out, false, nil
+		}
+
+		if generation != "" {
+			if current.Pending || !current.IdentityBound || current.UID != uid || current.Generation != generation {
+				return nil, false, fmt.Errorf("registry identity changed before deletion")
+			}
+			current.DeletionStarted = true
+		} else {
+			// A completed bound row must not be silently weakened. Pending rollback
+			// is the exception: after the caller has authorized userdel it becomes a
+			// recovery-only witness, so a crash cannot turn that pending intent into
+			// unattended live-account deletion authority.
+			if current.IdentityBound && !current.Pending {
+				return nil, false, fmt.Errorf("identity-bound registry row requires its generation")
+			}
+			if current.UID != 0 && current.UID != uid {
+				return nil, false, fmt.Errorf("registry UID changed before deletion")
+			}
+			current.UID = uid
+			current.Generation = ""
+			current.IdentityBound = false
+			current.Pending = false
+			current.DeletionStarted = true
+		}
+		if _, ok, err := ParseLine(current.TSV()); err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("deletion transition did not produce a data row")
+			}
+			return nil, false, fmt.Errorf("invalid deletion transition: %w", err)
+		}
+		out[i] = current
+		return out, true, nil
+	}
+
+	if generation != "" {
+		return nil, false, fmt.Errorf("registry identity disappeared before deletion")
+	}
+	recovery := Record{User: user, UID: uid, DeletionStarted: true}
+	if _, ok, err := ParseLine(recovery.TSV()); err != nil || !ok {
+		if err == nil {
+			err = fmt.Errorf("deletion transition did not produce a data row")
+		}
+		return nil, false, fmt.Errorf("invalid deletion transition: %w", err)
+	}
+	return append(out, recovery), true, nil
+}
+
+// FinishDeletionRecovery removes only the exact row whose deletion phase was
+// durably started. Every row is bound by user+UID; an identity-bound row also
+// requires its exact generation, while a UID-only row requires generation to be
+// empty. Absence is an idempotent success and a different same-name row is never
+// removed.
+func (s *Store) FinishDeletionRecovery(user string, uid int, generation string) error {
+	if err := validateDeletionIdentity(user, uid, generation); err != nil {
+		return fmt.Errorf("invalid deletion recovery identity: %w", err)
+	}
+	absent, err := s.completelyAbsent()
+	if err != nil {
+		return err
+	}
+	if absent {
+		return nil
+	}
+	return s.withLock(func() error {
+		recs, err := s.readAll()
+		if err != nil {
+			return err
+		}
+		out, changed, err := finishDeletionRecoveryRecords(recs, user, uid, generation)
+		if err != nil || !changed {
+			return err
+		}
+		return s.writeAll(out)
+	})
+}
+
+func finishDeletionRecoveryRecords(recs []Record, user string, uid int, generation string) ([]Record, bool, error) {
+	if err := validateDeletionIdentity(user, uid, generation); err != nil {
+		return nil, false, fmt.Errorf("invalid deletion recovery identity: %w", err)
+	}
+	out := make([]Record, 0, len(recs))
+	for i, r := range recs {
+		if r.User != user {
+			out = append(out, r)
+			continue
+		}
+		boundMatches := generation != "" && r.IdentityBound && r.Generation == generation
+		uidOnlyMatches := generation == "" && !r.IdentityBound && r.Generation == ""
+		if !r.DeletionStarted || r.UID != uid || (!boundMatches && !uidOnlyMatches) {
+			return nil, false, fmt.Errorf("registry deletion recovery identity changed")
+		}
+		return append(out, recs[i+1:]...), true, nil
+	}
+	return append([]Record(nil), recs...), false, nil
+}
+
+// Remove deletes an ordinary entry for user (no error if absent). Recovery rows
+// require FinishDeletionRecovery and cannot be discarded by name alone.
 func (s *Store) Remove(user string) error {
 	absent, err := s.completelyAbsent()
 	if err != nil {
@@ -258,6 +509,9 @@ func (s *Store) Remove(user string) error {
 		removed := false
 		for _, r := range recs {
 			if r.User == user {
+				if r.DeletionStarted {
+					return fmt.Errorf("registry record for %s is in deletion recovery", user)
+				}
 				removed = true
 				continue
 			}
@@ -319,11 +573,12 @@ func (s *Store) UnitFor(user string) (string, error) {
 	return "", nil
 }
 
-// Compact removes entries whose account no longer exists, deciding under a single
-// held lock (re-checking existence inside it) so a concurrent recreate cannot
-// lose its fresh entry. exists reports whether an account is still present.
-// Returns the number of entries pruned.
-func (s *Store) Compact(exists func(user string) (bool, error)) (int, error) {
+// Compact removes ordinary entries whose account no longer exists, deciding
+// under one held lock so a concurrent recreate cannot lose its fresh entry.
+// Deletion recovery rows are retained without calling keep: that row is the
+// authority needed to finish post-userdel cleanup. Callers must not re-enter
+// Store methods from the callback. Returns the number pruned.
+func (s *Store) Compact(keep func(Record) (bool, error)) (int, error) {
 	absent, err := s.completelyAbsent()
 	if err != nil {
 		return 0, err
@@ -339,7 +594,11 @@ func (s *Store) Compact(exists func(user string) (bool, error)) (int, error) {
 		}
 		out := recs[:0:0]
 		for _, r := range recs {
-			live, err := exists(r.User)
+			if r.DeletionStarted {
+				out = append(out, r)
+				continue
+			}
+			live, err := keep(r)
 			if err != nil {
 				return err
 			}

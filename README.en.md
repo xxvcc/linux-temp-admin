@@ -6,9 +6,9 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
-> One command creates a time-limited SSH administrator account for a trusted collaborator and removes it automatically when it expires.
+> One command creates a time-limited SSH administrator account for a trusted collaborator and schedules automatic revocation at expiry.
 
-**linux-temp-admin** avoids sharing the root password and never stores the invite's private key on the server. It creates a temporary account, prints a bundle you can forward privately, and later removes the account, SSH key, and sudo grant.
+**linux-temp-admin** avoids sharing the root password and never stores the invite's private key on the server. It creates a temporary account, prints a bundle you can forward privately, and schedules revocation of the managed account, SSH key, and sudo grant.
 
 The program is one static binary for amd64 and arm64 Linux, on both glibc and musl. Account, SSH, and scheduler operations still use the host's standard administration tools.
 
@@ -28,7 +28,7 @@ The tool then:
 
 1. creates a temporary account with a random name;
 2. generates a one-time SSH key and prints an invite bundle;
-3. grants passwordless sudo by default and removes the account after 24 hours;
+3. grants passwordless sudo by default and schedules automatic revocation after 24 hours;
 4. checks the effective sshd configuration before creation, refusing a definite blocker and reporting incomplete knowledge as `UNVERIFIED`.
 
 The quick start obtains the installer from the official mirror and sends it to a root shell. `set -o pipefail` propagates curl failures, so a failed install does not continue to `invite`; it **does not authenticate the script or stop an already received partial script from beginning execution**. Once the installer is running, the downloaded binary is still verified with SHA-256 and an ed25519 signature. Use the [high-assurance first-install procedure](docs/installing.en.md#high-assurance-first-install) when the script must be authenticated before execution.
@@ -70,7 +70,7 @@ The real private key is shown only once. Never put an invite bundle in a group c
 ## Inspect and revoke
 
 ```bash
-# Show all temporary accounts
+# Show all registered temporary accounts
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin status
 
 # Choose an account from a list and revoke it
@@ -80,7 +80,7 @@ The real private key is shown only once. Never put an invite bundle in a group c
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-By default, the account, home directory, SSH key, sudo grant, and any tool-created sshd exception are removed after 24 hours. Revoke access immediately when work is finished even when automatic removal is enabled.
+By default, automatic revocation is scheduled after 24 hours. When the complete account identity can still be checked, a successful revoke removes the personal crontab, UID-matched `at`/`batch` jobs, account, home directory, SSH key, sudo grant, and any tool-created sshd exception. If the account disappeared outside the tool, revoke cleans only the registry, name-scoped grants, and tasks it can still identify safely; it does not guess at Home or mail cleanup after losing the identity witness. If a safety check or cleanup fails, the command returns nonzero, retains the account when it still exists and the registry witness, and attempts to disable any surviving account for a systemd retry or manual recovery. Revoke access immediately when work is finished even when automatic revocation is enabled.
 
 ## Everyday commands
 
@@ -121,7 +121,7 @@ When public-key login is disabled, create an account-scoped sshd exception:
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo --fix-sshd
 ```
 
-This does not modify the global sshd policy, and the exception is removed with the account. See the [operator guide](docs/operator-guide.en.md) for automation, password login, permanent accounts, and complete troubleshooting.
+This does not modify the global sshd policy, and a successful account revoke removes the exception. See the [operator guide](docs/operator-guide.en.md) for automation, password login, permanent accounts, and complete troubleshooting.
 
 ## Security essentials
 

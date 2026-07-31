@@ -19,7 +19,9 @@ const (
 	schedulerOutputLimit    = int64(64 << 10)
 	atQueueOutputLimit      = int64(4 << 20)
 	atJobBodyLimit          = int64(1 << 20)
+	atOwnerProbeLimit       = int64(64 << 10)
 	maxAtJobs               = 4096
+	maxLoadedSystemdUnits   = 16384
 )
 
 var (
@@ -57,7 +59,7 @@ func has(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
 func (realSystem) HasSystemctl() bool { return has("systemctl") }
 func (realSystem) HasAt() bool {
-	return has("at") || has("atq") || has("atrm") || has("atd")
+	return has("at") || has("atq") || has("atrm") || has("atd") || has("batch")
 }
 
 func (realSystem) Systemctl(args ...string) error {
@@ -74,9 +76,61 @@ func (realSystem) Systemctl(args ...string) error {
 	return nil
 }
 
-// systemctlUnitFileMissing reports only the exact, benign failure produced when
+// loadedSystemdUnits inventories the manager, not only unit files on disk.
+// A timer whose file was removed before daemon-reload can remain loaded and
+// armed, so uninstall must still be able to derive its account name.
+func (realSystem) loadedSystemdUnits() ([]string, error) {
+	if !has("systemctl") {
+		return nil, fmt.Errorf("systemctl is unavailable")
+	}
+	args := []string{
+		"list-units", "--all", "--type=service", "--type=timer",
+		"--plain", "--full", "--no-legend", "--no-pager",
+	}
+	out, err := executil.Output("systemctl", args, schedulerCommandOptions(atQueueOutputLimit))
+	if err != nil {
+		return nil, fmt.Errorf("systemctl list loaded schedule units: %w", err)
+	}
+	return parseLoadedSystemdUnits(string(out))
+}
+
+func parseLoadedSystemdUnits(out string) ([]string, error) {
+	var units []string
+	seen := make(map[string]bool)
+	sc := bufio.NewScanner(strings.NewReader(out))
+	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		// list-units always emits UNIT LOAD ACTIVE SUB, with DESCRIPTION optional.
+		if len(fields) < 4 || (!strings.HasSuffix(fields[0], ".service") && !strings.HasSuffix(fields[0], ".timer")) {
+			return nil, fmt.Errorf("parse systemctl list-units line %d: %q", lineNo, line)
+		}
+		unit := fields[0]
+		if seen[unit] {
+			return nil, fmt.Errorf("parse systemctl list-units line %d: duplicate unit %q", lineNo, unit)
+		}
+		seen[unit] = true
+		units = append(units, unit)
+		if len(units) > maxLoadedSystemdUnits {
+			return nil, fmt.Errorf("systemd manager contains more than %d loaded service/timer units", maxLoadedSystemdUnits)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("parse systemctl list-units: %w", err)
+	}
+	return units, nil
+}
+
+// systemctlUnitFileMissing reports only the exact failure produced when
 // `systemctl disable --now` races with (or follows) removal of its target unit.
-// All other exit failures remain visible to the caller.
+// It is not success by itself: systemctl returns from the disable phase before
+// --now reaches stop, so callers must independently confirm the timer is inactive.
 func systemctlUnitFileMissing(err error, unit string) bool {
 	var commandErr *systemctlError
 	if !errors.As(err, &commandErr) || len(commandErr.args) != 3 {
@@ -89,7 +143,40 @@ func systemctlUnitFileMissing(err error, unit string) bool {
 	return commandErr.output == want
 }
 
-func (realSystem) ScheduleAt(command string, hours int) (string, error) {
+func systemctlStopUnitNotLoaded(err error, unit string) bool {
+	var commandErr *systemctlError
+	if !errors.As(err, &commandErr) || len(commandErr.args) != 2 ||
+		commandErr.args[0] != "stop" || commandErr.args[1] != unit {
+		return false
+	}
+	want := fmt.Sprintf("Failed to stop %s: Unit %s not loaded.", unit, unit)
+	return commandErr.output == want
+}
+
+// systemctlTimerStoppedState accepts only explicit non-running states from the
+// non-quiet `is-active` query used after a successful stop. Exit status 3 alone
+// is insufficient because systemd also uses it for "activating".
+func systemctlTimerStoppedState(err error, timer string) bool {
+	var commandErr *systemctlError
+	if !errors.As(err, &commandErr) || len(commandErr.args) != 2 ||
+		commandErr.args[0] != "is-active" || commandErr.args[1] != timer {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(commandErr, &exitErr) {
+		return errors.Is(commandErr, errSystemdUnitInactive) && commandErr.output == "inactive"
+	}
+	switch commandErr.output {
+	case "inactive", "failed":
+		return exitErr.ExitCode() == 3
+	case "unknown":
+		return exitErr.ExitCode() == 4
+	default:
+		return false
+	}
+}
+
+func (realSystem) ScheduleAt(command string, deadline time.Time) (string, error) {
 	for _, tool := range []string{"at", "atq", "atrm"} {
 		if !has(tool) {
 			return "", fmt.Errorf("%s is unavailable; refusing to create an at job that cannot be inventoried and cancelled", tool)
@@ -99,42 +186,75 @@ func (realSystem) ScheduleAt(command string, hours int) (string, error) {
 		return "", fmt.Errorf("atd is not running and could not be started; use systemd or start atd")
 	}
 	opts := schedulerCommandOptions(schedulerOutputLimit)
-	opts.Stdin = strings.NewReader(command + "\n")
-	out, err := executil.CombinedOutput("at", []string{"now", "+", strconv.Itoa(hours), "hours"}, opts)
+	// POSIX at -t is minute-granular and interprets its operand in the process
+	// timezone. Force UTC so DST gaps/folds cannot move the job by an hour. at
+	// copies its own environment into the queued script, so undo TZ before the
+	// revoke command to preserve the host's normal timezone at execution.
+	opts.ExtraEnv = append(opts.ExtraEnv, "TZ=UTC")
+	opts.Stdin = strings.NewReader("unset TZ\n" + command + "\n")
+	atTime := deadline.UTC().Format("200601021504")
+	out, err := executil.CombinedOutput("at", []string{"-t", atTime}, opts)
 	if err != nil {
-		return "", fmt.Errorf("at: %w: %s", err, strings.TrimSpace(string(out)))
+		cause := fmt.Errorf("at: %w: %s", err, strings.TrimSpace(string(out)))
+		return "", (realSystem{}).cleanupAmbiguousAtSubmission(command, cause)
 	}
 	id := parseAtJobID(string(out))
 	if id == "" {
-		return "", fmt.Errorf("could not parse at job id from %q", string(out))
+		cause := fmt.Errorf("could not parse at job id from %q", string(out))
+		return "", (realSystem{}).cleanupAmbiguousAtSubmission(command, cause)
 	}
 	return id, nil
 }
 
-// parseAtJobID extracts the numeric job id from at's output ("job 7 at ...").
+// cleanupAmbiguousAtSubmission closes the commit-unknown window where `at` may
+// have queued a job before its process failed or emitted an unparseable id. The
+// current revoke command contains a random account generation, so exact-command
+// matches are owned retries of this same scheduling attempt rather than a broad
+// username selector. Inventory/removal uncertainty is joined with the original
+// error so the caller cannot mistake an unconfirmed rollback for a clean failure.
+func (r realSystem) cleanupAmbiguousAtSubmission(command string, cause error) error {
+	errs := []error{cause}
+	jobs, err := r.AtJobs()
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("inventory at jobs after ambiguous submission: %w", err))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), atInventoryTimeout)
+	defer cancel()
+	for _, job := range jobs {
+		if job.OwnerUID != 0 || !atBodyHasExactCommand(job.Body, command) {
+			continue
+		}
+		err := r.removeAtJobIf(ctx, job.ID, func(body string) (bool, error) {
+			return rootAtBodyMatches(body, func(body string) (bool, error) {
+				return atBodyHasExactCommand(body, command), nil
+			})
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("roll back ambiguously submitted at job %s: %w", job.ID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// parseAtJobID accepts exactly one C-locale submission record ("job 7 at ...").
+// Choosing the first of multiple candidates, or an unrelated numeric line, can
+// record another user's job while leaving the newly queued revoke untracked.
 func parseAtJobID(out string) string {
 	sc := bufio.NewScanner(strings.NewReader(out))
 	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
+	id := ""
+	matches := 0
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) >= 2 && fields[0] == "job" {
-			if numericJobID(fields[1]) {
-				return fields[1]
-			}
+		if len(fields) >= 3 && fields[0] == "job" && fields[2] == "at" && numericJobID(fields[1]) {
+			id = fields[1]
+			matches++
 		}
 	}
-	// Fallback: first line whose first field is numeric.
-	sc = bufio.NewScanner(strings.NewReader(out))
-	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 1 {
-			if numericJobID(fields[0]) {
-				return fields[0]
-			}
-		}
+	if sc.Err() != nil || matches != 1 {
+		return ""
 	}
-	return ""
+	return id
 }
 
 // ensureAtd confirms or starts the atd daemon so queued jobs actually fire. It
@@ -173,7 +293,10 @@ func ensureAtd() bool {
 		}
 	}
 	if has("pgrep") {
-		return run("pgrep", "-x", "atd")
+		// atd starts as root and may drop its effective credentials to the daemon
+		// account, but its real UID remains 0. Binding the fallback probe to real root
+		// prevents an unprivileged process from spoofing only the short name "atd".
+		return run("pgrep", "-x", "-U", "0", "atd")
 	}
 	return false
 }
@@ -221,18 +344,51 @@ func atJobQueuedContext(ctx context.Context, id string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("atq: %w", err)
 	}
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) > 0 && fields[0] == id {
+	ids, err := parseAtQueueIDs(string(out))
+	if err != nil {
+		return false, err
+	}
+	for _, queuedID := range ids {
+		if queuedID == id {
 			return true, nil
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return false, err
-	}
 	return false, nil
+}
+
+// parseAtQueueIDs treats every non-empty atq line as inventory evidence. A
+// malformed or duplicate line must not be skipped: doing so can turn an
+// incomplete queue into "job absent" and authorize cleanup of the last witness.
+func parseAtQueueIDs(out string) ([]string, error) {
+	var ids []string
+	seen := make(map[string]bool)
+	sc := bufio.NewScanner(strings.NewReader(out))
+	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !numericJobID(fields[0]) {
+			return nil, fmt.Errorf("parse atq line %d: invalid job id in %q", lineNo, line)
+		}
+		id := fields[0]
+		if seen[id] {
+			return nil, fmt.Errorf("parse atq line %d: duplicate job id %s", lineNo, id)
+		}
+		seen[id] = true
+		ids = append(ids, id)
+		if len(ids) > maxAtJobs {
+			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs", maxAtJobs)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("parse atq: %w", err)
+	}
+	return ids, nil
 }
 
 func (r realSystem) RemoveAtJobsFor(command string) error {
@@ -252,14 +408,160 @@ func (r realSystem) RemoveAtJobsFor(command string) error {
 		return err
 	}
 	var errs []error
+	ctx, cancel := context.WithTimeout(context.Background(), atInventoryTimeout)
+	defer cancel()
 	for _, job := range jobs {
-		if atBodyHasKnownRevoke(job.Body, selector.installPath, selector.user) {
-			if err := r.AtrmJob(job.ID); err != nil {
+		if job.OwnerUID != 0 {
+			continue
+		}
+		match, inspectErr := atBodyHasKnownRevoke(job.Body, selector.installPath, selector.user)
+		if inspectErr != nil {
+			errs = append(errs, fmt.Errorf("inspect at job %s: %w", job.ID, inspectErr))
+			continue
+		}
+		if match {
+			if err := r.removeAtJobIf(ctx, job.ID, func(body string) (bool, error) {
+				return rootAtBodyMatches(body, func(body string) (bool, error) {
+					return atBodyHasKnownRevoke(body, selector.installPath, selector.user)
+				})
+			}); err != nil {
 				errs = append(errs, err)
 			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// removeAtJobIf binds an at deletion to a fresh body read. At job IDs are
+// eventually reusable, so a body observed during the earlier queue inventory is
+// not authority to pass that ID to atrm later. If the ID now names an unrelated
+// job, the original target is already gone and the replacement is preserved.
+// GNU/POSIX at exposes no atomic compare-and-delete primitive; this recheck makes
+// the remaining read-to-atrm interval as small as the external interface allows.
+func (r realSystem) removeAtJobIf(ctx context.Context, id string, match func(string) (bool, error)) error {
+	if !numericJobID(id) {
+		return fmt.Errorf("invalid at job id %q", id)
+	}
+	if match == nil {
+		return fmt.Errorf("at job matcher is not configured")
+	}
+	if !has("at") || !has("atq") || !has("atrm") {
+		return fmt.Errorf("complete at inventory/removal tools are unavailable")
+	}
+	body, owner, present, err := readAtJobContext(ctx, id)
+	if err != nil {
+		return fmt.Errorf("revalidate at job %s before removal: %w", id, err)
+	}
+	if !present || owner != 0 {
+		return nil
+	}
+	matched, err := match(body)
+	if err != nil {
+		return fmt.Errorf("revalidate at job %s before removal: %w", id, err)
+	}
+	if !matched {
+		return nil
+	}
+	opts := schedulerCommandOptions(schedulerOutputLimit)
+	opts.Context = ctx
+	out, removeErr := executil.CombinedOutput("atrm", []string{id}, opts)
+	current, currentOwner, stillPresent, inspectErr := readAtJobContext(ctx, id)
+	if inspectErr != nil {
+		if removeErr != nil {
+			return errors.Join(
+				fmt.Errorf("atrm %s: %w: %s", id, removeErr, strings.TrimSpace(string(out))),
+				fmt.Errorf("recheck at job %s: %w", id, inspectErr),
+			)
+		}
+		return fmt.Errorf("recheck at job %s after atrm success: %w", id, inspectErr)
+	}
+	if !stillPresent {
+		return nil
+	}
+	if currentOwner != 0 {
+		return nil
+	}
+	stillMatched, matchErr := match(current)
+	if matchErr != nil {
+		if removeErr != nil {
+			return errors.Join(
+				fmt.Errorf("atrm %s: %w: %s", id, removeErr, strings.TrimSpace(string(out))),
+				fmt.Errorf("recheck at job %s: %w", id, matchErr),
+			)
+		}
+		return fmt.Errorf("recheck at job %s after atrm success: %w", id, matchErr)
+	}
+	if !stillMatched {
+		return nil
+	}
+	if removeErr != nil {
+		return fmt.Errorf("atrm %s: %w: %s", id, removeErr, strings.TrimSpace(string(out)))
+	}
+	return fmt.Errorf("atrm %s reported success but the matching job remains queued", id)
+}
+
+// readAtJobContext probes the generated owner header under a small output bound
+// before retaining a body. Non-root users can queue arbitrarily large jobs; an
+// owner-first probe lets complete root inventory ignore those bodies without
+// letting their size poison cleanup or uninstall. Root jobs are read in full
+// under the ordinary body bound and their owner header is checked again.
+func readAtJobContext(ctx context.Context, id string) (string, uint32, bool, error) {
+	if !numericJobID(id) {
+		return "", 0, false, fmt.Errorf("invalid at job id %q", id)
+	}
+	opts := schedulerCommandOptions(atOwnerProbeLimit)
+	opts.Context = ctx
+	prefix, err := executil.Output("at", []string{"-c", id}, opts)
+	if err != nil && !errors.Is(err, executil.ErrOutputLimit) {
+		queued, queueErr := atJobQueuedContext(ctx, id)
+		if queueErr != nil {
+			return "", 0, false, errors.Join(
+				fmt.Errorf("read at job %s: %w", id, err),
+				fmt.Errorf("recheck at job %s: %w", id, queueErr),
+			)
+		}
+		if !queued {
+			return "", 0, false, nil
+		}
+		return "", 0, false, fmt.Errorf("read at job %s: %w", id, err)
+	}
+	owner, ownerErr := parseAtOwner(prefix)
+	if ownerErr != nil {
+		return "", 0, false, ownerErr
+	}
+	if owner != 0 {
+		return "", owner, true, nil
+	}
+	if err == nil {
+		return string(prefix), owner, true, nil
+	}
+
+	// A root-owned body exceeded the owner probe. Read it once under the full
+	// bound, then require the same root header from those exact bytes.
+	opts = schedulerCommandOptions(atJobBodyLimit)
+	opts.Context = ctx
+	body, err := executil.Output("at", []string{"-c", id}, opts)
+	if err != nil {
+		queued, queueErr := atJobQueuedContext(ctx, id)
+		if queueErr != nil {
+			return "", 0, false, errors.Join(
+				fmt.Errorf("read at job %s: %w", id, err),
+				fmt.Errorf("recheck at job %s: %w", id, queueErr),
+			)
+		}
+		if !queued {
+			return "", 0, false, nil
+		}
+		return "", 0, false, fmt.Errorf("read at job %s: %w", id, err)
+	}
+	owner, ownerErr = parseAtOwner(body)
+	if ownerErr != nil {
+		return "", 0, false, ownerErr
+	}
+	if owner != 0 {
+		return "", owner, true, nil
+	}
+	return string(body), owner, true, nil
 }
 
 func (realSystem) AtJobs() ([]AtJob, error) {
@@ -277,50 +579,79 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 	if err != nil {
 		return nil, fmt.Errorf("atq: %w", err)
 	}
+	ids, err := parseAtQueueIDs(string(out))
+	if err != nil {
+		return nil, err
+	}
 	var jobs []AtJob
-	inspected := 0
 	totalBodyBytes := int64(0)
-	sc := bufio.NewScanner(strings.NewReader(string(out)))
-	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) == 0 {
-			continue
-		}
-		id := fields[0]
-		if !numericJobID(id) {
-			continue
-		}
-		inspected++
-		if inspected > maxAtJobs {
-			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs", maxAtJobs)
-		}
-		bodyOpts := schedulerCommandOptions(atJobBodyLimit)
-		bodyOpts.Context = ctx
-		body, err := executil.Output("at", []string{"-c", id}, bodyOpts)
+	for _, id := range ids {
+		body, owner, present, err := readAtJobContext(ctx, id)
 		if err != nil {
-			queued, queueErr := atJobQueuedContext(ctx, id)
-			if queueErr != nil {
-				return nil, errors.Join(
-					fmt.Errorf("read at job %s: %w", id, err),
-					fmt.Errorf("recheck at job %s: %w", id, queueErr),
-				)
-			}
-			if !queued {
-				continue
-			}
-			return nil, fmt.Errorf("read at job %s: %w", id, err)
+			return nil, fmt.Errorf("inspect at job %s: %w", id, err)
+		}
+		if !present {
+			continue
+		}
+		if owner != 0 {
+			jobs = append(jobs, AtJob{ID: id, OwnerUID: owner})
+			continue
 		}
 		totalBodyBytes += int64(len(body))
 		if totalBodyBytes > atInventoryMaxBodyBytes {
 			return nil, fmt.Errorf("at job inventory exceeds %d bytes", atInventoryMaxBodyBytes)
 		}
-		jobs = append(jobs, AtJob{ID: id, Body: string(body)})
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
+		jobs = append(jobs, AtJob{ID: id, Body: body, OwnerUID: owner})
 	}
 	return jobs, nil
+}
+
+// parseAtOwner reads the first root-controlled atrun header emitted by at -c.
+// User-supplied command text can contain an identical-looking comment later, so
+// the first atrun-shaped header is authoritative and malformed data fails closed.
+func parseAtOwner(body []byte) (uint32, error) {
+	sc := bufio.NewScanner(strings.NewReader(string(body)))
+	sc.Buffer(make([]byte, 1024), int(atJobBodyLimit))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 || fields[0] != "#" || fields[1] != "atrun" {
+			continue
+		}
+		if len(fields) != 4 || !strings.HasPrefix(fields[2], "uid=") || !strings.HasPrefix(fields[3], "gid=") {
+			return 0, fmt.Errorf("invalid atrun owner header")
+		}
+		uid, err := parseAtKernelID(strings.TrimPrefix(fields[2], "uid="))
+		if err != nil {
+			return 0, fmt.Errorf("invalid atrun UID %q", fields[2])
+		}
+		if _, err := parseAtKernelID(strings.TrimPrefix(fields[3], "gid=")); err != nil {
+			return 0, fmt.Errorf("invalid atrun GID %q", fields[3])
+		}
+		return uid, nil
+	}
+	if err := sc.Err(); err != nil {
+		return 0, fmt.Errorf("scan at job: %w", err)
+	}
+	return 0, fmt.Errorf("job has no atrun owner header")
+}
+
+func parseAtKernelID(value string) (uint32, error) {
+	id, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || id == uint64(^uint32(0)) {
+		return 0, fmt.Errorf("invalid kernel ID %q", value)
+	}
+	return uint32(id), nil
+}
+
+func rootAtBodyMatches(body string, match func(string) (bool, error)) (bool, error) {
+	owner, err := parseAtOwner([]byte(body))
+	if err != nil {
+		return false, err
+	}
+	if owner != 0 {
+		return false, nil
+	}
+	return match(body)
 }
 
 type atRevokeKind uint8
@@ -384,11 +715,44 @@ func parseAtRevokeCommand(line, expectedInstallPath string) (atRevokeCommand, bo
 	return parsed, true
 }
 
-func atBodyHasKnownRevoke(body, installPath, user string) bool {
+func atBodyHasKnownRevoke(body, installPath, user string) (bool, error) {
+	matched := false
 	for _, line := range strings.Split(body, "\n") {
 		command, ok := parseAtRevokeCommand(line, installPath)
 		if ok && command.user == user {
-			return true
+			matched = true
+			continue
+		}
+		if !ok && atLineTargetsRevoke(line, installPath, user) {
+			return false, fmt.Errorf("owned revoke command for %s has an unsupported or corrupt shape", user)
+		}
+	}
+	return matched, nil
+}
+
+// atLineTargetsRevoke identifies an owned-looking command without authorizing
+// deletion of its job. It is used only to fail closed when the exact parser
+// rejects a command that still invokes this installation's revoke entry point.
+func atLineTargetsRevoke(line, installPath, user string) bool {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if installPath == "" || len(fields) < 2 || fields[0] != installPath || fields[1] != "revoke" {
+		return false
+	}
+	if user == "" {
+		return true
+	}
+	for i := 2; i < len(fields); i++ {
+		switch fields[i] {
+		case "--user", "-user":
+			if i+1 < len(fields) && fields[i+1] == user {
+				return true
+			}
+		default:
+			for _, prefix := range []string{"--user=", "-user="} {
+				if strings.TrimPrefix(fields[i], prefix) == user && strings.HasPrefix(fields[i], prefix) {
+					return true
+				}
+			}
 		}
 	}
 	return false

@@ -1,14 +1,15 @@
 package sysinfo
 
-// This file reads sshd's *effective* configuration and answers the one question
-// the tool used to assume: will this server actually let the account we are about
-// to create log in with the key we are about to write?
+// This file reads sshd's *effective* configuration and checks whether it admits
+// the account and credential the tool plans to create.
 //
-// The answer comes from `sshd -T`, never from parsing /etc/ssh/sshd_config by
-// hand: -T resolves Include directives, Match blocks, compiled-in defaults, and
-// distro crypto policy, and it is the same evaluation the running sshd performs.
-// Guessing at the file's text would be worse than not looking at all, because a
-// wrong guess turns into a confidently false invite.
+// The credential verdict comes from `sshd -T`: it resolves Include directives,
+// Match blocks, compiled-in defaults, and distro crypto policy with sshd's own
+// evaluator. A separate bounded scan of the source configuration only discovers
+// Match conditions that a user-only `-T -C` probe cannot evaluate; it never
+// derives the authentication verdict itself. This is not an end-to-end connection
+// test: network policy, PAM, SELinux, and the complete state of a running daemon
+// remain outside this check.
 
 import (
 	"bufio"
@@ -126,9 +127,13 @@ type sshdConfigIdentity struct {
 type sshdIncludeScan struct {
 	paths      map[string]bool
 	identities map[sshdConfigIdentity]bool
-	files      int
-	globs      int
-	bytes      int64
+	// accountExists controls whether Match Group is evaluable by `sshd -T -C
+	// user=...`. OpenSSH cannot resolve group membership for a not-yet-created
+	// account, but it can after creation.
+	accountExists bool
+	files         int
+	globs         int
+	bytes         int64
 }
 
 // HasConnectionScopedMatch reports whether sshd's configuration contains a
@@ -149,6 +154,16 @@ type sshdIncludeScan struct {
 // An include that cannot be read is also unverifiable, so an incomplete scan can
 // never produce a false verified claim.
 func HasConnectionScopedMatch() bool {
+	return HasUnverifiableMatch(true)
+}
+
+// HasUnverifiableMatch reports whether sshd has a Match rule that a user-only
+// effective-config probe cannot evaluate in the caller's account phase.
+// Connection attributes (address, host, port, routing domain) are always
+// unavailable. Group is unavailable only before the account exists: OpenSSH
+// resolves actual NSS group membership when evaluating an existing user, but a
+// future account receives only the global result from `sshd -T -C user=name`.
+func HasUnverifiableMatch(accountExists bool) bool {
 	files := []string{sshdConfigPath}
 	if entries, err := strictGlob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
 		files = append(files, entries...)
@@ -156,8 +171,9 @@ func HasConnectionScopedMatch() bool {
 		return true
 	}
 	scan := &sshdIncludeScan{
-		paths:      map[string]bool{},
-		identities: map[sshdConfigIdentity]bool{},
+		paths:         map[string]bool{},
+		identities:    map[sshdConfigIdentity]bool{},
+		accountExists: accountExists,
 	}
 	baseDir := filepath.Dir(sshdConfigPath)
 	for _, f := range files {
@@ -209,13 +225,15 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 	sc := bufio.NewScanner(limited)
 	sc.Buffer(make([]byte, 64<<10), maxSSHDConfigLine)
 	for sc.Scan() {
-		line, _, _ := strings.Cut(sc.Text(), "#")
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		keyword, fields, parsed := parseSSHDDirective(sc.Text())
+		if !parsed {
+			return false, false
+		}
+		if keyword == "" || len(fields) == 0 {
 			continue
 		}
-		if strings.EqualFold(fields[0], "Include") {
-			for _, pattern := range fields[1:] {
+		if strings.EqualFold(keyword, "Include") {
+			for _, pattern := range fields {
 				if scan.globs >= maxSSHDIncludeGlobs {
 					return false, false
 				}
@@ -239,22 +257,39 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 			}
 			continue
 		}
-		if !strings.EqualFold(fields[0], "Match") {
+		if !strings.EqualFold(keyword, "Match") {
 			continue
 		}
 		// Match is a sequence of criterion/value pairs, except the standalone All.
 		// Parse criterion positions rather than searching every token: `Match User
 		// host` has a value named "host", not a Host criterion.
-		for i := 1; i < len(fields); {
-			criterion := strings.ToLower(fields[i])
+		for i := 0; i < len(fields); {
+			criterion, _, embeddedValue := strings.Cut(fields[i], "=")
+			criterion = strings.ToLower(criterion)
 			switch criterion {
 			case "all":
 				i++
-			case "user", "group":
-				if i+1 >= len(fields) {
+			case "user":
+				if !embeddedValue && i+1 >= len(fields) {
 					return false, false
 				}
-				i += 2
+				if embeddedValue {
+					i++
+				} else {
+					i += 2
+				}
+			case "group":
+				if !embeddedValue && i+1 >= len(fields) {
+					return false, false
+				}
+				if !scan.accountExists {
+					return true, true
+				}
+				if embeddedValue {
+					i++
+				} else {
+					i += 2
+				}
 			case "address", "host", "localaddress", "localport", "rdomain", "localnetwork", "tagged":
 				return true, true
 			default:
@@ -265,6 +300,75 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 		}
 	}
 	return false, sc.Err() == nil && limited.N > 0
+}
+
+// parseSSHDDirective accepts both forms supported by OpenSSH's configuration
+// parser: "Keyword value" and "Keyword=value". It intentionally handles only
+// simple quoted tokens. A more complicated quoted line is reported as incomplete
+// so the caller downgrades the login verdict instead of silently skipping policy.
+func parseSSHDDirective(line string) (keyword string, args []string, complete bool) {
+	var ok bool
+	line, ok = stripSSHDComment(line)
+	if !ok {
+		return "", nil, false
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", nil, true
+	}
+	separator := strings.IndexAny(line, " \t=")
+	if separator < 0 {
+		keyword, ok := unquoteSimpleSSHDToken(line)
+		return keyword, nil, ok
+	}
+	keyword, ok = unquoteSimpleSSHDToken(line[:separator])
+	if !ok {
+		return "", nil, false
+	}
+	rest := strings.TrimLeft(line[separator:], " \t")
+	if strings.HasPrefix(rest, "=") {
+		rest = strings.TrimLeft(rest[1:], " \t")
+	}
+	for _, field := range strings.Fields(rest) {
+		value, ok := unquoteSimpleSSHDToken(field)
+		if !ok {
+			return "", nil, false
+		}
+		args = append(args, value)
+	}
+	return keyword, args, true
+}
+
+// stripSSHDComment mirrors OpenSSH's token boundary for comments: '#' starts a
+// comment only at the beginning of a token after whitespace. A hash embedded in
+// an unquoted or quoted argument is literal (for example Include conf#backup).
+// Backslash escapes are deliberately left unsupported; treating a complex line
+// as incomplete makes the caller downgrade the verdict instead of guessing.
+func stripSSHDComment(line string) (string, bool) {
+	inQuote := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			return "", false
+		case '"':
+			inQuote = !inQuote
+		case '#':
+			if !inQuote && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+				return line[:i], true
+			}
+		}
+	}
+	return line, !inQuote
+}
+
+func unquoteSimpleSSHDToken(token string) (string, bool) {
+	if !strings.ContainsRune(token, '"') {
+		return token, true
+	}
+	if len(token) < 2 || token[0] != '"' || token[len(token)-1] != '"' || strings.Count(token, "\"") != 2 {
+		return "", false
+	}
+	return token[1 : len(token)-1], true
 }
 
 var errSSHDGlobLimit = errors.New("sshd Include directory exceeds traversal limit")
@@ -292,7 +396,7 @@ func readSSHDGlobDir(path string) ([]os.DirEntry, error) {
 // incomplete sshd Include scan must downgrade the login verdict, not hide a
 // connection-scoped Match rule.
 func strictGlob(pattern string) ([]string, error) {
-	if _, err := filepath.Match(pattern, ""); err != nil {
+	if _, err := matchSSHDIncludeGlob(pattern, ""); err != nil {
 		return nil, err
 	}
 	return strictGlobDepth(pattern, 0)
@@ -357,7 +461,7 @@ func strictGlobDir(dir, pattern string, matches []string) ([]string, error) {
 		return nil, err
 	}
 	for _, entry := range entries {
-		matched, err := filepath.Match(pattern, entry.Name())
+		matched, err := matchSSHDIncludeGlob(pattern, entry.Name())
 		if err != nil {
 			return nil, err
 		}
@@ -369,6 +473,67 @@ func strictGlobDir(dir, pattern string, matches []string) ([]string, error) {
 		}
 	}
 	return matches, nil
+}
+
+// OpenSSH expands Include with POSIX glob(3), where [!x] negates a bracket
+// expression. Go's filepath.Match uses [^x] for the same operation. Translate
+// only an unescaped '!' immediately after '['; the rest of the pattern retains
+// filepath.Match's pathname and escaping rules.
+func matchSSHDIncludeGlob(pattern, name string) (bool, error) {
+	// POSIX glob also supports named character classes, collating symbols, and
+	// equivalence classes. filepath.Match does not. Refuse those constructs so an
+	// Include cannot silently disappear from this safety scan.
+	if hasUnsupportedPOSIXBracketConstruct(pattern) {
+		return false, filepath.ErrBadPattern
+	}
+	var normalized strings.Builder
+	normalized.Grow(len(pattern))
+	escaped := false
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if !escaped && ch == '[' && i+1 < len(pattern) && pattern[i+1] == '!' {
+			normalized.WriteString("[^")
+			i++
+			escaped = false
+			continue
+		}
+		normalized.WriteByte(ch)
+		if ch == '\\' && !escaped {
+			escaped = true
+		} else {
+			escaped = false
+		}
+	}
+	return filepath.Match(normalized.String(), name)
+}
+
+func hasUnsupportedPOSIXBracketConstruct(pattern string) bool {
+	inBracket := false
+	escaped := false
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if !inBracket {
+			if ch == '[' {
+				inBracket = true
+			}
+			continue
+		}
+		if ch == '[' && i+1 < len(pattern) && strings.ContainsRune(":.=", rune(pattern[i+1])) {
+			return true
+		}
+		if ch == ']' {
+			inBracket = false
+		}
+	}
+	return false
 }
 
 func globHasMeta(path string) bool { return strings.ContainsAny(path, `*?[\`) }
@@ -444,9 +609,9 @@ func (b Blocker) Fixable() bool {
 	return false
 }
 
-// LoginReport is what sshd's effective config says about one account's ability
-// to log in. Detail carries the offending effective value, so a message can
-// quote what it actually found rather than a generic complaint.
+// LoginReport describes whether sshd's effective config contains a known blocker
+// or an unevaluated rule for one account. Detail carries the offending effective
+// value, so a message can quote what it found rather than a generic complaint.
 type LoginReport struct {
 	Blockers []Blocker
 	Warnings []string // human-facing English notes; the cli renders them verbatim
@@ -457,7 +622,7 @@ type LoginReport struct {
 	// an `AllowUsers user@host` pattern, because nobody can say which IP the
 	// invitee will connect from. Such a rule is neither a pass nor a blocker: it
 	// means "no verdict". An invite must not be stamped verified while one stands,
-	// and a grant must not claim to have proved anything.
+	// and a grant must not claim a conclusive configuration result.
 	Unverifiable []string
 
 	// AlgoDirective is the directive name sshd itself used for the accepted
@@ -467,13 +632,12 @@ type LoginReport struct {
 	AlgoDirective string
 }
 
-// OK reports whether nothing blocks the login.
+// OK reports whether the effective-config check produced no blocker.
 func (r LoginReport) OK() bool { return len(r.Blockers) == 0 }
 
-// Certain reports whether the login provably works: nothing blocks it AND every
-// rule that bears on it could actually be evaluated. Only a Certain report may
-// be printed as "verified" — OK() alone would let an unevaluated rule pass for a
-// proof, which is the class of false promise this whole check exists to end.
+// Certain reports whether the effective-config check produced no blocker and could
+// evaluate every relevant rule. Only a Certain report may be printed as "verified
+// against the effective sshd config"; it does not prove an end-to-end login.
 func (r LoginReport) Certain() bool { return r.OK() && len(r.Unverifiable) == 0 }
 
 // Fixable reports whether every blocker can be lifted by a per-user drop-in.
@@ -507,15 +671,15 @@ func (r *LoginReport) block(b Blocker, detail string) {
 	r.Detail[b] = detail
 }
 
-// CheckKeyLogin reports whether c would let user log in with an ed25519 key
-// written to ~/.ssh/authorized_keys. groups are the account's group names (its
-// primary group is enough for a freshly created account); pass the predicted
-// group before the account exists.
+// CheckKeyLogin evaluates c for an ed25519 key planned for
+// ~/.ssh/authorized_keys. groups are the account's group names (its primary group
+// is enough for a freshly created account); pass the predicted group before the
+// account exists.
 //
 // It is used twice: once before anything is created (to refuse or to offer a
-// fix), and once after a drop-in is written (to prove the fix actually took
-// effect). Reusing one function for both is the point — the invite can only
-// claim "SSH key only" because this exact check passed against the live config.
+// fix), and once after a drop-in is written (to confirm the effective config
+// contains the intended change). Reusing one function for both keeps the invite's
+// configuration verdict tied to the same check.
 func CheckKeyLogin(c *SSHDConfig, user string, groups []string) LoginReport {
 	var r LoginReport
 	if !yes(c.First("pubkeyauthentication")) {
@@ -542,9 +706,9 @@ func CheckKeyLogin(c *SSHDConfig, user string, groups []string) LoginReport {
 	return r
 }
 
-// CheckPasswordLogin reports whether c would let user log in with a password.
-// It exists so --password-login can never print a password for an account that
-// the server would refuse anyway.
+// CheckPasswordLogin evaluates c for the planned password credential. It exists
+// so --password-login is refused when the check reports a blocker or cannot fully
+// evaluate that authentication method.
 func CheckPasswordLogin(c *SSHDConfig, user string, groups []string) LoginReport {
 	var r LoginReport
 	if !yes(c.First("passwordauthentication")) {
@@ -576,7 +740,7 @@ func checkAccess(c *SSHDConfig, user string, groups []string, r *LoginReport) {
 	if deny := c.Values("denygroups"); len(deny) > 0 && matchesUser(deny, groups) {
 		r.block(BlockDenyGroups, strings.Join(deny, " "))
 	}
-	// Allow: fail open only on proof. An address-qualified entry yields no verdict
+	// Allow: require a conclusive match. An address-qualified entry yields no verdict
 	// rather than a pass. It must NOT become a blocker either: the automatic fix
 	// would then write `AllowUsers <account>`, quietly cancelling the operator's
 	// network restriction for this account — repairing the report by weakening the
@@ -586,8 +750,8 @@ func checkAccess(c *SSHDConfig, user string, groups []string, r *LoginReport) {
 		switch {
 		case allowed:
 			// A bare entry admits the account from anywhere; the address-qualified ones
-			// are then redundant, so the login is provably allowed and there is nothing
-			// unverifiable to carry.
+			// are then redundant, so the config conclusively admits the account and
+			// there is nothing unverifiable to carry.
 		case len(unsure) > 0:
 			r.Unverifiable = append(r.Unverifiable, unsure...)
 		default:

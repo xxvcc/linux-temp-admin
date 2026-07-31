@@ -32,6 +32,7 @@ import (
 func uninstallApp(t *testing.T, in string, users ...string) (*App, *strings.Builder, *strings.Builder) {
 	t.Helper()
 	a, _, _ := newManageApp(t, in, users...)
+	a.ListMarkerAccounts = user.LifecycleMarkerAccounts
 
 	root := t.TempDir()
 	mk := func(name string, mode os.FileMode) string {
@@ -211,38 +212,59 @@ func TestInventoryUnionsEveryWitness(t *testing.T) {
 	}
 }
 
-// TestInventoryIgnoresTheGECOSMarker pins the one signal deliberately left out.
-// The marker is writable by anything with sudo — which every --sudo invitee has —
-// so `usermod -c 'linux-temp-admin temporary admin' realadmin` would otherwise
-// enlist a real administrator's account, and their home directory, into a
-// teardown. root is the stand-in here for "an account this tool did not create";
-// nothing deletes it, the inventory is a read.
-func TestInventoryIgnoresTheGECOSMarker(t *testing.T) {
-	const name = "ltagecos1"
-	a, _, _ := uninstallApp(t, "")
+// TestInventoryTreatsTheGECOSMarkerAsBlockOnly pins both sides of the weak
+// witness contract. A current permanent invite can have no sudo grant, sshd
+// exception, or auto-revoke task, so a lost registry must not make it invisible
+// and let uninstall strand it. But the user-writable marker can never authorize
+// deletion without a completed generation-bound registry identity.
+func TestInventoryTreatsTheGECOSMarkerAsBlockOnly(t *testing.T) {
+	const (
+		name       = "ltagecos1"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
 
-	// A REAL account carrying the managed marker and nothing else — no registry
-	// row, no sudo grant, no unit. This is what `usermod -c 'linux-temp-admin
-	// temporary admin' realadmin` produces, and the whole point is that the marker
-	// must not be enough to enlist it. An empty inventory would pass this test
-	// whether or not the marker were trusted, so the account has to exist for the
-	// assertion to mean anything.
+	// A live account carrying the current managed marker and nothing else: exactly
+	// the footprint of --no-sudo --no-auto-revoke after its registry row is lost.
 	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
 	rm()
 	t.Cleanup(rm)
-	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGenerationGECOSPrefix+generation, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
 	if !mustUserManaged(t, name) {
 		t.Fatalf("%s should carry the managed marker; the fixture is wrong", name)
 	}
 
-	plan := a.teardownPlan(false, false)
+	plan := a.teardownPlan(false, true)
+	found := false
 	for _, acc := range plan.accounts {
 		if acc.name == name {
-			t.Fatal("the GECOS marker enlisted an account no tool-owned FILE names — a real admin could be deleted by writing that marker to their own account")
+			found = true
+			if !acc.exists || len(acc.witnesses) != 1 || acc.witnesses[0] != witnessMarker {
+				t.Fatalf("marker-only account inventory = %+v, want one live block-only witness", acc)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("the GECOS marker did not block uninstall after the registry and all privilege/task artifacts were lost")
+	}
+
+	if rc := a.uninstall([]string{"--yes", "--remove-users", "--force"}); rc != 1 {
+		t.Fatalf("uninstall rc=%d, want marker-only identity refusal", rc)
+	}
+	if !mustUserExists(t, name) {
+		t.Fatal("a block-only GECOS marker authorized account deletion")
+	}
+	if _, err := os.Stat(a.InstallPath); err != nil {
+		t.Fatal("the command was removed while a marker-only permanent account remained")
+	}
+	if _, err := os.Stat(a.StateDir); err != nil {
+		t.Fatal("state was removed while a marker-only permanent account remained")
+	}
+	if !strings.Contains(errb.String(), "without a current generation-bound identity record") {
+		t.Fatalf("marker-only refusal did not explain the missing identity record: %q", errb.String())
 	}
 }
 
@@ -281,6 +303,9 @@ func TestUninstallWithAccountsRefusesNonInteractivelyWithoutTheFlag(t *testing.T
 	}
 	if !strings.Contains(errb.String(), "--remove-users") {
 		t.Errorf("the refusal must name the flag that unblocks it; got %q", errb.String())
+	}
+	if strings.Contains(errb.String(), "their auto-delete tasks") || !strings.Contains(errb.String(), "any auto-delete tasks already scheduled") {
+		t.Errorf("the refusal must cover permanent accounts without claiming every account has a task; got %q", errb.String())
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
 		t.Error("the binary was removed despite the refusal")
@@ -453,8 +478,8 @@ func TestUninstallRefusesIfInventoryChangesAfterConfirmation(t *testing.T) {
 // TestUninstallKeepsTheBinaryWhenAnAccountSurvives is the invariant the whole
 // design rests on: never remove the binary while a managed account it could not
 // remove is still there. Leaving a sudo-capable account behind while deleting the
-// only thing that manages it is worse than not uninstalling — its auto-delete
-// task's ExecStart IS that binary, so removing it means the account never expires.
+// only thing that can revoke it or clean its grants is worse than not uninstalling;
+// if an auto-delete task exists, its ExecStart also names that binary.
 //
 // The survivor is manufactured the way the tool itself would refuse one: a real
 // account whose recorded UID contradicts its current one is not provably the
@@ -482,7 +507,7 @@ func TestUninstallKeepsTheBinaryWhenAnAccountSurvives(t *testing.T) {
 		t.Fatal("the survivor was deleted; this test proves nothing")
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
-		t.Error("THE BINARY WAS REMOVED while a managed account survived — its auto-delete task can now never run")
+		t.Error("THE BINARY WAS REMOVED while a managed account survived, so it can no longer be revoked or have its grants cleaned")
 	}
 	if _, err := os.Stat(a.StateDir); err != nil {
 		t.Error("the state directory was removed while an account survived: its row is the only record of what it was")
@@ -989,7 +1014,7 @@ func TestDoctorReportsUntrustedRegistryIdentities(t *testing.T) {
 		t.Fatalf("doctor rc=%d, want 1 for untrusted registry identities", rc)
 	}
 	got := errb.String()
-	for _, want := range []string{pendingName, markerName, legacyName, "pending creation", "managed identity marker", "no trusted UID"} {
+	for _, want := range []string{pendingName, markerName, legacyName, "pending creation", "managed identity marker", "no safe non-root UID/GID"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("doctor output missing %q: %q", want, got)
 		}

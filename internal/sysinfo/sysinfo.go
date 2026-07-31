@@ -1,7 +1,6 @@
 // Package sysinfo detects the host's package manager, init system, SSH port, and
-// which external tools the tool still depends on. Key generation, downloads, date
-// arithmetic, passwd lookups, file installs, locking, and process signalling are
-// all native, leaving only the account-management tools as external commands.
+// account-management dependencies. It invokes bounded external helpers for
+// package installation and effective sshd configuration probes.
 package sysinfo
 
 import (
@@ -70,7 +69,7 @@ func InitSystem() string {
 	}
 }
 
-// Dep describes a required external tool (Any means one of Names suffices).
+// Dep describes a required external capability and its executable alternatives.
 type Dep struct {
 	Label   string
 	Names   []string
@@ -78,33 +77,32 @@ type Dep struct {
 }
 
 // RequiredDeps returns the external account-management tools the tool needs.
-// needSudo adds sudo.
-func RequiredDeps(needSudo bool) []Dep {
+// needPassword adds chpasswd; needSudo adds both sudo and its mandatory policy
+// validator, visudo.
+func RequiredDeps(needSudo, needPassword bool) []Dep {
 	deps := []Dep{
-		{Label: "id", Names: []string{"id"}},
-		{Label: "useradd/adduser", Names: []string{"useradd", "adduser"}},
-		{Label: "usermod", Names: []string{"usermod"}},
-		{Label: "chage", Names: []string{"chage"}},
-		{Label: "userdel/deluser", Names: []string{"userdel", "deluser"}},
+		{Label: "id", Names: []string{"id"}, Present: has("id")},
+		{Label: "useradd", Names: []string{"useradd"}, Present: has("useradd")},
+		{Label: "usermod", Names: []string{"usermod"}, Present: has("usermod")},
+		{Label: "chage", Names: []string{"chage"}, Present: has("chage")},
+		{Label: "userdel", Names: []string{"userdel"}, Present: has("userdel")},
+	}
+	if needPassword {
+		deps = append(deps, Dep{Label: "chpasswd", Names: []string{"chpasswd"}, Present: has("chpasswd")})
 	}
 	if needSudo {
-		deps = append(deps, Dep{Label: "sudo", Names: []string{"sudo"}})
-	}
-	for i := range deps {
-		for _, n := range deps[i].Names {
-			if has(n) {
-				deps[i].Present = true
-				break
-			}
-		}
+		deps = append(deps,
+			Dep{Label: "sudo", Names: []string{"sudo"}, Present: has("sudo")},
+			Dep{Label: "visudo", Names: []string{"visudo"}, Present: has("visudo")},
+		)
 	}
 	return deps
 }
 
 // MissingDeps returns the labels of required tools that are absent.
-func MissingDeps(needSudo bool) []string {
+func MissingDeps(needSudo, needPassword bool) []string {
 	var missing []string
-	for _, d := range RequiredDeps(needSudo) {
+	for _, d := range RequiredDeps(needSudo, needPassword) {
 		if !d.Present {
 			missing = append(missing, d.Label)
 		}
@@ -116,7 +114,7 @@ func MissingDeps(needSudo bool) []string {
 // manager, or "" if unknown.
 func PackageCandidate(label, pm string) string {
 	switch label {
-	case "useradd/adduser", "usermod", "userdel/deluser", "chage":
+	case "useradd", "usermod", "userdel", "chage", "chpasswd":
 		switch pm {
 		case "apt":
 			return "passwd"
@@ -127,7 +125,7 @@ func PackageCandidate(label, pm string) string {
 		}
 	case "id":
 		return "coreutils"
-	case "sudo":
+	case "sudo", "visudo":
 		return "sudo"
 	}
 	return ""

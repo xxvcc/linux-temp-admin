@@ -4,23 +4,33 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 )
+
+func TestHeaderMatchesConfiguredSchema(t *testing.T) {
+	want := "# linux-temp-admin registry v" + strconv.Itoa(config.RegistrySchema)
+	if Header != want {
+		t.Fatalf("registry header = %q, want %q", Header, want)
+	}
+}
 
 func TestRoundTrip(t *testing.T) {
 	in := Record{
-		User:          "xxvcc-a1b2c3",
-		Created:       "2026-07-07 12:00:00 UTC",
-		Expires:       "2026-07-08 12:00:00 UTC",
-		Sudo:          true,
-		Host:          "server-1.example.com",
-		Port:          22,
-		Fingerprint:   "SHA256:abcdef",
-		AutoRevoke:    true,
-		AutoUnit:      "linux-temp-admin-v2-revoke-xxvcc-a1b2c3",
-		UID:           1001,
-		Generation:    "0123456789abcdef0123456789abcdef",
-		IdentityBound: true,
-		Pending:       true,
+		User:            "xxvcc-a1b2c3",
+		Created:         "2026-07-07 12:00:00 UTC",
+		Expires:         "2026-07-08 12:00:00 UTC",
+		Sudo:            true,
+		Host:            "server-1.example.com",
+		Port:            22,
+		Fingerprint:     "SHA256:abcdef",
+		AutoRevoke:      true,
+		AutoUnit:        "linux-temp-admin-v2-revoke-xxvcc-a1b2c3",
+		UID:             1001,
+		Generation:      "0123456789abcdef0123456789abcdef",
+		IdentityBound:   true,
+		Pending:         false,
+		DeletionStarted: true,
 	}
 	line := in.TSV()
 	if strings.Contains(line, "\n") {
@@ -65,7 +75,7 @@ func TestParseLineRejectsNonRecords(t *testing.T) {
 			t.Errorf("ParseLine(%q) = ok=%v err=%v, want ignored", line, ok, err)
 		}
 	}
-	for _, line := range []string{"too\tfew\tfields", "# comment", legacyHeaderV2} {
+	for _, line := range []string{"too\tfew\tfields", "# comment", legacyHeaderV2, legacyHeaderV3} {
 		if _, _, err := ParseLine(line); err == nil {
 			t.Errorf("malformed/non-current line %q must return an error", line)
 		}
@@ -76,12 +86,13 @@ func TestParseLineRejectsCorruptFields(t *testing.T) {
 	valid := strings.Split(Record{User: "xxvcc-a1", Port: 22}.TSV(), "\t")
 	tests := map[string][]string{}
 	for name, mutate := range map[string]func([]string){
-		"boolean":        func(f []string) { f[3] = "maybe" },
-		"port":           func(f []string) { f[5] = "not-a-port" },
-		"uid":            func(f []string) { f[9] = "broken" },
-		"generation":     func(f []string) { f[10] = "too-short" },
-		"pending":        func(f []string) { f[11] = "maybe" },
-		"identity bound": func(f []string) { f[12] = "maybe" },
+		"boolean":          func(f []string) { f[3] = "maybe" },
+		"port":             func(f []string) { f[5] = "not-a-port" },
+		"uid":              func(f []string) { f[9] = "broken" },
+		"generation":       func(f []string) { f[10] = "too-short" },
+		"pending":          func(f []string) { f[11] = "maybe" },
+		"identity bound":   func(f []string) { f[12] = "maybe" },
+		"deletion started": func(f []string) { f[13] = "maybe" },
 	} {
 		fields := append([]string(nil), valid...)
 		mutate(fields)
@@ -100,6 +111,36 @@ func TestParseLineRequiresGenerationForBoundIdentity(t *testing.T) {
 	line := Record{User: "xxvcc-a1", Port: 22, UID: 1001, IdentityBound: true}.TSV()
 	if _, _, err := ParseLine(line); err == nil || !strings.Contains(err.Error(), "no valid generation") {
 		t.Fatalf("ParseLine error = %v, want missing generation refusal", err)
+	}
+}
+
+func TestParseLineRequiresUIDAndNonPendingStateForDeletionStarted(t *testing.T) {
+	for _, rec := range []Record{
+		{User: "xxvcc-a1", Port: 22, DeletionStarted: true},
+		{User: "xxvcc-a1", Port: 22, UID: 1001, Pending: true, DeletionStarted: true},
+		{User: "xxvcc-a1", Port: 22, UID: 1001, Generation: "0123456789abcdef0123456789abcdef", DeletionStarted: true},
+	} {
+		if _, _, err := ParseLine(rec.TSV()); err == nil || !strings.Contains(err.Error(), "deletion-started") {
+			t.Fatalf("ParseLine(%+v) error = %v, want incomplete deletion witness refusal", rec, err)
+		}
+	}
+	legacy := Record{User: "xxvcc-a1", Port: 22, UID: 1001, DeletionStarted: true}
+	if got, ok, err := ParseLine(legacy.TSV()); err != nil || !ok || got != legacy {
+		t.Fatalf("legacy deletion witness round trip = ok %v record %+v err %v", ok, got, err)
+	}
+	unregistered := Record{User: "xxvcc-a1", UID: 1001, DeletionStarted: true}
+	if got, ok, err := ParseLine(unregistered.TSV()); err != nil || !ok || got != unregistered {
+		t.Fatalf("unregistered deletion witness round trip = ok %v record %+v err %v", ok, got, err)
+	}
+	if _, _, err := ParseLine((Record{User: "xxvcc-a1", Port: 0}).TSV()); err == nil {
+		t.Fatal("ordinary record accepted recovery-only port 0")
+	}
+	boundWithoutPort := Record{
+		User: "xxvcc-a1", UID: 1001, Generation: "0123456789abcdef0123456789abcdef",
+		IdentityBound: true, DeletionStarted: true,
+	}
+	if _, _, err := ParseLine(boundWithoutPort.TSV()); err == nil || !strings.Contains(err.Error(), "invalid port") {
+		t.Fatalf("generation-bound recovery with port 0 error = %v, want invalid port refusal", err)
 	}
 }
 
@@ -141,19 +182,42 @@ func TestParseLineAcceptsLegacyNineFieldRow(t *testing.T) {
 	}
 }
 
-// TestV3SchemaStopsV2Writers pins the forward-compatibility boundary. v3 rows
-// carry fields a v2 writer would discard, so the header and exact row width must
-// make that writer fail closed instead of accepting and truncating them.
-func TestV3SchemaStopsV2Writers(t *testing.T) {
+func TestParseLegacyV3RowDefaultsDeletionPhase(t *testing.T) {
+	current := Record{
+		User: "xxvcc-a1", Port: 22, UID: 1001,
+		Generation: "0123456789abcdef0123456789abcdef", IdentityBound: true,
+	}
+	fields := strings.Split(current.TSV(), "\t")
+	legacy := strings.Join(fields[:legacyV3FieldCount], "\t")
+	got, ok, err := parseLegacyV3Line(legacy)
+	if err != nil || !ok {
+		t.Fatalf("parseLegacyV3Line ok=%v err=%v", ok, err)
+	}
+	if got.User != current.User || got.UID != current.UID || got.Generation != current.Generation ||
+		!got.IdentityBound || got.Pending || got.DeletionStarted {
+		t.Fatalf("legacy v3 row parsed incorrectly: %+v", got)
+	}
+	if _, _, err := ParseLine(legacy); err == nil {
+		t.Fatal("v4 parser accepted a released 13-column v3 row without migration")
+	}
+}
+
+// TestV4SchemaStopsOlderWriters pins the forward-compatibility boundary. v4
+// rows carry a field older writers would discard, so the header and exact width
+// make those writers fail closed instead of silently truncating recovery state.
+func TestV4SchemaStopsOlderWriters(t *testing.T) {
 	line := Record{User: "xxvcc-a1", Port: 22, UID: 1001, AutoUnit: "u.timer", Pending: true}.TSV()
 	f := strings.Split(line, "\t")
-	if Header == legacyHeaderV2 {
+	if Header == legacyHeaderV2 || Header == legacyHeaderV3 {
 		t.Fatal("current and legacy registry headers must differ")
 	}
 	if len(f) != currentFieldCount {
-		t.Fatalf("v3 row has %d fields, want %d", len(f), currentFieldCount)
+		t.Fatalf("v4 row has %d fields, want %d", len(f), currentFieldCount)
 	}
 	if _, _, err := parseLegacyV2Line(line); err == nil {
-		t.Fatal("v2 parser accepted a v3 row and could silently discard pending state")
+		t.Fatal("v2 parser accepted a v4 row and could silently discard state")
+	}
+	if _, _, err := parseLegacyV3Line(line); err == nil {
+		t.Fatal("v3 parser accepted a v4 row and could silently discard deletion state")
 	}
 }

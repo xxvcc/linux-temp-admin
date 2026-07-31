@@ -2,20 +2,31 @@
 //
 // chage -E is day-granular and locks the account at 00:00 UTC of the given date.
 // To keep an account usable for at least the requested window on every timezone
-// and creation time — and never lock it prematurely — the expiry date is
-// anchored to the first midnight strictly after now+hours (the date of
-// now+hours, plus one day). When an auto-delete timer is set it fires precisely
-// at now+hours; chage only backstops it and must not lock before it.
+// and creation time, the revoke deadline is rounded up to a whole minute and the
+// chage date is anchored to the first UTC midnight strictly after it. Scheduler
+// downtime and retries can delay deletion; chage only backstops it and must not
+// lock before the deadline.
 package expiry
 
 import "time"
 
 const dateLayout = "2006-01-02"
 
-// Date returns the chage -E expiry date (YYYY-MM-DD, UTC) for an account created
-// at now with the given lifetime in hours.
-func Date(now time.Time, hours int) string {
-	return now.UTC().Add(time.Duration(hours)*time.Hour).AddDate(0, 0, 1).Format(dateLayout)
+// Deadline returns the single absolute revoke deadline shared by display,
+// chage, and every scheduler backend. Rounding up accommodates at(1)'s
+// minute-granular absolute format without ever shortening the requested window.
+func Deadline(now time.Time, hours int) time.Time {
+	target := now.Add(time.Duration(hours) * time.Hour)
+	minute := target.Truncate(time.Minute)
+	if target.Equal(minute) {
+		return minute
+	}
+	return minute.Add(time.Minute)
+}
+
+// Date returns the chage -E backstop date (YYYY-MM-DD, UTC) for deadline.
+func Date(deadline time.Time) string {
+	return deadline.UTC().AddDate(0, 0, 1).Format(dateLayout)
 }
 
 // LockInstant returns the UTC instant at which chage disables the account for a
@@ -24,8 +35,8 @@ func LockInstant(date string) (time.Time, error) {
 	return time.ParseInLocation(dateLayout, date, time.UTC)
 }
 
-// DisplayLocal returns the exact scheduled-revoke deadline for the invite output
-// (now + hours). Date supplies only the later day-granularity lockout backstop.
-func DisplayLocal(now time.Time, hours int) string {
-	return now.Add(time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05 MST")
+// DisplayLocal formats the shared revoke deadline for the invite output. Date
+// supplies only the later day-granularity lockout backstop.
+func DisplayLocal(deadline time.Time) string {
+	return deadline.Format("2006-01-02 15:04:05 MST")
 }

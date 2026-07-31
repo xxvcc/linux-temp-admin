@@ -22,9 +22,10 @@ const (
 	defaultWaitDelay = time.Second
 )
 
-// Options controls one helper invocation. Privileged helpers receive a fixed,
-// minimal environment rather than caller-controlled values preserved by
-// `sudo -E`; ExtraEnv adds purpose-specific values such as a stable locale.
+// Options controls one helper invocation. Helpers receive a minimal environment
+// rather than caller-controlled values preserved by `sudo -E`; ExtraEnv adds
+// purpose-specific values such as a stable locale. PATH is the process PATH: the
+// production CLI pins it to trusted system directories before any root dispatch.
 type Options struct {
 	Context   context.Context
 	Timeout   time.Duration

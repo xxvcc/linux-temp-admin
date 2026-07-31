@@ -10,8 +10,12 @@
 *.out
 coverage.txt
 
-# Release staging (produced by scripts/release.sh)
+# Release build and staging output
 /dist/
+
+# Python test caches
+__pycache__/
+*.py[cod]
 
 # Editor / OS junk
 .DS_Store

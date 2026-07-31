@@ -31,6 +31,40 @@ func TestAllPropagatesDirectoryReadFailure(t *testing.T) {
 	}
 }
 
+func TestAllRejectsSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Manager{Dir: link}).All(); err == nil {
+		t.Fatal("All followed a symlinked sudoers directory")
+	}
+}
+
+func TestAllAllowsAbsentDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "absent")
+	users, err := (&Manager{Dir: dir}).All()
+	if err != nil || len(users) != 0 {
+		t.Fatalf("All on absent directory = %v, %v; want empty success", users, err)
+	}
+}
+
+func TestAllRejectsMalformedManagedArtifact(t *testing.T) {
+	dir := t.TempDir()
+	name := filePrefix + "not.valid"
+	if err := os.WriteFile(filepath.Join(dir, name), nil, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Manager{Dir: dir}).All(); err == nil || !strings.Contains(err.Error(), name) {
+		t.Fatalf("All error = %v, want malformed managed artifact", err)
+	}
+}
+
 func TestSudoersProbesAreBoundedAndUseCLocale(t *testing.T) {
 	old := sudoProbeOptions
 	t.Cleanup(func() { sudoProbeOptions = old })
@@ -42,6 +76,14 @@ func TestSudoersProbesAreBoundedAndUseCLocale(t *testing.T) {
 		t.Setenv("PATH", dir)
 		if err := visudoValidate([]byte("alice ALL=(ALL) NOPASSWD:ALL\n")); err != nil {
 			t.Fatalf("visudoValidate did not force the C locale: %v", err)
+		}
+	})
+
+	t.Run("missing visudo fails closed", func(t *testing.T) {
+		sudoProbeOptions = old
+		t.Setenv("PATH", t.TempDir())
+		if err := visudoValidate([]byte("alice ALL=(ALL) NOPASSWD:ALL\n")); err == nil || !strings.Contains(err.Error(), "visudo is required") {
+			t.Fatalf("visudoValidate with no visudo = %v, want fail-closed error", err)
 		}
 	})
 
@@ -80,6 +122,26 @@ printf '    (root) NOPASSWD: ALL\n'`)
 			t.Fatalf("visudoValidate error = %v, want output limit", err)
 		}
 	})
+}
+
+func TestGrantFailsClosedWithoutValidationOrPolicyVerification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    *Manager
+		want string
+	}{
+		{name: "validator", m: &Manager{Dir: t.TempDir()}, want: "validator is not configured"},
+		{name: "verifier", m: &Manager{Dir: t.TempDir(), Validate: func([]byte) error { return nil }}, want: "verifier is not configured"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.m.Grant("xxvcc-a1"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Grant without %s = %v, want fail-closed error", tc.name, err)
+			}
+			if _, err := os.Lstat(tc.m.FilePath("xxvcc-a1")); !os.IsNotExist(err) {
+				t.Fatalf("Grant without %s wrote a live policy: %v", tc.name, err)
+			}
+		})
+	}
 }
 
 func TestRemoveUsesInjectedRemoveFile(t *testing.T) {
@@ -148,12 +210,30 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 		ok   bool
 	}{
 		{"root", "User alice may run the following commands:\n    (root) NOPASSWD: ALL\n", true},
+		{"numeric root", "    (#0) NOPASSWD: ALL\n", true},
 		{"all runas", "    (ALL : ALL) NOPASSWD: ALL\n", true},
+		{"all except root", "    (ALL, !root) NOPASSWD: ALL\n", false},
+		{"root exclusion before all", "    (!root, ALL) NOPASSWD: ALL\n", false},
+		{"negated all", "    (root, !ALL) NOPASSWD: ALL\n", false},
 		{"non-root runas", "    (daemon) NOPASSWD: ALL\n", false},
 		{"restricted command", "    (root) NOPASSWD: /usr/bin/id\n", false},
 		{"password required", "    (root) PASSWD: ALL\n", false},
 		{"unrelated nopasswd", "    (daemon) NOPASSWD: /bin/true\n    (root) PASSWD: ALL\n", false},
 		{"tag changes before all", "    (root) NOPASSWD: /bin/true, PASSWD: ALL\n", false},
+		{"later passwd all overrides", "    (root) NOPASSWD: ALL\n    (root) PASSWD: ALL\n", false},
+		{"later all-runas passwd all overrides", "    (root) NOPASSWD: ALL\n    (ALL) PASSWD: ALL\n", false},
+		{"later root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: ALL\n", false},
+		{"restricted root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", false},
+		{"later restricted passwd invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n", false},
+		{"numeric root restricted passwd invalidates full grant", "    (root) NOPASSWD: ALL\n    (#0) PASSWD: /bin/true\n", false},
+		{"later command-list passwd all invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) NOPASSWD: /bin/false, PASSWD: ALL\n", false},
+		{"exact later grant restores after command list", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", true},
+		{"later nopasswd all restores", "    (root) PASSWD: ALL\n    (root) NOPASSWD: ALL\n", true},
+		{"later non-root rule does not override", "    (root) NOPASSWD: ALL\n    (daemon) PASSWD: ALL\n", true},
+		{"later non-root uid rule does not override", "    (root) NOPASSWD: ALL\n    (#1) PASSWD: ALL\n", true},
+		{"dynamic group is ambiguous", "    (root) NOPASSWD: ALL\n    (%wheel) PASSWD: /bin/true\n", false},
+		{"netgroup is ambiguous", "    (root) NOPASSWD: ALL\n    (+operators) PASSWD: /bin/true\n", false},
+		{"user alias is ambiguous", "    (root) NOPASSWD: ALL\n    (OPERATORS) PASSWD: /bin/true\n", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,6 +243,38 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 			}
 			if !tt.ok && (err == nil || !strings.Contains(err.Error(), "root NOPASSWD: ALL")) {
 				t.Fatalf("verifyNopasswdOutput error = %v, want precise refusal", err)
+			}
+		})
+	}
+}
+
+func TestRunasRootScopeFailsClosedOnDynamicOrNegatedEntries(t *testing.T) {
+	tests := []struct {
+		name  string
+		runas string
+		want  rootRunasScope
+	}{
+		{name: "root", runas: "root", want: runasRootIncluded},
+		{name: "numeric root", runas: "#0", want: runasRootIncluded},
+		{name: "numeric root with leading zeroes", runas: "#000", want: runasRootIncluded},
+		{name: "all users", runas: "ALL : ALL", want: runasRootIncluded},
+		{name: "mixed literal users", runas: "daemon, root", want: runasRootIncluded},
+		{name: "non-root user", runas: "daemon", want: runasRootExcluded},
+		{name: "non-root uid", runas: "#1", want: runasRootExcluded},
+		{name: "root exclusion", runas: "ALL, !root", want: runasRootAmbiguous},
+		{name: "leading exclusion", runas: "!root, ALL", want: runasRootAmbiguous},
+		{name: "all exclusion", runas: "root, !ALL", want: runasRootAmbiguous},
+		{name: "other exclusion", runas: "ALL, !daemon", want: runasRootAmbiguous},
+		{name: "unix group", runas: "%wheel", want: runasRootAmbiguous},
+		{name: "netgroup", runas: "+operators", want: runasRootAmbiguous},
+		{name: "user alias", runas: "OPERATORS", want: runasRootAmbiguous},
+		{name: "malformed uid", runas: "#root", want: runasRootAmbiguous},
+		{name: "empty user list", runas: ": wheel", want: runasRootAmbiguous},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runasRootScope(tt.runas); got != tt.want {
+				t.Fatalf("runasRootScope(%q) = %d, want %d", tt.runas, got, tt.want)
 			}
 		})
 	}
@@ -178,7 +290,6 @@ func TestOrphansFindsGrantsWhoseAccountIsGone(t *testing.T) {
 		filePrefix + "xxvcc-alive", // ours, account exists -> not an orphan
 		"90-someone-elses-file",    // not ours: never report or remove it
 		"foreign-valid-user",       // valid username, but still not our namespace
-		filePrefix + "BAD NAME",    // ours-looking but not a valid username -> ignore
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x ALL=(ALL) NOPASSWD:ALL\n"), 0o440); err != nil {
 			t.Fatal(err)

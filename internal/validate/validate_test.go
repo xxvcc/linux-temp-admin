@@ -2,6 +2,7 @@ package validate
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -59,7 +60,8 @@ func TestKernelAndAccountID(t *testing.T) {
 		}
 	}
 	if strconv.IntSize >= 64 {
-		reserved := int(uint64(^uint32(0)))
+		reservedKernelID := uint64(^uint32(0))
+		reserved := int(reservedKernelID)
 		for _, id := range []int{reserved, reserved + 1} {
 			if KernelID(id) || AccountID(id) {
 				t.Errorf("out-of-range/reserved id %d was accepted", id)
@@ -246,6 +248,25 @@ func TestPortAndHours(t *testing.T) {
 	for _, h := range []int{0, -1, 8761} {
 		if Hours(h) {
 			t.Errorf("Hours(%d) = true, want false", h)
+		}
+	}
+}
+
+func TestManagedHomeRequiresExactDedicatedPath(t *testing.T) {
+	for _, home := range []string{"/home/xxvcc-u", "/home/_x"} {
+		user := strings.TrimPrefix(home, "/home/")
+		if !ManagedHome(user, home) {
+			t.Errorf("ManagedHome(%q, %q) = false", user, home)
+		}
+	}
+	for _, tc := range []struct{ user, home string }{
+		{"xxvcc-u", "/srv/xxvcc-u"},
+		{"xxvcc-u", "/home/xxvcc-u/"},
+		{"xxvcc-u", "/home/../home/xxvcc-u"},
+		{"bad:user", "/home/bad:user"},
+	} {
+		if ManagedHome(tc.user, tc.home) {
+			t.Errorf("ManagedHome(%q, %q) accepted an unsafe path", tc.user, tc.home)
 		}
 	}
 }

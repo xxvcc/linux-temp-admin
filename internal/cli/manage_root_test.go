@@ -4,29 +4,124 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/expiry"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
 
 // fakeSys satisfies schedule.System without touching systemd or at.
 type fakeSys struct{}
 
-func (fakeSys) HasSystemctl() bool                     { return false }
-func (fakeSys) Systemctl(...string) error              { return nil }
-func (fakeSys) HasAt() bool                            { return false }
-func (fakeSys) ScheduleAt(string, int) (string, error) { return "", nil }
-func (fakeSys) RemoveAtJobsFor(string) error           { return nil }
-func (fakeSys) AtrmJob(string) error                   { return nil }
-func (fakeSys) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+func (fakeSys) HasSystemctl() bool                           { return false }
+func (fakeSys) Systemctl(...string) error                    { return nil }
+func (fakeSys) HasAt() bool                                  { return false }
+func (fakeSys) ScheduleAt(string, time.Time) (string, error) { return "", nil }
+func (fakeSys) RemoveAtJobsFor(string) error                 { return nil }
+func (fakeSys) AtrmJob(string) error                         { return nil }
+func (fakeSys) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
+
+type failedCreateRunner struct{}
+
+func (failedCreateRunner) Look(name string) bool { return name == "useradd" }
+func (failedCreateRunner) Run(string, ...string) error {
+	return os.ErrInvalid
+}
+func (r failedCreateRunner) RunInput(_ string, name string, args ...string) error {
+	return r.Run(name, args...)
+}
+
+type inviteTimingRunner struct {
+	account                user.Passwd
+	present                bool
+	events                 *[]string
+	eventsBeforeCredential []string
+	registry               *registry.Store
+	recordAtCredential     registry.Record
+	recordFound            bool
+	recordErr              error
+	stopErr                error
+}
+
+func (*inviteTimingRunner) Look(name string) bool {
+	switch name {
+	case "useradd", "usermod", "chpasswd", "chage", "userdel":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *inviteTimingRunner) Run(name string, args ...string) error {
+	switch name {
+	case "useradd":
+		valueAfter := func(flag string) (string, bool) {
+			for i := 0; i+1 < len(args); i++ {
+				if args[i] == flag {
+					return args[i+1], true
+				}
+			}
+			return "", false
+		}
+		home, homeOK := valueAfter("-d")
+		shell, shellOK := valueAfter("-s")
+		gecos, gecosOK := valueAfter("-c")
+		if len(args) == 0 || !homeOK || !shellOK || !gecosOK {
+			return fmt.Errorf("unexpected useradd arguments")
+		}
+		r.account.Name = args[len(args)-1]
+		r.account.Home = home
+		r.account.Shell = shell
+		r.account.GECOS = gecos
+		r.present = true
+	case "usermod":
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "-c" {
+				r.account.GECOS = args[i+1]
+			}
+		}
+		if len(args) == 2 && args[0] == "-L" {
+			*r.events = append(*r.events, "password-lock")
+		}
+	case "chage":
+		if len(args) != 3 || args[0] != "-E" {
+			return fmt.Errorf("unexpected chage arguments: %v", args)
+		}
+		*r.events = append(*r.events, "expiry:"+args[1])
+	case "userdel":
+		r.present = false
+	}
+	return nil
+}
+
+func (r *inviteTimingRunner) RunInput(_ string, name string, args ...string) error {
+	if name != "chpasswd" {
+		return r.Run(name, args...)
+	}
+	r.eventsBeforeCredential = append([]string(nil), (*r.events)...)
+	*r.events = append(*r.events, "credential")
+	r.recordAtCredential, r.recordFound, r.recordErr = r.registry.Lookup(r.account.Name)
+	return r.stopErr
+}
+
+func (r *inviteTimingRunner) lookup(name string) (user.Passwd, bool, error) {
+	if !r.present || name != r.account.Name {
+		return user.Passwd{}, false, nil
+	}
+	return r.account, true, nil
+}
 
 func mustUserExists(t *testing.T, name string) bool {
 	t.Helper()
@@ -53,6 +148,300 @@ func mustUserManaged(t *testing.T, name string) bool {
 		t.Fatal(err)
 	}
 	return managed
+}
+
+func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testing.T) {
+	dir := rootOwnedDir(t)
+	username := ""
+	for i := 0; i < 100; i++ {
+		candidate := fmt.Sprintf("ltagate%02d", i)
+		inUse, err := user.NameInUse(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !inUse {
+			username = candidate
+			break
+		}
+	}
+	if username == "" {
+		t.Fatal("could not find an unused test username")
+	}
+
+	a, _, errb := newTestApp(t, "")
+	regDir := filepath.Join(dir, "registry")
+	a.Registry = &registry.Store{
+		Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+	}
+	a.Users = &user.Manager{
+		Runner:             failedCreateRunner{},
+		PrepareManagedHome: func(string) error { return nil },
+		CreateManagedHome:  func(user.Passwd) error { return nil },
+	}
+	createdAt := time.Date(2026, 7, 7, 12, 34, 59, 0, time.FixedZone("test", 8*60*60))
+	clockCalls := 0
+	a.Now = func() time.Time {
+		clockCalls++
+		return createdAt.Add(time.Duration(clockCalls-1) * time.Hour)
+	}
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: filepath.Join(dir, "systemd"), InstallPath: filepath.Join(dir, "linux-temp-admin"),
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now, Sys: fakeSys{},
+	}
+	a.RandHex = func(n int) (string, error) {
+		if n == 16 {
+			return "0123456789abcdef0123456789abcdef", nil
+		}
+		return "abcdef0123", nil
+	}
+
+	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}); rc != 1 {
+		t.Fatalf("runInvite rc=%d, want helper failure", rc)
+	}
+	rec, found, err := a.Registry.Lookup(username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !rec.Pending || rec.UID != 0 || !rec.IdentityBound {
+		t.Fatalf("pending recovery witness was removed after ambiguous helper failure: found=%v rec=%+v", found, rec)
+	}
+	if clockCalls != 1 {
+		t.Fatalf("invite transaction read its creation clock %d times, want once", clockCalls)
+	}
+	if got, want := rec.Created, createdAt.Format("2006-01-02 15:04:05 MST"); got != want {
+		t.Fatalf("recorded creation = %q, want %q", got, want)
+	}
+	if got, want := rec.Expires, expiry.DisplayLocal(expiry.Deadline(createdAt, 1)); got != want {
+		t.Fatalf("recorded deadline = %q, want %q", got, want)
+	}
+	if !strings.Contains(errb.String(), "account artifact cleanup is unconfirmed") {
+		t.Fatalf("ambiguous helper failure did not report retained registry evidence: %q", errb.String())
+	}
+}
+
+func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T) {
+	const (
+		username   = "xxvcc-timing1"
+		generation = "0123456789abcdef0123456789abcdef"
+		uid        = 4_000_000
+	)
+	if _, exists, err := user.Lookup(username); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Fatalf("test username %s already exists", username)
+	}
+
+	binDir := t.TempDir()
+	idScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"-u\" ]; then\n" +
+		"  printf \"id: '%s': no such user\\n\" \"$3\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"-Gn\" ]; then\n" +
+		"  printf '%s\\n' \"$2\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 2\n"
+	if err := os.WriteFile(filepath.Join(binDir, "id"), []byte(idScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	baseDir := rootOwnedDir(t)
+	regDir := filepath.Join(baseDir, "registry")
+	a, _, errb := newTestApp(t, "")
+	a.Registry = &registry.Store{
+		Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+	}
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: filepath.Join(baseDir, "systemd"), InstallPath: filepath.Join(baseDir, "linux-temp-admin"),
+		UnitPrefix: config.AutoRevokeUnitPrefix, Sys: fakeSys{},
+	}
+
+	events := []string{}
+	stopErr := errors.New("stop after credential timing observation")
+	runner := &inviteTimingRunner{
+		account:  user.Passwd{UID: uid, GID: uid},
+		events:   &events,
+		registry: a.Registry,
+		stopErr:  stopErr,
+	}
+	mailCalls := 0
+	a.Users = &user.Manager{
+		Runner:             runner,
+		LookupUser:         runner.lookup,
+		PrepareManagedHome: func(string) error { return nil },
+		CreateManagedHome: func(user.Passwd) error {
+			events = append(events, "home")
+			return nil
+		},
+		ValidateManagedHome: func(user.Passwd) error {
+			events = append(events, "home-validate")
+			return nil
+		},
+		RemoveManagedMail: func(user.Passwd) error {
+			mailCalls++
+			events = append(events, "mail")
+			return nil
+		},
+		RemoveManagedHome: func(user.Passwd) error { return nil },
+	}
+	a.LookupUser = runner.lookup
+
+	t0 := time.Date(2026, 7, 7, 12, 0, 0, 0, time.FixedZone("test", 8*60*60))
+	t1 := t0.Add(65 * time.Second)
+	drained := false
+	beforeDrainClockCalls := 0
+	afterDrainClockCalls := 0
+	a.Now = func() time.Time {
+		if drained {
+			afterDrainClockCalls++
+			return t1
+		}
+		beforeDrainClockCalls++
+		return t0
+	}
+	a.Scheduler.Now = a.Now
+	a.ClearScheduledJobs = func(name string, gotUID int) error {
+		if name != username || gotUID != uid {
+			t.Fatalf("ClearScheduledJobs(%q, %d), want (%q, %d)", name, gotUID, username, uid)
+		}
+		events = append(events, "clear")
+		return nil
+	}
+	a.TerminateProcesses = func(gotUID int) error {
+		if gotUID != uid {
+			t.Fatalf("TerminateProcesses UID = %d, want %d", gotUID, uid)
+		}
+		events = append(events, "kill")
+		return nil
+	}
+	a.DrainScheduledJobs = func() error {
+		events = append(events, "drain")
+		drained = true
+		return nil
+	}
+	a.RandHex = func(n int) (string, error) {
+		if n != 16 {
+			return "", fmt.Errorf("unexpected random byte count %d", n)
+		}
+		return generation, nil
+	}
+	a.RandPassword = func(int) (string, error) { return "password-for-timing-test", nil }
+	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
+
+	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{password: true, verified: true}); rc != 1 {
+		t.Fatalf("runInvite rc = %d, want injected credential failure", rc)
+	}
+	if !strings.Contains(errb.String(), stopErr.Error()) {
+		t.Fatalf("runInvite did not reach the injected credential stop: %q", errb.String())
+	}
+	if runner.recordErr != nil || !runner.recordFound {
+		t.Fatalf("registry row at credential: found=%v err=%v", runner.recordFound, runner.recordErr)
+	}
+	if got, want := strings.Join(runner.eventsBeforeCredential, ","), "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate"; got != want {
+		t.Fatalf("events before credential = %q, want %q", got, want)
+	}
+	if mailCalls < 2 {
+		t.Fatalf("mail cleanup calls before/during rollback = %d, want at least create and post-drain sweeps", mailCalls)
+	}
+	if got, want := runner.recordAtCredential.Created, t1.Format("2006-01-02 15:04:05 MST"); got != want {
+		t.Fatalf("creation time at credential = %q, want %q", got, want)
+	}
+	if got, want := runner.recordAtCredential.Expires, expiry.DisplayLocal(expiry.Deadline(t1, 1)); got != want {
+		t.Fatalf("expiry at credential = %q, want %q", got, want)
+	}
+	if runner.recordAtCredential.Pending {
+		t.Fatal("credential was attempted before the rebased registry record was finalized")
+	}
+	if beforeDrainClockCalls != 1 || afterDrainClockCalls != 1 {
+		t.Fatalf("clock calls before/after drain = %d/%d, want 1/1", beforeDrainClockCalls, afterDrainClockCalls)
+	}
+}
+
+func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
+	const (
+		username   = "xxvcc-permtime"
+		generation = "fedcba9876543210fedcba9876543210"
+		uid        = 4_000_001
+	)
+	if _, exists, err := user.Lookup(username); err != nil {
+		t.Fatal(err)
+	} else if exists {
+		t.Fatalf("test username %s already exists", username)
+	}
+
+	binDir := t.TempDir()
+	idScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"-u\" ]; then printf \"id: '%s': no such user\\n\" \"$3\" >&2; exit 1; fi\n" +
+		"if [ \"$1\" = \"-Gn\" ]; then printf '%s\\n' \"$2\"; exit 0; fi\n" +
+		"exit 2\n"
+	if err := os.WriteFile(filepath.Join(binDir, "id"), []byte(idScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	baseDir := rootOwnedDir(t)
+	regDir := filepath.Join(baseDir, "registry")
+	a, _, errb := newTestApp(t, "")
+	a.Registry = &registry.Store{
+		Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+	}
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: filepath.Join(baseDir, "systemd"), InstallPath: filepath.Join(baseDir, "linux-temp-admin"),
+		UnitPrefix: config.AutoRevokeUnitPrefix, Sys: fakeSys{},
+	}
+	events := []string{}
+	runner := &inviteTimingRunner{
+		account: user.Passwd{UID: uid, GID: uid}, events: &events, registry: a.Registry,
+	}
+	mailCalls := 0
+	a.Users = &user.Manager{
+		Runner:             runner,
+		LookupUser:         runner.lookup,
+		PrepareManagedHome: func(string) error { return nil },
+		CreateManagedHome: func(user.Passwd) error {
+			events = append(events, "home")
+			return nil
+		},
+		ValidateManagedHome: func(user.Passwd) error {
+			events = append(events, "home-validate")
+			return nil
+		},
+		RemoveManagedMail: func(user.Passwd) error {
+			mailCalls++
+			events = append(events, "mail")
+			return nil
+		},
+		RemoveManagedHome: func(user.Passwd) error { return nil },
+	}
+	a.LookupUser = runner.lookup
+	a.ClearScheduledJobs = func(string, int) error { events = append(events, "clear"); return nil }
+	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
+	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
+	a.RandHex = func(int) (string, error) { return generation, nil }
+	a.RandPassword = func(int) (string, error) { return "password-for-permanent-test", nil }
+	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
+
+	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}); rc != 0 {
+		t.Fatalf("permanent runInvite rc = %d: %s", rc, errb.String())
+	}
+	want := "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
+	if got := strings.Join(events, ","); got != want {
+		t.Fatalf("permanent invite events = %q, want %q", got, want)
+	}
+	if mailCalls != 2 {
+		t.Fatalf("permanent invite mail cleanup calls = %d, want create and post-drain sweeps", mailCalls)
+	}
+	rec, found, err := a.Registry.Lookup(username)
+	if err != nil || !found {
+		t.Fatalf("permanent registry row: found=%v err=%v", found, err)
+	}
+	if rec.AutoRevoke || rec.Expires != "never (does not expire or auto-delete)" {
+		t.Fatalf("permanent registry row = %+v", rec)
+	}
 }
 
 // newManageApp is newTestApp plus the collaborators a revoke reached from the

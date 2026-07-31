@@ -1,12 +1,71 @@
 package lifecycle
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestTryAcquireReportsBusyWithoutWaiting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lifecycle.lock")
+	first, err := New(path).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := first(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	started := time.Now()
+	if release, err := New(path).TryAcquire(); !errors.Is(err, ErrBusy) || release != nil {
+		t.Fatalf("TryAcquire while held returned release=%t, err=%v; want release=false, ErrBusy", release != nil, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("TryAcquire blocked for %s", elapsed)
+	}
+}
+
+func TestSharedLocksDistinguishReadersFromExclusiveReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lifecycle.lock")
+	firstReader, err := New(path).AcquireShared()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReader, err := New(path).TryAcquireShared()
+	if err != nil {
+		_ = firstReader()
+		t.Fatalf("second shared acquisition failed: %v", err)
+	}
+	if release, err := New(path).TryAcquire(); !errors.Is(err, ErrBusy) || release != nil {
+		_ = secondReader()
+		_ = firstReader()
+		t.Fatalf("exclusive acquisition with readers returned release=%t, err=%v; want busy", release != nil, err)
+	}
+	if err := secondReader(); err != nil {
+		_ = firstReader()
+		t.Fatal(err)
+	}
+	if err := firstReader(); err != nil {
+		t.Fatal(err)
+	}
+
+	exclusive, err := New(path).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release, err := New(path).TryAcquireShared(); !errors.Is(err, ErrBusy) || release != nil {
+		_ = exclusive()
+		t.Fatalf("shared acquisition with writer returned release=%t, err=%v; want busy", release != nil, err)
+	}
+	if err := exclusive(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestLockSerializesIndependentCallers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lifecycle.lock")

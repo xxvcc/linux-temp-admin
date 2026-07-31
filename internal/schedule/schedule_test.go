@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 )
 
 type fakeSystem struct {
@@ -15,14 +17,16 @@ type fakeSystem struct {
 	hasAt        bool
 	calls        [][]string
 	atCommand    string
-	atHours      int
+	atDeadline   time.Time
 	atID         string
 	removedFor   []string
 	atrmd        []string
 	atJobs       []AtJob
+	loadedUnits  []string
 	removeAtErr  error
 	atrmErr      error
 	atJobsErr    error
+	loadedErr    error
 	systemctlErr func(args ...string) error
 }
 
@@ -35,9 +39,13 @@ func (f *fakeSystem) Systemctl(args ...string) error {
 	}
 	return nil
 }
-func (f *fakeSystem) ScheduleAt(command string, hours int) (string, error) {
-	f.atCommand, f.atHours = command, hours
+func (f *fakeSystem) ScheduleAt(command string, deadline time.Time) (string, error) {
+	f.atCommand, f.atDeadline = command, deadline
 	return f.atID, nil
+}
+
+func deadlineAfter(s *Scheduler, hours int) time.Time {
+	return s.now().Add(time.Duration(hours) * time.Hour)
 }
 func (f *fakeSystem) RemoveAtJobsFor(command string) error {
 	f.removedFor = append(f.removedFor, command)
@@ -45,6 +53,9 @@ func (f *fakeSystem) RemoveAtJobsFor(command string) error {
 }
 func (f *fakeSystem) AtrmJob(id string) error  { f.atrmd = append(f.atrmd, id); return f.atrmErr }
 func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
+func (f *fakeSystem) loadedSystemdUnits() ([]string, error) {
+	return f.loadedUnits, f.loadedErr
+}
 
 func newScheduler(dir string, sys System) *Scheduler {
 	return &Scheduler{
@@ -58,7 +69,7 @@ func newScheduler(dir string, sys System) *Scheduler {
 }
 
 func TestOnCalendarAndNames(t *testing.T) {
-	if got := OnCalendar(time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC), 24); got != "2026-07-08 12:00:00 UTC" {
+	if got := OnCalendar(time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)); got != "2026-07-08 12:00:00 UTC" {
 		t.Errorf("OnCalendar = %q", got)
 	}
 	s := newScheduler("/x", &fakeSystem{})
@@ -82,7 +93,7 @@ func TestUnitContents(t *testing.T) {
 	}
 	tmr := timerContent("linux-temp-admin-v2-revoke-xxvcc-a1", "2026-07-08 12:00:00 UTC")
 	for _, want := range []string{"OnCalendar=2026-07-08 12:00:00 UTC", "Persistent=true",
-		"Unit=linux-temp-admin-v2-revoke-xxvcc-a1.service", "WantedBy=timers.target"} {
+		"AccuracySec=1us", "Unit=linux-temp-admin-v2-revoke-xxvcc-a1.service", "WantedBy=timers.target"} {
 		if !strings.Contains(tmr, want) {
 			t.Errorf("timer missing %q:\n%s", want, tmr)
 		}
@@ -92,15 +103,16 @@ func TestUnitContents(t *testing.T) {
 func TestScheduleFallsBackToAt(t *testing.T) {
 	sys := &fakeSystem{hasSystemctl: false, hasAt: true, atID: "42"}
 	s := newScheduler(t.TempDir(), sys)
-	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
+	deadline := deadlineAfter(s, 6)
+	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if unit != "at:42" {
 		t.Errorf("unit = %q, want at:42", unit)
 	}
-	if sys.atCommand != s.RevokeCommand("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef") || sys.atHours != 6 {
-		t.Errorf("ScheduleAt got %q, %d", sys.atCommand, sys.atHours)
+	if sys.atCommand != s.RevokeCommand("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef") || !sys.atDeadline.Equal(deadline) {
+		t.Errorf("ScheduleAt got %q, %s; want deadline %s", sys.atCommand, sys.atDeadline, deadline)
 	}
 	// The queued command carries --force --confirm-force so a lost registry row at
 	// expiry cannot make the unattended revoke refuse the account.
@@ -111,8 +123,78 @@ func TestScheduleFallsBackToAt(t *testing.T) {
 
 func TestScheduleNoBackend(t *testing.T) {
 	s := newScheduler(t.TempDir(), &fakeSystem{})
-	if _, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6); err == nil {
+	if _, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", deadlineAfter(s, 6)); err == nil {
 		t.Fatal("expected error when no systemctl or at")
+	}
+}
+
+func TestScheduleRefusesAtFallbackAfterDeadlinePasses(t *testing.T) {
+	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	deadline := base.Add(time.Minute)
+	clockCalls := 0
+	sys := &fakeSystem{hasAt: true, atID: "42"}
+	s := newScheduler(t.TempDir(), sys)
+	s.Now = func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return base
+		}
+		return deadline
+	}
+
+	_, err := s.Schedule("xxvcc-a1", 1001, testGeneration, deadline)
+	if err == nil || !strings.Contains(err.Error(), "passed before the at fallback") {
+		t.Fatalf("Schedule error = %v, want elapsed-deadline refusal", err)
+	}
+	if sys.atCommand != "" {
+		t.Fatalf("expired deadline reached at backend: %q", sys.atCommand)
+	}
+}
+
+func TestScheduleRejectsInvalidAtJobIDAndSweepsKnownJobs(t *testing.T) {
+	for _, id := range []string{"", "0", "not-numeric"} {
+		t.Run(id, func(t *testing.T) {
+			sys := &fakeSystem{hasAt: true, atID: id}
+			s := newScheduler(t.TempDir(), sys)
+			if _, err := s.Schedule("xxvcc-a1", 1001, testGeneration, deadlineAfter(s, 6)); err == nil || !strings.Contains(err.Error(), "invalid job id") {
+				t.Fatalf("Schedule invalid id %q error = %v", id, err)
+			}
+			if len(sys.removedFor) != 1 || sys.removedFor[0] != s.revokeAtNeedle("xxvcc-a1") {
+				t.Fatalf("invalid-id cleanup selectors = %v", sys.removedFor)
+			}
+		})
+	}
+}
+
+func TestScheduleRejectsUnsafeUnitPrefix(t *testing.T) {
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	s := newScheduler(t.TempDir(), sys)
+	s.UnitPrefix = "unsafe\tprefix-"
+	unit, err := s.Schedule("xxvcc-a1", 1001, testGeneration, deadlineAfter(s, 6))
+	if err != nil || unit != "at:42" {
+		t.Fatalf("Schedule unsafe systemd prefix fallback = %q, %v", unit, err)
+	}
+	if len(sys.calls) != 0 {
+		t.Fatalf("unsafe prefix reached systemctl: %v", sys.calls)
+	}
+}
+
+func TestSchedulerUsesWallClockWhenNowIsUnset(t *testing.T) {
+	s := &Scheduler{}
+	before := time.Now()
+	got := s.now()
+	after := time.Now()
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("fallback clock returned %v outside [%v, %v]", got, before, after)
+	}
+}
+
+func TestCancelRejectsInvalidInputAndMissingBackend(t *testing.T) {
+	if err := (&Scheduler{}).Cancel("bad user", ""); err == nil || !strings.Contains(err.Error(), "invalid temporary username") {
+		t.Fatalf("Cancel invalid-user error = %v", err)
+	}
+	if err := (&Scheduler{}).Cancel("xxvcc-a1", ""); err == nil || !strings.Contains(err.Error(), "no scheduler backend") {
+		t.Fatalf("Cancel missing-backend error = %v", err)
 	}
 }
 
@@ -122,8 +204,9 @@ func TestScheduleRejectsReservedLinuxUIDBeforeMutation(t *testing.T) {
 	}
 	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
 	s := newScheduler(t.TempDir(), sys)
-	reserved := int(uint64(^uint32(0)))
-	if _, err := s.Schedule("xxvcc-a1", reserved, testGeneration, 6); err == nil || !strings.Contains(err.Error(), "invalid Linux account UID") {
+	reservedKernelID := uint64(^uint32(0))
+	reserved := int(reservedKernelID)
+	if _, err := s.Schedule("xxvcc-a1", reserved, testGeneration, deadlineAfter(s, 6)); err == nil || !strings.Contains(err.Error(), "invalid Linux account UID") {
 		t.Fatalf("Schedule reserved UID error = %v, want range refusal", err)
 	}
 	if len(sys.calls) != 0 || sys.atCommand != "" {
@@ -131,22 +214,25 @@ func TestScheduleRejectsReservedLinuxUIDBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestScheduleRejectsInvalidIdentityAndLifetimeBeforeMutation(t *testing.T) {
+func TestScheduleRejectsInvalidIdentityAndDeadlineBeforeMutation(t *testing.T) {
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	validDeadline := now.Add(time.Hour)
 	for _, tc := range []struct {
 		name       string
 		user       string
 		generation string
-		hours      int
+		deadline   time.Time
 	}{
-		{name: "username", user: "bad user", generation: testGeneration, hours: 1},
-		{name: "generation", user: "xxvcc-a1", generation: "bad", hours: 1},
-		{name: "zero hours", user: "xxvcc-a1", generation: testGeneration, hours: 0},
-		{name: "excessive hours", user: "xxvcc-a1", generation: testGeneration, hours: 24*366 + 1},
+		{name: "username", user: "bad user", generation: testGeneration, deadline: validDeadline},
+		{name: "generation", user: "xxvcc-a1", generation: "bad", deadline: validDeadline},
+		{name: "expired", user: "xxvcc-a1", generation: testGeneration, deadline: now},
+		{name: "not minute aligned", user: "xxvcc-a1", generation: testGeneration, deadline: validDeadline.Add(time.Second)},
+		{name: "too far", user: "xxvcc-a1", generation: testGeneration, deadline: now.Add(time.Duration(config.MaxExpireHours)*time.Hour + 2*time.Minute)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sys := &fakeSystem{hasSystemctl: true, hasAt: true}
-			s := &Scheduler{SystemdDir: t.TempDir(), InstallPath: "/usr/local/sbin/linux-temp-admin", UnitPrefix: "lta-", Now: time.Now, Sys: sys}
-			if _, err := s.Schedule(tc.user, 1001, tc.generation, tc.hours); err == nil {
+			s := &Scheduler{SystemdDir: t.TempDir(), InstallPath: "/usr/local/sbin/linux-temp-admin", UnitPrefix: "lta-", Now: func() time.Time { return now }, Sys: sys}
+			if _, err := s.Schedule(tc.user, 1001, tc.generation, tc.deadline); err == nil {
 				t.Fatal("Schedule accepted invalid input")
 			}
 			if len(sys.calls) != 0 || sys.atCommand != "" {
@@ -181,12 +267,16 @@ func TestScheduleRollsBackPartiallyEnabledSystemdTimerBeforeAtFallback(t *testin
 		t.Fatal(err)
 	}
 
-	got, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
+	deadline := deadlineAfter(s, 6)
+	got, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", deadline)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != "at:42" {
 		t.Fatalf("Schedule = %q, want at fallback", got)
+	}
+	if !sys.atDeadline.Equal(deadline) {
+		t.Fatalf("at fallback deadline = %s, want original absolute deadline %s", sys.atDeadline, deadline)
 	}
 	wantCalls := []string{
 		"daemon-reload",
@@ -224,7 +314,7 @@ func TestScheduleDoesNotFallbackWhenSystemdRollbackFails(t *testing.T) {
 	}
 	s := newScheduler(dir, sys)
 
-	_, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 6)
+	_, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", deadlineAfter(s, 6))
 	if err == nil || !strings.Contains(err.Error(), "enable failed") || !strings.Contains(err.Error(), "rollback disable failed") {
 		t.Fatalf("Schedule error = %v, want original and rollback failures", err)
 	}
@@ -393,6 +483,13 @@ func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
 				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
 			}
 		}
+		if len(args) == 2 && args[0] == "stop" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 5"),
+				output: "Failed to stop " + unit + ".timer: Unit " + unit + ".timer not loaded.",
+			}
+		}
 		return nil
 	}
 
@@ -404,6 +501,121 @@ func TestCancelTreatsMissingTimerAsSuccessWhenOnlyServiceRemains(t *testing.T) {
 	}
 	if !calledSystemctl(sys.calls, "daemon-reload") {
 		t.Errorf("removing the service must reload systemd; calls=%v", sys.calls)
+	}
+}
+
+func TestCancelExplicitlyStopsActiveTimerWhoseUnitFileIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	unit := s.UnitName("xxvcc-a1")
+	servicePath := filepath.Join(dir, unit+".service")
+	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	active := true
+	sys.systemctlErr = func(args ...string) error {
+		switch {
+		case len(args) == 3 && args[0] == "disable":
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+			}
+		case len(args) == 2 && args[0] == "stop":
+			active = false
+			return nil
+		case len(args) == 2 && args[0] == "is-active":
+			if active {
+				return nil
+			}
+			return &systemctlError{args: append([]string(nil), args...), err: errSystemdUnitInactive, output: "inactive"}
+		default:
+			return nil
+		}
+	}
+
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if active || !calledSystemctl(sys.calls, "stop") {
+		t.Fatalf("active missing-file timer was not explicitly stopped; calls=%v", sys.calls)
+	}
+	if _, err := os.Lstat(servicePath); !os.IsNotExist(err) {
+		t.Fatalf("service evidence survived confirmed stop: %v", err)
+	}
+}
+
+func TestCancelPreservesEvidenceWhenMissingTimerStateIsUncertain(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(dir, sys)
+	unit := s.UnitName("xxvcc-a1")
+	servicePath := filepath.Join(dir, unit+".service")
+	if err := os.WriteFile(servicePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys.systemctlErr = func(args ...string) error {
+		if len(args) == 3 && args[0] == "disable" {
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+			}
+		}
+		if len(args) == 2 && args[0] == "stop" {
+			return errors.New("injected state query failure")
+		}
+		return nil
+	}
+
+	err := s.Cancel("xxvcc-a1", "")
+	if err == nil || !strings.Contains(err.Error(), "injected state query failure") {
+		t.Fatalf("Cancel error = %v, want state uncertainty", err)
+	}
+	if _, err := os.Lstat(servicePath); err != nil {
+		t.Fatalf("service evidence was removed without a stopped verdict: %v", err)
+	}
+}
+
+func TestScheduleDoesNotFallbackWhenMissingFileRollbackCannotStopTimer(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("systemd schedule rollback requires root-owned fixtures")
+	}
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	s := newScheduler(dir, sys)
+	unit := s.UnitName("xxvcc-a1")
+	sys.systemctlErr = func(args ...string) error {
+		switch {
+		case len(args) == 3 && args[0] == "enable":
+			return errors.New("enable failed after starting timer")
+		case len(args) == 3 && args[0] == "disable":
+			return &systemctlError{
+				args:   append([]string(nil), args...),
+				err:    errors.New("exit status 1"),
+				output: "Failed to disable unit: Unit file " + unit + ".timer does not exist.",
+			}
+		case len(args) == 3 && args[0] == "is-active":
+			return nil
+		case len(args) == 2 && args[0] == "stop":
+			return errors.New("injected stop failure")
+		default:
+			return nil
+		}
+	}
+
+	_, err := s.Schedule("xxvcc-a1", 1001, testGeneration, deadlineAfter(s, 6))
+	if err == nil || !strings.Contains(err.Error(), "injected stop failure") {
+		t.Fatalf("Schedule error = %v, want unconfirmed rollback stop", err)
+	}
+	if sys.atCommand != "" {
+		t.Fatalf("at fallback ran after timer stop remained uncertain: %q", sys.atCommand)
+	}
+	for _, suffix := range []string{".service", ".timer"} {
+		if _, statErr := os.Lstat(filepath.Join(dir, unit+suffix)); statErr != nil {
+			t.Fatalf("%s evidence was removed after stop failure: %v", suffix, statErr)
+		}
 	}
 }
 
@@ -500,6 +712,63 @@ func TestCancelPropagatesAtRemovalFailure(t *testing.T) {
 	}
 }
 
+func TestCancelNeverRemovesARecordedAtIDWithoutBodyVerification(t *testing.T) {
+	sys := &fakeSystem{hasAt: true}
+	s := newScheduler(t.TempDir(), sys)
+	if err := s.Cancel("xxvcc-a1", "at:42"); err != nil {
+		t.Fatal(err)
+	}
+	if len(sys.atrmd) != 0 {
+		t.Fatalf("Cancel passed a reusable recorded id directly to atrm: %v", sys.atrmd)
+	}
+	if len(sys.removedFor) != 1 {
+		t.Fatalf("Cancel did not use the verified command-body sweep: %v", sys.removedFor)
+	}
+}
+
+func TestCancelKeepsRecordedAtEvidenceWithoutInventoryBackend(t *testing.T) {
+	sys := &fakeSystem{}
+	s := newScheduler(t.TempDir(), sys)
+	err := s.Cancel("xxvcc-a1", "at:42")
+	if err == nil || !strings.Contains(err.Error(), "at backend is unavailable") {
+		t.Fatalf("Cancel error = %v, want missing-inventory refusal", err)
+	}
+	if len(sys.atrmd) != 0 {
+		t.Fatalf("Cancel passed an unverified recorded id directly to atrm: %v", sys.atrmd)
+	}
+}
+
+func TestCancelPreservesUnknownRecordedScheduleEvidence(t *testing.T) {
+	for _, recorded := range []string{"future-revoke-xxvcc-a1", "at:not-numeric", "at:0"} {
+		t.Run(recorded, func(t *testing.T) {
+			sys := &fakeSystem{}
+			s := newScheduler(t.TempDir(), sys)
+			err := s.Cancel("xxvcc-a1", recorded)
+			if err == nil || !strings.Contains(err.Error(), "unsupported recorded auto-revoke identifier") {
+				t.Fatalf("Cancel(%q) error = %v, want unsupported evidence refusal", recorded, err)
+			}
+			if len(sys.atrmd) != 0 {
+				t.Fatalf("Cancel passed an invalid recorded id to atrm: %v", sys.atrmd)
+			}
+			if len(sys.removedFor) != 1 {
+				t.Fatalf("Cancel did not still sweep exact known at commands: %v", sys.removedFor)
+			}
+		})
+	}
+}
+
+func TestCancelReloadsManagerWhenUnitFilesWereAlreadyAbsent(t *testing.T) {
+	sys := &fakeSystem{hasSystemctl: true}
+	s := newScheduler(t.TempDir(), sys)
+
+	if err := s.Cancel("xxvcc-a1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if !calledSystemctl(sys.calls, "daemon-reload") {
+		t.Fatalf("Cancel did not reload manager-only cleanup: calls=%v", sys.calls)
+	}
+}
+
 // TestCancelUnderFiringServiceRemovesBothFiles pins the successful firing path:
 // the unit is already loaded, so unlinking its configuration and reloading does
 // not stop the oneshot process and avoids a permanent orphaned .service.
@@ -541,9 +810,12 @@ func TestParseAtJobID(t *testing.T) {
 	cases := map[string]string{
 		"job 7 at Wed Jul  8 12:00:00 2026":                 "7",
 		"warning: commands will be executed\njob 12 at ...": "12",
-		"9\tWed Jul 8":   "9",
-		"job -1 at ...":  "",
-		"nothing useful": "",
+		"9\tWed Jul 8":               "",
+		"job 7 on Wed Jul 8":         "",
+		"job 7 at ...\njob 8 at ...": "",
+		"job 0 at ...":               "",
+		"job -1 at ...":              "",
+		"nothing useful":             "",
 	}
 	for in, want := range cases {
 		if got := parseAtJobID(in); got != want {

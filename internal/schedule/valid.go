@@ -28,6 +28,9 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 	if !validate.Username(user) || !validate.AccountID(uid) || !validate.Generation(generation) {
 		return false, nil
 	}
+	if s == nil {
+		return false, fmt.Errorf("inventory schedule: no scheduler configured")
+	}
 
 	if strings.HasPrefix(recordedUnit, "at:") {
 		id := strings.TrimPrefix(recordedUnit, "at:")
@@ -46,7 +49,7 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 			if job.ID != id {
 				continue
 			}
-			if found || !atBodyHasExactCommand(job.Body, s.RevokeCommand(user, uid, generation)) {
+			if found || job.OwnerUID != 0 || !atBodyHasExactCommand(job.Body, s.RevokeCommand(user, uid, generation)) {
 				return false, nil
 			}
 			found = true
@@ -71,7 +74,7 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 	}
 
 	calendar, ok := uniqueCalendar(timer)
-	if !ok || string(timer) != timerContent(unit, calendar) {
+	if !ok || (string(timer) != timerContent(unit, calendar) && string(timer) != legacyTimerContent(unit, calendar)) {
 		return false, nil
 	}
 	trigger, err := time.Parse("2006-01-02 15:04:05 UTC", calendar)
@@ -140,7 +143,10 @@ func systemctlTimerStateNegative(err error, query, timer string) bool {
 }
 
 func numericJobID(id string) bool {
-	if id == "" {
+	// at/atq emit canonical positive decimal identifiers. Reject leading zeroes
+	// and unbounded digit strings so a corrupt registry/queue cannot be passed as
+	// a giant helper argument or alias the same job under two textual ids.
+	if id == "" || len(id) > 20 || id[0] == '0' {
 		return false
 	}
 	for _, r := range id {

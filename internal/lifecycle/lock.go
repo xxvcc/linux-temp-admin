@@ -3,6 +3,7 @@ package lifecycle
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,11 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 )
+
+// ErrBusy is returned by TryAcquire when another process owns the lifecycle
+// lock. Callers that cannot safely queue behind an in-flight mutation can use it
+// to abandon that operation without changing the host.
+var ErrBusy = errors.New("lifecycle lock is busy")
 
 // Lock is an advisory process lock. Path must live outside removable application
 // state so uninstall cannot unlink a held lock and let another process lock a new
@@ -28,6 +34,29 @@ func (l *Lock) tombstonePath() string { return l.Path + ".uninstalled" }
 // Acquire blocks until the lifecycle lock is held. The returned release function
 // must be called exactly once.
 func (l *Lock) Acquire() (func() error, error) {
+	return l.acquire(syscall.LOCK_EX)
+}
+
+// AcquireShared blocks until a shared lifecycle lock is held. It is used by
+// operations that may run one at a time under a separate global lock but must all
+// finish before an exclusive same-object replacement begins.
+func (l *Lock) AcquireShared() (func() error, error) {
+	return l.acquire(syscall.LOCK_SH)
+}
+
+// TryAcquire acquires the lifecycle lock without waiting. It returns ErrBusy
+// when another process owns the lock; every other validation and I/O error is
+// reported exactly as Acquire reports it.
+func (l *Lock) TryAcquire() (func() error, error) {
+	return l.acquire(syscall.LOCK_EX | syscall.LOCK_NB)
+}
+
+// TryAcquireShared acquires a shared lifecycle lock without waiting.
+func (l *Lock) TryAcquireShared() (func() error, error) {
+	return l.acquire(syscall.LOCK_SH | syscall.LOCK_NB)
+}
+
+func (l *Lock) acquire(operation int) (func() error, error) {
 	if l == nil || l.Path == "" {
 		return func() error { return nil }, nil
 	}
@@ -53,7 +82,10 @@ func (l *Lock) Acquire() (func() error, error) {
 	if fi.Mode().Perm()&0o077 != 0 {
 		return fail(fmt.Errorf("lifecycle lock %s is group/world accessible (mode %o)", l.Path, fi.Mode().Perm()))
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(f.Fd()), operation); err != nil {
+		if operation&syscall.LOCK_NB != 0 && (errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)) {
+			return fail(ErrBusy)
+		}
 		return fail(fmt.Errorf("flock lifecycle: %w", err))
 	}
 	released := false

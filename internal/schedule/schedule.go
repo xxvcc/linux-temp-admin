@@ -25,21 +25,26 @@ type System interface {
 	// HasAt reports any installed at-backend footprint. A completely absent
 	// backend is not an inventory error; a partial backend is and must fail closed.
 	HasAt() bool
-	// ScheduleAt queues command to run in `hours` hours and returns the job id.
-	ScheduleAt(command string, hours int) (jobID string, err error)
+	// ScheduleAt queues command for the absolute, minute-aligned deadline and
+	// returns its canonical positive decimal job id. If it returns an error after
+	// an ambiguous submission, it first attempts to remove every queued job whose
+	// body contains that exact standalone command.
+	ScheduleAt(command string, deadline time.Time) (jobID string, err error)
 	// RemoveAtJobsFor removes queued jobs matching a known standalone revoke
 	// command selected by command's legacy-compatible prefix.
 	RemoveAtJobsFor(command string) error
 	// AtrmJob removes a specific at job by id. An already-absent job is success.
 	AtrmJob(id string) error
-	// AtJobs returns queued job bodies so uninstall can inventory jobs whose
-	// registry row has been lost. Missing inventory commands are an error.
+	// AtJobs returns queued job bodies and their generated owner UID so uninstall
+	// can inventory root-created jobs whose registry row has been lost. Missing
+	// inventory commands or an unparseable owner header are errors.
 	AtJobs() ([]AtJob, error)
 }
 
 type AtJob struct {
-	ID   string
-	Body string
+	ID       string
+	Body     string
+	OwnerUID uint32
 }
 
 // Scheduler writes units / queues jobs. Paths and time source are fields for tests.
@@ -97,8 +102,8 @@ func (s *Scheduler) revokeAtNeedle(user string) string {
 }
 
 // OnCalendar formats the absolute UTC trigger time for a systemd timer.
-func OnCalendar(now time.Time, hours int) string {
-	return now.UTC().Add(time.Duration(hours) * time.Hour).Format("2006-01-02 15:04:05 UTC")
+func OnCalendar(deadline time.Time) string {
+	return deadline.UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
 func (s *Scheduler) serviceContent(user string, uid int, generation string) string {
@@ -120,18 +125,28 @@ RestartSec=5min
 }
 
 func timerContent(unit, onCalendar string) string {
+	return timerContentWithAccuracy(unit, onCalendar, "1us")
+}
+
+// legacyTimerContent is accepted only when inventorying timers written by
+// releases that used systemd's one-minute coalescing window.
+func legacyTimerContent(unit, onCalendar string) string {
+	return timerContentWithAccuracy(unit, onCalendar, "1min")
+}
+
+func timerContentWithAccuracy(unit, onCalendar, accuracy string) string {
 	return fmt.Sprintf(`[Unit]
 Description=linux-temp-admin auto revoke timer for %s
 
 [Timer]
 OnCalendar=%s
 Persistent=true
-AccuracySec=1min
+AccuracySec=%s
 Unit=%s.service
 
 [Install]
 WantedBy=timers.target
-`, unit, onCalendar, unit)
+`, unit, onCalendar, accuracy, unit)
 }
 
 // Schedule creates the auto-revoke task and returns its recorded identifier
@@ -143,7 +158,7 @@ WantedBy=timers.target
 // systemd host that could not write a unit report the fallback's misleading "no
 // systemctl or at available", sending the operator to debug a missing tool that
 // was in fact present.
-func (s *Scheduler) Schedule(user string, uid int, generation string, hours int) (string, error) {
+func (s *Scheduler) Schedule(user string, uid int, generation string, deadline time.Time) (string, error) {
 	if !validate.Username(user) {
 		return "", fmt.Errorf("invalid temporary username %q", user)
 	}
@@ -153,15 +168,17 @@ func (s *Scheduler) Schedule(user string, uid int, generation string, hours int)
 	if !validate.Generation(generation) {
 		return "", fmt.Errorf("invalid account generation %q", generation)
 	}
-	if !validate.Hours(hours) {
-		return "", fmt.Errorf("invalid account lifetime %d hours", hours)
-	}
 	if s == nil || s.Sys == nil {
 		return "", fmt.Errorf("no scheduler backend configured")
 	}
+	now := s.now()
+	if !validDeadline(now, deadline) {
+		return "", fmt.Errorf("invalid auto-revoke deadline %s", deadline.Format(time.RFC3339Nano))
+	}
+	deadline = deadline.UTC()
 	var systemdErr error
 	if s.Sys.HasSystemctl() {
-		unit, err := s.scheduleSystemd(user, uid, generation, hours)
+		unit, err := s.scheduleSystemd(user, uid, generation, deadline)
 		if err == nil {
 			return unit, nil
 		}
@@ -171,18 +188,18 @@ func (s *Scheduler) Schedule(user string, uid int, generation string, hours int)
 			return "", fmt.Errorf("systemd: %w", err)
 		}
 	}
-	unit, atErr := s.scheduleAt(user, uid, generation, hours)
+	unit, atErr := s.scheduleAt(user, uid, generation, deadline)
 	if atErr != nil && systemdErr != nil {
 		return "", fmt.Errorf("systemd: %w; at fallback: %v", systemdErr, atErr)
 	}
 	return unit, atErr
 }
 
-func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hours int) (string, error) {
-	unit := s.UnitName(user)
-	if strings.ContainsAny(unit, "/ ") {
-		return "", fmt.Errorf("invalid unit name %q", unit)
+func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, deadline time.Time) (string, error) {
+	if !validManagedUnitPrefix(s.UnitPrefix) {
+		return "", fmt.Errorf("unsafe managed systemd unit prefix %q", s.UnitPrefix)
 	}
+	unit := s.UnitName(user)
 	servicePath := filepath.Join(s.SystemdDir, unit+".service")
 	timerPath := filepath.Join(s.SystemdDir, unit+".timer")
 	if err := fsutil.WriteRootFile(servicePath, []byte(s.serviceContent(user, uid, generation)), 0o644); err != nil {
@@ -192,7 +209,7 @@ func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hou
 		}
 		return "", err
 	}
-	oc := OnCalendar(s.Now(), hours)
+	oc := OnCalendar(deadline)
 	if err := fsutil.WriteRootFile(timerPath, []byte(timerContent(unit, oc)), 0o644); err != nil {
 		var committed *fsutil.DurabilityError
 		if errors.As(err, &committed) {
@@ -207,6 +224,21 @@ func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, hou
 		return "", s.rollbackFailedEnable(unit, servicePath, timerPath, err)
 	}
 	return unit, nil
+}
+
+func (s *Scheduler) now() time.Time {
+	if s != nil && s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
+}
+
+func validDeadline(now, deadline time.Time) bool {
+	if deadline.IsZero() || deadline.Second() != 0 || deadline.Nanosecond() != 0 || !deadline.After(now) {
+		return false
+	}
+	maxDelay := time.Duration(config.MaxExpireHours)*time.Hour + time.Minute
+	return deadline.Sub(now) <= maxDelay
 }
 
 func systemdWriteRollback(cause error, paths ...string) error {
@@ -234,7 +266,7 @@ func (s *Scheduler) rollbackFailedEnable(unit, servicePath, timerPath string, en
 	errs := []error{fmt.Errorf("enable systemd timer: %w", enableErr)}
 	rollbackFailed := false
 	timerUnit := unit + ".timer"
-	if err := s.Sys.Systemctl("disable", "--now", timerUnit); err != nil && !systemctlUnitFileMissing(err, timerUnit) {
+	if err := s.disableAndConfirmTimerStopped(timerUnit); err != nil {
 		errs = append(errs, fmt.Errorf("rollback disable systemd timer: %w", err))
 		// enable --now may have started the timer before returning its error. If
 		// stopping it cannot be confirmed, keep both files as durable inventory and
@@ -263,13 +295,65 @@ func (s *Scheduler) rollbackFailedEnable(unit, servicePath, timerPath string, en
 	return joined
 }
 
-func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours int) (string, error) {
+// disableAndConfirmTimerStopped handles systemctl's split disable/--now
+// implementation. When the unit file is missing, `disable --now` returns before
+// it reaches the stop phase, even though an already-loaded timer may still be
+// active in the manager. Treat that diagnostic only as a reason to explicitly
+// stop the loaded timer and confirm its final state, never as proof it stopped.
+func (s *Scheduler) disableAndConfirmTimerStopped(timerUnit string) error {
+	disableErr := s.Sys.Systemctl("disable", "--now", timerUnit)
+	if disableErr == nil {
+		return nil
+	}
+	if !systemctlUnitFileMissing(disableErr, timerUnit) {
+		return disableErr
+	}
+
+	stopErr := s.Sys.Systemctl("stop", timerUnit)
+	if stopErr != nil {
+		if systemctlStopUnitNotLoaded(stopErr, timerUnit) {
+			return nil
+		}
+		return errors.Join(
+			fmt.Errorf("disable systemd timer: %w", disableErr),
+			fmt.Errorf("stop missing-file timer: %w", stopErr),
+		)
+	}
+
+	stateErr := s.Sys.Systemctl("is-active", timerUnit)
+	if stateErr == nil {
+		return errors.Join(
+			fmt.Errorf("disable systemd timer: %w", disableErr),
+			fmt.Errorf("timer %s remains active after stop", timerUnit),
+		)
+	}
+	if !systemctlTimerStoppedState(stateErr, timerUnit) {
+		return errors.Join(
+			fmt.Errorf("disable systemd timer: %w", disableErr),
+			fmt.Errorf("confirm timer stopped: %w", stateErr),
+		)
+	}
+	return nil
+}
+
+func (s *Scheduler) scheduleAt(user string, uid int, generation string, deadline time.Time) (string, error) {
 	if !s.Sys.HasAt() {
 		return "", fmt.Errorf("no systemctl or at available")
 	}
-	id, err := s.Sys.ScheduleAt(s.RevokeCommand(user, uid, generation), hours)
+	if !deadline.After(s.now()) {
+		return "", fmt.Errorf("auto-revoke deadline %s passed before the at fallback could be queued", deadline.Format(time.RFC3339))
+	}
+	command := s.RevokeCommand(user, uid, generation)
+	id, err := s.Sys.ScheduleAt(command, deadline)
 	if err != nil {
 		return "", err
+	}
+	if !numericJobID(id) {
+		cause := fmt.Errorf("at scheduler returned invalid job id %q", id)
+		if cleanupErr := s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user)); cleanupErr != nil {
+			return "", errors.Join(cause, fmt.Errorf("sweep jobs after invalid at id: %w", cleanupErr))
+		}
+		return "", cause
 	}
 	return "at:" + id, nil
 }
@@ -282,13 +366,46 @@ func (s *Scheduler) scheduleAt(user string, uid int, generation string, hours in
 // files and reloading prevents every successful automatic revoke from leaving a
 // permanent orphaned .service behind.
 func (s *Scheduler) Cancel(user, recordedUnit string) error {
+	if !validate.Username(user) {
+		return fmt.Errorf("invalid temporary username %q", user)
+	}
+	if s == nil || s.Sys == nil {
+		return fmt.Errorf("no scheduler backend configured")
+	}
 	var errs []error
 	hasSystemctl := s.Sys.HasSystemctl()
-	// Remove a specifically-recorded at job even where atq is unavailable (so
-	// RemoveAtJobsFor's body sweep can't run).
+	prefixes := s.unitPrefixes()
+	validPrefixes := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if !validManagedUnitPrefix(prefix) {
+			errs = append(errs, fmt.Errorf("unsafe managed systemd unit prefix %q", prefix))
+			continue
+		}
+		validPrefixes = append(validPrefixes, prefix)
+	}
+	// A recorded at id is inventory evidence, not deletion authority. at job ids
+	// are eventually reusable, so handing a stale id directly to atrm can remove an
+	// unrelated job that later acquired the same number. The body sweep below is
+	// the only safe removal path: it accepts only standalone revoke commands emitted
+	// by known releases. If that inventory backend has disappeared, preserve the
+	// registry evidence and fail closed instead of guessing from the id.
 	if strings.HasPrefix(recordedUnit, "at:") {
-		if err := s.Sys.AtrmJob(strings.TrimPrefix(recordedUnit, "at:")); err != nil {
-			errs = append(errs, err)
+		id := strings.TrimPrefix(recordedUnit, "at:")
+		if !numericJobID(id) {
+			errs = append(errs, fmt.Errorf("unsupported recorded auto-revoke identifier %q", recordedUnit))
+		} else if !s.Sys.HasAt() {
+			errs = append(errs, fmt.Errorf("at backend is unavailable; cannot verify recorded auto-revoke job %s before preserving its registry evidence", id))
+		}
+	} else if recordedUnit != "" {
+		known := false
+		for _, prefix := range validPrefixes {
+			if recordedUnit == prefix+user {
+				known = true
+				break
+			}
+		}
+		if !known {
+			errs = append(errs, fmt.Errorf("unsupported recorded auto-revoke identifier %q", recordedUnit))
 		}
 	}
 	if err := s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user)); err != nil {
@@ -301,8 +418,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 	// an uninstall then removes the binary, that timer fails forever. Disabling by
 	// the v2 name alone would leave it armed. There is normally at most one unit per
 	// account, so the extra names are no-ops on a pure-v2 host.
-	reloadNeeded := false
-	for _, prefix := range s.unitPrefixes() {
+	for _, prefix := range validPrefixes {
 		unit := prefix + user
 		if strings.ContainsAny(unit, "/ ") {
 			continue
@@ -327,8 +443,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 		}
 		if hasSystemctl {
 			timerUnit := unit + ".timer"
-			err := s.Sys.Systemctl("disable", "--now", timerUnit)
-			if err != nil && !systemctlUnitFileMissing(err, timerUnit) {
+			if err := s.disableAndConfirmTimerStopped(timerUnit); err != nil {
 				errs = append(errs, err)
 				// Preserve both files as retry/inventory evidence. Deleting them after
 				// a stop failure can leave a timer active only in systemd's memory.
@@ -339,18 +454,19 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 				errs = append(errs, err)
 			}
 		}
-		if removed, err := removeIfNotSymlink(timerPath); err != nil {
+		if _, err := removeIfNotSymlink(timerPath); err != nil {
 			errs = append(errs, err)
-		} else if removed {
-			reloadNeeded = true
 		}
-		if removed, err := removeIfNotSymlink(servicePath); err != nil {
+		if _, err := removeIfNotSymlink(servicePath); err != nil {
 			errs = append(errs, err)
-		} else if removed {
-			reloadNeeded = true
 		}
 	}
-	if reloadNeeded && hasSystemctl {
+	if hasSystemctl {
+		// Always reload, even when both files were already absent. ScheduledUsers can
+		// discover a managed timer that survives only in PID 1's manager state; after
+		// stopping it, daemon-reload is what drops the deleted fragment. It also makes
+		// a retry repair an earlier cleanup whose file removals committed before its
+		// daemon-reload failed.
 		if err := s.Sys.Systemctl("daemon-reload"); err != nil {
 			errs = append(errs, err)
 		}
@@ -427,7 +543,7 @@ func (s *Scheduler) managedTimerStamp(name string) bool {
 		return false
 	}
 	for _, prefix := range s.unitPrefixes() {
-		if prefix == "" || filepath.Base(prefix) != prefix || strings.ContainsAny(prefix, "/ ") {
+		if !validManagedUnitPrefix(prefix) {
 			continue
 		}
 		stem := strings.TrimSuffix(strings.TrimPrefix(name, "stamp-"+prefix), ".timer")

@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestAtomicWriteFileAs(t *testing.T) {
@@ -34,7 +36,8 @@ func TestOwnershipMutationsRejectChownSentinel(t *testing.T) {
 	if strconv.IntSize < 64 {
 		t.Skip("int cannot represent the reserved uint32 chown sentinel")
 	}
-	reserved := int(uint64(^uint32(0)))
+	reservedKernelID := uint64(^uint32(0))
+	reserved := int(reservedKernelID)
 	dir := t.TempDir()
 	if err := EnsureDir(filepath.Join(dir, "child"), 0o700, reserved, 1); err == nil {
 		t.Fatal("EnsureDir accepted chown's all-ones uid sentinel")
@@ -117,7 +120,7 @@ func TestRemoveFileSyncsParentAndDoesNotFollowSymlink(t *testing.T) {
 	}
 }
 
-func TestRemoveFileReportsCommittedSyncFailure(t *testing.T) {
+func TestRemoveFileRetrySyncsParentAfterCommittedSyncFailure(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target")
 	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
@@ -125,7 +128,14 @@ func TestRemoveFileReportsCommittedSyncFailure(t *testing.T) {
 	}
 	wantErr := errors.New("forced unlink sync failure")
 	old := syncDirectory
-	syncDirectory = func(*os.File) error { return wantErr }
+	syncs := 0
+	syncDirectory = func(*os.File) error {
+		syncs++
+		if syncs == 1 {
+			return wantErr
+		}
+		return nil
+	}
 	t.Cleanup(func() { syncDirectory = old })
 
 	err := RemoveFile(target)
@@ -135,6 +145,60 @@ func TestRemoveFileReportsCommittedSyncFailure(t *testing.T) {
 	}
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {
 		t.Fatalf("unlink was not committed: %v", err)
+	}
+	if err := RemoveFile(target); err != nil {
+		t.Fatalf("RemoveFile retry after visible unlink: %v", err)
+	}
+	if syncs != 2 {
+		t.Fatalf("parent directory sync calls = %d, want failed unlink sync plus absent-target retry sync", syncs)
+	}
+}
+
+func TestRemoveFileAbsentTargetReportsParentSyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	wantErr := errors.New("forced absent-target sync failure")
+	old := syncDirectory
+	syncDirectory = func(*os.File) error { return wantErr }
+	t.Cleanup(func() { syncDirectory = old })
+
+	err := RemoveFile(filepath.Join(dir, "absent"))
+	var durability *DurabilityError
+	if !errors.As(err, &durability) || !errors.Is(err, wantErr) || durability.Operation != "unlink" {
+		t.Fatalf("RemoveFile absent-target error = %v, want unlink DurabilityError", err)
+	}
+}
+
+func TestRemoveFileSyncsParentWhenTargetDisappearsBeforeUnlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldUnlinkFileAt := unlinkFileAt
+	unlinkFileAt = func(dirfd int, path string, flags int) error {
+		if err := oldUnlinkFileAt(dirfd, path, flags); err != nil {
+			return err
+		}
+		return unix.ENOENT
+	}
+	t.Cleanup(func() { unlinkFileAt = oldUnlinkFileAt })
+
+	oldSync := syncDirectory
+	syncs := 0
+	syncDirectory = func(*os.File) error {
+		syncs++
+		return nil
+	}
+	t.Cleanup(func() { syncDirectory = oldSync })
+
+	if err := RemoveFile(target); err != nil {
+		t.Fatalf("RemoveFile after concurrent disappearance: %v", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("target still exists after simulated unlink race: %v", err)
+	}
+	if syncs != 1 {
+		t.Fatalf("parent directory sync calls = %d, want 1 after unlink race", syncs)
 	}
 }
 
@@ -261,8 +325,8 @@ func TestEnsureDir(t *testing.T) {
 	if err := EnsureDir(p, 0o700, os.Getuid(), os.Getgid()); err != nil {
 		t.Fatal(err)
 	}
-	if syncs != 4 {
-		t.Fatalf("new nested directory sync calls=%d, want child+parent for both components", syncs)
+	if syncs != 6 {
+		t.Fatalf("new nested directory sync calls=%d, want existing-prefix inode+parent repair plus child+parent for both components", syncs)
 	}
 	fi, err := os.Lstat(p)
 	if err != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
@@ -272,8 +336,67 @@ func TestEnsureDir(t *testing.T) {
 	if err := EnsureDir(p, 0o700, os.Getuid(), os.Getgid()); err != nil {
 		t.Fatalf("second EnsureDir: %v", err)
 	}
-	if syncs != 5 {
-		t.Fatalf("existing leaf metadata sync calls=%d, want one additional call", syncs)
+	if syncs != 8 {
+		t.Fatalf("existing leaf durability sync calls=%d, want leaf and parent added on retry", syncs)
+	}
+}
+
+func TestEnsureDirRepairsEveryNewSuffixDespiteRestrictiveUmask(t *testing.T) {
+	base := t.TempDir()
+	existing := filepath.Join(base, "existing")
+	if err := os.Mkdir(existing, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(existing, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	var existingBefore unix.Stat_t
+	if err := unix.Stat(existing, &existingBefore); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(existing, "middle", "leaf")
+	wantUID, wantGID := os.Getuid(), os.Getgid()
+	if os.Geteuid() == 0 {
+		wantUID, wantGID = 12345, 12346
+	}
+
+	oldUmask := unix.Umask(0o077)
+	t.Cleanup(func() { unix.Umask(oldUmask) })
+	if err := EnsureDir(target, 0o755, wantUID, wantGID); err != nil {
+		t.Fatal(err)
+	}
+
+	existingInfo, err := os.Lstat(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var existingAfter unix.Stat_t
+	if err := unix.Stat(existing, &existingAfter); err != nil {
+		t.Fatal(err)
+	}
+	if existingInfo.Mode().Perm() != 0o711 || existingAfter.Uid != existingBefore.Uid || existingAfter.Gid != existingBefore.Gid {
+		t.Fatalf("existing prefix metadata changed: mode=%o owner %d:%d, want 711 %d:%d",
+			existingInfo.Mode().Perm(), existingAfter.Uid, existingAfter.Gid, existingBefore.Uid, existingBefore.Gid)
+	}
+	for _, want := range []struct {
+		path     string
+		uid, gid int
+	}{
+		{path: filepath.Join(existing, "middle"), uid: os.Geteuid(), gid: os.Getegid()},
+		{path: target, uid: wantUID, gid: wantGID},
+	} {
+		fi, err := os.Lstat(want.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(want.path, &st); err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o755 || int(st.Uid) != want.uid || int(st.Gid) != want.gid {
+			t.Fatalf("new directory %s metadata = mode %o owner %d:%d, want 755 %d:%d",
+				want.path, fi.Mode().Perm(), st.Uid, st.Gid, want.uid, want.gid)
+		}
 	}
 }
 
@@ -310,11 +433,39 @@ func TestEnsureDirRefusesSymlinkIntermediateComponent(t *testing.T) {
 	}
 }
 
+func TestEnsureDirRejectsRelativeAndTraversalPathsBeforeMutation(t *testing.T) {
+	working := t.TempDir()
+	t.Chdir(working)
+	if err := EnsureDir("relative/child", 0o700, os.Getuid(), os.Getgid()); err == nil {
+		t.Fatal("EnsureDir accepted a relative path")
+	}
+	if _, err := os.Lstat(filepath.Join(working, "relative")); !os.IsNotExist(err) {
+		t.Fatalf("relative path was mutated before refusal: %v", err)
+	}
+
+	dir := t.TempDir()
+	escaped := filepath.Join(dir, "escaped")
+	path := dir + string(filepath.Separator) + "missing" + string(filepath.Separator) + ".." + string(filepath.Separator) + "escaped"
+	if err := EnsureDir(path, 0o700, os.Getuid(), os.Getgid()); err == nil {
+		t.Fatal("EnsureDir accepted an absolute path containing ..")
+	}
+	if _, err := os.Lstat(escaped); !os.IsNotExist(err) {
+		t.Fatalf("traversal path was mutated before refusal: %v", err)
+	}
+}
+
 func TestEnsureDirReportsVisibleDirectoryOnSyncFailure(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "new")
 	wantErr := errors.New("forced directory sync failure")
 	old := syncDirectory
-	syncDirectory = func(*os.File) error { return wantErr }
+	syncs := 0
+	syncDirectory = func(*os.File) error {
+		syncs++
+		if syncs == 3 {
+			return wantErr
+		}
+		return nil
+	}
 	t.Cleanup(func() { syncDirectory = old })
 
 	err := EnsureDir(p, 0o700, os.Getuid(), os.Getgid())
@@ -324,5 +475,93 @@ func TestEnsureDirReportsVisibleDirectoryOnSyncFailure(t *testing.T) {
 	}
 	if fi, statErr := os.Lstat(p); statErr != nil || !fi.IsDir() {
 		t.Fatalf("created directory is not visible: info=%v err=%v", fi, statErr)
+	}
+}
+
+func TestEnsureDirRetrySyncsVisibleIntermediateParentEntry(t *testing.T) {
+	base := t.TempDir()
+	visible := filepath.Join(base, "visible")
+	target := filepath.Join(visible, "leaf")
+	wantErr := errors.New("forced visible-mkdir parent sync failure")
+	old := syncDirectory
+	failed := false
+	baseSyncs := 0
+	var retrySyncs []string
+	inRetry := false
+	syncDirectory = func(dir *os.File) error {
+		if inRetry {
+			retrySyncs = append(retrySyncs, dir.Name())
+		}
+		if dir.Name() == base {
+			baseSyncs++
+			if !failed && baseSyncs == 2 {
+				failed = true
+				return wantErr
+			}
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncDirectory = old })
+
+	err := EnsureDir(target, 0o700, os.Getuid(), os.Getgid())
+	var durability *DurabilityError
+	if !errors.As(err, &durability) || !errors.Is(err, wantErr) || durability.Operation != "mkdir" {
+		t.Fatalf("first EnsureDir error = %v, want mkdir DurabilityError", err)
+	}
+	if fi, statErr := os.Lstat(visible); statErr != nil || !fi.IsDir() {
+		t.Fatalf("intermediate directory is not visible after failed parent sync: info=%v err=%v", fi, statErr)
+	}
+	if _, statErr := os.Lstat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("first EnsureDir continued after failed parent sync: %v", statErr)
+	}
+
+	inRetry = true
+	if err := EnsureDir(target, 0o700, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatalf("EnsureDir retry: %v", err)
+	}
+	if len(retrySyncs) < 2 || retrySyncs[0] != visible || retrySyncs[1] != base {
+		t.Fatalf("retry syncs = %v, want visible inode %s then parent %s before extending it", retrySyncs, visible, base)
+	}
+}
+
+func TestEnsureDirRetryAfterVisibleDirectorySyncFailurePreservesSyncOrder(t *testing.T) {
+	base := t.TempDir()
+	visible := filepath.Join(base, "visible")
+	target := filepath.Join(visible, "leaf")
+	wantErr := errors.New("forced visible-directory sync failure")
+	old := syncDirectory
+	failed := false
+	inRetry := false
+	var retrySyncs []string
+	syncDirectory = func(dir *os.File) error {
+		if inRetry {
+			retrySyncs = append(retrySyncs, dir.Name())
+		}
+		if !failed && dir.Name() == visible {
+			failed = true
+			return wantErr
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncDirectory = old })
+
+	err := EnsureDir(target, 0o700, os.Getuid(), os.Getgid())
+	var durability *DurabilityError
+	if !errors.As(err, &durability) || !errors.Is(err, wantErr) || durability.Operation != "directory metadata update" {
+		t.Fatalf("first EnsureDir error = %v, want directory metadata DurabilityError", err)
+	}
+	if fi, statErr := os.Lstat(visible); statErr != nil || !fi.IsDir() {
+		t.Fatalf("intermediate directory is not visible after its failed sync: info=%v err=%v", fi, statErr)
+	}
+	if _, statErr := os.Lstat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("first EnsureDir continued after child sync failure: %v", statErr)
+	}
+
+	inRetry = true
+	if err := EnsureDir(target, 0o700, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatalf("EnsureDir retry: %v", err)
+	}
+	if len(retrySyncs) < 2 || retrySyncs[0] != visible || retrySyncs[1] != base {
+		t.Fatalf("retry syncs = %v, want failed visible inode %s before parent %s", retrySyncs, visible, base)
 	}
 }

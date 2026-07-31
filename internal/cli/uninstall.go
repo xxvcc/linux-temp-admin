@@ -9,11 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/mountinfo"
+	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/table"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -30,10 +31,13 @@ import (
 // namespaced files. An account can be hidden from the registry; it cannot be
 // hidden from the sudo grant that is the whole reason it is worth hiding.
 //
-// The managed GECOS marker is deliberately NOT a witness. It is the one signal an
-// account can write to itself: `usermod -c 'linux-temp-admin temporary admin'
-// realadmin` would enlist a real administrator's account — and their home
-// directory — into a teardown. It is reported (see gecosOnly) and never acted on.
+// A passwd GECOS marker is deliberately only a block-only witness. It is the one
+// signal an account can write to itself: `usermod -c 'linux-temp-admin temporary
+// admin' realadmin` must never enlist that account or its home for deletion. But
+// ignoring the marker entirely can strand a permanent no-sudo/no-timer account if
+// its registry row is lost. The marker therefore keeps the command and state in
+// place for manual recovery; only a completed registry+UID+generation+passwd
+// identity can authorize automatic deletion.
 type witness string
 
 const (
@@ -42,7 +46,17 @@ const (
 	witnessSudoers  witness = "sudo-grant"
 	witnessSSHD     witness = "sshd-exception"
 	witnessUnit     witness = "auto-delete-task"
+	witnessMarker   witness = "passwd-marker-block-only"
 )
+
+func hasRegistryWitness(acc teardownAccount) bool {
+	for _, w := range acc.witnesses {
+		if w == witnessRegistry {
+			return true
+		}
+	}
+	return false
+}
 
 // hasArtifactWitness reports whether the account is named by a filesystem
 // artifact that carries privilege — a sudo grant, an sshd exception, or an
@@ -61,10 +75,23 @@ func hasArtifactWitness(acc teardownAccount) bool {
 // teardownAccount is one account the uninstall has to get rid of, and why it
 // thinks so.
 type teardownAccount struct {
-	name      string
-	exists    bool
-	witnesses []witness
+	name           string
+	exists         bool
+	witnesses      []witness
+	recovery       deletionRecoveryState
+	registryFound  bool
+	registryRecord registry.Record
+	passwd         user.Passwd
 }
+
+type deletionRecoveryState uint8
+
+const (
+	noDeletionRecovery deletionRecoveryState = iota
+	absentDeletionRecovery
+	boundDeletionRecovery
+	manualDeletionRecovery
+)
 
 // teardownPlan is what an uninstall would do, gathered before anything is
 // touched. It is built first and shown first: everything it reports is something
@@ -101,6 +128,7 @@ func (p teardownPlan) names() []string {
 // teardownPlan gathers every account any witness names, plus the footprint.
 func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	found := map[string][]witness{}
+	records := map[string]registry.Record{}
 	add := func(name string, w witness) {
 		if name == "" || !validate.Username(name) {
 			return
@@ -120,6 +148,7 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	} else {
 		for _, r := range recs {
 			add(r.User, witnessRegistry)
+			records[r.User] = r
 		}
 	}
 	if users, err := a.v1RegistryUsers(); err != nil {
@@ -156,6 +185,13 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 			}
 		}
 	}
+	if users, err := a.listMarkerAccounts(); err != nil {
+		addInventoryErr(fmt.Errorf("%s: %w", a.P.M("扫描账号生命周期标记失败", "scanning account lifecycle markers failed"), err))
+	} else {
+		for _, u := range users {
+			add(u, witnessMarker)
+		}
+	}
 
 	names := make([]string, 0, len(found))
 	for n := range found {
@@ -172,11 +208,26 @@ func (a *App) teardownPlan(purgeAudit, force bool) teardownPlan {
 	for _, n := range names {
 		ws := found[n]
 		sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
-		exists, err := user.Exists(n)
+		pw, exists, err := a.lookupUser(n)
 		if err != nil {
 			addInventoryErr(fmt.Errorf("%s %s: %w", a.P.M("读取账号失败", "reading account"), n, err))
 		}
-		plan.accounts = append(plan.accounts, teardownAccount{name: n, exists: exists, witnesses: ws})
+		rec, registered := records[n]
+		recovery := noDeletionRecovery
+		if registered && rec.DeletionStarted && err == nil {
+			switch {
+			case !exists:
+				recovery = absentDeletionRecovery
+			case rec.IdentityBound && deletionRecordMatchesPasswd(rec, pw):
+				recovery = boundDeletionRecovery
+			default:
+				recovery = manualDeletionRecovery
+			}
+		}
+		plan.accounts = append(plan.accounts, teardownAccount{
+			name: n, exists: exists, witnesses: ws, recovery: recovery,
+			registryFound: registered, registryRecord: rec, passwd: pw,
+		})
 	}
 	plan.binaryBlocker = a.binaryBlocker(force)
 	plan.inventoryErr = inventoryErr
@@ -266,11 +317,14 @@ func (a *App) v1RegistryUsers() ([]string, error) {
 	lineNo := 0
 	for sc.Scan() {
 		lineNo++
-		line := strings.TrimSpace(sc.Text())
+		line := sc.Text()
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		name, _, _ := strings.Cut(line, "\t")
+		name, _, tabSeparated := strings.Cut(line, "\t")
+		if !tabSeparated {
+			return nil, fmt.Errorf("v1 registry line %d is not tab-separated", lineNo)
+		}
 		if !validate.Username(name) {
 			return nil, fmt.Errorf("v1 registry line %d has invalid username %q", lineNo, name)
 		}
@@ -301,8 +355,17 @@ func (a *App) printTeardownPlan(p teardownPlan) {
 		)
 		for _, acc := range p.accounts {
 			state := a.P.M("缺失（仅剩痕迹）", "gone (leftovers only)")
-			if acc.exists {
-				state = a.P.M("在册（连同家目录删除）", "live (deleted with its home)")
+			switch acc.recovery {
+			case absentDeletionRecovery:
+				state = a.P.M("缺失（删除恢复待完成）", "gone (deletion recovery pending)")
+			case boundDeletionRecovery:
+				state = a.P.M("存在（删除世代已绑定）", "live (deletion generation bound)")
+			case manualDeletionRecovery:
+				state = a.P.M("存在（删除恢复需人工）", "live (manual deletion recovery required)")
+			case noDeletionRecovery:
+				if acc.exists {
+					state = a.P.M("存在（身份核验后尝试撤销）", "live (revoke after identity checks)")
+				}
 			}
 			ws := make([]string, 0, len(acc.witnesses))
 			for _, w := range acc.witnesses {
@@ -319,8 +382,8 @@ func (a *App) printTeardownPlan(p teardownPlan) {
 		a.warnf("%s %s（%s）", a.P.M("无法移除：", "cannot be removed:"), p.binaryPath, p.binaryBlocker)
 	}
 	if p.auditKept {
-		a.info(fmt.Sprintf(a.P.M("审计日志保留在 %s —— 它记录了谁开过、谁删过 root 级账号，卸载不会替你抹掉它。要一并删除请加 --purge-audit。",
-			"the audit log is KEPT at %s — it records who opened and closed root-capable accounts, and an uninstall does not erase that for you. Pass --purge-audit to remove it too."), p.auditPath))
+		a.info(fmt.Sprintf(a.P.M("审计日志保留在 %s —— 其中保留了成功写入的 root 级账号操作记录，卸载不会替你抹掉它。要一并删除请加 --purge-audit。",
+			"the audit log is KEPT at %s — it retains successfully written records of root-capable account operations, and an uninstall does not erase them for you. Pass --purge-audit to remove it too."), p.auditPath))
 	} else {
 		a.warnf("%s %s", a.P.M("审计日志将被删除：", "the audit log will be DELETED:"), p.auditPath)
 	}
@@ -401,8 +464,8 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 		a.errorf("%s: %v", a.P.M("无法确定这台机器上有哪些账号，拒绝卸载",
 			"cannot determine which accounts are on this host; refusing to uninstall"), plan.inventoryErr)
 		a.warnf("%s", a.P.M(
-			"清单不全就卸载，会删掉命令、留下它没看见的账号——而它们的自动删除任务执行的正是这个命令。请先修好上面的问题再重试。",
-			"uninstalling on a partial inventory removes the command and leaves behind accounts it never saw. Repair the account database or managed state before retrying."))
+			"清单不全就卸载，会删掉命令、留下它没看见的账号或授权，并使已有自动删除任务无法执行。请先修好上面的问题再重试。",
+			"uninstalling on a partial inventory can leave unseen accounts or grants behind and prevent any existing auto-delete task from running. Repair the account database or managed state before retrying."))
 		return false
 	}
 
@@ -421,6 +484,37 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 			plan.binaryPath, plan.binaryBlocker)
 		a.warnf("%s", a.P.M("先处理该路径（或用 --force 明确接受），再重试——否则卸载会删光账号与状态却卡在最后一步。",
 			"resolve that path (or pass --force to accept it explicitly) and retry — otherwise the uninstall would remove every account and all state, then stop at the last step."))
+		return false
+	}
+
+	// A live UID-only (or mismatched) deletion witness proves only that a prior
+	// operator reached the userdel boundary; it does not prove that today's
+	// same-name account is the one they approved. Bulk uninstall is unattended per
+	// account, so refuse the whole operation before touching any host state. The
+	// operator must recover it through an interactive revoke --force confirmation.
+	for _, acc := range plan.accounts {
+		if acc.recovery != manualDeletionRecovery {
+			continue
+		}
+		a.errorf("%s %s", a.P.M(
+			"拒绝卸载：活账号的删除恢复见证未绑定当前世代；已保留账号、命令和状态。请先人工核查并交互执行 revoke --force：",
+			"refusing to uninstall: a live account has a deletion-recovery witness that is not bound to its current generation; the account, command, and state were kept. Inspect it and complete an interactive revoke --force first:"), acc.name)
+		return false
+	}
+
+	// Validate every other live account from the displayed, immutable snapshot
+	// before the lifecycle lock is entered and before teardown can revoke the first
+	// account. Without this whole-plan preflight, a valid alphabetically earlier
+	// account could be deleted before a later marker-only, pending, legacy, or
+	// identity-mismatched account made the same bulk operation fail. The plan is
+	// rebuilt and compared under the lock before teardown, and revoke still repeats
+	// its identity checks immediately before each mutation.
+	for _, acc := range plan.accounts {
+		if !acc.exists || liveTeardownAccountAuthorized(acc) {
+			continue
+		}
+		a.errorf("%s %s", a.P.M("拒绝卸载：无法在缺少当前世代绑定身份登记时自动删除活账号；在删除任何账号前已停止：",
+			"refusing to uninstall: cannot auto-delete a live account without a current generation-bound identity record; stopped before deleting any account:"), acc.name)
 		return false
 	}
 
@@ -447,12 +541,20 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 			a.errorf("%s", a.P.M(
 				fmt.Sprintf("非交互模式不会删除账号。这台机器上有 %d 个由本工具管理的账号，卸载必须先删除它们；确认请加 --remove-users。", len(plan.accounts)),
 				fmt.Sprintf("a non-interactive run will not delete accounts. This host has %d managed by this tool, and the uninstall must remove them first; pass --remove-users to say so.", len(plan.accounts))))
-			a.warnf("%s", a.P.M("（不能只卸载命令、留下账号：它们的自动删除任务执行的就是这个命令，删掉命令它们就再也不会过期。）",
-				"(uninstalling the command and keeping the accounts is not an option: their auto-delete tasks invoke this very command, so removing it means they never expire.)"))
+			a.warnf("%s", a.P.M("（不能只卸载命令、留下受管账号：这会让工具失去撤销这些账号、清理授权和执行已有自动删除任务的能力。）",
+				"(uninstalling the command while keeping managed accounts is not an option: it removes the ability to revoke those accounts, clean their grants, and run any auto-delete tasks already scheduled.)"))
 			return false
 		}
 	}
 	return true
+}
+
+func liveTeardownAccountAuthorized(acc teardownAccount) bool {
+	if !acc.exists || !acc.registryFound || !hasRegistryWitness(acc) {
+		return false
+	}
+	state := classifyRegisteredAccount(acc.registryRecord, acc.passwd, true, nil)
+	return state == registeredActive || state == registeredRecoveryBound
 }
 
 func sameTeardownPlan(a, b teardownPlan) bool {
@@ -462,7 +564,9 @@ func sameTeardownPlan(a, b teardownPlan) bool {
 	}
 	for i := range a.accounts {
 		left, right := a.accounts[i], b.accounts[i]
-		if left.name != right.name || left.exists != right.exists || len(left.witnesses) != len(right.witnesses) {
+		if left.name != right.name || left.exists != right.exists || left.recovery != right.recovery ||
+			left.registryFound != right.registryFound || left.registryRecord != right.registryRecord ||
+			left.passwd != right.passwd || len(left.witnesses) != len(right.witnesses) {
 			return false
 		}
 		for j := range left.witnesses {
@@ -499,6 +603,17 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// survivor check below is for.
 	var failedRevokes []string
 	for _, acc := range plan.accounts {
+		// A passwd marker, v1 row, or name-scoped artifact can make a live account
+		// block uninstall, but none can authorize its deletion. Require the current
+		// registry witness before even entering the destructive revoke path; the
+		// completedAccountIdentity check below then binds UID, generation, home, and
+		// the exact marker on one passwd snapshot.
+		if acc.exists && !hasRegistryWitness(acc) {
+			a.errorf("%s %s", a.P.M("缺少当前世代绑定身份登记，拒绝自动删除活账号：",
+				"refusing to auto-delete a live account without a current generation-bound identity record:"), acc.name)
+			failedRevokes = append(failedRevokes, acc.name)
+			continue
+		}
 		ours, live, identityErr := a.completedAccountIdentity(acc.name)
 		if identityErr != nil {
 			a.errorf("%s %s: %v", a.P.M("无法重新验证活账号身份，拒绝自动删除：",
@@ -645,15 +760,24 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 // removeStateDir deletes everything this tool kept under /var/lib, v1's files
 // included. It is only ever reached once no managed account survives.
 //
-// The symlink check is the same discipline the rest of the tool writes with: the
-// directory is root-owned by construction, so anything else standing at that path
-// is not ours to delete recursively.
+// Ancestor symlinks are always refused so the mount inventory and removal name the
+// same tree. Without --force, the managed leaf must also be a root-safe directory;
+// force relaxes only that leaf check (for example, to unlink a symlink at the
+// managed name), never the ancestor or mount boundaries.
 func (a *App) removeStateDir(force bool) error {
 	if err := safeRecursiveRemovalPath(a.StateDir); err != nil {
 		return fmt.Errorf("unsafe state directory: %w", err)
 	}
+	if err := refuseSymlinkedRemovalParent(a.StateDir); err != nil {
+		return fmt.Errorf("unsafe state directory: %w", err)
+	}
 	if _, err := os.Lstat(a.StateDir); os.IsNotExist(err) {
-		return nil
+		// A previous recursive removal can have made the name disappear and then
+		// failed to sync its parent. Route the retry through removeAll so it
+		// finishes that durability step instead of treating visibility as durable.
+		return a.removeAll(a.StateDir)
+	} else if err != nil {
+		return fmt.Errorf("inspect state directory: %w", err)
 	}
 	if err := refuseMountedRemoval(a.StateDir); err != nil {
 		return err
@@ -670,8 +794,13 @@ func (a *App) removeAuditDir(force bool) error {
 	if err := safeRecursiveRemovalPath(a.AuditLogDir); err != nil {
 		return fmt.Errorf("unsafe audit directory: %w", err)
 	}
+	if err := refuseSymlinkedRemovalParent(a.AuditLogDir); err != nil {
+		return fmt.Errorf("unsafe audit directory: %w", err)
+	}
 	if _, err := os.Lstat(a.AuditLogDir); os.IsNotExist(err) {
-		return nil
+		return a.removeAll(a.AuditLogDir)
+	} else if err != nil {
+		return fmt.Errorf("inspect audit directory: %w", err)
 	}
 	if err := refuseMountedRemoval(a.AuditLogDir); err != nil {
 		return err
@@ -685,8 +814,33 @@ func (a *App) removeAuditDir(force bool) error {
 }
 
 func safeRecursiveRemovalPath(path string) error {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) == string(filepath.Separator) {
+	clean := filepath.Clean(path)
+	if path == "" || !filepath.IsAbs(path) || clean != path || clean == string(filepath.Separator) {
 		return fmt.Errorf("refusing recursive removal of %q", path)
+	}
+	parts := strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator))
+	if len(parts) < 3 {
+		return fmt.Errorf("refusing recursive removal of broad path %q", path)
+	}
+	return nil
+}
+
+// refuseSymlinkedRemovalParent keeps the lexical path checked against mountinfo
+// identical to the path os.RemoveAll will traverse. A symlink in an ancestor
+// could otherwise redirect removal to a different tree whose mounts were never
+// inspected. The final entry is intentionally not resolved: --force may safely
+// unlink a symlink at the managed name because RemoveAll does not follow it.
+func refuseSymlinkedRemovalParent(path string) error {
+	parent := filepath.Dir(path)
+	resolved, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("resolve recursive-removal parent %s: %w", parent, err)
+	}
+	if resolved != parent {
+		return fmt.Errorf("refusing recursive removal through symlinked parent %s (resolves to %s)", parent, resolved)
 	}
 	return nil
 }
@@ -696,59 +850,16 @@ func safeRecursiveRemovalPath(path string) error {
 // dedicated tool directory can be used as a mountpoint for unrelated data. This
 // check is intentionally not bypassed by --force.
 func refuseMountedRemoval(path string) error {
-	f, err := os.Open("/proc/self/mountinfo")
-	if err != nil {
-		return fmt.Errorf("cannot inspect mount boundaries: %w", err)
-	}
-	defer f.Close()
-	return rejectMountsUnder(f, filepath.Clean(path))
+	return mountinfo.RefuseUnder(filepath.Clean(path))
 }
 
 func rejectMountsUnder(r io.Reader, root string) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 4096), 1024*1024)
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 5 {
-			return fmt.Errorf("malformed mountinfo line")
-		}
-		mountpoint, err := unescapeMountInfoPath(fields[4])
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, filepath.Clean(mountpoint))
-		if err != nil {
-			return fmt.Errorf("compare mountpoint %q: %w", mountpoint, err)
-		}
-		if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
-			return fmt.Errorf("refusing recursive removal across mountpoint %s", mountpoint)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("read mount boundaries: %w", err)
-	}
-	return nil
+	return mountinfo.RejectUnder(r, root)
 }
 
-func unescapeMountInfoPath(value string) (string, error) {
-	var out strings.Builder
-	for i := 0; i < len(value); i++ {
-		if value[i] != '\\' {
-			out.WriteByte(value[i])
-			continue
-		}
-		if i+3 >= len(value) {
-			return "", fmt.Errorf("malformed mountinfo escape in %q", value)
-		}
-		n, err := strconv.ParseUint(value[i+1:i+4], 8, 8)
-		if err != nil {
-			return "", fmt.Errorf("malformed mountinfo escape in %q", value)
-		}
-		out.WriteByte(byte(n))
-		i += 3
-	}
-	return out.String(), nil
-}
+// syncRecursiveRemovalParent is indirected so tests can exercise a retry after
+// the recursive removal became visible but the parent fsync failed.
+var syncRecursiveRemovalParent = func(parent *os.File) error { return parent.Sync() }
 
 func (a *App) removeAll(path string) error {
 	var err error
@@ -766,12 +877,17 @@ func (a *App) removeAll(path string) error {
 		}
 		return fmt.Errorf("verify recursive removal of %s: %w", path, err)
 	}
-	parent, err := os.Open(filepath.Dir(path))
+	parent, err := os.OpenFile(filepath.Dir(path), os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
+		// If another actor removed the whole parent tree, there is no remaining
+		// directory entry for this function to make durable.
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return fmt.Errorf("open recursive-removal parent: %w", err)
 	}
 	defer parent.Close()
-	if err := parent.Sync(); err != nil {
+	if err := syncRecursiveRemovalParent(parent); err != nil {
 		return &fsutil.DurabilityError{Operation: "recursive removal", Err: err}
 	}
 	return nil

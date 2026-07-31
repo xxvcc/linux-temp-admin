@@ -1,6 +1,7 @@
 // Package version compares X.Y.Z[suffix] version strings, reproducing the bash
 // version_gt semantics: numeric major/minor/patch, then a final release ranks
-// above a prerelease (suffix), then suffixes compare lexicographically.
+// above a prerelease (suffix), then suffixes compare naturally with digit runs
+// ordered numerically.
 package version
 
 import (
@@ -78,9 +79,10 @@ func compareDecimal(a, b string) int {
 	return 0
 }
 
-// naturalCompare orders two strings so that runs of digits compare by numeric value
-// (with leading zeros ignored) and everything else compares byte-wise. It returns
-// -1, 0, or 1. This gives "-rc2" < "-rc10" while keeping a stable total order.
+// naturalCompare orders two strings so that runs of digits compare by numeric
+// value and everything else compares byte-wise. Numerically equal digit runs use
+// their original bytes as a tie-breaker, so distinct suffixes such as rc01 and
+// rc1 do not collapse into the same version. It returns -1, 0, or 1.
 func naturalCompare(a, b string) int {
 	ia, ib := 0, 0
 	for ia < len(a) && ib < len(b) {
@@ -102,6 +104,13 @@ func naturalCompare(a, b string) int {
 			}
 			if na != nb { // equal length: lexical order equals numeric order
 				if na < nb {
+					return -1
+				}
+				return 1
+			}
+			rawA, rawB := a[ia:ja], b[ib:jb]
+			if rawA != rawB { // equal numeric value: retain a deterministic total order
+				if rawA < rawB {
 					return -1
 				}
 				return 1

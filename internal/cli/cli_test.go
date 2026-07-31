@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,8 +18,10 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
+	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -36,12 +39,12 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { re
 
 type failingScheduleSystem struct{}
 
-func (failingScheduleSystem) HasSystemctl() bool                     { return false }
-func (failingScheduleSystem) Systemctl(...string) error              { return nil }
-func (failingScheduleSystem) HasAt() bool                            { return true }
-func (failingScheduleSystem) ScheduleAt(string, int) (string, error) { return "", nil }
-func (failingScheduleSystem) RemoveAtJobsFor(string) error           { return nil }
-func (failingScheduleSystem) AtrmJob(string) error                   { return nil }
+func (failingScheduleSystem) HasSystemctl() bool                           { return false }
+func (failingScheduleSystem) Systemctl(...string) error                    { return nil }
+func (failingScheduleSystem) HasAt() bool                                  { return true }
+func (failingScheduleSystem) ScheduleAt(string, time.Time) (string, error) { return "", nil }
+func (failingScheduleSystem) RemoveAtJobsFor(string) error                 { return nil }
+func (failingScheduleSystem) AtrmJob(string) error                         { return nil }
 func (failingScheduleSystem) AtJobs() ([]schedule.AtJob, error) {
 	return nil, errors.New("at queue unreadable")
 }
@@ -65,6 +68,11 @@ func (r *revokeRunner) RunInput(_ string, name string, args ...string) error {
 
 func (*revokeRunner) Look(name string) bool { return name == "userdel" }
 
+var (
+	testClearScheduledJobs = func(string, int) error { return nil }
+	testDrainScheduledJobs = func() error { return nil }
+)
+
 // newTestApp builds a minimal, root-free App: Geteuid is faked to 0 and the
 // registry points at a temp dir. Collaborators that only the mutating paths need
 // (Users/Sudoers/Scheduler/Selfmanage) are left nil; the tests here exercise
@@ -75,17 +83,57 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 	var out, errb bytes.Buffer
 	a := &App{
 		Out: &out, Err: &errb, In: strings.NewReader(in),
-		P:                            i18n.Printer{Lang: i18n.EN},
-		Registry:                     &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
-		InstallPath:                  filepath.Join(dir, "lta"),
-		Now:                          func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
-		RandHex:                      func(int) (string, error) { return "abcdef0123", nil },
-		StdoutIsTTY:                  func() bool { return true },
-		StdinIsTTY:                   func() bool { return false },
-		Geteuid:                      func() int { return 0 },
-		SSHDHasConnectionScopedMatch: func() bool { return false },
+		P:                        i18n.Printer{Lang: i18n.EN},
+		Registry:                 &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
+		InstallPath:              filepath.Join(dir, "lta"),
+		Now:                      func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
+		RandHex:                  func(int) (string, error) { return "abcdef0123", nil },
+		StdoutIsTTY:              func() bool { return true },
+		StdinIsTTY:               func() bool { return false },
+		Geteuid:                  func() int { return 0 },
+		SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		ClearScheduledJobs:       testClearScheduledJobs,
+		DrainScheduledJobs:       testDrainScheduledJobs,
+		ListMarkerAccounts:       func() ([]string, error) { return nil, nil },
+		RunningLegacyRevoke:      func(string, string) (bool, error) { return false, nil },
 	}
 	return a, &out, &errb
+}
+
+func requireRootRegistryFixture(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned Registry fixtures are covered by required Root integration")
+	}
+}
+
+func setTestRegistryRecord(t *testing.T, a *App, rec registry.Record) {
+	t.Helper()
+	requireRootRegistryFixture(t)
+	dir := t.TempDir()
+	a.Registry = &registry.Store{
+		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),
+	}
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Port == 0 {
+		rec.Port = 22
+	}
+	deletionStarted := rec.DeletionStarted
+	rec.DeletionStarted = false
+	if err := a.Registry.Record(rec); err != nil {
+		t.Fatal(err)
+	}
+	if deletionStarted {
+		generation := rec.Generation
+		if rec.Pending || !rec.IdentityBound {
+			generation = ""
+		}
+		if err := a.Registry.BeginDeletion(rec.User, rec.UID, generation); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestPrintInviteClearsPrivateKeySource(t *testing.T) {
@@ -380,6 +428,141 @@ func TestQueuedLifecycleMutationStopsAfterUninstallMarker(t *testing.T) {
 	}
 }
 
+func TestLegacyUnboundRevokeSkipsSameNameInviteBarrier(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.Lifecycle = lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	release, err := a.accountLifecycleLock("xxvcc-a1").Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	started := time.Now()
+	rc := a.revoke([]string{"--user", "xxvcc-a1", "--yes"})
+	if rc != 0 {
+		t.Fatalf("contending legacy revoke rc = %d, want successful stale-job skip", rc)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("legacy revoke queued behind the lifecycle lock for %s", elapsed)
+	}
+	if got := errb.String(); !strings.Contains(got, "no account was revoked") ||
+		!strings.Contains(got, "invoke revoke again") {
+		t.Fatalf("legacy revoke did not explain the non-destructive retry requirement: %q", got)
+	}
+}
+
+func TestGenerationBoundRevokeWaitsForSameNameInviteBarrier(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	a.Lifecycle = lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	release, err := a.accountLifecycleLock("xxvcc-a1").Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- a.revoke([]string{
+			"--user", "xxvcc-a1", "--yes", "--force", "--confirm-force", "xxvcc-a1",
+			"--expected-uid", "1001", "--generation", "0123456789abcdef0123456789abcdef",
+		})
+	}()
+	select {
+	case rc := <-done:
+		_ = release()
+		t.Fatalf("generation-bound revoke bypassed serialization with rc=%d", rc)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rc := <-done:
+		if rc != 0 {
+			t.Fatalf("stale generation-bound revoke rc = %d, want safe skip", rc)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("generation-bound revoke did not resume after account-barrier release")
+	}
+}
+
+func TestLegacyUnboundRevokeStillQueuesBehindUnrelatedGlobalMutation(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.Lifecycle = lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	release, err := a.Lifecycle.Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- a.revoke([]string{"--user", "xxvcc-a1", "--yes"})
+	}()
+	select {
+	case rc := <-done:
+		_ = release()
+		t.Fatalf("legacy revoke treated unrelated global contention as stale with rc=%d", rc)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rc := <-done:
+		if rc != 1 {
+			t.Fatalf("legacy revoke after global release rc=%d, want normal unregistered-user refusal", rc)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("legacy revoke did not resume after global lifecycle release")
+	}
+	if strings.Contains(errb.String(), "no account was revoked") {
+		t.Fatalf("unrelated global contention was reported as a stale same-name collision: %q", errb.String())
+	}
+}
+
+func TestLegacyUnboundRevokesShareSameNameBarrier(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lifecycle.lock")
+	globalRelease, err := lifecycle.New(path).Acquire()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a1, _, err1 := newTestApp(t, "")
+	a2, _, err2 := newTestApp(t, "")
+	a1.Lifecycle = lifecycle.New(path)
+	a2.Lifecycle = lifecycle.New(path)
+
+	done1 := make(chan int, 1)
+	done2 := make(chan int, 1)
+	go func() { done1 <- a1.revoke([]string{"--user", "xxvcc-a1", "--yes"}) }()
+	go func() { done2 <- a2.revoke([]string{"--user", "xxvcc-a1", "--yes"}) }()
+	for i, done := range []<-chan int{done1, done2} {
+		select {
+		case rc := <-done:
+			_ = globalRelease()
+			t.Fatalf("legacy revoke %d was swallowed while another reader held the same-name barrier: rc=%d", i+1, rc)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if err := globalRelease(); err != nil {
+		t.Fatal(err)
+	}
+	for i, done := range []<-chan int{done1, done2} {
+		select {
+		case rc := <-done:
+			if rc != 1 {
+				t.Fatalf("legacy revoke %d rc=%d, want normal unregistered-user refusal", i+1, rc)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("legacy revoke %d did not resume after global lifecycle release", i+1)
+		}
+	}
+	if strings.Contains(err1.String(), "no account was revoked") || strings.Contains(err2.String(), "no account was revoked") {
+		t.Fatalf("shared same-name revokes were treated as writer contention: first=%q second=%q", err1.String(), err2.String())
+	}
+}
+
 func TestReadRunningBinaryUsesProcSelfExe(t *testing.T) {
 	got, err := (&App{}).readRunningBinary()
 	if err != nil {
@@ -445,13 +628,34 @@ func TestOrphanScanErrorsAreNotHealthy(t *testing.T) {
 }
 
 func TestDoctorFailsWhenSSHDLoginCannotBeConfirmed(t *testing.T) {
+	t.Run("future account phase", func(t *testing.T) {
+		a, _, errb := newTestApp(t, "")
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+		}
+		var phases []bool
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool {
+			phases = append(phases, accountExists)
+			return !accountExists
+		}
+		if rc := a.doctor(nil); rc != 1 {
+			t.Fatalf("doctor rc=%d, want 1 for a pre-account Match uncertainty", rc)
+		}
+		if len(phases) != 2 || !phases[0] || phases[1] {
+			t.Fatalf("doctor Match account phases = %v, want [true false]", phases)
+		}
+		if !strings.Contains(errb.String(), "before creation") {
+			t.Fatalf("doctor did not report the pre-account uncertainty: %q", errb.String())
+		}
+	})
+
 	t.Run("connection-dependent rule", func(t *testing.T) {
 		a, _, errb := newTestApp(t, "")
 		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 			return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\nallowusers xxvcc-doctor@203.0.113.0/24\n"), nil
 		}
 
-		rep := a.checkKeyLogin(mustSSHDConfig(t, a, "xxvcc-doctor"), "xxvcc-doctor", []string{"xxvcc-doctor"})
+		rep := a.checkKeyLogin(mustSSHDConfig(t, a, "xxvcc-doctor"), "xxvcc-doctor", []string{"xxvcc-doctor"}, false)
 		if !rep.OK() || rep.Certain() {
 			t.Fatalf("fixture report: OK=%v Certain=%v blockers=%v unverifiable=%v", rep.OK(), rep.Certain(), rep.Blockers, rep.Unverifiable)
 		}
@@ -475,6 +679,78 @@ func TestDoctorFailsWhenSSHDLoginCannotBeConfirmed(t *testing.T) {
 			t.Fatalf("doctor hid the sshd probe failure: %q", errb.String())
 		}
 	})
+}
+
+func TestDoctorDependencyPolicyTreatsConditionalHelpersAsOptionalFeatures(t *testing.T) {
+	for _, label := range []string{"sudo", "visudo", "chpasswd"} {
+		if doctorDependencyIsFatal(label) {
+			t.Errorf("missing %s should disable only its invite feature, not fail the base doctor report", label)
+		}
+	}
+	for _, label := range []string{"id", "useradd", "usermod", "chage", "userdel"} {
+		if !doctorDependencyIsFatal(label) {
+			t.Errorf("missing core dependency %s should fail the doctor report", label)
+		}
+	}
+}
+
+func TestDoctorDescribesOnlyEffectiveConfigCredentialVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		lang      i18n.Lang
+		config    string
+		wantOut   string
+		wantErr   string
+		forbidden string
+	}{
+		{
+			name:      "English success",
+			lang:      i18n.EN,
+			config:    "pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n",
+			wantOut:   "effective sshd config check found no blocker for a new account's key credential",
+			forbidden: "sshd accepts public-key logins",
+		},
+		{
+			name:      "English blocker",
+			lang:      i18n.EN,
+			config:    "pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n",
+			wantErr:   "effective sshd config check found a blocker for a freshly created temporary account's key credential",
+			forbidden: "sshd would not accept a public-key login",
+		},
+		{
+			name:      "Chinese success",
+			lang:      i18n.ZH,
+			config:    "pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n",
+			wantOut:   "sshd 有效配置检查未发现新账号公钥凭据的阻碍",
+			forbidden: "sshd 接受公钥登录",
+		},
+		{
+			name:      "Chinese blocker",
+			lang:      i18n.ZH,
+			config:    "pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n",
+			wantErr:   "sshd 有效配置检查发现新建临时账号公钥凭据的阻碍",
+			forbidden: "sshd 不会接受",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, out, errb := newTestApp(t, "")
+			a.P = i18n.Printer{Lang: tc.lang}
+			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+				return sysinfo.ParseSSHD(tc.config), nil
+			}
+			_ = a.doctor(nil)
+			combined := out.String() + errb.String()
+			if tc.wantOut != "" && !strings.Contains(out.String(), tc.wantOut) {
+				t.Fatalf("doctor stdout missing %q: %q", tc.wantOut, out.String())
+			}
+			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
+				t.Fatalf("doctor stderr missing %q: %q", tc.wantErr, errb.String())
+			}
+			if strings.Contains(combined, tc.forbidden) {
+				t.Fatalf("doctor retained end-to-end claim %q: %q", tc.forbidden, combined)
+			}
+		})
+	}
 }
 
 func mustSSHDConfig(t *testing.T, a *App, user string) *sysinfo.SSHDConfig {
@@ -861,20 +1137,42 @@ func TestRevokeGuardsReject(t *testing.T) {
 	}
 }
 
+func TestForceWarningDoesNotClaimManagedIdentityChecksAreBypassed(t *testing.T) {
+	a, _, errb := newTestApp(t, "not-alice\n")
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		return user.Passwd{Name: "alice", UID: 1001, GID: 1001, Home: "/home/alice", Shell: "/bin/sh"}, true, nil
+	}
+	if rc := a.revoke([]string{"--user", "alice", "--force"}); rc != 0 {
+		t.Fatalf("cancelled revoke rc = %d, want 0", rc)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "only if the remaining managed-identity checks also pass") {
+		t.Fatalf("force warning omits the protection boundary: %q", got)
+	}
+	if strings.Contains(got, "delete a real system user") {
+		t.Fatalf("force warning contradicts the real-account protection gate: %q", got)
+	}
+}
+
 func TestTeardownLocalAccountStopsWhenDisableLoginIsIncomplete(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, Home: "/home/xxvcc-a1", Shell: "/bin/sh", GECOS: config.ManagedGenerationGECOSPrefix + generation}
 	for _, failedCommand := range []string{"chage", "usermod"} {
 		t.Run(failedCommand, func(t *testing.T) {
 			runner := &revokeRunner{failOn: failedCommand}
 			terminateCalls := 0
 			a := &App{
 				Users: &user.Manager{Runner: runner},
+				LookupUser: func(string) (user.Passwd, bool, error) {
+					return pw, true, nil
+				},
 				TerminateProcesses: func(int) error {
 					terminateCalls++
 					return nil
 				},
 			}
 
-			stage, err := a.teardownLocalAccount("xxvcc-a1", user.Passwd{Name: "xxvcc-a1", UID: 1001})
+			stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil })
 			if err == nil || stage != revokeDisableLogin {
 				t.Fatalf("teardownLocalAccount = stage %v, err %v; want disable failure", stage, err)
 			}
@@ -893,8 +1191,13 @@ func TestTeardownLocalAccountReachesDeleteOnlyAfterDisableSucceeds(t *testing.T)
 	pw := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, Home: "/home/xxvcc-a1", Shell: "/bin/sh", GECOS: config.ManagedGenerationGECOSPrefix + generation}
 	runner := &revokeRunner{failOn: "userdel"}
 	terminateCalls := 0
+	lookup := func(string) (user.Passwd, bool, error) { return pw, true, nil }
 	a := &App{
-		Users: &user.Manager{Runner: runner},
+		Users: &user.Manager{
+			Runner: runner, LookupUser: lookup,
+			RemoveManagedMail: func(user.Passwd) error { return nil },
+			RemoveManagedHome: func(user.Passwd) error { return nil },
+		},
 		TerminateProcesses: func(uid int) error {
 			terminateCalls++
 			if uid != 1001 {
@@ -902,22 +1205,24 @@ func TestTeardownLocalAccountReachesDeleteOnlyAfterDisableSucceeds(t *testing.T)
 			}
 			return nil
 		},
-		LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil },
+		LookupUser:         lookup,
+		ClearScheduledJobs: testClearScheduledJobs,
+		DrainScheduledJobs: testDrainScheduledJobs,
 	}
 
-	stage, err := a.teardownLocalAccount("xxvcc-a1", pw)
+	stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil })
 	if err == nil || stage != revokeDeleteAccount {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want delete failure", stage, err)
 	}
-	if terminateCalls != 1 {
-		t.Fatalf("TerminateProcesses calls = %d, want 1", terminateCalls)
+	if terminateCalls != 3 {
+		t.Fatalf("TerminateProcesses calls = %d, want initial two-pass drain plus final pre-userdel pass", terminateCalls)
 	}
 	if got, want := strings.Join(runner.calls, ","), "chage,usermod,userdel"; got != want {
 		t.Fatalf("account commands = %q, want %q", got, want)
 	}
 }
 
-func TestRollbackInviteAccountRequiresCompletedIdentity(t *testing.T) {
+func TestRollbackInviteAccountRequiresCompleteCapturedIdentity(t *testing.T) {
 	runner := &revokeRunner{}
 	terminateCalls := 0
 	a := &App{
@@ -928,12 +1233,15 @@ func TestRollbackInviteAccountRequiresCompletedIdentity(t *testing.T) {
 		},
 	}
 
-	for _, rec := range []registry.Record{
-		{User: "xxvcc-a1", Pending: true},
-		{User: "xxvcc-a1", UID: 0},
+	for _, tc := range []struct {
+		rec      registry.Record
+		expected user.Passwd
+	}{
+		{rec: registry.Record{User: "xxvcc-a1", Pending: true}},
+		{rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: "0123456789abcdef0123456789abcdef", IdentityBound: true}},
 	} {
-		if err := a.rollbackInviteAccount("xxvcc-a1", rec, true); err == nil || !strings.Contains(err.Error(), "pending") {
-			t.Fatalf("rollbackInviteAccount(%+v) error = %v, want pending-identity refusal", rec, err)
+		if err := a.rollbackInviteAccount("xxvcc-a1", tc.rec, tc.expected, true); err == nil || !strings.Contains(err.Error(), "identity") {
+			t.Fatalf("rollbackInviteAccount(%+v) error = %v, want incomplete-identity refusal", tc.rec, err)
 		}
 	}
 	if len(runner.calls) != 0 || terminateCalls != 0 {
@@ -948,8 +1256,18 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		runner := &revokeRunner{}
 		terminateCalls := 0
+		lookup := func(string) (user.Passwd, bool, error) {
+			if len(runner.calls) > 0 && runner.calls[len(runner.calls)-1] == "userdel" {
+				return user.Passwd{}, false, nil
+			}
+			return pw, true, nil
+		}
 		a := &App{
-			Users: &user.Manager{Runner: runner},
+			Users: &user.Manager{
+				Runner: runner, LookupUser: lookup,
+				RemoveManagedMail: func(user.Passwd) error { return nil },
+				RemoveManagedHome: func(user.Passwd) error { return nil },
+			},
 			TerminateProcesses: func(uid int) error {
 				terminateCalls++
 				if uid != 1001 {
@@ -957,12 +1275,15 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 				}
 				return nil
 			},
-			LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil },
+			LookupUser:         lookup,
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
 		}
-		if err := a.rollbackInviteAccount("xxvcc-a1", rec, true); err != nil {
+		setTestRegistryRecord(t, a, rec)
+		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true); err != nil {
 			t.Fatal(err)
 		}
-		if terminateCalls != 1 || strings.Join(runner.calls, ",") != "chage,usermod,userdel" {
+		if terminateCalls != 3 || strings.Join(runner.calls, ",") != "chage,usermod,userdel" {
 			t.Fatalf("rollback order wrong: commands=%v terminateCalls=%d", runner.calls, terminateCalls)
 		}
 	})
@@ -974,13 +1295,104 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			Users:              &user.Manager{Runner: runner},
 			TerminateProcesses: func(int) error { return wantErr },
 			LookupUser:         func(string) (user.Passwd, bool, error) { return pw, true, nil },
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
 		}
-		err := a.rollbackInviteAccount("xxvcc-a1", rec, true)
+		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true)
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("rollback error = %v, want %v", err, wantErr)
 		}
 		if got := strings.Join(runner.calls, ","); got != "chage,usermod" {
 			t.Fatalf("process uncertainty reached userdel: commands=%q", got)
+		}
+	})
+
+	t.Run("captured pending identity can be rolled back", func(t *testing.T) {
+		pending := pw
+		pending.GECOS = config.PendingGenerationGECOSPrefix + generation
+		pendingRec := rec
+		pendingRec.UID = 0
+		pendingRec.Pending = true
+		runner := &revokeRunner{}
+		lookup := func(string) (user.Passwd, bool, error) {
+			if len(runner.calls) > 0 && runner.calls[len(runner.calls)-1] == "userdel" {
+				return user.Passwd{}, false, nil
+			}
+			return pending, true, nil
+		}
+		a := &App{
+			Users: &user.Manager{
+				Runner: runner, LookupUser: lookup,
+				RemoveManagedMail: func(user.Passwd) error { return nil },
+				RemoveManagedHome: func(user.Passwd) error { return nil },
+			},
+			TerminateProcesses: func(int) error { return nil },
+			LookupUser:         lookup,
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
+		}
+		setTestRegistryRecord(t, a, pendingRec)
+		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, true); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(runner.calls, ","); got != "chage,usermod,userdel" {
+			t.Fatalf("pending rollback order = %q", got)
+		}
+	})
+
+	t.Run("retained pending identity uses captured UID", func(t *testing.T) {
+		pending := pw
+		pending.GECOS = config.PendingGenerationGECOSPrefix + generation
+		pendingRec := rec
+		pendingRec.UID = 0
+		pendingRec.Pending = true
+		runner := &revokeRunner{}
+		terminatedUID := 0
+		a := &App{
+			Users:              &user.Manager{Runner: runner},
+			TerminateProcesses: func(uid int) error { terminatedUID = uid; return nil },
+			LookupUser:         func(string) (user.Passwd, bool, error) { return pending, true, nil },
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
+		}
+		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, false); err != nil {
+			t.Fatal(err)
+		}
+		if terminatedUID != pending.UID {
+			t.Fatalf("rollback terminated UID %d, want captured UID %d", terminatedUID, pending.UID)
+		}
+		if got := strings.Join(runner.calls, ","); got != "chage,usermod" {
+			t.Fatalf("retained pending rollback commands = %q", got)
+		}
+	})
+
+	t.Run("already absent account never reaches home cleanup", func(t *testing.T) {
+		runner := &revokeRunner{}
+		lookup := func(string) (user.Passwd, bool, error) { return user.Passwd{}, false, nil }
+		homeTouched := false
+		mailCalls := 0
+		a := &App{
+			Users: &user.Manager{
+				Runner: runner, LookupUser: lookup,
+				RemoveManagedMail: func(user.Passwd) error { mailCalls++; return nil },
+				RemoveManagedHome: func(got user.Passwd) error {
+					homeTouched = true
+					if got != pw {
+						t.Fatalf("cleanup identity = %+v, want %+v", got, pw)
+					}
+					return nil
+				},
+			},
+			LookupUser: lookup,
+		}
+		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true); err != nil {
+			t.Fatal(err)
+		}
+		if len(runner.calls) != 0 {
+			t.Fatalf("absent account reached a name-scoped helper: %v", runner.calls)
+		}
+		if homeTouched || mailCalls != 2 {
+			t.Fatalf("absent cleanup touched Home=%v or mail calls=%d, want Home=false mail=2", homeTouched, mailCalls)
 		}
 	})
 
@@ -1003,12 +1415,12 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 				return nil
 			},
 		}
-		err := a.rollbackInviteAccount("xxvcc-a1", rec, true)
+		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true)
 		if err == nil || !strings.Contains(err.Error(), "identity changed") {
 			t.Fatalf("rollback error = %v, want replacement refusal", err)
 		}
-		if got := strings.Join(runner.calls, ","); got != "chage,usermod" {
-			t.Fatalf("replacement reached delete: commands=%q", got)
+		if got := strings.Join(runner.calls, ","); got != "" {
+			t.Fatalf("replacement reached account helper: commands=%q", got)
 		}
 	})
 }
@@ -1024,14 +1436,92 @@ func TestUninstallRefusesOnRegistryReadError(t *testing.T) {
 	}
 }
 
-func TestRecursiveRemovalNeverAcceptsRootOrRelativePaths(t *testing.T) {
-	for _, path := range []string{"", ".", "relative/state", "/"} {
+func TestRecursiveRemovalNeverAcceptsBroadNonCanonicalOrRelativePaths(t *testing.T) {
+	for _, path := range []string{"", ".", "relative/state", "/", "/etc", "/tmp", "/var", "/var/lib", "/var/log", "/usr/local", "/var/lib/../etc"} {
 		if err := safeRecursiveRemovalPath(path); err == nil {
 			t.Errorf("safeRecursiveRemovalPath(%q) unexpectedly allowed recursive removal", path)
 		}
 	}
 	if err := safeRecursiveRemovalPath("/var/lib/linux-temp-admin"); err != nil {
 		t.Fatalf("safe managed path rejected: %v", err)
+	}
+}
+
+func TestRecursiveRemovalRefusesSymlinkedParentEvenWithForce(t *testing.T) {
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realState := filepath.Join(realParent, "state")
+	if err := os.Mkdir(realState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(realState, "must-survive")
+	if err := os.WriteFile(sentinel, []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkParent := filepath.Join(base, "linked-parent")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatal(err)
+	}
+
+	removeCalled := false
+	a := &App{
+		StateDir: filepath.Join(linkParent, "state"),
+		RemoveAll: func(path string) error {
+			removeCalled = true
+			return os.RemoveAll(path)
+		},
+	}
+	err := a.removeStateDir(true)
+	if err == nil || !strings.Contains(err.Error(), "symlinked parent") {
+		t.Fatalf("symlinked-parent removal error = %v, want refusal", err)
+	}
+	if removeCalled {
+		t.Fatal("symlinked parent reached recursive removal")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "unrelated" {
+		t.Fatalf("redirected tree changed: content=%q err=%v", got, err)
+	}
+}
+
+func TestRecursiveRemovalRetrySyncsParentAfterVisibleDeletion(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "managed")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(parent, "state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	realSync := syncRecursiveRemovalParent
+	t.Cleanup(func() { syncRecursiveRemovalParent = realSync })
+	wantErr := errors.New("forced recursive-removal parent sync failure")
+	syncs := 0
+	syncRecursiveRemovalParent = func(*os.File) error {
+		syncs++
+		if syncs == 1 {
+			return wantErr
+		}
+		return nil
+	}
+
+	a := &App{StateDir: state}
+	err := a.removeStateDir(true)
+	var durability *fsutil.DurabilityError
+	if !errors.As(err, &durability) || !errors.Is(err, wantErr) || durability.Operation != "recursive removal" {
+		t.Fatalf("first removal error = %v, want recursive-removal DurabilityError", err)
+	}
+	if _, err := os.Lstat(state); !os.IsNotExist(err) {
+		t.Fatalf("first removal was not visible: %v", err)
+	}
+	if err := a.removeStateDir(true); err != nil {
+		t.Fatalf("retry after visible removal: %v", err)
+	}
+	if syncs != 2 {
+		t.Fatalf("recursive-removal parent sync calls = %d, want failed sync plus absent-root retry", syncs)
 	}
 }
 
@@ -1114,6 +1604,23 @@ func TestInviteRefusesBeforeAskingAnything(t *testing.T) {
 	}
 }
 
+func TestDetectedLocalHostRequiresOperatorConfirmation(t *testing.T) {
+	metadata := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("8.8.4.4"))
+	}))
+	t.Cleanup(metadata.Close)
+
+	a, _, errb := newTestApp(t, "admin.example.com\n")
+	a.Detector = netdetect.New()
+	a.Detector.MetadataServices = []string{metadata.URL}
+	if got := a.detectOrPromptHost(); got != "admin.example.com" {
+		t.Fatalf("detected Host = %q, want the operator's confirmed override", got)
+	}
+	if !strings.Contains(errb.String(), "[8.8.4.4]") {
+		t.Fatalf("metadata Host was not presented as a confirmable default: %q", errb.String())
+	}
+}
+
 // TestInviteSurvivesAnUnwiredSSHDProbe pins that a root-run tool has no path that
 // panics: an unset probe is reported, not dereferenced.
 func TestInviteSurvivesAnUnwiredSSHDProbe(t *testing.T) {
@@ -1129,6 +1636,16 @@ func TestInviteSurvivesAnUnwiredSSHDProbe(t *testing.T) {
 	_ = a.invite([]string{"--user", "xxvcc-a1", "--host", "1.2.3.4", "--no-sudo", "--no-auto-revoke", "--yes"})
 	if !strings.Contains(errb.String(), "unverified") {
 		t.Errorf("an unwired probe should be reported as unverified:\n%s", errb.String())
+	}
+}
+
+func TestSSHDConfigRejectsNilResult(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return nil, nil }
+
+	cfg, err := a.sshdConfig("xxvcc-a1")
+	if err == nil || cfg != nil || !strings.Contains(err.Error(), "returned no configuration") {
+		t.Fatalf("sshdConfig nil result = %#v, %v; want nil, descriptive error", cfg, err)
 	}
 }
 
@@ -1165,7 +1682,7 @@ func TestPasswordLoginFailsClosedWhenSSHDPolicyIsUnverifiable(t *testing.T) {
 	if plan, ok := a.planLogin("xxvcc-a1", true, "no", true); ok {
 		t.Fatalf("password plan unexpectedly accepted an address-dependent policy: %+v", plan)
 	}
-	if !strings.Contains(errb.String(), "cannot prove") {
+	if !strings.Contains(errb.String(), "effective sshd config check cannot confirm") {
 		t.Fatalf("password refusal did not name the unverifiable policy: %q", errb.String())
 	}
 }
@@ -1193,21 +1710,195 @@ func TestPasswordFallbackIsNotOfferedForUnverifiablePolicy(t *testing.T) {
 	}
 }
 
-func TestLoginChecksUseInjectedConnectionScopedMatchProbe(t *testing.T) {
+func TestDeferredPasswordFallbackRequiresExplicitConsentAndPostAccountCheck(t *testing.T) {
+	const conf = "pubkeyauthentication no\npasswordauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
+
+	t.Run("default no declines", func(t *testing.T) {
+		a, errb := interactiveApp(t, "\n", conf)
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+		if plan, ok := a.offerPasswordFallback(sysinfo.ParseSSHD(conf), "xxvcc-a1", true); ok {
+			t.Fatalf("default-No consent unexpectedly produced a password plan: %+v", plan)
+		}
+		diagnostic := errb.String()
+		if !strings.Contains(diagnostic, "brute-forceable") || !strings.Contains(diagnostic, "[y/N]") {
+			t.Fatalf("deferred fallback omitted its risk warning or default-No prompt: %q", diagnostic)
+		}
+	})
+
+	t.Run("yes still fails closed after creation", func(t *testing.T) {
+		a, errb := interactiveApp(t, "y\n", conf)
+		var phases []bool
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool {
+			phases = append(phases, accountExists)
+			return !accountExists
+		}
+		plan, ok := a.offerPasswordFallback(sysinfo.ParseSSHD(conf), "xxvcc-a1", true)
+		if !ok || !plan.password || plan.verified || plan.unverified == "" {
+			t.Fatalf("consented deferred fallback = (%+v, %v), want an unverified password plan", plan, ok)
+		}
+		if !strings.Contains(errb.String(), "brute-forceable") || !strings.Contains(errb.String(), "[y/N]") {
+			t.Fatalf("consented deferred fallback omitted its risk warning or prompt: %q", errb.String())
+		}
+
+		// Account creation resolves Match Group, but consent must not authorize a
+		// password by itself. The mandatory post-account check sees the real policy
+		// and refuses before runInvite reaches SetPassword.
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("passwordauthentication no\n"), nil
+		}
+		if a.confirmLogin("xxvcc-a1", []string{"xxvcc-a1"}, &plan) {
+			t.Fatal("password fallback consent bypassed the post-account policy check")
+		}
+		if len(phases) != 3 || !phases[0] || phases[1] || !phases[2] {
+			t.Fatalf("deferred fallback Match phases = %v, want [true false true]", phases)
+		}
+	})
+}
+
+func TestDeferredPasswordFallbackDoesNotHideKnownBlocker(t *testing.T) {
+	const conf = "pubkeyauthentication no\npasswordauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n"
+	a, errb := interactiveApp(t, "y\n", conf)
+	a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+	if plan, ok := a.offerPasswordFallback(sysinfo.ParseSSHD(conf), "xxvcc-a1", true); ok {
+		t.Fatalf("known password blocker was hidden by Match Group deferral: %+v", plan)
+	}
+	if strings.Contains(errb.String(), "Issue a password login instead?") {
+		t.Fatalf("known password blocker still reached the fallback consent prompt: %q", errb.String())
+	}
+}
+
+func TestLoginChecksPassAccountPhaseToInjectedUnverifiableMatchProbe(t *testing.T) {
 	a, _, _ := newTestApp(t, "")
-	probes := 0
-	a.SSHDHasConnectionScopedMatch = func() bool {
-		probes++
-		return true
+	var phases []bool
+	a.SSHDHasUnverifiableMatch = func(accountExists bool) bool {
+		phases = append(phases, accountExists)
+		return !accountExists
 	}
 	cfg := sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n")
-	rep := a.checkKeyLogin(cfg, "xxvcc-a1", []string{"xxvcc-a1"})
+	rep := a.checkKeyLogin(cfg, "xxvcc-a1", []string{"xxvcc-a1"}, false)
 	if rep.Certain() || len(rep.Unverifiable) != 1 {
-		t.Fatalf("connection-scoped Match probe did not downgrade the report: %+v", rep)
+		t.Fatalf("unverifiable Match probe did not downgrade the report: %+v", rep)
 	}
-	if probes != 1 {
-		t.Fatalf("connection-scoped Match probes = %d, want 1", probes)
+	post := a.checkKeyLogin(cfg, "xxvcc-a1", []string{"xxvcc-a1"}, true)
+	if !post.Certain() {
+		t.Fatalf("post-account Group-only Match remained unverifiable: %+v", post)
 	}
+	if len(phases) != 3 || !phases[0] || phases[1] || !phases[2] {
+		t.Fatalf("unverifiable Match account phases = %v, want [true false true]", phases)
+	}
+}
+
+func TestLoginPlanningAndConfirmationUseTheirActualAccountPhase(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+	var phases []bool
+	a.SSHDHasUnverifiableMatch = func(accountExists bool) bool {
+		phases = append(phases, accountExists)
+		return false
+	}
+	plan, ok := a.planLogin("xxvcc-a1", false, "no", true)
+	if !ok {
+		t.Fatal("key login planning unexpectedly failed")
+	}
+	if len(phases) != 2 || !phases[0] || phases[1] {
+		t.Fatalf("planning Match account phases = %v, want [true false]", phases)
+	}
+	phases = nil
+	if !a.confirmLogin("xxvcc-a1", []string{"xxvcc-a1"}, &plan) {
+		t.Fatal("key login confirmation unexpectedly failed")
+	}
+	if len(phases) != 1 || !phases[0] {
+		t.Fatalf("confirmation Match account phases = %v, want [true]", phases)
+	}
+}
+
+func TestExplicitSSHDRepairPermissionSurvivesPreAccountMatchGroup(t *testing.T) {
+	a, _, _ := newTestApp(t, "")
+	a.SSHD = &sshdconf.Manager{}
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+	a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+	plan, ok := a.planLogin("xxvcc-a1", false, "yes", true)
+	if !ok || !plan.fixSSHD {
+		t.Fatalf("pre-account Match Group discarded explicit repair permission: ok=%v plan=%+v", ok, plan)
+	}
+	if !a.confirmLogin("xxvcc-a1", []string{"xxvcc-a1"}, &plan) {
+		t.Fatal("post-account fixable blocker was refused despite explicit repair permission")
+	}
+	if !plan.fixSSHD || !plan.report.Has(sysinfo.BlockPubkeyDisabled) {
+		t.Fatalf("confirmed repair plan = %+v, want retained fix with real blocker", plan)
+	}
+}
+
+func TestPreAccountMatchGroupDoesNotBypassKeyRepairChoice(t *testing.T) {
+	const conf = "pubkeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n"
+
+	t.Run("explicit refusal remains refusal", func(t *testing.T) {
+		a, _, _ := newTestApp(t, "")
+		a.SSHD = &sshdconf.Manager{}
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD(conf), nil
+		}
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+		if plan, ok := a.planLogin("xxvcc-a1", false, "no", true); ok {
+			t.Fatalf("known key blocker bypassed --no-fix-sshd through Match Group deferral: %+v", plan)
+		}
+	})
+
+	t.Run("interactive consent is still required", func(t *testing.T) {
+		a, _ := interactiveApp(t, "y\n", conf)
+		a.SSHD = &sshdconf.Manager{}
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+		plan, ok := a.planLogin("xxvcc-a1", false, "ask", false)
+		if !ok || !plan.fixSSHD {
+			t.Fatalf("known key blocker bypassed the normal repair choice: ok=%v plan=%+v", ok, plan)
+		}
+	})
+}
+
+func TestPasswordDefersOnlyPreAccountMatchGroup(t *testing.T) {
+	t.Run("group is resolved before password", func(t *testing.T) {
+		a, _, _ := newTestApp(t, "")
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
+		}
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+		plan, ok := a.planLogin("xxvcc-a1", true, "no", true)
+		if !ok || !plan.password {
+			t.Fatalf("Group-only pre-account uncertainty was not deferred: ok=%v plan=%+v", ok, plan)
+		}
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
+		}
+		if !a.confirmLogin("xxvcc-a1", []string{"xxvcc-a1"}, &plan) {
+			t.Fatal("password was not accepted after the post-account config became conclusive")
+		}
+	})
+
+	t.Run("known blocker is rejected before account creation", func(t *testing.T) {
+		a, _, _ := newTestApp(t, "")
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("passwordauthentication no\n"), nil
+		}
+		a.SSHDHasUnverifiableMatch = func(accountExists bool) bool { return !accountExists }
+		if plan, ok := a.planLogin("xxvcc-a1", true, "no", true); ok {
+			t.Fatalf("known password blocker was deferred until after account creation: %+v", plan)
+		}
+	})
+
+	t.Run("connection uncertainty still fails closed", func(t *testing.T) {
+		a, _, _ := newTestApp(t, "")
+		a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
+		}
+		a.SSHDHasUnverifiableMatch = func(bool) bool { return true }
+		if plan, ok := a.planLogin("xxvcc-a1", true, "no", true); ok {
+			t.Fatalf("password plan accepted persistent Match uncertainty: %+v", plan)
+		}
+	})
 }
 
 func TestDetachedSignatureURLPreservesQueryAndFragment(t *testing.T) {
@@ -1611,8 +2302,17 @@ func TestPromptYesNoStopsAfterInvalidNonTTYInputAndEOF(t *testing.T) {
 
 func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
-	managed := user.Passwd{UID: 1001, GECOS: config.ManagedGenerationGECOSPrefix + generation}
-	legacy := user.Passwd{UID: 1001, GECOS: config.ManagedGECOS}
+	managed := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: config.ManagedGenerationGECOSPrefix + generation, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
+	legacy := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: config.ManagedGECOS, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
+	rootUID := managed
+	rootUID.UID = 0
+	rootGID := managed
+	rootGID.GID = 0
+	invalidGID := managed
+	reservedKernelID := uint64(^uint32(0))
+	invalidGID.GID = int(reservedKernelID)
+	homeMismatch := managed
+	homeMismatch.Home = "/srv/xxvcc-a1"
 	tests := []struct {
 		name   string
 		rec    registry.Record
@@ -1624,12 +2324,18 @@ func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 		{name: "missing", want: registeredMissing},
 		{name: "lookup error", err: errors.New("passwd unreadable"), want: registeredUnknown},
 		{name: "pending", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true, Pending: true}, pw: managed, exists: true, want: registeredPending},
+		{name: "pending with root primary GID", rec: registry.Record{Generation: generation, IdentityBound: true, Pending: true}, pw: rootGID, exists: true, want: registeredIdentityUnverified},
 		{name: "no trusted UID", rec: registry.Record{}, pw: managed, exists: true, want: registeredIdentityUnverified},
+		{name: "root account UID", rec: registry.Record{UID: 1001}, pw: rootUID, exists: true, want: registeredIdentityUnverified},
+		{name: "root primary GID", rec: registry.Record{UID: 1001}, pw: rootGID, exists: true, want: registeredIdentityUnverified},
+		{name: "reserved kernel GID", rec: registry.Record{UID: 1001}, pw: invalidGID, exists: true, want: registeredIdentityUnverified},
+		{name: "reserved recorded UID", rec: registry.Record{UID: int(reservedKernelID)}, pw: managed, exists: true, want: registeredIdentityUnverified},
 		{name: "UID mismatch", rec: registry.Record{UID: 1002, Generation: generation, IdentityBound: true}, pw: managed, exists: true, want: registeredUIDMismatch},
 		{name: "legacy", rec: registry.Record{UID: 1001}, pw: legacy, exists: true, want: registeredLegacyIdentity},
-		{name: "marker mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true}, pw: user.Passwd{UID: 1001}, exists: true, want: registeredMarkerMismatch},
+		{name: "marker mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true}, pw: user.Passwd{UID: 1001, GID: 1001}, exists: true, want: registeredMarkerMismatch},
 		{name: "generation mismatch", rec: registry.Record{UID: 1001, Generation: "fedcba9876543210fedcba9876543210", IdentityBound: true}, pw: managed, exists: true, want: registeredMarkerMismatch},
-		{name: "active", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true}, pw: managed, exists: true, want: registeredActive},
+		{name: "home mismatch", rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: generation, IdentityBound: true}, pw: homeMismatch, exists: true, want: registeredHomeMismatch},
+		{name: "active", rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: generation, IdentityBound: true}, pw: managed, exists: true, want: registeredActive},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1659,7 +2365,7 @@ func TestPlanDepsAllPresent(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir)
 
-	pkgs, ok := a.planDeps(false, false, false, true)
+	pkgs, ok := a.planDeps(false, false, false, false, true)
 	if !ok || len(pkgs) != 0 {
 		t.Errorf("planDeps = %v, %v; want nil,true when nothing is missing", pkgs, ok)
 	}
@@ -1673,7 +2379,7 @@ func TestPlanDepsRefusesAutomaticPacmanPartialUpgrade(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	pkgs, ok := a.planDeps(false, true, false, true)
+	pkgs, ok := a.planDeps(false, false, true, false, true)
 	if ok || len(pkgs) != 0 {
 		t.Fatalf("planDeps = %v, %v; want refusal on pacman", pkgs, ok)
 	}
@@ -1681,6 +2387,27 @@ func TestPlanDepsRefusesAutomaticPacmanPartialUpgrade(t *testing.T) {
 	if !strings.Contains(got, "Arch does not support partial upgrades") ||
 		!strings.Contains(got, "pacman -Syu --needed coreutils shadow") {
 		t.Fatalf("pacman refusal did not explain the safe manual path: %q", got)
+	}
+}
+
+func TestPlanDepsRequiresChpasswdOnlyForPasswordLogin(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	binDir := t.TempDir()
+	for _, name := range []string{"id", "useradd", "usermod", "chage", "userdel"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir)
+
+	if pkgs, ok := a.planDeps(false, false, false, false, true); !ok || len(pkgs) != 0 {
+		t.Fatalf("key-only planDeps = %v, %v; want nil,true", pkgs, ok)
+	}
+	if pkgs, ok := a.planDeps(false, true, false, false, true); ok || len(pkgs) != 0 {
+		t.Fatalf("password planDeps = %v, %v; want pre-transaction refusal", pkgs, ok)
+	}
+	if got := errb.String(); !strings.Contains(got, "missing dependencies") || !strings.Contains(got, "chpasswd") {
+		t.Fatalf("password dependency refusal did not name chpasswd: %q", got)
 	}
 }
 

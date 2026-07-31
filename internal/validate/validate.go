@@ -47,6 +47,14 @@ func KernelID(id int) bool {
 // and every unattended action tied to one require this stronger form.
 func AccountID(id int) bool { return id > 0 && KernelID(id) }
 
+// ManagedHome reports whether home is the exact dedicated path assigned to a
+// newly created temporary account. Keep this check textual and exact: accepting
+// a cleaned or symlink-resolved equivalent would weaken the pathname binding
+// used before recursive cleanup.
+func ManagedHome(user, home string) bool {
+	return Username(user) && home == "/home/"+user
+}
+
 // Prefix reports whether s is a valid username prefix.
 func Prefix(s string) bool {
 	return prefixRe.MatchString(s) && !strings.HasSuffix(s, "-") && !strings.HasSuffix(s, "_")

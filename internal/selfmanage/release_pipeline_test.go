@@ -42,9 +42,11 @@ func TestReleaseWriterIsSeparatedFromCandidateWorkflow(t *testing.T) {
 		strings.Count(stage, ".verification.signature") != 2 || strings.Count(stage, "-----BEGIN PGP SIGNATURE-----") != 2 {
 		t.Fatal("trusted stage workflow does not reject unsigned annotated tags")
 	}
-	if !strings.Contains(stage, "[[ \"$lookup_status\" -eq 1 ]]") ||
-		strings.Contains(stage, "[[ \"$lookup_status\" -ne 124") {
-		t.Fatal("trusted stage workflow accepts an abnormal release-lookup exit status as an HTTP 404")
+	if !strings.Contains(stage, `gh api --paginate`) ||
+		!strings.Contains(stage, `releases?per_page=100`) ||
+		!strings.Contains(stage, `(( match_count == 0 ))`) ||
+		strings.Contains(stage, `releases/tags/${TAG}`) {
+		t.Fatal("trusted stage workflow does not enumerate authenticated draft and published Release identities")
 	}
 	if strings.Contains(stage, "--clobber") {
 		t.Fatal("trusted stage workflow must never refresh an existing draft")
@@ -234,10 +236,10 @@ func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *tes
 	}
 }
 
-func TestStageReleaseLookupAcceptsOnlyExactGHHTTPErrorStatus(t *testing.T) {
+func TestStageReleaseLookupRejectsEveryExistingDraftOrPublishedTag(t *testing.T) {
 	stage := readReleaseFile(t, "../../.github/workflows/stage-release.yml")
-	start := strings.Index(stage, "          lookup=\"$(mktemp)\"")
-	endMarker := "          rm -f -- \"$lookup\""
+	start := strings.Index(stage, "          release_records=\"")
+	endMarker := "          # Re-resolve the protected tag immediately before the first write;"
 	if start < 0 {
 		t.Fatal("could not isolate staged-release absence check")
 	}
@@ -262,7 +264,7 @@ exec "$@"
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(binDir, "gh"), []byte(`#!/bin/sh
-printf 'HTTP/2 404 Not Found\n\n{}\n'
+printf '%b' "${MOCK_RELEASES-}"
 exit "${MOCK_GH_STATUS:?}"
 `), 0o700); err != nil {
 		t.Fatal(err)
@@ -272,29 +274,35 @@ exit "${MOCK_GH_STATUS:?}"
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		status int
-		ok     bool
+		name     string
+		status   int
+		releases string
+		ok       bool
 	}{
-		{status: 1, ok: true},
-		{status: 0, ok: false},
-		{status: 2, ok: false},
-		{status: 124, ok: false},
-		{status: 137, ok: false},
+		{name: "empty list", status: 0, ok: true},
+		{name: "unrelated release", status: 0, releases: "v2.7.3\\t100\\n", ok: true},
+		{name: "existing draft", status: 0, releases: "v2.8.0\\t101\\n"},
+		{name: "duplicate matching tag", status: 0, releases: "v2.8.0\\t101\\nv2.8.0\\t102\\n"},
+		{name: "zero id", status: 0, releases: "v2.7.3\\t0\\n"},
+		{name: "extra field", status: 0, releases: "v2.7.3\\t100\\textra\\n"},
+		{name: "api failure", status: 1},
+		{name: "api timeout", status: 124},
 	} {
-		t.Run(fmt.Sprintf("status-%d", tc.status), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			cmd := exec.Command("/bin/bash", script)
 			cmd.Env = []string{
 				"PATH=" + binDir + ":/usr/bin:/bin",
 				fmt.Sprintf("MOCK_GH_STATUS=%d", tc.status),
+				"MOCK_RELEASES=" + tc.releases,
 				"GH_REPO=xxvcc/linux-temp-admin",
 				"TAG=v2.8.0",
 			}
 			out, err := cmd.CombinedOutput()
 			if tc.ok && err != nil {
-				t.Fatalf("exact HTTP error status was rejected: %v\n%s", err, out)
+				t.Fatalf("absent tag was rejected: %v\n%s", err, out)
 			}
 			if !tc.ok && err == nil {
-				t.Fatalf("abnormal status was accepted: %s", out)
+				t.Fatalf("existing, malformed, or unverified state was accepted: %s", out)
 			}
 		})
 	}
@@ -320,6 +328,9 @@ func TestManualLatestRecoveryUsesSanitizedBoundedGitHubClient(t *testing.T) {
 		"GH_PROMPT_DISABLED=1",
 		"gh_with_timeout() {",
 		"timeout -k 5 300 gh \"$@\"",
+		"enumerate_recovery_target() {",
+		"expected_fallback_id=$fallback_id",
+		"highest stable fallback changed during Latest recovery",
 		"[[ \"$latest_status\" -eq 1 ]]",
 	} {
 		if !strings.Contains(recovery, required) {
@@ -339,8 +350,26 @@ func TestManualLatestRecoveryUsesSanitizedBoundedGitHubClient(t *testing.T) {
 	if strings.Contains(releasing, `GH_TOKEN="$GH_TOKEN"`) {
 		t.Fatal("release documentation exposes GH_TOKEN through a command argument")
 	}
+	if got := strings.Count(recovery, "\nenumerate_recovery_target\n"); got != 2 {
+		t.Fatalf("manual Latest recovery enumerates stable Releases %d times, want 2", got)
+	}
 	if got := strings.Count(releasing, "read -r -s -p 'Short-lived github.com release token: ' GH_TOKEN </dev/tty"); got != 3 {
 		t.Fatalf("release documentation has %d protected GH_TOKEN prompts, want 3", got)
+	}
+	const opener = "/bin/bash -p <<'LTA_LATEST_RECOVERY'\n"
+	bodyStart := strings.Index(recovery, opener)
+	if bodyStart < 0 {
+		t.Fatal("manual Latest recovery heredoc opener is missing")
+	}
+	bodyStart += len(opener)
+	bodyEnd := strings.Index(recovery[bodyStart:], "\nLTA_LATEST_RECOVERY\n")
+	if bodyEnd < 0 {
+		t.Fatal("manual Latest recovery heredoc terminator is missing")
+	}
+	cmd := exec.Command("/bin/bash", "-n")
+	cmd.Stdin = strings.NewReader(recovery[bodyStart : bodyStart+bodyEnd])
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("manual Latest recovery block has invalid Bash syntax: %v\n%s", err, out)
 	}
 }
 
@@ -2614,7 +2643,17 @@ func TestTrustedReleaseScriptsPinTemporaryDirectoryAndGitHubHost(t *testing.T) {
 		t.Fatal("trusted staging workflow does not bound GitHub calls and fail closed on ambiguous release lookup")
 	}
 	preflight := strings.Index(publish, "for command_name in")
-	firstMutation := strings.Index(publish, `gh_with_timeout release upload "$TAG"`)
+	firstMutation := -1
+	for _, mutation := range []string{
+		"gh_with_timeout api --method PATCH",
+		"gh_with_timeout api --method POST",
+		"gh_with_timeout api --method DELETE",
+	} {
+		index := strings.Index(publish, mutation)
+		if index >= 0 && (firstMutation < 0 || index < firstMutation) {
+			firstMutation = index
+		}
+	}
 	if preflight < 0 || firstMutation < 0 || preflight > firstMutation {
 		t.Fatal("publisher command preflight does not precede its first remote mutation")
 	}
@@ -3151,13 +3190,23 @@ func TestPublisherResumeAndRecoveryGuards(t *testing.T) {
 	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
 	for _, required := range []string{
 		"resume exactly matching published release (no asset mutation)",
+		`repos/${REPO}/releases?per_page=100`,
+		`repos/${REPO}/releases/${EXPECTED_RELEASE_ID}`,
+		"initial_release_state",
+		"bind_initial_release",
+		"readonly EXPECTED_RELEASE_ID RELEASE_WAS_DRAFT",
+		"replace_bound_draft_assets",
+		"publish_bound_release",
+		"secure_failed_publication_state",
+		"set_latest_by_release_id",
 		"require_exact_signed_assets",
 		"require_remote_asset_digests",
 		"RESUMING_ALREADY_LATEST",
 		"LATEST_PROMOTION_ATTEMPTED=1",
 		"restore_latest_after_failed_promotion",
 		"highest_stable_release_excluding",
-		"require_latest_exact",
+		"require_latest_release_exact",
+		"require_immutable_release",
 		"HTTP/[0-9.]+ 404",
 		"CRITICAL: automatic Latest restoration failed",
 	} {
@@ -3166,9 +3215,692 @@ func TestPublisherResumeAndRecoveryGuards(t *testing.T) {
 		}
 	}
 	resume := strings.Index(publish, "resume exactly matching published release")
-	upload := strings.Index(publish, `gh_with_timeout release upload "$TAG"`)
+	upload := strings.Index(publish, "\n  replace_bound_draft_assets\n")
 	if resume < 0 || upload < 0 || resume < upload {
 		t.Fatal("published-release resume path is not separated from draft asset upload")
+	}
+	if strings.Count(publish, "require_immutable_release") != 4 {
+		t.Fatal("publisher must define and enforce the immutable-Release gate before and after public verification")
+	}
+	immutableAfterPublish := strings.Index(publish, "\nif ! require_immutable_release; then")
+	versionedVerification := strings.Index(publish, `echo ">> [publish 3/4] independently verify public versioned assets"`)
+	promotionGate := strings.Index(publish, "\n    require_immutable_release\n    set_latest_by_release_id")
+	latestVerification := strings.Index(publish, `verify_public_set "https://github.com/${REPO}/releases/latest/download"`)
+	if immutableAfterPublish < 0 || versionedVerification < 0 || immutableAfterPublish > versionedVerification ||
+		promotionGate < 0 || latestVerification < 0 || promotionGate > latestVerification {
+		t.Fatal("publisher does not enforce immutable state before public fetching and Latest promotion")
+	}
+	if strings.Count(publish, `require_latest_release_exact "$TAG" "$EXPECTED_RELEASE_ID"`) != 2 {
+		t.Fatal("publisher does not verify the promoted target's exact numeric Latest identity before and after Latest downloads")
+	}
+	for _, forbidden := range []string{
+		"gh_with_timeout release upload",
+		"gh_with_timeout release edit",
+		"gh_with_timeout release delete",
+		`--method PATCH "repos/${REPO}/releases/tags/`,
+		`--method DELETE "repos/${REPO}/releases/tags/`,
+		`--method POST "repos/${REPO}/releases/tags/`,
+		"require_tag_release_identity",
+	} {
+		if strings.Contains(publish, forbidden) {
+			t.Fatalf("publisher still performs a tag-addressed Release mutation: %q", forbidden)
+		}
+	}
+	bind := strings.Index(publish, "\nbind_initial_release\nreadonly EXPECTED_RELEASE_ID RELEASE_WAS_DRAFT")
+	baseline := strings.Index(publish, "\nBASELINE_HIGHEST_TAG=")
+	if bind < 0 || baseline < 0 || bind > baseline {
+		t.Fatal("publisher does not bind the numeric Release identity from its initial state before baseline checks")
+	}
+}
+
+func TestPublisherDraftAssetReplacementIsRecoverableAndBound(t *testing.T) {
+	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
+	start := strings.Index(publish, "remote_asset_names() {")
+	end := strings.Index(publish[start:], "\nif [[ \"$TAG\" == *-* ]]")
+	if start < 0 || end <= 0 {
+		t.Fatal("could not isolate publisher draft-asset replacement functions")
+	}
+	functions := publish[start : start+end]
+
+	const (
+		checksums = "SHA256SUMS"
+		amd64     = "linux-temp-admin-linux-amd64"
+		amd64Sig  = "linux-temp-admin-linux-amd64.sig"
+		arm64     = "linux-temp-admin-linux-arm64"
+		arm64Sig  = "linux-temp-admin-linux-arm64.sig"
+	)
+	type replacementCase struct {
+		name    string
+		assets  []string
+		wantOK  bool
+		wantErr string
+		failAt  int
+	}
+	tests := []replacementCase{
+		{
+			name:   "staged unsigned set",
+			assets: []string{checksums, amd64, arm64},
+			wantOK: true,
+		},
+		{
+			name:   "resume after one core deletion",
+			assets: []string{checksums, amd64, amd64Sig, arm64Sig},
+			wantOK: true,
+		},
+		{
+			name:   "resume after one signature deletion",
+			assets: []string{checksums, amd64, amd64Sig, arm64},
+			wantOK: true,
+		},
+		{
+			name:    "reject partial unsigned set",
+			assets:  []string{checksums, amd64},
+			wantErr: "neither the staged set nor a recoverable one-asset interruption",
+		},
+		{
+			name:    "reject two-asset deficit after signing began",
+			assets:  []string{checksums, amd64, amd64Sig},
+			wantErr: "neither the staged set nor a recoverable one-asset interruption",
+		},
+		{
+			name:    "reject unexpected asset",
+			assets:  []string{checksums, amd64, arm64, "untrusted-extra"},
+			wantErr: "unexpected asset",
+		},
+		{
+			name:    "reject duplicate asset name",
+			assets:  []string{checksums, amd64, arm64, amd64},
+			wantErr: "repeats an asset name or identity",
+		},
+	}
+	exactAssets := []string{checksums, amd64, amd64Sig, arm64, arm64Sig}
+	for failAt := 1; failAt <= 10; failAt++ {
+		tests = append(tests, replacementCase{
+			name:   fmt.Sprintf("resume exact set after ambiguous mutation %02d", failAt),
+			assets: exactAssets,
+			wantOK: true,
+			failAt: failAt,
+		})
+	}
+	for failAt := 1; failAt <= 2; failAt++ {
+		tests = append(tests, replacementCase{
+			name:   fmt.Sprintf("resume missing signatures after ambiguous upload %02d", failAt),
+			assets: []string{checksums, amd64, arm64},
+			wantOK: true,
+			failAt: failAt,
+		})
+	}
+
+	assertRecoverableRecords := func(t *testing.T, path string, wantExact bool) {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed := map[string]bool{
+			checksums: true,
+			amd64:     true,
+			amd64Sig:  true,
+			arm64:     true,
+			arm64Sig:  true,
+		}
+		seenNames := make(map[string]bool)
+		seenIDs := make(map[string]bool)
+		coreCount := 0
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) == 1 && lines[0] == "" {
+			lines = nil
+		}
+		for _, line := range lines {
+			fields := strings.Split(line, "\t")
+			if len(fields) != 3 || !allowed[fields[0]] || seenNames[fields[0]] || seenIDs[fields[1]] {
+				t.Fatalf("unsafe residual draft asset record %q after ambiguous mutation", line)
+			}
+			seenNames[fields[0]] = true
+			seenIDs[fields[1]] = true
+			if fields[0] == checksums || fields[0] == amd64 || fields[0] == arm64 {
+				coreCount++
+			}
+		}
+		if !((len(seenNames) == 3 && coreCount == 3) || len(seenNames) == 4 || len(seenNames) == 5) {
+			t.Fatalf("ambiguous mutation left a non-recoverable asset set: %s", data)
+		}
+		if wantExact && len(seenNames) != len(allowed) {
+			t.Fatalf("resumed replacement left %d assets, want exact set of %d: %s", len(seenNames), len(allowed), data)
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bundle := filepath.Join(dir, "bundle")
+			if err := os.Mkdir(bundle, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{checksums, amd64, amd64Sig, arm64, arm64Sig} {
+				if err := os.WriteFile(filepath.Join(bundle, name), []byte("signed "+name+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var records strings.Builder
+			for i, name := range tt.assets {
+				id := 100 + i
+				fmt.Fprintf(&records, "%s\t%d\thttps://api.github.com/repos/mock/repo/releases/assets/%d\n", name, id, id)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "records"), []byte(records.String()), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "next-id"), []byte("1000"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "mutations"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "mutation-count"), []byte("0"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			script := filepath.Join(dir, "replace-assets.sh")
+			body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+EXPECTED_RELEASE_ID=12345
+BUNDLE_DIR="$TEST_BUNDLE"
+require_draft() { return 0; }
+record_applied_mutation() {
+  local count
+  count="$(<"$TEST_STATE/mutation-count")"
+  count=$((count + 1))
+  printf '%s' "$count" > "$TEST_STATE/mutation-count"
+  (( TEST_FAIL_AT == 0 || count != TEST_FAIL_AT ))
+}
+gh_with_timeout() {
+  if [[ "$1" == api && "$2" == --paginate \
+       && "$3" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" ]]; then
+    case "$5" in
+      '.[].name') cut -f1 "$TEST_STATE/records" ;;
+      *'@tsv'*) cat "$TEST_STATE/records" ;;
+      *) return 98 ;;
+    esac
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+       && "$3" == --jq && "$4" == .upload_url ]]; then
+    printf 'https://uploads.github.com/repos/%s/releases/%s/assets{?name,label}\n' \
+      "$REPO" "$EXPECTED_RELEASE_ID"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == DELETE ]]; then
+    local id=${4##*/} before after
+    printf 'DELETE %s\n' "$4" >> "$TEST_STATE/mutations"
+    before="$(wc -l < "$TEST_STATE/records")"
+    awk -F '\t' -v id="$id" '$2 != id' "$TEST_STATE/records" > "$TEST_STATE/records.next"
+    after="$(wc -l < "$TEST_STATE/records.next")"
+    [[ "$before" -eq $((after + 1)) ]] || return 97
+    mv "$TEST_STATE/records.next" "$TEST_STATE/records"
+	  record_applied_mutation || return $?
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == POST ]]; then
+    local endpoint= input= arg name id size
+    for arg in "$@"; do
+      case "$arg" in
+        https://uploads.github.com/*) endpoint=$arg ;;
+      esac
+    done
+    for ((i=1; i <= $#; i++)); do
+      if [[ "${!i}" == --input ]]; then
+        i=$((i + 1))
+        input=${!i}
+        break
+      fi
+    done
+    [[ "$endpoint" == "https://uploads.github.com/repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?name="* \
+       && -f "$input" ]] || return 96
+    name=${endpoint##*?name=}
+    id="$(<"$TEST_STATE/next-id")"
+    printf '%s' "$((id + 1))" > "$TEST_STATE/next-id"
+    size="$(wc -c < "$input")"
+    printf 'POST %s\n' "$endpoint" >> "$TEST_STATE/mutations"
+    printf '%s\t%s\thttps://api.github.com/repos/%s/releases/assets/%s\n' \
+      "$name" "$id" "$REPO" "$id" >> "$TEST_STATE/records"
+	  record_applied_mutation || return $?
+    printf '%s\t%s\t%s\thttps://api.github.com/repos/%s/releases/assets/%s\n' \
+      "$id" "$name" "$size" "$REPO" "$id"
+    return 0
+  fi
+  printf 'unexpected mock GitHub call: %q ' "$@" >&2
+  return 99
+}
+	` + functions + `
+if [[ "$TEST_WANT_OK" == true ]]; then
+	require_recoverable_draft_assets
+	replace_bound_draft_assets
+	require_exact_signed_assets
+else
+	if require_recoverable_draft_assets; then
+	  echo 'unsafe draft asset state passed the entry precheck' >&2
+	  exit 89
+	fi
+	if replace_bound_draft_assets; then
+	  echo 'unsafe draft asset state was accepted' >&2
+    exit 90
+  fi
+  [[ ! -s "$TEST_STATE/mutations" ]]
+fi
+`
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			run := func(failAt int) ([]byte, error) {
+				cmd := exec.Command("/bin/bash", script)
+				cmd.Env = append(os.Environ(),
+					"TEST_STATE="+dir,
+					"TEST_BUNDLE="+bundle,
+					"TEST_WANT_OK="+strconv.FormatBool(tt.wantOK),
+					"TEST_FAIL_AT="+strconv.Itoa(failAt),
+				)
+				return cmd.CombinedOutput()
+			}
+			out, err := run(tt.failAt)
+			if tt.failAt > 0 {
+				if err == nil {
+					t.Fatalf("ambiguous mutation %d unexpectedly completed: %s", tt.failAt, out)
+				}
+				assertRecoverableRecords(t, filepath.Join(dir, "records"), false)
+				if writeErr := os.WriteFile(filepath.Join(dir, "mutation-count"), []byte("0"), 0o600); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				resumeOut, resumeErr := run(0)
+				if resumeErr != nil {
+					t.Fatalf("draft did not resume after ambiguous mutation %d: %v\nfirst run:\n%s\nresume:\n%s",
+						tt.failAt, resumeErr, out, resumeOut)
+				}
+				assertRecoverableRecords(t, filepath.Join(dir, "records"), true)
+				return
+			}
+			if tt.wantOK {
+				if err != nil {
+					t.Fatalf("recoverable draft asset replacement failed: %v\n%s", err, out)
+				}
+				mutations, readErr := os.ReadFile(filepath.Join(dir, "mutations"))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				mutationLog := string(mutations)
+				firstPOST := strings.Index(mutationLog, "POST ")
+				firstDELETE := strings.Index(mutationLog, "DELETE ")
+				if firstPOST < 0 || firstDELETE < 0 || firstPOST > firstDELETE {
+					t.Fatalf("missing assets were not filled before destructive replacement:\n%s", mutationLog)
+				}
+				for _, line := range strings.Split(strings.TrimSpace(mutationLog), "\n") {
+					if strings.HasPrefix(line, "POST ") && !strings.Contains(line, "/releases/12345/assets?name=") {
+						t.Fatalf("asset upload escaped the bound Release ID: %s", line)
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("fail-closed fixture did not handle rejection: %v\n%s", err, out)
+				}
+				if !strings.Contains(string(out), tt.wantErr) {
+					t.Fatalf("draft rejection did not explain %q: %s", tt.wantErr, out)
+				}
+			}
+		})
+	}
+}
+
+func TestPublisherBindsInitialReleaseIdentity(t *testing.T) {
+	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
+	start := strings.Index(publish, "initial_release_state() {")
+	if start < 0 {
+		t.Fatal("could not locate publisher initial Release state reader")
+	}
+	end := strings.Index(publish[start:], "\nrequire_remote_tag_object() {")
+	if end < 0 {
+		t.Fatal("could not isolate publisher initial Release identity binding")
+	}
+	initialGuards := publish[start : start+end]
+
+	for _, tc := range []struct {
+		name    string
+		records string
+		want    string
+	}{
+		{name: "mutable draft", records: "v2.8.0\ttrue\tfalse\tfalse\t12345", want: "1 12345\n"},
+		{name: "immutable published release", records: "v2.8.0\tfalse\tfalse\ttrue\t12345", want: "0 12345\n"},
+		{
+			name: "unrelated releases do not hide unique draft",
+			records: "v2.7.3\tfalse\tfalse\ttrue\t11111\n" +
+				"v2.8.0\ttrue\tfalse\tfalse\t12345\n" +
+				"v2.9.0-rc.1\tfalse\ttrue\ttrue\t22222",
+			want: "1 12345\n",
+		},
+		{name: "mutable published release", records: "v2.8.0\tfalse\tfalse\tfalse\t12345"},
+		{name: "immutable draft", records: "v2.8.0\ttrue\tfalse\ttrue\t12345"},
+		{name: "no matching release", records: "v2.8.1\tfalse\tfalse\ttrue\t12345"},
+		{name: "empty release list"},
+		{name: "missing numeric identity", records: "v2.8.0\tfalse\tfalse\ttrue\tnull"},
+		{name: "zero identity", records: "v2.8.0\tfalse\tfalse\ttrue\t0"},
+		{
+			name: "duplicate tag is ambiguous",
+			records: "v2.8.0\ttrue\tfalse\tfalse\t12345\n" +
+				"v2.8.0\tfalse\tfalse\ttrue\t67890",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "initial-release.sh")
+			body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+gh_with_timeout() {
+  [[ "$1" == api && "$2" == --paginate \
+     && "$3" == "repos/${REPO}/releases?per_page=100" ]] || return 99
+  printf '%s\n' "$TEST_RELEASE_RECORDS"
+}
+` + initialGuards + `
+bind_initial_release
+printf '%s %s\n' "$RELEASE_WAS_DRAFT" "$EXPECTED_RELEASE_ID"
+`
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", script)
+			cmd.Env = append(os.Environ(), "TEST_RELEASE_RECORDS="+tc.records)
+			out, err := cmd.CombinedOutput()
+			if tc.want != "" {
+				if err != nil || string(out) != tc.want {
+					t.Fatalf("valid initial Release state was rejected: %v\n%s", err, out)
+				}
+			} else if err == nil {
+				t.Fatalf("unsafe initial Release records %q were accepted: %s", tc.records, out)
+			}
+		})
+	}
+
+	t.Run("published-only tag endpoint is unnecessary and numeric identity remains fixed", func(t *testing.T) {
+		script := filepath.Join(t.TempDir(), "draft-identity.sh")
+		body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+printf 'v2.8.0\ttrue\tfalse\tfalse\t12345\n' > "$TEST_STATE/release-records"
+printf 'v2.8.0 true false false 12345\n' > "$TEST_STATE/bound-state"
+gh_with_timeout() {
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/tags/${TAG}" ]]; then
+    printf 'HTTP 404: published release not found\n' >&2
+    printf 'tag\n' >> "$TEST_STATE/calls"
+    return 1
+  fi
+  if [[ "$1" == api && "$2" == --paginate \
+       && "$3" == "repos/${REPO}/releases?per_page=100" ]]; then
+    printf 'list\n' >> "$TEST_STATE/calls"
+    cat "$TEST_STATE/release-records"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/12345" ]]; then
+    printf 'bound\n' >> "$TEST_STATE/calls"
+    cat "$TEST_STATE/bound-state"
+    return 0
+  fi
+  return 99
+}
+` + initialGuards + `
+if gh_with_timeout api "repos/${REPO}/releases/tags/${TAG}" >/dev/null 2>&1; then
+  echo "published-only tag endpoint unexpectedly exposed the draft" >&2
+  exit 98
+fi
+: > "$TEST_STATE/calls"
+bind_initial_release
+require_draft
+grep -Fxq list "$TEST_STATE/calls"
+grep -Fxq bound "$TEST_STATE/calls"
+if grep -Fxq tag "$TEST_STATE/calls"; then
+  echo "publisher depended on the published-only tag endpoint" >&2
+  exit 97
+fi
+printf 'v2.8.0 true false false 67890\n' > "$TEST_STATE/bound-state"
+require_draft
+`
+		if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/bash", script)
+		cmd.Env = append(os.Environ(), "TEST_STATE="+filepath.Dir(script))
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "identity changed") {
+			t.Fatalf("replacement draft Release identity was accepted: %v\n%s", err, out)
+		}
+	})
+}
+
+func TestPublisherRejectsMutableReleaseState(t *testing.T) {
+	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
+	identityStart := strings.Index(publish, "initial_release_state() {")
+	identityEnd := strings.Index(publish, "\nbind_initial_release() {")
+	gateStart := strings.Index(publish, "require_immutable_release() {")
+	if identityStart < 0 || identityEnd <= identityStart || gateStart < 0 {
+		t.Fatal("could not locate publisher immutable-Release gate")
+	}
+	gateEnd := strings.Index(publish[gateStart:], "\n}\n")
+	if gateEnd < 0 {
+		t.Fatal("could not isolate publisher immutable-Release gate")
+	}
+	gate := publish[identityStart:identityEnd] + "\n" + publish[gateStart:gateStart+gateEnd+2]
+
+	for _, tc := range []struct {
+		name  string
+		state string
+		ok    bool
+	}{
+		{name: "expected immutable release", state: "v2.8.0 false false true 12345", ok: true},
+		{name: "mutable release", state: "v2.8.0 false false false 12345"},
+		{name: "draft release", state: "v2.8.0 true false true 12345"},
+		{name: "wrong prerelease state", state: "v2.8.0 false true true 12345"},
+		{name: "different tag", state: "v2.8.1 false false true 12345"},
+		{name: "missing numeric identity", state: "v2.8.0 false false true null"},
+		{name: "zero identity", state: "v2.8.0 false false true 0"},
+		{name: "different numeric identity", state: "v2.8.0 false false true 67890"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "immutable-gate.sh")
+			body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+EXPECTED_RELEASE_ID=12345
+gh_with_timeout() {
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]]; then
+    printf '%s\n' "$TEST_RELEASE_STATE"
+    return 0
+  fi
+  return 99
+}
+` + gate + `
+require_immutable_release
+`
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", script)
+			cmd.Env = append(os.Environ(), "TEST_RELEASE_STATE="+tc.state)
+			out, err := cmd.CombinedOutput()
+			if tc.ok && err != nil {
+				t.Fatalf("immutable release was rejected: %v\n%s", err, out)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("unsafe release state %q was accepted", tc.state)
+			}
+		})
+	}
+
+	t.Run("release identity remains fixed", func(t *testing.T) {
+		script := filepath.Join(t.TempDir(), "immutable-identity.sh")
+		body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+EXPECTED_RELEASE_ID=12345
+gh_with_timeout() {
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]]; then
+    printf '%s\n' "$TEST_RELEASE_STATE"
+    return 0
+  fi
+  return 99
+}
+` + gate + `
+TEST_RELEASE_STATE="v2.8.0 false false true 12345"
+require_immutable_release
+TEST_RELEASE_STATE="v2.8.0 false false true 67890"
+require_immutable_release
+`
+		if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("/bin/bash", script).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "identity changed") {
+			t.Fatalf("replacement Release identity was accepted: %v\n%s", err, out)
+		}
+	})
+}
+
+func TestPublisherMutationStaysBoundAfterTagReplacement(t *testing.T) {
+	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
+	start := strings.Index(publish, "initial_release_state() {")
+	if start < 0 {
+		t.Fatal("could not locate bound publication functions")
+	}
+	end := strings.Index(publish[start:], "\nsecure_failed_publication_state() {")
+	if end <= 0 {
+		t.Fatal("could not isolate bound publication functions")
+	}
+	functions := publish[start : start+end]
+	dir := t.TempDir()
+	script := filepath.Join(dir, "bound-publication.sh")
+	body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+EXPECTED_RELEASE_ID=12345
+printf 'v2.8.0\ttrue\tfalse\tfalse\t12345\n' > "$TEST_STATE/release-records"
+printf 'v2.8.0 true false false 12345\n' > "$TEST_STATE/bound-state"
+gh_with_timeout() {
+  printf '%q ' "$@" >> "$TEST_STATE/calls"
+  printf '\n' >> "$TEST_STATE/calls"
+  if [[ "$1" == api && "$2" == --paginate \
+       && "$3" == "repos/${REPO}/releases?per_page=100" ]]; then
+    printf 'list\n' >> "$TEST_STATE/tag-queries"
+    cat "$TEST_STATE/release-records"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]]; then
+    cat "$TEST_STATE/bound-state"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == PATCH ]]; then
+    [[ "$4" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]] || return 97
+    printf 'v2.8.0 false false true 12345\n' > "$TEST_STATE/bound-state"
+    printf 'v2.8.0 false false true 12345\n'
+    return 0
+  fi
+  return 99
+}
+` + functions + `
+printf 'v2.8.0\ttrue\tfalse\tfalse\t67890\n' > "$TEST_STATE/release-records"
+publish_bound_release
+require_immutable_release
+grep -Fq 'api --method PATCH repos/mock/repo/releases/12345 ' "$TEST_STATE/calls"
+if grep -Fq 'api --method PATCH repos/mock/repo/releases/67890 ' "$TEST_STATE/calls"; then
+  echo "publication targeted replacement Release" >&2
+  exit 91
+fi
+if grep -Fq 'api --paginate ' "$TEST_STATE/calls" || [[ -s "$TEST_STATE/tag-queries" ]]; then
+  echo "publisher re-resolved the tag after binding the numeric Release ID" >&2
+  exit 92
+fi
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/bash", script)
+	cmd.Env = append(os.Environ(), "TEST_STATE="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bound publication race guard failed: %v\n%s", err, out)
+	}
+}
+
+func TestPublisherRollsMutablePublicationBackToBoundDraft(t *testing.T) {
+	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
+	start := strings.Index(publish, "initial_release_state() {")
+	if start < 0 {
+		t.Fatal("could not locate mutable-publication rollback functions")
+	}
+	end := strings.Index(publish[start:], "\nresolve_published_stable_release_id() {")
+	if end <= 0 {
+		t.Fatal("could not isolate mutable-publication rollback functions")
+	}
+	functions := publish[start : start+end]
+	dir := t.TempDir()
+	script := filepath.Join(dir, "mutable-rollback.sh")
+	body := `#!/bin/bash
+set -Eeuo pipefail
+TAG=v2.8.0
+REPO=mock/repo
+expected_prerelease=false
+EXPECTED_RELEASE_ID=12345
+printf 'v2.8.0 false false false 12345\n' > "$TEST_STATE/release-state"
+printf 'v2.8.0\tfalse\tfalse\tfalse\t12345\n' > "$TEST_STATE/release-records"
+gh_with_timeout() {
+  if [[ "$1" == api && "$2" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]]; then
+    cat "$TEST_STATE/release-state"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --paginate \
+       && "$3" == "repos/${REPO}/releases?per_page=100" ]]; then
+    printf 'list\n' >> "$TEST_STATE/tag-queries"
+    cat "$TEST_STATE/release-records"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == PATCH ]]; then
+    [[ "$4" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" ]] || return 97
+    [[ "$*" == *'-F draft=true'* && "$*" == *'-f make_latest=false'* ]] || return 96
+    printf '%s\n' "$4" > "$TEST_STATE/write-endpoint"
+    printf 'v2.8.0 true false false 12345\n' > "$TEST_STATE/release-state"
+    cat "$TEST_STATE/release-state"
+    return 0
+  fi
+  return 99
+}
+` + functions + `
+secure_failed_publication_state
+[[ "$(cat "$TEST_STATE/release-state")" == 'v2.8.0 true false false 12345' ]]
+[[ "$(cat "$TEST_STATE/write-endpoint")" == 'repos/mock/repo/releases/12345' ]]
+
+# If another Release takes over the tag mapping after an ambiguous publication,
+# the original numeric Release must still be returned to draft without resolving
+# or following that replacement mapping.
+printf 'v2.8.0 false false false 12345\n' > "$TEST_STATE/release-state"
+printf 'v2.8.0\ttrue\tfalse\tfalse\t67890\n' > "$TEST_STATE/release-records"
+: > "$TEST_STATE/write-endpoint"
+secure_failed_publication_state
+[[ "$(cat "$TEST_STATE/release-state")" == 'v2.8.0 true false false 12345' ]]
+[[ "$(cat "$TEST_STATE/write-endpoint")" == 'repos/mock/repo/releases/12345' ]]
+[[ ! -s "$TEST_STATE/tag-queries" ]]
+`
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/bash", script)
+	cmd.Env = append(os.Environ(), "TEST_STATE="+dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("mutable publication was not safely returned to the bound draft: %v\n%s", err, out)
 	}
 }
 
@@ -3246,40 +3978,73 @@ current_latest_tag > "$TEST_STATE/result"
 func TestPublisherLatestRestorationWithMockGitHub(t *testing.T) {
 	publish := readReleaseFile(t, "../../scripts/publish-release.sh")
 	start := strings.Index(publish, "decimal_gt() {")
-	end := strings.Index(publish, "\nrelease_state() {")
+	end := strings.Index(publish, "\nrequire_remote_tag_object() {")
 	if start < 0 || end <= start {
 		t.Fatal("could not isolate publisher Latest recovery functions")
 	}
 	recoveryFunctions := publish[start:end]
 
 	tests := []struct {
-		name       string
-		stableTags string
-		initial    string
-		expected   string
-		apiMode    string
-		wantOK     bool
+		name                string
+		stableTags          string
+		stableAfterMutation string
+		latestAfterMutation string
+		initial             string
+		expected            string
+		apiMode             string
+		mutableFallback     bool
+		wantOK              bool
+		wantErr             string
 	}{
 		{
 			name:       "restore previous highest stable",
 			stableTags: "v2.7.3\nv2.8.0\n",
-			initial:    "v2.8.0",
-			expected:   "v2.7.3",
+			initial:    "v2.8.0 280",
+			expected:   "v2.7.3 273",
 			apiMode:    "404",
 			wantOK:     true,
 		},
 		{
 			name:       "restore concurrently published higher stable",
 			stableTags: "v2.7.3\nv2.8.0\nv2.9.0\n",
-			initial:    "v2.8.0",
-			expected:   "v2.9.0",
+			initial:    "v2.8.0 280",
+			expected:   "v2.9.0 290",
 			apiMode:    "404",
 			wantOK:     true,
 		},
 		{
+			name:                "detect higher stable published during restoration",
+			stableTags:          "v2.7.3\nv2.8.0\n",
+			stableAfterMutation: "v2.7.3\nv2.8.0\nv2.9.0\n",
+			initial:             "v2.8.0 280",
+			expected:            "v2.7.3 273",
+			apiMode:             "404",
+			wantOK:              false,
+			wantErr:             "highest stable release changed during Latest restoration",
+		},
+		{
+			name:                "reject same-tag replacement Release during restoration",
+			stableTags:          "v2.7.3\nv2.8.0\n",
+			latestAfterMutation: "v2.7.3 999",
+			initial:             "v2.8.0 280",
+			expected:            "v2.7.3 273",
+			apiMode:             "404",
+			wantOK:              false,
+			wantErr:             "Latest restoration failed: Latest is v2.7.3 (999)",
+		},
+		{
+			name:            "reject mutable fallback Release",
+			stableTags:      "v2.7.3\nv2.8.0\n",
+			initial:         "v2.8.0 280",
+			apiMode:         "404",
+			mutableFallback: true,
+			wantOK:          false,
+			wantErr:         "does not resolve to one published GitHub Release",
+		},
+		{
 			name:       "clear Latest when no alternative exists",
 			stableTags: "v2.8.0\n",
-			initial:    "v2.8.0",
+			initial:    "v2.8.0 280",
 			expected:   "",
 			apiMode:    "404",
 			wantOK:     true,
@@ -3287,7 +4052,7 @@ func TestPublisherLatestRestorationWithMockGitHub(t *testing.T) {
 		{
 			name:       "transport failure is not empty Latest",
 			stableTags: "v2.8.0\n",
-			initial:    "v2.8.0",
+			initial:    "v2.8.0 280",
 			expected:   "",
 			apiMode:    "transport",
 			wantOK:     false,
@@ -3295,7 +4060,7 @@ func TestPublisherLatestRestorationWithMockGitHub(t *testing.T) {
 		{
 			name:       "mixed 404 and server error is not empty Latest",
 			stableTags: "v2.8.0\n",
-			initial:    "v2.8.0",
+			initial:    "v2.8.0 280",
 			expected:   "",
 			apiMode:    "mixed",
 			wantOK:     false,
@@ -3310,6 +4075,7 @@ func TestPublisherLatestRestorationWithMockGitHub(t *testing.T) {
 set -Eeuo pipefail
 TAG=v2.8.0
 REPO=mock/repo
+EXPECTED_RELEASE_ID=280
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 work="$TEST_STATE/work"
 mkdir -p "$work"
@@ -3332,20 +4098,57 @@ gh() {
   fi
   if [[ "$1" == release && "$2" == view ]]; then
     if [[ -s "$TEST_STATE/latest" ]]; then
-      cat "$TEST_STATE/latest"
+      read -r tag id extra < "$TEST_STATE/latest"
+      [[ -z "$extra" && "$id" =~ ^[1-9][0-9]*$ ]] || return 95
+      printf '%s\n' "$tag"
       return 0
     fi
     printf 'no latest release\n' >&2
     return 1
   fi
-  if [[ "$1" == release && "$2" == edit ]]; then
-    local tag=$3 arg
+	if [[ "$1" == api && "$2" == repos/mock/repo/releases/latest ]]; then
+	  [[ -s "$TEST_STATE/latest" ]] || return 1
+	  read -r tag id extra < "$TEST_STATE/latest"
+	  [[ -z "$extra" && "$id" =~ ^[1-9][0-9]*$ ]] || return 95
+	  printf '%s false false true %s\n' "$tag" "$id"
+	  return 0
+	fi
+  if [[ "$1" == api && "$2" == repos/mock/repo/releases/tags/* ]]; then
+	  local tag=${2##*/} id immutable=true
+    case "$tag" in
+      v2.7.3) id=273 ;;
+      v2.8.0) id=280 ;;
+      v2.9.0) id=290 ;;
+      *) return 97 ;;
+    esac
+	  if [[ "$TEST_MUTABLE_FALLBACK" == true && "$tag" != "$TAG" ]]; then
+	    immutable=false
+	  fi
+	  printf '%s false false %s %s\n' "$tag" "$immutable" "$id"
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == PATCH ]]; then
+    local id=${4##*/} tag arg
+    case "$id" in
+      273) tag=v2.7.3 ;;
+      280) tag=v2.8.0 ;;
+      290) tag=v2.9.0 ;;
+      *) return 96 ;;
+    esac
     for arg in "$@"; do
       case "$arg" in
-        --latest) printf '%s' "$tag" > "$TEST_STATE/latest"; return 0 ;;
-        --latest=false) : > "$TEST_STATE/latest"; return 0 ;;
+		make_latest=true) printf '%s %s' "$tag" "$id" > "$TEST_STATE/latest" ;;
+        make_latest=false) : > "$TEST_STATE/latest" ;;
       esac
     done
+    if [[ -n "$TEST_STABLE_AFTER_MUTATION" ]]; then
+      printf '%s' "$TEST_STABLE_AFTER_MUTATION" > "$TEST_STATE/stable"
+    fi
+	if [[ -n "$TEST_LATEST_AFTER_MUTATION" ]]; then
+	  printf '%s' "$TEST_LATEST_AFTER_MUTATION" > "$TEST_STATE/latest"
+	fi
+    printf '%s false false true %s\n' "$tag" "$id"
+    return 0
   fi
   printf 'unexpected gh invocation: %q ' "$@" >&2
   return 99
@@ -3363,9 +4166,12 @@ actual="$(cat "$TEST_STATE/latest")"
 			cmd.Env = append(os.Environ(),
 				"TEST_STATE="+dir,
 				"TEST_STABLE_TAGS="+tt.stableTags,
+				"TEST_STABLE_AFTER_MUTATION="+tt.stableAfterMutation,
+				"TEST_LATEST_AFTER_MUTATION="+tt.latestAfterMutation,
 				"TEST_INITIAL_LATEST="+tt.initial,
 				"TEST_EXPECTED_LATEST="+tt.expected,
 				"TEST_API_MODE="+tt.apiMode,
+				"TEST_MUTABLE_FALLBACK="+strconv.FormatBool(tt.mutableFallback),
 			)
 			out, err := cmd.CombinedOutput()
 			if tt.wantOK && err != nil {
@@ -3373,6 +4179,9 @@ actual="$(cat "$TEST_STATE/latest")"
 			}
 			if !tt.wantOK && err == nil {
 				t.Fatalf("mock recovery unexpectedly succeeded: %s", out)
+			}
+			if tt.wantErr != "" && !strings.Contains(string(out), tt.wantErr) {
+				t.Fatalf("mock recovery did not report %q: %v\n%s", tt.wantErr, err, out)
 			}
 		})
 	}
@@ -3435,11 +4244,13 @@ func TestPublisherPublishedAssetValidationWithMockGitHub(t *testing.T) {
 set -Eeuo pipefail
 TAG=v2.8.0
 REPO=mock/repo
+EXPECTED_RELEASE_ID=12345
 BUNDLE_DIR="$TEST_BUNDLE"
 gh() {
-  [[ "$1" == release && "$2" == view ]] || return 99
+  [[ "$1" == api && "$2" == --paginate \
+     && "$3" == "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" ]] || return 99
   case "$*" in
-    *'.assets[].name'*) printf '%s' "$TEST_ASSET_NAMES" ;;
+    *'.[].name'*) printf '%s' "$TEST_ASSET_NAMES" ;;
     *'.digest // ""'*) printf '%s' "$TEST_ASSET_DIGESTS" ;;
     *) return 98 ;;
   esac
@@ -3474,7 +4285,7 @@ func TestPublisherExitTrapRestoresLatestWithMockGitHub(t *testing.T) {
 	cleanupStart := strings.Index(publish, "cleanup() {")
 	cleanupEnd := strings.Index(publish[cleanupStart:], "\ntrap cleanup EXIT")
 	recoveryStart := strings.Index(publish, "decimal_gt() {")
-	recoveryEnd := strings.Index(publish, "\nrelease_state() {")
+	recoveryEnd := strings.Index(publish, "\nrequire_remote_tag_object() {")
 	if cleanupStart < 0 || cleanupEnd < 0 || recoveryStart < 0 || recoveryEnd <= recoveryStart {
 		t.Fatal("could not isolate publisher EXIT recovery logic")
 	}
@@ -3487,16 +4298,29 @@ func TestPublisherExitTrapRestoresLatestWithMockGitHub(t *testing.T) {
 set -Eeuo pipefail
 TAG=v2.8.0
 REPO=mock/repo
+EXPECTED_RELEASE_ID=280
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 work="$TEST_STATE/work"
 mkdir -p "$work"
 printf 'v2.7.3\nv2.8.0\n' > "$TEST_STATE/stable"
-printf 'v2.8.0' > "$TEST_STATE/latest"
+printf 'v2.8.0 280' > "$TEST_STATE/latest"
 gh() {
   if [[ "$1" == api && "$2" == --paginate ]]; then cat "$TEST_STATE/stable"; return 0; fi
-  if [[ "$1" == release && "$2" == view ]]; then cat "$TEST_STATE/latest"; return 0; fi
-  if [[ "$1" == release && "$2" == edit && "$4" == --repo && "$6" == --latest ]]; then
-    printf '%s' "$3" > "$TEST_STATE/latest"
+  if [[ "$1" == release && "$2" == view ]]; then cut -d ' ' -f1 "$TEST_STATE/latest"; return 0; fi
+  if [[ "$1" == api && "$2" == repos/mock/repo/releases/latest ]]; then
+	read -r tag id extra < "$TEST_STATE/latest"
+	[[ -z "$extra" && "$id" =~ ^[1-9][0-9]*$ ]] || return 98
+	printf '%s false false true %s\n' "$tag" "$id"
+	return 0
+  fi
+  if [[ "$1" == api && "$2" == repos/mock/repo/releases/tags/v2.7.3 ]]; then
+    printf 'v2.7.3 false false true 273\n'
+    return 0
+  fi
+  if [[ "$1" == api && "$2" == --method && "$3" == PATCH \
+       && "$4" == repos/mock/repo/releases/273 ]]; then
+	printf 'v2.7.3 273' > "$TEST_STATE/latest"
+    printf 'v2.7.3 false false true 273\n'
     return 0
   fi
   return 99
@@ -3525,8 +4349,8 @@ exit 42
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if string(latest) != "v2.7.3" {
-		t.Fatalf("EXIT trap restored Latest to %q, want v2.7.3\n%s", latest, out)
+	if string(latest) != "v2.7.3 273" {
+		t.Fatalf("EXIT trap restored Latest to %q, want v2.7.3 Release 273\n%s", latest, out)
 	}
 }
 
