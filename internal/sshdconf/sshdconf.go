@@ -1,5 +1,5 @@
-// Package sshdconf grants and removes a per-account sshd exception, so an invite
-// can work on a server that does not accept public-key logins by default.
+// Package sshdconf grants and removes a per-account sshd exception, so the
+// effective configuration can admit a key credential that is disabled by default.
 //
 // The exception is a drop-in file of its own, containing a
 // `Match User <account>` block followed by an empty `Match all` scope reset.
@@ -15,11 +15,11 @@
 //     restore a stale config from an unattended timer at 3am.
 //   - It is removed by revoke, exactly like the sudoers drop-in next to it.
 //
-// A grant is written, syntax-checked with `sshd -t`, and then *proved* against
-// `sshd -T -C user=<account>` before the running sshd is reloaded. If the proof
-// fails — a missing Include, a competing Match block, an sshd too old for a
-// directive — the file is removed and the grant fails. An invite is never
-// printed on top of a half-applied sshd change.
+// A grant is written, syntax-checked with `sshd -t`, and then confirmed in the
+// effective configuration from `sshd -T -C user=<account>` before the running
+// sshd is reloaded. If that check fails — a missing Include, a competing Match
+// block, or an sshd too old for a directive — the file is removed and the grant
+// fails. This is a configuration check, not an end-to-end SSH connection test.
 //
 // sshd is reloaded, never restarted: a restart drops every live session, and a
 // botched restart on a remote box cannot be undone from the far end. Every
@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,7 +76,7 @@ var (
 // DefaultDir is where sshd's per-file configuration drop-ins live.
 const DefaultDir = "/etc/ssh/sshd_config.d"
 
-// DefaultLock guards the write/validate/prove/reload sequence. It lives outside
+// DefaultLock guards the write/validate/check/reload sequence. It lives outside
 // DefaultDir so it can never be swept into sshd's `*.conf` include glob.
 const DefaultLock = "/run/" + config.ManagedTag + "-sshd.lock"
 
@@ -92,10 +93,9 @@ var ErrNoReloadMechanism = errors.New("no running sshd could be asked to re-read
 // GrantResult describes what a grant actually achieved.
 type GrantResult struct {
 	Path string
-	// Reloaded says the running sshd was asked to re-read its configuration and
-	// did. When false, the drop-in is on disk and proved correct there, but no
-	// running daemon confirmed it — the invite must say so rather than claim a
-	// verified login.
+	// Reloaded says a request for the running sshd to re-read its configuration
+	// succeeded. When false, the drop-in is on disk and confirmed by a fresh config
+	// evaluation there, but no running daemon was reached; the invite must say so.
 	Reloaded bool
 }
 
@@ -129,8 +129,8 @@ func (m *Manager) FilePath(user string) string {
 }
 
 // Grant writes a Match block for user that lifts exactly the blockers in report,
-// proves it took effect, and reloads sshd. On any failure the file is removed,
-// sshd is left as it was found, and an error is returned.
+// confirms it in the effective config, and reloads sshd. On any failure the file
+// is removed, sshd is left as it was found, and an error is returned.
 //
 // groups are the account's real group names (not a prediction), used when an
 // AllowGroups whitelist has to be satisfied.
@@ -146,6 +146,22 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 	if !report.Fixable() {
 		return GrantResult{}, fmt.Errorf("sshd policy cannot be lifted for one account: %s", strings.Join(unfixable(report), ", "))
 	}
+	// All three probes are part of the grant's safety contract. In particular,
+	// writing without Validate can make the host config invalid, and writing without
+	// Effective can leave a file outside sshd's Include graph while reporting a
+	// usable invite. A nil Reload is not equivalent to ErrNoReloadMechanism: the
+	// default reload probe returns that sentinel only after it actually looked for a
+	// running daemon, whereas a nil function proves nothing and would also make a
+	// later removal impossible to confirm.
+	if m.Validate == nil {
+		return GrantResult{}, fmt.Errorf("sshd configuration validator is not configured")
+	}
+	if m.Effective == nil {
+		return GrantResult{}, fmt.Errorf("sshd effective-configuration probe is not configured")
+	}
+	if m.Reload == nil {
+		return GrantResult{}, fmt.Errorf("sshd reload probe is not configured")
+	}
 	content, err := dropIn(user, groups, report)
 	if err != nil {
 		return GrantResult{}, err
@@ -159,10 +175,8 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 		// `sshd -t`, `sshd -T` and the reload all read the whole config directory, so
 		// they are not scoped to our own file: without this check a pre-existing
 		// syntax error elsewhere would be blamed on the file we are about to write.
-		if m.Validate != nil {
-			if err := m.Validate(); err != nil {
-				return fmt.Errorf("the host's sshd configuration is already invalid; refusing to touch it: %w", err)
-			}
+		if err := m.Validate(); err != nil {
+			return fmt.Errorf("the host's sshd configuration is already invalid; refusing to touch it: %w", err)
 		}
 		path := m.FilePath(user)
 		rollback := func(cause error, restoreDaemon bool) error {
@@ -194,42 +208,40 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			}
 			return err
 		}
-		// Everything below reads the config from disk, so the grant is proved correct
+		// Everything below reads the config from disk, so the grant is checked there
 		// before the running sshd is asked to adopt it. Until the reload, the running
 		// daemon has not seen this file at all, so removing it fully undoes the grant.
-		if m.Validate != nil {
-			if err := m.Validate(); err != nil {
-				return rollback(fmt.Errorf("sshd rejected the configuration this grant produced: %w", err), false)
-			}
+		if err := m.Validate(); err != nil {
+			return rollback(fmt.Errorf("sshd rejected the configuration this grant produced: %w", err), false)
 		}
-		if m.Effective != nil {
-			cfg, err := m.Effective(user)
-			if err != nil {
-				return rollback(fmt.Errorf("cannot re-read the effective sshd config: %w", err), false)
-			}
-			// OK, not Certain: this proves the blockers we set out to lift are gone.
-			// It must NOT demand Certain(), because a rule we can never evaluate — an
-			// address-qualified AllowUsers, which is Unverifiable rather than a blocker —
-			// would make Certain() unreachable for any drop-in, and this proof would then
-			// roll back a file that took effect perfectly and blame a missing Include.
-			// Whether such an unevaluable rule downgrades the invite to UNVERIFIED is the
-			// caller's decision, taken from the same report; it is not this proof's job.
-			if rep := sysinfo.CheckKeyLogin(cfg, user, groups); !rep.OK() {
-				return rollback(fmt.Errorf("the sshd drop-in did not take effect (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir), false)
-			}
+		cfg, err := m.Effective(user)
+		if err != nil {
+			return rollback(fmt.Errorf("cannot re-read the effective sshd config: %w", err), false)
 		}
-		if m.Reload != nil {
-			switch err := m.Reload(); {
-			case err == nil:
-				res.Reloaded = true
-			case errors.Is(err, ErrNoReloadMechanism):
-				// Keep the file: it is correct on disk, and a socket-activated sshd will
-				// read it on the next connection. But leave Reloaded false — the caller
-				// must not claim a verified login on a daemon we never reached.
-				res.Reloaded = false
-			default:
-				return rollback(fmt.Errorf("sshd reload failed: %w", err), true)
-			}
+		if cfg == nil {
+			return rollback(fmt.Errorf("cannot re-read the effective sshd config: probe returned no configuration"), false)
+		}
+		// OK, not Certain: this confirms the blockers we set out to lift are gone.
+		// It must NOT demand Certain(), because a rule we can never evaluate — an
+		// address-qualified AllowUsers, which is Unverifiable rather than a blocker —
+		// would make Certain() unreachable for any drop-in, and this check would then
+		// roll back a file that produced the intended effective config and blame a
+		// missing Include.
+		// Whether such an unevaluable rule downgrades the invite to UNVERIFIED is the
+		// caller's decision, taken from the same report; it is not this check's job.
+		if rep := sysinfo.CheckKeyLogin(cfg, user, groups); !rep.OK() {
+			return rollback(fmt.Errorf("the sshd drop-in is not present in the effective config (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir), false)
+		}
+		switch err := m.Reload(); {
+		case err == nil:
+			res.Reloaded = true
+		case errors.Is(err, ErrNoReloadMechanism):
+			// Keep the file: it is correct on disk, and a socket-activated sshd will
+			// read it on the next connection. But leave Reloaded false — the caller
+			// must not claim a verified login on a daemon we never reached.
+			res.Reloaded = false
+		default:
+			return rollback(fmt.Errorf("sshd reload failed: %w", err), true)
 		}
 		res.Path = path
 		return nil
@@ -244,8 +256,8 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 // blindly — like the sudoers drop-in next to it, it only ever removes the
 // managed file for this one account — so revoke need not know whether a grant
 // was ever made. Removing a file that is not there is not an error and does not
-// disturb sshd unless a pending marker says an earlier removal still needs to
-// be adopted by the running daemon.
+// disturb sshd unless a pending marker says an earlier removal still needs a
+// successful reload request.
 func (m *Manager) Remove(user string) error {
 	if !validate.Username(user) {
 		return fmt.Errorf("refusing to remove an sshd drop-in for invalid username %q", user)
@@ -467,7 +479,7 @@ func (m *Manager) Orphans(exists func(string) (bool, error)) ([]string, error) {
 	return orphans, nil
 }
 
-// withLock serializes the whole write/validate/prove/reload sequence. `sshd -t`,
+// withLock serializes the whole write/validate/check/reload sequence. `sshd -t`,
 // `sshd -T` and the reload are all global over the config directory, so two
 // concurrent invites are not independent: without this, one grant's reload could
 // push the other's not-yet-validated file live.
@@ -621,7 +633,7 @@ func sshdSyntaxCheck() error {
 //
 // Finding nothing to reload returns ErrNoReloadMechanism rather than nil: the
 // caller decides what that means. Reporting it as success would let an invite
-// claim a "verified" login against a daemon that never re-read the file.
+// claim the running daemon was reached when it was not.
 func reload() error {
 	if _, err := exec.LookPath("systemctl"); err == nil {
 		// The unit is "ssh" on Debian/Ubuntu and "sshd" on RHEL/Arch; one is usually
@@ -736,7 +748,7 @@ func readSSHDMasterPID(path string) (int, time.Time, error) {
 	if err != nil || pid <= 0 {
 		return 0, time.Time{}, fmt.Errorf("sshd pid file %s has invalid pid", path)
 	}
-	return pid, time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec), nil
+	return pid, time.Unix(int64(stat.Mtim.Sec), int64(stat.Mtim.Nsec)), nil
 }
 
 // isSSHDMaster proves that pid is a root sshd listener from the same process
@@ -797,9 +809,12 @@ func sshdProcessStartTime(pid int) (time.Time, error) {
 	if len(fields) <= 19 {
 		return time.Time{}, fmt.Errorf("process stat has too few fields")
 	}
-	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
+	startTicks, err := strconv.ParseInt(fields[19], 10, 64)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("malformed process start time: %w", err)
+	}
+	if startTicks < 0 {
+		return time.Time{}, fmt.Errorf("malformed process start time: negative tick count")
 	}
 	procStat, err := readBoundedSSHDProcFile(filepath.Join(sshdProcRoot, "stat"), 1<<20)
 	if err != nil {
@@ -821,8 +836,11 @@ func sshdProcessStartTime(pid int) (time.Time, error) {
 	}
 	// Linux exposes process starttime in USER_HZ ticks. The supported Linux
 	// amd64/arm64 ABIs both define USER_HZ as 100 regardless of CONFIG_HZ.
-	const linuxUserHZ = uint64(100)
+	const linuxUserHZ = int64(100)
 	seconds := startTicks / linuxUserHZ
-	nanos := (startTicks % linuxUserHZ) * uint64(time.Second) / linuxUserHZ
-	return time.Unix(bootSeconds, 0).Add(time.Duration(seconds)*time.Second + time.Duration(nanos)), nil
+	nanos := (startTicks % linuxUserHZ) * (int64(time.Second) / linuxUserHZ)
+	if seconds > math.MaxInt64-bootSeconds {
+		return time.Time{}, fmt.Errorf("process start time overflows kernel boot time")
+	}
+	return time.Unix(bootSeconds+seconds, nanos), nil
 }

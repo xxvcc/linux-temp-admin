@@ -58,9 +58,62 @@ func TestEnsureFileSyncsRepairedMetadataAndReportsFailure(t *testing.T) {
 	}
 }
 
+func TestOpenOrCreateLockAtUsesOneStableInode(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dirFile.Close()
+
+	path := filepath.Join(dir, "registry.lock")
+	first, err := openOrCreateLockAt(dirFile, filepath.Base(path), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := openOrCreateLockAt(dirFile, filepath.Base(path), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	firstStat := fiStatFD(t, first)
+	secondStat := fiStatFD(t, second)
+	if firstStat.Dev != secondStat.Dev || firstStat.Ino != secondStat.Ino {
+		t.Fatalf("concurrent lock opens resolved to different inodes: first=%d:%d second=%d:%d",
+			firstStat.Dev, firstStat.Ino, secondStat.Dev, secondStat.Ino)
+	}
+	if err := syscall.Flock(int(first.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("lock first fd: %v", err)
+	}
+	defer func() { _ = syscall.Flock(int(first.Fd()), syscall.LOCK_UN) }()
+	if err := syscall.Flock(int(second.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("second fd did not contend on the same lock inode: %v", err)
+	}
+}
+
 func fiStat(t *testing.T, path string) *syscall.Stat_t {
 	t.Helper()
 	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Sys().(*syscall.Stat_t)
+}
+
+func fiStatFD(t *testing.T, f *os.File) *syscall.Stat_t {
+	t.Helper()
+	fi, err := f.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}

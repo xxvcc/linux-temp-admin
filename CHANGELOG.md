@@ -2,6 +2,171 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.0 - 2026-08-01
+
+- Repair an incomplete audit-log tail before the next append so a crash cannot
+  leave subsequent JSON records permanently joined to a partial line. Document
+  that audit writes are best-effort and an operation may be missing after a size
+  limit or write failure, and refuse a hard-linked log inode before metadata or
+  content repair could mutate its alias.
+- Clarify that SSH verification is an effective-configuration verdict, not an
+  end-to-end login test covering the network, PAM, SELinux, or running daemon.
+  Replace unconditional expiry-deletion wording with scheduled revocation, and
+  document the `UNVERIFIED` no-running-daemon path plus rollback cleanup failure.
+  Make sshd grant validation fail closed when any syntax, effective-config, or
+  reload probe is not configured, including a nil effective-config result, and
+  reject an overflowing `/proc` process-start timestamp before using a pid file
+  to select the sshd reload target.
+- When no known blocker already decides the credential, defer future-account
+  `Match Group` decisions until the credential-less account exists, then re-check
+  its real groups before installing a password or key; keep password fallback
+  behind an explicit default-No risk confirmation.
+- Treat a public IP returned by plaintext cloud metadata or found on a local
+  interface only as an interactive Host default that the operator must confirm
+  or replace, rather than silently directing an invite and its password to it.
+- Re-check the complete account identity around revoke and failed-create
+  rollback, refusing an observable same-name replacement before a helper or
+  fallback can continue. System account helpers remain name-scoped and are not
+  an atomic compare-and-swap. Bind interactive revoke and uninstall approval to
+  the complete registry record and passwd snapshot visible at confirmation;
+  any change before the locked mutation phase requires a new confirmation.
+- Reserve an absent deterministic `/home/<user>` before creation. Create the
+  account entry with `useradd -M` already past-date expired and password-locked,
+  never copy `/etc/skel`, and keep Home absent while inherited cron/at work and
+  daemon-cached jobs are drained. Create an empty `0700` Home through a pinned
+  parent descriptor only after the selected UID is proved idle and that cleanup
+  is rechecked, so an old generation cannot plant credentials or startup files
+  for the new account to inherit. Require the created real
+  directory to belong to the new non-root UID/GID, reject nested
+  mounts, and remove that Home plus any UID-matched conventional mail spool under
+  the still-bound account identity before invoking account deletion helpers. Sweep
+  mail again after the helper confirms account absence. Invoke only `userdel --`
+  without `-r/-f`: a distro `deluser` can re-enable recursive Home or
+  whole-filesystem UID cleanup, while shadow's `-f` can remove a same-name group
+  still used as another account's primary group. Do not accept arbitrary BusyBox
+  account applets because their compiled shadow/group semantics cannot be proven
+  from the applet name.
+  Traverse Home through directory descriptors without following symlinks, and
+  bound cleanup to 100,000 entries, 128 levels, and a cooperative two-minute
+  deadline checked between filesystem calls; a single blocked call cannot be
+  interrupted by that deadline. Exceeding any budget retains the disabled account
+  and registry witness for a later retry.
+- Retain a credential-less, past-date-expired, password-locked pending account
+  without a Home to keep its UID occupied when a residual process already carries
+  that UID or `/proc` cannot be scanned reliably, rather than freeing the number
+  for immediate reuse. Inspect every
+  live thread so a zombie thread-group leader cannot hide an executable worker,
+  and re-check the group after binding its leader with pidfd. Re-scan the UID
+  after every SIGKILL sweep so a parent that forks and exits between snapshots
+  cannot hide its new child. Require two consecutive stable empty snapshots
+  before declaring the UID free; a disappearing TGID/TID resets that confirmation.
+- Before issuing credentials or releasing an account identity, remove and verify
+  its personal crontab and every queued `at`/`batch` job carrying the UID. Wait
+  65 seconds for daemon-cached due work, then repeat job and process cleanup;
+  partial tooling, malformed inventories, surviving known-spool evidence, or jobs
+  and processes that survive retain the disabled account. Start the requested
+  invite lifetime after this drain, and document that process/job checks are
+  repeated snapshots rather than a kernel-atomic freeze. Detect a still-running
+  cron/at daemon through `/proc` even if its executable has disappeared, and wait
+  conservatively when that inventory is unreliable. Re-read each `at` job before
+  `atrm` so ID reuse cannot redirect deletion, and recognize a managed auto-revoke
+  job only when its generated owner header binds it to root. Probe the owner under
+  a 64 KiB limit so an oversized non-root body cannot block inventory, while root
+  jobs remain subject to the bounded full-body check and the external interface's
+  remaining non-atomic interval. Keep the account expired until its
+  credential, grants, registry state, and revoke task are complete, then explicitly
+  clear the temporary safety expiry for a permanent invite so `--no-auto-revoke`
+  does not leave it unable to log in. Check openSUSE's actual
+  `/var/spool/cron/tabs` layout rather than the unrelated `/var/spool/tabs` path.
+- Serialize same-name creation and revocation with an account reader/writer
+  barrier in front of the global lifecycle lock. A legacy `revoke --yes` without
+  UID/generation binding that collides with same-name creation now deletes
+  nothing and exits successfully so an old systemd job cannot retry against the
+  new generation. The same safe skip applies to a manual non-interactive command;
+  its warning and the bilingual guides require `doctor` plus a fresh revoke after
+  the concurrent operation. Accounts migrated with an unverified fixed identity
+  marker now require interactive full-name confirmation: the historical
+  `--yes --force --confirm-force` timer command can no longer be mistaken for
+  direct operator authorization. Report and sweep that now-unauthorized task as
+  stale instead of retaining a systemd service that can only retry forever.
+- Upgrade the registry to schema v4 and persist a deletion-started witness after
+  the final identity/job checks but before `userdel`. This lets an interrupted
+  post-deletion owner-checked mail sweep retry without allowing an ordinary stale
+  row to remove UID-owned data; recovery for an absent account never recursively
+  removes its old Home path. Exact generations remain bound; legacy, unregistered,
+  and pending rollback paths retain only a UID witness and require interactive
+  `--force` recovery while the account is live; their old unattended tasks are
+  cancelled as stale. Ordinary upsert, removal, compaction, and same-name invite
+  cannot discard or overwrite the witness.
+- Reconcile visible-but-not-yet-durable file deletions and directory creation on
+  retry in inode-before-parent order, including an absent unlink target, missing
+  Home/mail artifact, an intermediate directory whose inode or parent sync failed,
+  and an already-absent state/audit tree after recursive-removal parent sync failed.
+  Refuse recursive uninstall through a symlinked ancestor before checking mounts,
+  and fail closed on an empty or malformed mount inventory.
+- Require `visudo` as the pre-commit parser for `--sudo` grants, keep both
+  `sudo` and `visudo` optional for non-sudo invites, keep numerically equivalent
+  suffix spellings distinct in natural version ordering, and correct documentation
+  for host-detection helpers. Refuse to inventory sudoers through a symlinked
+  directory or silently ignore a malformed artifact in the managed namespace.
+  Fail the complete effective-policy proof when a root/ALL RunAs user is combined
+  with any negation, so exclusions such as `(ALL, !root)`
+  cannot be mistaken for root NOPASSWD access or skipped in favor of an earlier
+  apparently valid line.
+  Honor sudoers' last-match ordering when checking `sudo -l` output, so a later
+  `PASSWD: ALL`, restricted PASSWD command, or unparsed command list cannot be
+  hidden by an earlier `NOPASSWD: ALL` match; only a later exact NOPASSWD grant
+  restores the full-policy proof.
+- Require `chpasswd` during dependency planning only for password-login invites,
+  so a missing password helper is reported or installed before account creation;
+  keep it optional for key-only invites and the base `doctor` verdict.
+- Treat every non-empty `atq` line as inventory evidence, reject malformed or
+  duplicate job IDs, and roll back an exact matching revoke job when `at` reports
+  an ambiguous submission result. Treat a lone `batch` command as a partial at
+  installation that must fail closed during inventory, and bind the last-resort
+  `pgrep` atd probe to a process started by real UID 0 so an unprivileged process
+  cannot spoof only the daemon name. Inventory loaded systemd manager units as
+  well as unit files, reload the manager after cancellation even when files
+  already disappeared, and explicitly stop and confirm a still-loaded timer when
+  `systemctl disable --now` reports that its unit file is missing.
+- Compute one minute-ceiled absolute revoke deadline for display, `chage`,
+  systemd, and `at`. Submit `at` jobs by absolute UTC time instead of `now + N
+  hours`, which could run almost a minute early and, across daylight-saving
+  changes, up to an hour early or late. Tighten systemd's timer accuracy window
+  and fail closed if account setup consumes the whole requested lifetime before
+  scheduling.
+- Clarify that permanent accounts have no automatic revoke task and that an
+  incomplete uninstall inventory can leave accounts, grants, or now-unrunnable
+  tasks behind. A failed invite rollback reports nonzero and may retain a disabled
+  account plus its registry witness when cleanup cannot be confirmed. Clarify
+  that the uninstall marker blocks current binaries that check it under the
+  lifecycle lock, but cannot constrain every already-loaded historical binary.
+- Preflight deletion authority for every live account in an uninstall plan before
+  revoking the first one, so a later marker-only, pending, legacy, or mismatched
+  identity cannot leave an earlier valid account already deleted. Complete the
+  mirror-receiver maintenance example with a root-owned same-directory temporary
+  file, metadata checks, sync, and atomic rename.
+- Prevent a cancelled upgrade retry from blocking on the pre-Go-1.23 timer-drain
+  pattern, and require the online publisher to observe an immutable GitHub
+  Release before it reports publication complete.
+- Bind every publication mutation to an explicitly verified numeric GitHub
+  Release ID: pin the candidate before the first write, and bind any failure
+  restoration target before changing Latest. Never use a tag-addressed mutation;
+  tag reads select or cross-check numeric identities. Return an unexpectedly
+  public mutable candidate to draft by its pinned ID, and require repository
+  immutable Releases to be enabled before staging. Replace draft assets one at a
+  time after first filling missing entries, allowing an interrupted attempt with
+  at most one of the five final assets absent to resume without ever deleting the
+  whole draft asset set at once.
+- Discover both staged drafts and published Releases through the authenticated,
+  paginated Release list. GitHub's tag-specific REST endpoint hides drafts, so it
+  is no longer used either to bind the publisher's target or to prove that the CI
+  staging job may create a new draft.
+- Make the manual Latest incident procedure re-enumerate all stable Releases after
+  its mutation and verify that the same immutable numeric Release is still the
+  highest fallback, including the no-fallback case, before accepting the final
+  Latest route.
+
 ## v2.8.4 - 2026-07-27
 
 - Run mirror synchronization only from an explicit protected-`main` dispatch.
@@ -154,8 +319,8 @@ All notable changes to this project are documented here.
   pathname. Account creation also checks NSS before touching stale grants or
   creating a local identity, preventing LDAP/SSSD username shadowing.
 - Refuse and fully roll back an auto-delete invite when neither systemd nor `at`
-  can schedule the exact deadline. Document `chage` accurately as a later,
-  day-granularity backstop rather than the exact expiry mechanism.
+  can schedule the requested revoke target. Document `chage` accurately as a
+  later, day-granularity backstop rather than the scheduled revoke mechanism.
 - Parse sshd `Match` criterion/value positions and treat `LocalAddress`,
   `LocalPort`, routing-domain, and unknown connection criteria as unverifiable.
   sshd grant rollback now reports removal and restore-reload failures, and the
@@ -398,10 +563,11 @@ the unprivileged-invitee surface all held.
   `schedule` gained the `Orphans`/`UnitUsers` sweep that `sudoers` and `sshdconf`
   always had, and it globs both prefixes.
 
-- **The audit log survives an uninstall by default.** It records who opened and
-  closed root-capable accounts; erasing it on the way out is what covering your
-  tracks looks like. `--purge-audit` removes it, and the teardown's own record is
-  written *before* the purge, so "purge" cannot mean "leave exactly one line".
+- **The audit log survives an uninstall by default.** It preserves a best-effort
+  trail of attempts to open and close root-capable accounts; erasing it on the way
+  out is what covering your tracks looks like. `--purge-audit` removes it, and
+  teardown attempts to write its own record *before* the purge, so a successful
+  purge does not intentionally leave exactly one line.
 
 - **`uninstall` refuses when run from the account it would delete.** A temp admin
   has sudo and can run it; deleting its own account mid-teardown reaps the sudo
@@ -418,9 +584,11 @@ the unprivileged-invitee surface all held.
   printed "removed an orphaned sudo grant" whichever way the removal went.
 
 - **A recorded UID now decides in both directions** (this was to be v2.5.1; it
-  ships here). The registry pins a `(name, uid)` pair at creation and the code calls
-  it the tool's only immutable proof, precisely because the GECOS marker beside it
-  can be rewritten by the account itself. A matching UID was honoured; a
+  ships here). The registry pins a `(name, uid)` pair at creation and that release
+  treated it as a stronger creation-time witness than the account-writable GECOS
+  marker. The pair detects a contradiction but cannot prove identity across
+  deletion and recreation because Linux may reuse a UID; current releases also
+  bind a random per-creation generation. Previously, a matching UID was honoured; a
   contradicting one fell through and asked the marker instead, so an account
   carrying a UID this tool never issued was deleted anyway, on the say-so of the
   weaker witness. A contradiction is not a missing witness but a disproof.
@@ -624,9 +792,11 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   them.
 
   The registry now records each account's UID at creation — fixed before the
-  invitee ever had access, and unlike GECOS it cannot be rewritten retroactively —
-  and that (name, uid) pair is what proves an account is the tool's. It stays
-  reuse-proof, because a recreated account under the same name draws a fresh UID.
+  invitee ever had access, and unlike GECOS it cannot be rewritten retroactively.
+  That (name, uid) pair detects a changed UID but is not reuse-proof because Linux
+  may later allocate the same UID again. Current releases additionally bind a
+  per-creation generation in GECOS and the registry and compare a complete passwd
+  snapshot around name-scoped helpers.
   A registry row written before this field still parses (the field is appended;
   the parser's minimum stays at nine), so accounts already on deployed hosts remain
   revocable, and a row written now still parses under an older build. The privilege
@@ -660,14 +830,15 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   semantics (only `*` and `?` are special — Go's `path.Match` honours `[...]`
   classes that sshd treats literally, which could print "verified" for a login sshd
   refuses); the silent metadata probe no longer queries a DNS-named endpoint, which
-  broke the "never leaves this host or its link" promise and let a DNS spoofer seed
-  the invite's Host; and the interactive menu no longer spins on a non-TTY stream of
-  invalid input.
+  exposed the lookup to resolver traffic and let a DNS spoofer seed the invite's
+  Host; and the interactive menu no longer spins on a non-TTY stream of invalid
+  input.
 
 ## v2.2.5 - The invite stops promising a login it never checked
 
-- **`invite` now verifies that the account can actually log in — before it creates
-  anything.** The tool wrote the public key to `~/.ssh/authorized_keys` and printed
+- **`invite` now checks whether the effective sshd configuration admits the
+  planned credential — before it creates anything.** The tool wrote the public
+  key to `~/.ssh/authorized_keys` and printed
   `Login: SSH key only` as a hardcoded literal, without ever asking sshd whether it
   would accept that key. On a host with `PubkeyAuthentication no`, an
   `AuthorizedKeysFile` pointing somewhere else, an `AllowUsers`/`AllowGroups`
@@ -688,7 +859,8 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   sshd's global configuration is never edited, so every other account keeps the
   operator's baseline byte for byte — and "restoring" is deleting our own file, so
   there is no backup to go stale and clobber a later change. The grant is
-  syntax-checked with `sshd -t`, *proved* effective with `sshd -T -C user=`, and
+  syntax-checked with `sshd -t`, confirmed in the effective configuration with
+  `sshd -T -C user=`, and
   only then reloaded (`reload`, never `restart`: live sessions survive). Any failure
   removes the file and refuses the invite. `revoke` — including the auto-revoke
   timer — deletes the drop-in and reloads sshd. An interactive run asks first; a
@@ -697,7 +869,8 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   `DenyUsers`/`DenyGroups` rule is never bypassed: not being on an allow list is a
   default nobody spoke about, an explicit deny is a decision.
 - **`--password-login` is the opt-in fallback for hosts you would rather not
-  touch.** It verifies that sshd really accepts passwords (refusing otherwise),
+  touch.** It checks that the effective sshd configuration permits password
+  authentication (refusing otherwise),
   issues a 24-character password from `crypto/rand` shown once, and hands it to
   `chpasswd` on stdin so it never appears in the process table. The invite says
   `Login: password` truthfully and warns that this is the weakest grant the tool
@@ -714,9 +887,10 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   command should never reach a question at all.
 
 - **The interactive flow no longer dead-ends a menu-driven operator on a
-  locked-down host.** When a key login cannot be made to work — an unfixable deny, or
-  the operator declines the per-account sshd exception — and sshd would accept a
-  password, the interactive run now offers one (defaulting to No, behind the same
+  locked-down host.** When the effective-config check reports a key-credential
+  blocker — with an unfixable deny, or after the operator declines the per-account
+  sshd exception — but conclusively admits a password credential, the interactive
+  run now offers one (defaulting to No, behind the same
   "weakest grant this tool issues" warning). Previously the only route to a working
   invite there was `--password-login`, a flag the menu cannot reach, so a menu-only
   operator was stranded.
@@ -746,9 +920,10 @@ held up. Everything it did find was in the revoke path, and this release fixes i
 
   Previously the operator typed YES and was only then asked whether sshd could be
   modified — agreeing to the account before seeing what it would cost the host. And
-  when the post-creation re-check against the account's real groups finds that sshd
-  accepts the login as it is, the promised exception is not written and the invite
-  says so, rather than quietly skipping a file the summary had named.
+  when the post-creation re-check against the account's real groups finds that the
+  effective config already admits the credential, the promised exception is not
+  written and the invite says so, rather than quietly skipping a file the summary
+  had named.
 
 - **No path in a root-run tool may panic, and none may hang.** The sshd probe is
   reached through a guard that reports an unwired collaborator instead of
@@ -776,10 +951,10 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   under `.../local-ipv6s`, each needing a per-provider two-hop lookup that buys
   nothing here).
 
-- **`doctor` reports whether sshd would accept a key login** for a freshly created
-  temporary account, so the answer is available before an invite is needed, and
-  names any sshd exception that outlived its account. `cleanup-expired --compact`
-  removes those orphans.
+- **`doctor` reports the effective sshd configuration verdict for a key
+  credential** on a freshly created temporary account, so the result is available
+  before an invite is needed, and names any sshd exception that outlived its
+  account. `cleanup-expired --compact` removes those orphans.
 
   Safety properties worth stating, because they are what make the sshd write
   defensible at all:
@@ -807,7 +982,8 @@ held up. Everything it did find was in the revoke path, and this release fixes i
     in 8.5).
   - **An address-qualified `AllowUsers user@host` rule yields no verdict, not a pass.**
     The tool cannot know which IP the invitee will connect from, so it reports the
-    login as UNVERIFIED instead of claiming a proof — and does not "fix" it either,
+    login as UNVERIFIED instead of claiming a conclusive result — and does not
+    "fix" it either,
     since writing `AllowUsers <account>` would quietly cancel the operator's network
     restriction. Deny rules fail closed for the same reason, in the other direction.
   - **The login is re-checked against the account's real groups** once it exists.
@@ -825,9 +1001,9 @@ held up. Everything it did find was in the revoke path, and this release fixes i
     cannot be evaluated without knowing the invitee's address, so it is treated as a
     reason to print UNVERIFIED — never as a blocker to "repair" (which would silently
     cancel the network restriction) and never as something that fails the drop-in's
-    proof-of-effect (the drop-in still makes the key work; that is what the proof
-    checks). A bare `AllowUsers <account>` alongside it still counts as an
-    unconditional pass.
+    effective-config check (the drop-in still removes the known key blocker; that is
+    what this check confirms). A bare `AllowUsers <account>` alongside it still
+    counts as an unconditional configuration pass.
   - **An address- or host-scoped `Match` block downgrades the invite to UNVERIFIED.**
     `sshd -T -C user=X` cannot evaluate `Match Address`/`Match Host` — the invitee's
     source address is unknown — so a host that, say, denies the account from the
@@ -930,13 +1106,14 @@ held up. Everything it did find was in the revoke path, and this release fixes i
   table so a reordered entry can no longer run the wrong command.
 - **Host detection no longer interrogates before it looks.** `invite` without
   `--host` used to ask "detect public IP? [y/N]" before doing anything, so the
-  common case cost an extra keystroke and defaulted to No. Cloud metadata and
-  local interfaces — neither of which leaves the host or its link — are now
-  probed silently, and what they find prefills the host prompt (Enter accepts,
-  or type over it). The external echo services (`api.ipify.org` and friends)
-  still require an explicit yes, because that step discloses the server to a
-  third party. `--yes` mode is unchanged: it never reaches out and still
-  requires `--host`.
+  common case cost an extra keystroke and defaulted to No. Local interfaces and
+  fixed-address cloud metadata are now probed silently, and what they find
+  prefills the host prompt (Enter accepts, or type over it). Interface inspection
+  sends no traffic; metadata avoids public DNS and echo services but may traverse
+  the local or provider network. External echo services (`api.ipify.org` and
+  friends) still require an explicit yes because they disclose the server to a
+  third party. `--yes` mode is unchanged: it never reaches out and still requires
+  `--host`.
 - Restored the `TerminateProcesses` uid guard test that was lost with the v1
   unit-test suite: `kill` is now indirected so a test can prove a non-positive
   uid signals nothing, without signalling every root process when the guard
@@ -954,9 +1131,9 @@ held up. Everything it did find was in the revoke path, and this release fixes i
 
 ## v2.1.0 - Operation audit log; v1 deprecation
 
-- **Operation audit log (new).** Every privileged mutating operation — account
-  create/delete, and install / uninstall / upgrade — is appended as a JSON line to
-  a root-owned, append-only `/var/log/linux-temp-admin/audit.log` (0600), recording
+- **Operation audit log (new).** Each privileged mutating operation — account
+  create/delete, and install / uninstall / upgrade — is submitted to a best-effort
+  JSONL logger at `/var/log/linux-temp-admin/audit.log` (root-owned, 0600), recording
   the timestamp, actor (the invoking user under sudo, plus the effective uid),
   action, target, result, and key parameters. Writes are best-effort and never
   block or fail the operation itself. (An on-host log is tamperable by root;
@@ -988,12 +1165,13 @@ Follow-up hardening from a multi-pass security audit of the v2 rewrite. No new
 features and no command/flag changes; existing behavior is unchanged except for the
 `revoke` protection fix noted below.
 
-- **revoke: never delete a real account via a stale registry entry.** A UID>=1000
-  account is now protected unless it carries the tool's managed GECOS marker — a
-  per-account, reuse-proof signal — instead of trusting a name-keyed registry entry
-  that can outlive a deleted temp account and be inherited by a later real user of
-  the same name. The managed check is now an exact GECOS-field match, not a
-  substring, matching its documented guarantee.
+- **revoke: stop trusting a stale registry name alone.** A UID>=1000 account in
+  that release was protected unless it carried the tool's exact managed GECOS
+  marker, instead of trusting a name-keyed registry entry that can outlive a
+  deleted temp account and be inherited by a later real user of the same name.
+  That marker was an additional per-account check, not reuse-proof identity: it
+  can be rewritten and copied. Current releases also require the registry UID and
+  a random per-creation generation.
 - **invite: a failed sudo grant can no longer leave a NOPASSWD drop-in behind.** The
   drop-in is removed on any grant/verification failure, and a removal failure is
   reported rather than silently swallowed.

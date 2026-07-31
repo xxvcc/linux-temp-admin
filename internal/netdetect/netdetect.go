@@ -48,12 +48,11 @@ func New() *Detector {
 			// Never auto-follow redirects for a metadata/echo probe.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		// Link-local literals only. A DNS-named endpoint (Tencent publishes
-		// metadata.tencentyun.com for this) would emit a resolver query, which breaks
-		// the promise that these probes never leave the host or its link — and hands
-		// anyone who can answer that query the ability to seed the Host the invite
-		// hands out. 169.254.169.254 is Tencent's documented address for the same
-		// service, so nothing is lost by naming it numerically.
+		// Fixed numeric metadata endpoints only. This avoids DNS, redirects, and
+		// environment proxies, but it does not imply that every provider handles the
+		// request on the host's immediate link: 100.100.100.200 is shared address
+		// space and may traverse the local or cloud-provider network. Tencent also
+		// documents 169.254.169.254, so no DNS-named metadata endpoint is needed.
 		MetadataServices: []string{
 			"http://169.254.169.254/latest/meta-data/public-ipv4",
 			"http://100.100.100.200/latest/meta-data/eipv4",
@@ -88,10 +87,10 @@ func (d *Detector) fetch(ctx context.Context, url string) (string, error) {
 	return strings.TrimSpace(s), nil
 }
 
-// LocalPublicIP tries the sources that never leave this host or its link — cloud
-// metadata (IPv4 only; see the Detector doc) then local interface addresses — and
-// returns the first routable public address found. perReq bounds each metadata
-// request.
+// LocalPublicIP tries fixed-address cloud metadata (IPv4 only; see the Detector
+// doc) and then local interface addresses. Metadata requests avoid DNS, redirects,
+// and environment proxies, but may traverse the local or cloud-provider network.
+// perReq bounds each metadata request.
 //
 // IPv4 is preferred over IPv6: a dual-stack box hands out its v4 address (the
 // more universally reachable one), and a v6-only box, whose interfaces carry no

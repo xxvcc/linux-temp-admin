@@ -413,13 +413,13 @@ func TestGrantRollsBackWhenTheFixDoesNotTakeEffect(t *testing.T) {
 	m.Effective = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(blocked), nil }
 
 	if _, err := m.Grant(acct, []string{acct}, report(blocked)); err == nil {
-		t.Fatal("Grant must fail when the drop-in provably did not take effect")
+		t.Fatal("Grant must fail when the drop-in is absent from the effective config")
 	}
 	if ents, _ := os.ReadDir(m.Dir); len(ents) != 0 {
 		t.Errorf("a failed grant left files behind: %v", ents)
 	}
 	if reloads != 0 {
-		t.Errorf("a grant that never proved itself reloaded sshd %d time(s)", reloads)
+		t.Errorf("a grant absent from the effective config reloaded sshd %d time(s)", reloads)
 	}
 }
 
@@ -569,14 +569,14 @@ func TestRemoveOnlyEverTouchesItsOwnFile(t *testing.T) {
 func TestGrantSucceedsDespiteAnUnverifiableAllowUsers(t *testing.T) {
 	// The false diagnosis regression: a host with `PubkeyAuthentication no` plus a
 	// routine `AllowUsers *@10.0.0.0/8` ("SSH only from the VPN"). The Match User
-	// drop-in genuinely makes pubkey auth work, but the address-qualified AllowUsers
-	// can never be evaluated, so the report is OK() yet not Certain(). Grant's proof
-	// must accept it (the blockers it lifted are gone) rather than roll back a
-	// working file and blame a missing Include.
+	// drop-in enables pubkey auth in the effective config, but the address-qualified
+	// AllowUsers can never be evaluated, so the report is OK() yet not Certain().
+	// Grant's check must accept it (the blockers it lifted are gone) rather than
+	// roll back the intended file and blame a missing Include.
 	reloads := 0
 	m := okManager(t, &reloads)
-	// After the drop-in, sshd accepts the key but the address-qualified AllowUsers
-	// still stands -- exactly what the real host reports.
+	// After the drop-in, the effective config admits the key but the
+	// address-qualified AllowUsers still stands -- exactly what the real host reports.
 	m.Effective = func(string) (*sysinfo.SSHDConfig, error) {
 		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\nallowusers *@10.0.0.0/8\n"), nil
 	}

@@ -49,7 +49,7 @@ func TestUserLifecycle(t *testing.T) {
 	if err := m.SetExpiry(name, "2999-01-01"); err != nil {
 		t.Errorf("SetExpiry: %v", err)
 	}
-	if err := m.Delete(name); err != nil {
+	if err := m.DeleteExpected(name, pw, func() error { return nil }); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if exists, err := Exists(name); err != nil || exists {

@@ -13,7 +13,7 @@
 - 安装需要 root 权限、curl、OpenSSL 3、sha256sum 和 timeout；
 - GitHub CDN 回退还需要 `getent` 或 `nslookup`，用于验证并固定每个重定向目标的公网地址。
 
-二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`/`adduser`、`userdel`/`deluser`、`usermod` 和 `chage`；授予 sudo 时还需要 `sudo`。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装。
+二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`、`userdel`、`usermod` 和 `chage`；密码登录还需要 `chpasswd`，授予 sudo 时还需要 `sudo` 和用于写入前策略校验的 `visudo`。程序不回退到发行版 `adduser`/`deluser` 或任意 BusyBox 账号 applet：这些实现的参数、配置及编译期 shadow/group 语义不能仅凭命令名证明与 shadow 工具链等价。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装。
 
 Arch Linux 不允许安全的部分升级，而 `pacman -Syu` 会升级整个系统，因此本工具不会在创建账号时自动运行 pacman。请根据提示由管理员先完成完整升级和依赖安装。
 

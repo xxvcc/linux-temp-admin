@@ -173,7 +173,7 @@ func TestPackageCandidate(t *testing.T) {
 	if got := PackageCandidate("chage", "apt"); got != "passwd" {
 		t.Errorf("chage/apt = %q, want passwd", got)
 	}
-	if got := PackageCandidate("useradd/adduser", "apk"); got != "shadow" {
+	if got := PackageCandidate("useradd", "apk"); got != "shadow" {
 		t.Errorf("useradd/apk = %q, want shadow", got)
 	}
 	if got := PackageCandidate("chage", "dnf"); got != "shadow-utils" {
@@ -185,14 +185,61 @@ func TestPackageCandidate(t *testing.T) {
 	if got := PackageCandidate("unknown-tool", "apt"); got != "" {
 		t.Errorf("unknown = %q, want empty", got)
 	}
+	if got := PackageCandidate("chpasswd", "apk"); got != "shadow" {
+		t.Errorf("chpasswd/apk = %q, want shadow", got)
+	}
 }
 
 func TestRequiredDepsShape(t *testing.T) {
-	// Without sudo: id plus 4 account deps. With sudo: 6.
-	if n := len(RequiredDeps(false)); n != 5 {
-		t.Errorf("RequiredDeps(false) has %d deps, want 5", n)
+	// Base: id plus 4 account deps. Password and sudo features add their own
+	// helpers without making them mandatory for key-only, non-sudo invites.
+	deps := RequiredDeps(false, false)
+	if n := len(deps); n != 5 {
+		t.Errorf("RequiredDeps(false, false) has %d deps, want 5", n)
 	}
-	if n := len(RequiredDeps(true)); n != 6 {
-		t.Errorf("RequiredDeps(true) has %d deps, want 6", n)
+	if n := len(RequiredDeps(false, true)); n != 6 {
+		t.Errorf("RequiredDeps(false, true) has %d deps, want 6", n)
+	}
+	if n := len(RequiredDeps(true, false)); n != 7 {
+		t.Errorf("RequiredDeps(true, false) has %d deps, want 7", n)
+	}
+	if n := len(RequiredDeps(true, true)); n != 8 {
+		t.Errorf("RequiredDeps(true, true) has %d deps, want 8", n)
+	}
+	passwordDep := false
+	for _, dep := range RequiredDeps(false, true) {
+		if dep.Label == "chpasswd" && len(dep.Names) == 1 && dep.Names[0] == "chpasswd" {
+			passwordDep = true
+		}
+	}
+	if !passwordDep {
+		t.Fatal("password mode did not require chpasswd")
+	}
+	if got := PackageCandidate("visudo", "apt"); got != "sudo" {
+		t.Errorf("PackageCandidate(visudo, apt) = %q, want sudo", got)
+	}
+	foundCreate := false
+	foundDelete := false
+	for _, dep := range deps {
+		if dep.Label == "useradd" {
+			foundCreate = len(dep.Names) == 1 && dep.Names[0] == "useradd"
+		}
+		if dep.Label == "userdel" {
+			foundDelete = len(dep.Names) == 1 && dep.Names[0] == "userdel"
+		}
+		for _, name := range dep.Names {
+			if name == "adduser" || name == "deluser" || name == "busybox" {
+				t.Errorf("RequiredDeps accepts an account helper with unproven semantics: %+v", dep)
+			}
+		}
+	}
+	if !foundCreate {
+		t.Fatalf("RequiredDeps does not require useradd: %+v", deps)
+	}
+	if !foundDelete {
+		t.Fatalf("RequiredDeps does not require userdel: %+v", deps)
+	}
+	if got := PackageCandidate("userdel", "apt"); got != "passwd" {
+		t.Errorf("PackageCandidate(userdel, apt) = %q, want passwd", got)
 	}
 }

@@ -47,18 +47,25 @@ func (a *App) status(args []string) int {
 			a.errorf("%s", a.P.M("用户名不合法："+u, "invalid username: "+u))
 			return 1
 		}
+		rec, found, err := a.Registry.Lookup(u)
+		if err != nil {
+			a.errorf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
+			return 1
+		}
 		pw, ok, err := a.lookupUser(u)
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), err)
 			return 1
 		}
 		if !ok {
+			if found && rec.DeletionStarted {
+				a.printf("user=%s uid=%d exists=false managed=false identity=deletion-recovery-absent", rec.User, rec.UID)
+				if rec.AutoUnit != "" {
+					a.printf("auto-revoke unit=%s", rec.AutoUnit)
+				}
+				return 0
+			}
 			a.errorf("%s", a.P.M("用户不存在："+u, "user does not exist: "+u))
-			return 1
-		}
-		rec, found, err := a.Registry.Lookup(u)
-		if err != nil {
-			a.errorf("%s: %v", a.P.M("读取注册表失败", "reading registry failed"), err)
 			return 1
 		}
 		managed := false
@@ -67,6 +74,10 @@ func (a *App) status(args []string) int {
 			switch classifyRegisteredAccount(rec, pw, true, nil) {
 			case registeredActive:
 				managed, identity = true, "generation-bound"
+			case registeredRecoveryBound:
+				identity = "deletion-recovery-bound"
+			case registeredRecoveryManual:
+				identity = "deletion-recovery-manual"
 			case registeredLegacyIdentity:
 				identity = "legacy-unverified"
 			case registeredPending:
@@ -75,6 +86,8 @@ func (a *App) status(args []string) int {
 				identity = "uid-mismatch"
 			case registeredMarkerMismatch:
 				identity = "generation-marker-mismatch"
+			case registeredHomeMismatch:
+				identity = "home-mismatch"
 			default:
 				identity = "unverified"
 			}
@@ -148,6 +161,12 @@ func (a *App) userCells(r registry.Record) []string {
 	switch classifyRegisteredAccount(r, pw, exists, err) {
 	case registeredActive:
 		state = a.P.M("在册", "active")
+	case registeredRecoveryAbsent:
+		state = a.P.M("删除后恢复", "post-delete recovery")
+	case registeredRecoveryBound:
+		state = a.P.M("删除恢复（可续删）", "deletion recovery (bound retry)")
+	case registeredRecoveryManual:
+		state = a.P.M("删除恢复（需人工）", "deletion recovery (manual)")
 	case registeredPending:
 		state = a.P.M("创建未完成", "pending")
 	case registeredIdentityUnverified:
@@ -158,6 +177,8 @@ func (a *App) userCells(r registry.Record) []string {
 		state = a.P.M("UID 不匹配", "UID mismatch")
 	case registeredMarkerMismatch:
 		state = a.P.M("标记不匹配", "marker mismatch")
+	case registeredHomeMismatch:
+		state = a.P.M("家目录不匹配", "home mismatch")
 	case registeredUnknown:
 		state = a.P.M("未知", "unknown")
 	default:
@@ -257,11 +278,15 @@ type registeredAccountState uint8
 const (
 	registeredMissing registeredAccountState = iota
 	registeredUnknown
+	registeredRecoveryAbsent
+	registeredRecoveryBound
+	registeredRecoveryManual
 	registeredPending
 	registeredIdentityUnverified
 	registeredLegacyIdentity
 	registeredUIDMismatch
 	registeredMarkerMismatch
+	registeredHomeMismatch
 	registeredActive
 )
 
@@ -269,11 +294,19 @@ func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool,
 	switch {
 	case lookupErr != nil:
 		return registeredUnknown
+	case rec.DeletionStarted && !exists:
+		return registeredRecoveryAbsent
+	case rec.DeletionStarted && rec.IdentityBound && deletionRecordMatchesPasswd(rec, pw):
+		return registeredRecoveryBound
+	case rec.DeletionStarted:
+		return registeredRecoveryManual
 	case !exists:
 		return registeredMissing
+	case !validate.AccountID(pw.UID) || !validate.AccountID(pw.GID):
+		return registeredIdentityUnverified
 	case rec.Pending:
 		return registeredPending
-	case rec.UID < 1:
+	case !validate.AccountID(rec.UID):
 		return registeredIdentityUnverified
 	case pw.UID != rec.UID:
 		return registeredUIDMismatch
@@ -284,6 +317,8 @@ func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool,
 		return registeredMarkerMismatch
 	case !user.MatchesManagedGeneration(pw, rec.Generation):
 		return registeredMarkerMismatch
+	case !validate.ManagedHome(rec.User, pw.Home):
+		return registeredHomeMismatch
 	default:
 		return registeredActive
 	}
@@ -455,6 +490,29 @@ func (a *App) accountIsOursAndLive(name string) (bool, error) {
 	return state == registeredActive || state == registeredLegacyIdentity, nil
 }
 
+// accountNeedsAutoRevoke reports whether a managed auto-revoke task must be
+// retained. An absent recovery row needs its retry path for owner-checked mail
+// cleanup, and an exactly bound live recovery may safely retry deletion. A legacy
+// identity and a live UID-only or generation-mismatched recovery are manual-only,
+// so their old unattended tasks are stale and must be swept while the registry
+// witness remains.
+func (a *App) accountNeedsAutoRevoke(name string) (bool, error) {
+	if a.Registry == nil {
+		return false, fmt.Errorf("no registry available to verify %s", name)
+	}
+	rec, found, err := a.Registry.Lookup(name)
+	if err != nil || !found {
+		return false, err
+	}
+	pw, exists, err := a.lookupUser(name)
+	if err != nil {
+		return false, err
+	}
+	state := classifyRegisteredAccount(rec, pw, exists, nil)
+	return state == registeredActive || state == registeredRecoveryAbsent ||
+		state == registeredRecoveryBound, nil
+}
+
 // completedAccountIdentity returns whether name currently resolves to the
 // completed v2 identity recorded by this tool, and whether a local account with
 // that name exists at all. The UID and marker are checked on the same passwd
@@ -475,10 +533,11 @@ func (a *App) completedAccountIdentity(name string) (ours, live bool, err error)
 	if !exists {
 		return false, false, nil
 	}
-	if !found || rec.Pending || rec.UID < 1 || pw.UID != rec.UID || !rec.IdentityBound {
+	if !found {
 		return false, true, nil
 	}
-	return user.MatchesManagedGeneration(pw, rec.Generation), true, nil
+	state := classifyRegisteredAccount(rec, pw, true, nil)
+	return state == registeredActive || state == registeredRecoveryBound, true, nil
 }
 
 // installedCommandVersion best-effort reads the version of the binary at
@@ -549,7 +608,7 @@ func (a *App) orphanArtifacts(recs []registry.Record) ([]orphanArtifact, error) 
 		}
 	}
 	if a.Scheduler != nil {
-		if o, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err != nil {
+		if o, err := a.Scheduler.Orphans(a.accountNeedsAutoRevoke); err != nil {
 			scanErrs = append(scanErrs, fmt.Errorf("scheduler: %w", err))
 		} else {
 			addKind(o, a.P.M("自动删除任务", "auto-delete task"))
@@ -633,7 +692,7 @@ func (a *App) compactLocked() int {
 	// after an uninstall). Scheduler.Orphans mirrors the two sweeps above, and
 	// globs the v1 prefix too.
 	if a.Scheduler != nil {
-		orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive)
+		orphans, err := a.Scheduler.Orphans(a.accountNeedsAutoRevoke)
 		if err != nil {
 			a.warnf("%v", err)
 			rc = 1
@@ -653,7 +712,9 @@ func (a *App) compactLocked() int {
 			"orphan scanning or cleanup did not complete; the registry was not compacted so recovery evidence is retained."))
 		return rc
 	}
-	removed, err := a.Registry.Compact(user.Exists)
+	removed, err := a.Registry.Compact(func(rec registry.Record) (bool, error) {
+		return user.Exists(rec.User)
+	})
 	if err != nil {
 		a.warnf("%v", err)
 		rc = 1
@@ -710,12 +771,12 @@ func (a *App) doctor(args []string) int {
 	} else {
 		a.success(a.P.M("pidfd 进程撤销能力可用。", "pidfd process revocation is available."))
 	}
-	for _, d := range sysinfo.RequiredDeps(true) {
+	for _, d := range sysinfo.RequiredDeps(true, true) {
 		if d.Present {
 			a.success(a.P.M("依赖存在：", "dependency found: ") + d.Label)
 		} else {
 			a.warnf("%s%s", a.P.M("缺少依赖：", "missing dependency: "), d.Label)
-			if d.Label != "sudo" { // sudo is only needed for --sudo invites
+			if doctorDependencyIsFatal(d.Label) {
 				rc = 1
 			}
 		}
@@ -725,35 +786,36 @@ func (a *App) doctor(args []string) int {
 	a.info(fmt.Sprintf(a.P.M("探测到 SSH 端口：%d", "detected SSH port: %d"), sysinfo.SSHPort()))
 	// Probe with a name shaped like a fresh invite account: brand new, on no
 	// whitelist, and in no group but its own. That is what an invite actually hits,
-	// and reporting on it here is the only way an operator can learn that key logins
-	// are off *before* they hand out an invite.
+	// and reporting on it here lets an operator see effective-configuration blockers
+	// before handing out an invite.
 	//
 	// The probe name is passed to SSHDConfig, not just to the check: `sshd -T` alone
 	// cannot see `Match User` blocks, so asking the global view a per-user question
 	// would let doctor contradict the invite it is meant to predict.
 	probe := config.DefaultPrefix + "-doctor"
 	if cfg, err := a.sshdConfig(probe); err != nil {
-		a.warnf("%s (%v)", a.P.M("无法读取 sshd 有效配置；invite 无法验证公钥登录是否真的可用。",
-			"cannot read the effective sshd config; invite cannot verify that a key login would work."), err)
+		a.warnf("%s (%v)", a.P.M("无法读取 sshd 有效配置；无法运行新邀请的公钥凭据检查。",
+			"cannot read the effective sshd config; cannot run the public-key credential check for a new invite."), err)
 		rc = 1
 	} else {
-		rep := a.checkKeyLogin(cfg, probe, []string{probe})
+		rep := a.checkKeyLogin(cfg, probe, []string{probe}, false)
 		for _, w := range rep.Warnings {
 			a.warnf("%s", w)
 		}
 		if rep.Certain() {
-			a.success(a.P.M("sshd 接受公钥登录。", "sshd accepts public-key logins."))
+			a.success(a.P.M("sshd 有效配置检查未发现新账号公钥凭据的阻碍。",
+				"the effective sshd config check found no blocker for a new account's key credential."))
 		} else if rep.OK() {
-			a.warnf("%s", a.P.M("sshd 没有显示阻断公钥登录，但存在无法求值的连接条件，不能确认新邀请可登录。",
-				"sshd has no explicit key-login blocker, but connection-dependent rules could not be evaluated; a new invite cannot be confirmed healthy."))
+			a.warnf("%s", a.P.M("sshd 有效配置检查未发现明确的公钥凭据阻碍，但存在创建前或连接时无法求值的 Match 条件，配置结论不完整。",
+				"the effective sshd config check found no explicit public-key credential blocker, but a Match rule cannot be evaluated before creation or without connection attributes; the configuration verdict is inconclusive."))
 			rc = 1
 		} else {
-			a.warnf("%s", a.P.M("sshd 不会接受新建临时账号的公钥登录：",
-				"sshd would not accept a public-key login for a freshly created temporary account:"))
+			a.warnf("%s", a.P.M("sshd 有效配置检查发现新建临时账号公钥凭据的阻碍：",
+				"the effective sshd config check found a blocker for a freshly created temporary account's key credential:"))
 			a.reportBlockers(rep)
 			if rep.Fixable() {
-				a.warnf("%s", a.P.M("可用 `invite --fix-sshd` 只为该账号开启（不改动全局策略）。",
-					"`invite --fix-sshd` can enable it for that one account, leaving the global policy untouched."))
+				a.warnf("%s", a.P.M("可用 `invite --fix-sshd` 只为该账号移除已知配置阻碍（不改动全局策略）。",
+					"`invite --fix-sshd` can remove the known configuration blocker for that account only, leaving the global policy untouched."))
 			}
 			rc = 1
 		}
@@ -782,32 +844,76 @@ func (a *App) doctor(args []string) int {
 					rc = 1
 					continue
 				}
-				switch {
-				case rec.Pending:
+				switch classifyRegisteredAccount(rec, pw, exists, nil) {
+				case registeredRecoveryAbsent:
+					a.warnf("%s%s", a.P.M(
+						"删除事务已持久化且账号已不存在；见证只允许重试按 UID 校验所属者的邮件清扫，请运行 revoke 完成恢复：",
+						"deletion was durably started and the account is absent; the witness authorizes only an owner-checked UID-bound mail cleanup retry. Run revoke to finish recovery: "), rec.User)
+					rc = 1
+				case registeredRecoveryBound:
+					a.warnf("%s%s", a.P.M(
+						"活账号与已持久化的删除世代精确匹配；这是可重试的中断删除，请运行 revoke 完成：",
+						"the live account exactly matches a durably started deletion generation; this interrupted deletion can be retried with revoke: "), rec.User)
+					rc = 1
+				case registeredRecoveryManual:
+					a.warnf("%s%s", a.P.M(
+						"活账号的删除恢复见证未绑定当前世代或已不匹配；自动删除、--yes 和卸载批量删除均被拒绝。人工核查后，请直接运行 revoke --force 并输入完整用户名：",
+						"the live account's deletion-recovery witness is unbound to the current generation or no longer matches; automatic deletion, --yes, and uninstall bulk deletion are refused. Inspect it, then invoke revoke --force directly and type the full username: "), rec.User)
+					rc = 1
+				case registeredPending:
 					a.warnf("%s%s", a.P.M("登记仍是未完成的 pending 创建意图，不能证明当前账号身份：",
 						"registry row is still an incomplete pending creation intent and cannot prove the current account identity: "), rec.User)
 					rc = 1
-				case !exists:
+				case registeredMissing:
 					a.warnf("%s%s", a.P.M("登记指向已不存在的账号（可用 cleanup-expired --compact 清理）：",
 						"registry row points to an absent account (remove it with cleanup-expired --compact): "), rec.User)
 					rc = 1
-				case rec.UID < 1:
-					a.warnf("%s%s", a.P.M("活账号登记没有可信 UID，不能证明身份：",
-						"live account registry row has no trusted UID and cannot prove identity: "), rec.User)
+				case registeredIdentityUnverified:
+					a.warnf("%s%s", a.P.M("活账号或登记没有安全的非 root UID/GID，不能证明身份：",
+						"live account or registry row has no safe non-root UID/GID and cannot prove identity: "), rec.User)
 					rc = 1
-				case pw.UID != rec.UID:
+				case registeredUIDMismatch:
 					a.warnf("%s", fmt.Sprintf(a.P.M("登记账号 %s 的 UID 不匹配：记录为 %d，当前为 %d；拒绝自动删除。",
 						"registered account %s has a UID mismatch: recorded %d, current %d; automatic deletion is refused."), rec.User, rec.UID, pw.UID))
 					rc = 1
-				case !rec.IdentityBound:
+				case registeredLegacyIdentity:
 					a.warnf("%s%s", a.P.M("登记账号来自旧版固定身份标记，无法排除同名/同 UID 重用；自动和批量删除已禁用，请人工核查后用 revoke --force 处理：",
 						"registered account uses a legacy fixed identity marker, so same-name/same-UID reuse cannot be excluded; automatic and bulk deletion are disabled; inspect it and use revoke --force: "), rec.User)
 					rc = 1
-				case !user.MatchesManagedGeneration(pw, rec.Generation):
+				case registeredMarkerMismatch:
 					a.warnf("%s%s", a.P.M("登记账号缺少与登记世代精确匹配的受管身份标记，可能已被替换或篡改：",
 						"registered account lacks a managed identity marker matching its recorded generation and may have been replaced or modified: "), rec.User)
 					rc = 1
+				case registeredHomeMismatch:
+					a.warnf("%s%s", a.P.M("登记账号的家目录不是本工具使用的确定路径；自动删除已禁用：",
+						"registered account home is not the deterministic path used by this tool; automatic deletion is disabled: "), rec.User)
+					rc = 1
 				}
+			}
+		}
+	}
+	// A lifecycle marker is deliberately weaker than identity proof, but it is
+	// still the only durable witness for a permanent no-sudo/no-timer account
+	// after its registry row is lost. Compare markers only after a complete,
+	// successful registry read: an unreadable registry is already a failure and
+	// cannot support a meaningful missing-row comparison.
+	if a.Registry != nil && registryReadable {
+		registered := make(map[string]struct{}, len(registryRecords))
+		for _, rec := range registryRecords {
+			registered[rec.User] = struct{}{}
+		}
+		markerAccounts, err := a.listMarkerAccounts()
+		if err != nil {
+			a.warnf("%s: %v", a.P.M("无法扫描账号生命周期标记", "cannot scan account lifecycle markers"), err)
+			rc = 1
+		} else {
+			for _, name := range markerAccounts {
+				if _, ok := registered[name]; ok {
+					continue
+				}
+				a.warnf("%s%s", a.P.M("账号带有本工具的生命周期标记，但登记表中没有对应记录；该标记只能用于发现异常，不能授权自动或批量删除：",
+					"account carries this tool's lifecycle marker but has no registry row; the marker is discovery evidence only and cannot authorize automatic or bulk deletion: "), name)
+				rc = 1
 			}
 		}
 	}
@@ -858,7 +964,7 @@ func (a *App) doctor(args []string) int {
 	// against a binary that no longer exists — so it belongs in the same health list
 	// the two grants are in.
 	if a.Scheduler != nil {
-		if orphans, err := a.Scheduler.Orphans(a.accountIsOursAndLive); err != nil {
+		if orphans, err := a.Scheduler.Orphans(a.accountNeedsAutoRevoke); err != nil {
 			a.warnf("%s: %v", a.P.M("无法扫描孤儿自动删除任务", "cannot scan for orphaned auto-delete tasks"), err)
 			rc = 1
 		} else if len(orphans) > 0 {
@@ -908,6 +1014,13 @@ func (a *App) doctor(args []string) int {
 		}
 	}
 	return rc
+}
+
+// sudo and visudo are mandatory only for --sudo invites. chpasswd is mandatory
+// only for password invites. Missing optional-feature helpers do not make the
+// base key-only doctor verdict fail.
+func doctorDependencyIsFatal(label string) bool {
+	return label != "sudo" && label != "visudo" && label != "chpasswd"
 }
 
 // menuItems are the interactive menu entries in order. An entry's position is

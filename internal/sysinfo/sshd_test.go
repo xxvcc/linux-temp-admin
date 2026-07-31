@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -408,6 +409,38 @@ func TestHasConnectionScopedMatch(t *testing.T) {
 		t.Error("a `Match Address` block in the main config must be detected")
 	}
 
+	// OpenSSH accepts '=' between a keyword and its first argument. Treating the
+	// whole left-hand side as a keyword used to hide both Match and Include.
+	write(main, "PubkeyAuthentication yes\nMatch=Address 203.0.113.0/24\n    DenyUsers "+acct+"\n")
+	if !HasConnectionScopedMatch() {
+		t.Error("a `Match=Address` block in the main config must be detected")
+	}
+	write(dir+"/equals.conf", "Match Address 203.0.113.0/24\n")
+	write(main, "Include=equals.conf\n")
+	if !HasConnectionScopedMatch() {
+		t.Error("a connection-scoped Match behind `Include=path` must be detected")
+	}
+
+	// '#' is literal when attached to an OpenSSH argument. Truncating at every
+	// hash would scan hash.conf below and miss the real hash.conf#backup Include.
+	write(dir+"/hash.conf", "PubkeyAuthentication yes\n")
+	write(dir+"/hash.conf#backup", "Match Address 203.0.113.0/24\n")
+	write(main, "Include hash.conf#backup\n")
+	if !HasConnectionScopedMatch() {
+		t.Error("a literal # in an Include path was mistaken for a comment")
+	}
+
+	// Include uses POSIX glob(3), whose bracket negation is [!x]. filepath.Match
+	// uses [^x], so the scanner must bridge that syntax difference.
+	if err := os.MkdirAll(dir+"/glob", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(dir+"/glob/abc.conf", "Match Address 203.0.113.0/24\n")
+	write(main, "Include glob/[!x]*.conf\n")
+	if !HasConnectionScopedMatch() {
+		t.Error("a connection-scoped Match behind a POSIX [!x] Include glob must be detected")
+	}
+
 	// In a drop-in, on the Host criterion, and as a later criterion after User.
 	write(main, "PubkeyAuthentication yes\n")
 	write(dropins+"/10-x.conf", "Match User bob Host bastion.example\n    X11Forwarding no\n")
@@ -420,6 +453,17 @@ func TestHasConnectionScopedMatch(t *testing.T) {
 	write(dropins+"/10-x.conf", "Match User bob\n    PermitTTY no\n")
 	if HasConnectionScopedMatch() {
 		t.Error("a plain `Match User` block is not connection-scoped and must not be flagged")
+	}
+
+	// Before useradd, OpenSSH cannot resolve the future account's NSS groups, so a
+	// Group criterion is unknown. Once the account exists, a user-only -C probe can
+	// evaluate it and only genuinely connection-scoped criteria remain unknown.
+	write(dropins+"/10-x.conf", "Match Group admins\n    PermitTTY no\n")
+	if !HasUnverifiableMatch(false) {
+		t.Error("a pre-account `Match Group` rule must make the probe unverifiable")
+	}
+	if HasUnverifiableMatch(true) {
+		t.Error("an existing account's `Match Group` rule is evaluable by sshd")
 	}
 
 	// Criterion values that happen to equal criterion names are not criteria.
@@ -458,6 +502,31 @@ func TestHasConnectionScopedMatch(t *testing.T) {
 	}
 }
 
+func TestParseSSHDDirectiveCommentBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		line     string
+		keyword  string
+		args     []string
+		complete bool
+	}{
+		{name: "whole comment", line: "  # Include ignored.conf", complete: true},
+		{name: "inline comment", line: "Include live.conf # backup", keyword: "Include", args: []string{"live.conf"}, complete: true},
+		{name: "attached hash", line: "Include live.conf#backup", keyword: "Include", args: []string{"live.conf#backup"}, complete: true},
+		{name: "quoted hash", line: `Include "live.conf#backup"`, keyword: "Include", args: []string{"live.conf#backup"}, complete: true},
+		{name: "escaped token is unknown", line: `Include live\\ file.conf`, complete: false},
+		{name: "unterminated quote is unknown", line: `Include "live.conf`, complete: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyword, args, complete := parseSSHDDirective(tc.line)
+			if keyword != tc.keyword || !reflect.DeepEqual(args, tc.args) || complete != tc.complete {
+				t.Fatalf("parseSSHDDirective(%q) = %q, %v, %v; want %q, %v, %v",
+					tc.line, keyword, args, complete, tc.keyword, tc.args, tc.complete)
+			}
+		})
+	}
+}
+
 func TestHasConnectionScopedMatchFailsClosedOnGlobIOError(t *testing.T) {
 	dir := t.TempDir()
 	main := dir + "/sshd_config"
@@ -482,6 +551,53 @@ func TestHasConnectionScopedMatchFailsClosedOnGlobIOError(t *testing.T) {
 
 	if !HasConnectionScopedMatch() {
 		t.Fatal("an unreadable drop-in directory was treated as a complete sshd policy scan")
+	}
+}
+
+func TestSSHDIncludePOSIXBracketGlobAndMalformedPattern(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		name    string
+		want    bool
+	}{
+		{pattern: "[!x]*.conf", name: "abc.conf", want: true},
+		{pattern: "[!x]*.conf", name: "xbc.conf", want: false},
+		{pattern: "[^x]*.conf", name: "abc.conf", want: true},
+	} {
+		got, err := matchSSHDIncludeGlob(tc.pattern, tc.name)
+		if err != nil || got != tc.want {
+			t.Errorf("matchSSHDIncludeGlob(%q, %q) = %v, %v; want %v", tc.pattern, tc.name, got, err, tc.want)
+		}
+	}
+	if _, err := matchSSHDIncludeGlob("[!unterminated", "anything.conf"); err == nil {
+		t.Fatal("an unterminated POSIX bracket expression was accepted")
+	}
+	for _, pattern := range []string{
+		"[[:alpha:]]*.conf", "[[.ch.]]*.conf", "[[=a=]]*.conf",
+		"[a[:digit:]]*.conf", "[a[.ch.]]*.conf", "[a[=x=]]*.conf",
+	} {
+		if _, err := matchSSHDIncludeGlob(pattern, "abc.conf"); err == nil {
+			t.Errorf("unsupported POSIX bracket construct %q was not rejected", pattern)
+		}
+		if _, err := strictGlob(filepath.Join(t.TempDir(), pattern)); err == nil {
+			t.Errorf("unsupported POSIX bracket construct %q was accepted when its directory was empty", pattern)
+		}
+	}
+
+	dir := t.TempDir()
+	main := filepath.Join(dir, "sshd_config")
+	dropins := filepath.Join(dir, "sshd_config.d")
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(main, []byte("Include missing/[!unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+	if !HasConnectionScopedMatch() {
+		t.Fatal("a malformed Include bracket expression was treated as a complete policy scan")
 	}
 }
 

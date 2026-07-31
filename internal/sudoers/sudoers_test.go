@@ -31,6 +31,40 @@ func TestAllPropagatesDirectoryReadFailure(t *testing.T) {
 	}
 }
 
+func TestAllRejectsSymlinkedDirectory(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Manager{Dir: link}).All(); err == nil {
+		t.Fatal("All followed a symlinked sudoers directory")
+	}
+}
+
+func TestAllAllowsAbsentDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "absent")
+	users, err := (&Manager{Dir: dir}).All()
+	if err != nil || len(users) != 0 {
+		t.Fatalf("All on absent directory = %v, %v; want empty success", users, err)
+	}
+}
+
+func TestAllRejectsMalformedManagedArtifact(t *testing.T) {
+	dir := t.TempDir()
+	name := filePrefix + "not.valid"
+	if err := os.WriteFile(filepath.Join(dir, name), nil, 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Manager{Dir: dir}).All(); err == nil || !strings.Contains(err.Error(), name) {
+		t.Fatalf("All error = %v, want malformed managed artifact", err)
+	}
+}
+
 func TestSudoersProbesAreBoundedAndUseCLocale(t *testing.T) {
 	old := sudoProbeOptions
 	t.Cleanup(func() { sudoProbeOptions = old })
@@ -42,6 +76,14 @@ func TestSudoersProbesAreBoundedAndUseCLocale(t *testing.T) {
 		t.Setenv("PATH", dir)
 		if err := visudoValidate([]byte("alice ALL=(ALL) NOPASSWD:ALL\n")); err != nil {
 			t.Fatalf("visudoValidate did not force the C locale: %v", err)
+		}
+	})
+
+	t.Run("missing visudo fails closed", func(t *testing.T) {
+		sudoProbeOptions = old
+		t.Setenv("PATH", t.TempDir())
+		if err := visudoValidate([]byte("alice ALL=(ALL) NOPASSWD:ALL\n")); err == nil || !strings.Contains(err.Error(), "visudo is required") {
+			t.Fatalf("visudoValidate with no visudo = %v, want fail-closed error", err)
 		}
 	})
 
@@ -80,6 +122,26 @@ printf '    (root) NOPASSWD: ALL\n'`)
 			t.Fatalf("visudoValidate error = %v, want output limit", err)
 		}
 	})
+}
+
+func TestGrantFailsClosedWithoutValidationOrPolicyVerification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		m    *Manager
+		want string
+	}{
+		{name: "validator", m: &Manager{Dir: t.TempDir()}, want: "validator is not configured"},
+		{name: "verifier", m: &Manager{Dir: t.TempDir(), Validate: func([]byte) error { return nil }}, want: "verifier is not configured"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.m.Grant("xxvcc-a1"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Grant without %s = %v, want fail-closed error", tc.name, err)
+			}
+			if _, err := os.Lstat(tc.m.FilePath("xxvcc-a1")); !os.IsNotExist(err) {
+				t.Fatalf("Grant without %s wrote a live policy: %v", tc.name, err)
+			}
+		})
+	}
 }
 
 func TestRemoveUsesInjectedRemoveFile(t *testing.T) {
@@ -149,11 +211,23 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 	}{
 		{"root", "User alice may run the following commands:\n    (root) NOPASSWD: ALL\n", true},
 		{"all runas", "    (ALL : ALL) NOPASSWD: ALL\n", true},
+		{"all except root", "    (ALL, !root) NOPASSWD: ALL\n", false},
+		{"root exclusion before all", "    (!root, ALL) NOPASSWD: ALL\n", false},
+		{"negated all", "    (root, !ALL) NOPASSWD: ALL\n", false},
 		{"non-root runas", "    (daemon) NOPASSWD: ALL\n", false},
 		{"restricted command", "    (root) NOPASSWD: /usr/bin/id\n", false},
 		{"password required", "    (root) PASSWD: ALL\n", false},
 		{"unrelated nopasswd", "    (daemon) NOPASSWD: /bin/true\n    (root) PASSWD: ALL\n", false},
 		{"tag changes before all", "    (root) NOPASSWD: /bin/true, PASSWD: ALL\n", false},
+		{"later passwd all overrides", "    (root) NOPASSWD: ALL\n    (root) PASSWD: ALL\n", false},
+		{"later all-runas passwd all overrides", "    (root) NOPASSWD: ALL\n    (ALL) PASSWD: ALL\n", false},
+		{"later root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: ALL\n", false},
+		{"restricted root-applicable exclusion is globally ambiguous", "    (root) NOPASSWD: ALL\n    (ALL, !daemon) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", false},
+		{"later restricted passwd invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n", false},
+		{"later command-list passwd all invalidates full grant", "    (root) NOPASSWD: ALL\n    (root) NOPASSWD: /bin/false, PASSWD: ALL\n", false},
+		{"exact later grant restores after command list", "    (root) NOPASSWD: ALL\n    (root) PASSWD: /bin/true\n    (root) NOPASSWD: ALL\n", true},
+		{"later nopasswd all restores", "    (root) PASSWD: ALL\n    (root) NOPASSWD: ALL\n", true},
+		{"later non-root rule does not override", "    (root) NOPASSWD: ALL\n    (daemon) PASSWD: ALL\n", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -163,6 +237,29 @@ func TestVerifyNopasswdOutputRequiresRootNopasswdAll(t *testing.T) {
 			}
 			if !tt.ok && (err == nil || !strings.Contains(err.Error(), "root NOPASSWD: ALL")) {
 				t.Fatalf("verifyNopasswdOutput error = %v, want precise refusal", err)
+			}
+		})
+	}
+}
+
+func TestRunasIncludesRootFailsClosedOnExclusions(t *testing.T) {
+	tests := []struct {
+		runas string
+		want  bool
+	}{
+		{runas: "root", want: true},
+		{runas: "ALL : ALL", want: true},
+		{runas: "daemon, root", want: true},
+		{runas: "daemon"},
+		{runas: "ALL, !root"},
+		{runas: "!root, ALL"},
+		{runas: "root, !ALL"},
+		{runas: "ALL, !daemon"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.runas, func(t *testing.T) {
+			if got := runasIncludesRoot(tt.runas); got != tt.want {
+				t.Fatalf("runasIncludesRoot(%q) = %t, want %t", tt.runas, got, tt.want)
 			}
 		})
 	}
@@ -178,7 +275,6 @@ func TestOrphansFindsGrantsWhoseAccountIsGone(t *testing.T) {
 		filePrefix + "xxvcc-alive", // ours, account exists -> not an orphan
 		"90-someone-elses-file",    // not ours: never report or remove it
 		"foreign-valid-user",       // valid username, but still not our namespace
-		filePrefix + "BAD NAME",    // ours-looking but not a valid username -> ignore
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x ALL=(ALL) NOPASSWD:ALL\n"), 0o440); err != nil {
 			t.Fatal(err)

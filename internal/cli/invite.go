@@ -282,7 +282,7 @@ func (a *App) invite(args []string) int {
 	// Work out what would have to be installed BEFORE the summary, so the summary
 	// can name it and the YES can be its consent. This only decides — the install
 	// itself is a host change and waits until after the confirmation.
-	depPkgs, ok := a.planDeps(grantSudo == "yes", fInstallDeps, fNoInstallDeps, fYes)
+	depPkgs, ok := a.planDeps(grantSudo == "yes", plan.password, fInstallDeps, fNoInstallDeps, fYes)
 	if !ok {
 		return 1
 	}
@@ -308,12 +308,15 @@ func (a *App) invite(args []string) int {
 
 	// Dependency packages are host prerequisites, not lifecycle state; install
 	// them before taking the account lock so a package manager cannot delay an
-	// already-due scheduled revoke. The account transaction starts below.
-	if !a.installDeps(grantSudo == "yes", depPkgs) {
+	// already-due scheduled revoke. The account transaction starts below. Keep the
+	// per-name lock outside the global lock: every account path uses that order.
+	if !a.installDeps(grantSudo == "yes", plan.password, depPkgs) {
 		return 1
 	}
-	return a.withLifecycleLock(func() int {
-		return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan)
+	return a.withAccountExclusiveLock(username, func() int {
+		return a.withLifecycleLock(func() int {
+			return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan)
+		})
 	})
 }
 
@@ -404,11 +407,11 @@ func (a *App) loginSummary(plan loginPlan, username string) string {
 // effective configuration before a single change is made to the host.
 type loginPlan struct {
 	password bool                // issue a password instead of a key (--password-login)
-	fixSSHD  bool                // write a per-account sshd drop-in to make the key work
+	fixSSHD  bool                // write a per-account sshd drop-in to admit the key in config
 	report   sysinfo.LoginReport // what the check found (drives the drop-in's contents)
-	verified bool                // sshd's effective config was read and it says this login works
-	// unverified says, in the invite's own words, why the login could not be
-	// proved. Non-empty exactly when verified is false.
+	verified bool                // the effective-config check completed without a blocker or unknown
+	// unverified says, in the invite's own words, why the config verdict was
+	// inconclusive. Non-empty exactly when verified is false.
 	unverified string
 }
 
@@ -420,25 +423,33 @@ func (a *App) sshdConfig(user string) (*sysinfo.SSHDConfig, error) {
 	if a.SSHDConfig == nil {
 		return nil, fmt.Errorf("no sshd config probe is wired")
 	}
-	return a.SSHDConfig(user)
+	cfg, err := a.SSHDConfig(user)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("sshd config probe returned no configuration")
+	}
+	return cfg, nil
 }
 
-// planLogin decides how the invitee will log in, and is the gate that stops the
-// tool from printing an invite nobody can use.
+// planLogin decides how the invitee will log in. It blocks known configuration
+// incompatibilities and requires a conclusive effective-config verdict before a
+// password is issued; a key invite may instead be marked UNVERIFIED.
 //
 // It runs before any mutation: on refusal the account does not exist, so there
 // is nothing to roll back and nothing left behind.
 func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool) (loginPlan, bool) {
-	// useradd -m gives the account a primary group of its own name; that is the
-	// group an AllowGroups whitelist would have to admit. The real group set is
-	// re-checked after creation, when the drop-in is proved.
+	// A same-name primary group is the common useradd default and is the only safe
+	// pre-creation prediction. Some distributions instead select a shared group;
+	// the real group set is re-checked after creation before any credential lands.
 	predicted := []string{username}
 
 	cfg, err := a.sshdConfig(username)
 	if err != nil {
 		// Password authentication exposes a reusable secret. Never issue one unless
-		// the effective configuration was read successfully and proved that sshd
-		// accepts it. Key-only invitations can remain explicitly UNVERIFIED.
+		// the effective-configuration check is conclusive. Key-only invitations can
+		// remain explicitly UNVERIFIED.
 		if wantPassword {
 			a.errorf("%s: %v", a.P.M("无法读取 sshd 有效配置，拒绝创建密码登录",
 				"cannot read the effective sshd config; refusing a password login"), err)
@@ -451,15 +462,24 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 	}
 
 	if wantPassword {
-		rep := a.checkPasswordLogin(cfg, username, predicted)
+		rep, deferred := a.checkPasswordLoginDetailed(cfg, username, predicted, false)
+		if deferred && rep.OK() {
+			a.warnf("%s", a.P.M(
+				"sshd 含有账号创建前无法求值的 Match Group；将先创建无凭据账号，并在设置密码前按真实用户组重新检查。",
+				"sshd has a Match Group that cannot be evaluated before the account exists; a credential-less account will be created and re-checked against its real groups before any password is set."))
+			a.warnf("%s", a.P.M(
+				"密码登录会削弱本工具的安全模型：密码在账号的整个生命周期内都可被全网爆破，且必须以明文交付。用完请立即撤销。",
+				"password login weakens this tool's security model: the password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear. Revoke as soon as you are done."))
+			return loginPlan{password: true, report: rep, unverified: uncertainReason(rep)}, true
+		}
 		if !rep.Certain() {
 			if rep.OK() {
-				a.errorf("%s", a.P.M("无法证明 sshd 会接受该账号的密码登录，拒绝创建密码登录：",
-					"cannot prove sshd would accept a password login for this account; refusing a password login:"))
+				a.errorf("%s", a.P.M("sshd 有效配置检查无法确认该账号的密码凭据，拒绝创建密码登录：",
+					"the effective sshd config check cannot confirm the password credential for this account; refusing a password login:"))
 				a.reportUncertainty(rep)
 				return loginPlan{}, false
 			}
-			a.errorf("%s", a.P.M("sshd 不接受该账号的密码登录：", "sshd would not accept a password login for this account:"))
+			a.errorf("%s", a.P.M("sshd 有效配置检查发现该账号密码凭据的阻碍：", "the effective sshd config check found a blocker for this account's password credential:"))
 			a.reportBlockers(rep)
 			return loginPlan{}, false
 		}
@@ -469,17 +489,27 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 		return loginPlan{password: true, verified: true, report: rep}, true
 	}
 
-	rep := a.checkKeyLogin(cfg, username, predicted)
+	rep, deferred := a.checkKeyLoginDetailed(cfg, username, predicted, false)
 	a.reportUncertainty(rep)
+	if deferred && rep.OK() {
+		// A future account's Match Group result is unknowable until NSS can resolve
+		// its real memberships. Preserve an explicit repair authorization through that
+		// phase; confirmLogin will either discover no blocker, update report with the
+		// real fixable blockers, or fail closed before credentials are installed.
+		return loginPlan{
+			fixSSHD:    fix == "yes",
+			report:     rep,
+			verified:   false,
+			unverified: "sshd Match Group cannot be evaluated until the account exists",
+		}, true
+	}
 	if rep.OK() {
 		// Certain(), not OK(): a rule that could not be evaluated — an AllowUsers
-		// entry that also pins the source address — is not a proof, and an invite
-		// that called it one would be exactly the false promise this check exists
-		// to end.
+		// entry that also pins the source address — prevents a conclusive verdict.
 		return loginPlan{verified: rep.Certain(), unverified: uncertainReason(rep)}, true
 	}
 
-	a.errorf("%s", a.P.M("sshd 不会接受该账号的公钥登录：", "sshd would not accept a public-key login for this account:"))
+	a.errorf("%s", a.P.M("sshd 有效配置检查发现该账号公钥凭据的阻碍：", "the effective sshd config check found a blocker for this account's public-key credential:"))
 	a.reportBlockers(rep)
 
 	// An interactive operator who ends up unable to use a key gets one offer of the
@@ -547,10 +577,11 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 	return loginPlan{}, false
 }
 
-// confirmLogin re-runs the preflight against the account's REAL groups, now that
-// it exists, and updates the plan. It returns false if the login the invite is
-// about to promise would not actually work — the caller rolls back, so the host
-// is left as it was found.
+// confirmLogin re-runs the effective-config check against the account's REAL
+// groups, now that it exists, and updates the plan. It returns false when that
+// check blocks the credential, or cannot conclusively assess a password. The
+// caller then attempts rollback; any cleanup it cannot prove complete retains the
+// credential-less account and registry witness for explicit recovery.
 //
 // This is where a wrong prediction is caught. planLogin had to guess the group
 // set before the account existed; sshd decides Allow/DenyGroups on the real one.
@@ -560,7 +591,7 @@ func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bo
 		if plan.fixSSHD || plan.password {
 			// We were about to modify sshd on the strength of a reading we can no
 			// longer take, or issue a reusable password whose login path can no
-			// longer be proved. Refuse and let the caller roll the account back.
+			// longer be checked conclusively. Refuse and let the caller roll the account back.
 			a.errorf("%s: %v", a.P.M("无法重新读取 sshd 有效配置", "cannot re-read the effective sshd config"), err)
 			return false
 		}
@@ -568,19 +599,21 @@ func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bo
 		plan.unverified = "the effective sshd config could not be read"
 		return true
 	}
-	rep := a.checkKeyLogin(cfg, username, groups)
+	var rep sysinfo.LoginReport
 	if plan.password {
-		rep = a.checkPasswordLogin(cfg, username, groups)
+		rep = a.checkPasswordLogin(cfg, username, groups, true)
 		if !rep.Certain() {
 			if rep.OK() {
-				a.errorf("%s", a.P.M("无法证明 sshd 会接受该账号的密码登录，拒绝签发密码：",
-					"cannot prove sshd would accept a password login for this account; refusing to issue a password:"))
+				a.errorf("%s", a.P.M("sshd 有效配置检查无法确认该账号的密码凭据，拒绝签发密码：",
+					"the effective sshd config check cannot confirm the password credential for this account; refusing to issue a password:"))
 				a.reportUncertainty(rep)
 			} else {
 				a.reportBlockers(rep)
 			}
 			return false
 		}
+	} else {
+		rep = a.checkKeyLogin(cfg, username, groups, true)
 	}
 	switch {
 	case rep.OK():
@@ -591,8 +624,8 @@ func (a *App) confirmLogin(username string, groups []string, plan *loginPlan) bo
 			// The confirmation summary promised an sshd exception at a named path.
 			// Not writing it is the right outcome, but the operator was told it would
 			// appear, so say plainly that it will not.
-			a.info(a.P.M("按该账号的真实用户组复核后，sshd 本就接受此登录；未写入 sshd 例外。",
-				"re-checked against the account's real groups: sshd accepts this login as it is; no sshd exception was written."))
+			a.info(a.P.M("按该账号的真实用户组复核后，sshd 有效配置本就允许此凭据；未写入 sshd 例外。",
+				"re-checked against the account's real groups: the effective sshd config already permits this credential; no sshd exception was written."))
 		}
 		plan.fixSSHD = false
 		plan.report = sysinfo.LoginReport{}
@@ -656,37 +689,58 @@ func (a *App) reportBlockers(rep sysinfo.LoginReport) {
 	}
 }
 
-// checkKeyLogin runs the key-login check and augments it with the one thing the
-// per-user `sshd -T` probe cannot see: a connection-scoped `Match` block.
-// Whether such a block admits the invitee depends on attributes such as source
-// address or local port, which are unknowable here, so its mere presence makes the login unverifiable — never a
-// blocker, so it neither refuses the invite nor triggers a fix, only downgrades a
-// "verified" claim to an honest UNVERIFIED.
-func (a *App) checkKeyLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return a.withConnectionScopedMatch(sysinfo.CheckKeyLogin(cfg, user, groups))
-}
-
-func (a *App) checkPasswordLogin(cfg *sysinfo.SSHDConfig, user string, groups []string) sysinfo.LoginReport {
-	return a.withConnectionScopedMatch(sysinfo.CheckPasswordLogin(cfg, user, groups))
-}
-
-func (a *App) withConnectionScopedMatch(rep sysinfo.LoginReport) sysinfo.LoginReport {
-	hasConnectionScopedMatch := sysinfo.HasConnectionScopedMatch
-	if a.SSHDHasConnectionScopedMatch != nil {
-		hasConnectionScopedMatch = a.SSHDHasConnectionScopedMatch
-	}
-	if hasConnectionScopedMatch() {
-		rep.Unverifiable = append(rep.Unverifiable,
-			"sshd has a connection-scoped Match rule; whether this account is admitted depends on address, port, or routing attributes that cannot be checked here")
-	}
+// checkKeyLogin runs the key-login check and augments it with Match criteria a
+// user-only `sshd -T` probe cannot evaluate in the current account phase.
+func (a *App) checkKeyLogin(cfg *sysinfo.SSHDConfig, user string, groups []string, accountExists bool) sysinfo.LoginReport {
+	rep, _ := a.checkKeyLoginDetailed(cfg, user, groups, accountExists)
 	return rep
 }
 
-// offerPasswordFallback is the escape hatch for when a key login cannot be made
-// to work. On an interactive run, if sshd would accept a password for this
-// account, it offers that instead — so an operator driving the menu (who cannot
-// reach --password-login, a flag) is not dead-ended on a locked-down host with no
-// working invite and no obvious way forward.
+func (a *App) checkPasswordLogin(cfg *sysinfo.SSHDConfig, user string, groups []string, accountExists bool) sysinfo.LoginReport {
+	rep, _ := a.checkPasswordLoginDetailed(cfg, user, groups, accountExists)
+	return rep
+}
+
+func (a *App) checkKeyLoginDetailed(cfg *sysinfo.SSHDConfig, user string, groups []string, accountExists bool) (sysinfo.LoginReport, bool) {
+	return a.withUnverifiableMatch(sysinfo.CheckKeyLogin(cfg, user, groups), accountExists)
+}
+
+func (a *App) checkPasswordLoginDetailed(cfg *sysinfo.SSHDConfig, user string, groups []string, accountExists bool) (sysinfo.LoginReport, bool) {
+	return a.withUnverifiableMatch(sysinfo.CheckPasswordLogin(cfg, user, groups), accountExists)
+}
+
+// withUnverifiableMatch returns the augmented report and whether account
+// creation alone can resolve every unknown. That second result is true only for
+// a pre-account Match Group: connection-scoped rules, incomplete scans, and
+// address-qualified AllowUsers remain unknown after useradd and are never
+// eligible for deferred password issuance.
+func (a *App) withUnverifiableMatch(rep sysinfo.LoginReport, accountExists bool) (sysinfo.LoginReport, bool) {
+	hasUnverifiableMatch := sysinfo.HasUnverifiableMatch
+	if a.SSHDHasUnverifiableMatch != nil {
+		hasUnverifiableMatch = a.SSHDHasUnverifiableMatch
+	}
+	persistent := hasUnverifiableMatch(true)
+	if persistent {
+		rep.Unverifiable = append(rep.Unverifiable,
+			"sshd has a connection-scoped or otherwise unreadable Match rule; whether this account is admitted cannot be checked from user and group information alone")
+		return rep, false
+	}
+	if accountExists {
+		return rep, false
+	}
+	if hasUnverifiableMatch(false) {
+		deferred := len(rep.Unverifiable) == 0
+		rep.Unverifiable = append(rep.Unverifiable,
+			"sshd has a Match Group rule that cannot be evaluated until the account exists and its NSS groups can be resolved")
+		return rep, deferred
+	}
+	return rep, false
+}
+
+// offerPasswordFallback is the escape hatch when the effective-config check
+// reports a blocker for the planned key. If the same check conclusively admits a
+// password for this account, it offers that instead, so an operator driving the
+// menu (who cannot reach --password-login, a flag) has an alternative.
 //
 // Password login is the weakest grant the tool issues, so the offer states that
 // cost first and defaults to No: it removes the dead-end without nudging anyone
@@ -698,27 +752,40 @@ func (a *App) offerPasswordFallback(cfg *sysinfo.SSHDConfig, username string, in
 	if !interactive {
 		return loginPlan{}, false
 	}
-	rep := a.checkPasswordLogin(cfg, username, []string{username})
-	if !rep.Certain() {
+	rep, deferred := a.checkPasswordLoginDetailed(cfg, username, []string{username}, false)
+	if deferred && rep.OK() {
+		a.warnf("%s", a.P.M(
+			"密码策略取决于账号创建后的真实用户组；将在设置任何密码前重新检查。",
+			"password policy depends on the account's real post-creation groups; it will be re-checked before any password is set."))
+	} else if !rep.Certain() {
 		if rep.OK() {
-			a.warnf("%s", a.P.M("无法证明 sshd 会接受密码登录，因此不提供密码回退。",
-				"cannot prove sshd would accept a password login, so no password fallback is offered."))
+			a.warnf("%s", a.P.M("sshd 有效配置检查无法确认密码凭据，因此不提供密码回退。",
+				"the effective sshd config check cannot confirm the password credential, so no password fallback is offered."))
 			a.reportUncertainty(rep)
 		}
 		return loginPlan{}, false
 	}
-	a.warnf("%s", a.P.M(
-		"该账号无法用公钥登录，但 sshd 接受密码登录。密码在账号整个生命周期内可被全网爆破、且必须以明文交付，是本工具最弱的授权方式。",
-		"this account cannot log in with a key, but sshd accepts a password. A password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear — the weakest grant this tool issues."))
+	if deferred && rep.OK() {
+		a.warnf("%s", a.P.M(
+			"密码在账号整个生命周期内可被全网爆破、且必须以明文交付，是本工具最弱的授权方式。",
+			"A password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear — the weakest grant this tool issues."))
+	} else {
+		a.warnf("%s", a.P.M(
+			"sshd 有效配置检查发现该账号公钥凭据的阻碍，但未发现密码凭据的阻碍或无法判断项。密码在账号整个生命周期内可被全网爆破、且必须以明文交付，是本工具最弱的授权方式。",
+			"the effective sshd config check found a blocker for this account's key credential but no blocker or unevaluated rule for a password credential. A password is brute-forceable from anywhere for the account's whole lifetime and must be delivered in the clear — the weakest grant this tool issues."))
+	}
 	usePassword, answered := a.promptYesNo(a.P.M("改用密码登录？[y/N]: ", "Issue a password login instead? [y/N]: "), false)
 	if !answered || !usePassword {
 		return loginPlan{}, false
 	}
+	if deferred && rep.OK() {
+		return loginPlan{password: true, report: rep, unverified: uncertainReason(rep)}, true
+	}
 	return loginPlan{password: true, verified: true, report: rep}, true
 }
 
-// reportUncertainty prints the notes and the could-not-evaluate rules that keep
-// a report from being a proof.
+// reportUncertainty prints the notes and unevaluated rules that keep an
+// effective-config verdict from being conclusive.
 func (a *App) reportUncertainty(rep sysinfo.LoginReport) {
 	for _, w := range rep.Warnings {
 		a.warnf("%s", w)
@@ -728,8 +795,8 @@ func (a *App) reportUncertainty(rep sysinfo.LoginReport) {
 	}
 }
 
-// uncertainReason is the invite's own words for why a login could not be proved,
-// or "" when it was.
+// uncertainReason is the invite's own words for why an effective-config verdict
+// was inconclusive, or "" when it was conclusive.
 func uncertainReason(rep sysinfo.LoginReport) string {
 	if rep.Certain() {
 		return ""
@@ -740,8 +807,8 @@ func uncertainReason(rep sysinfo.LoginReport) string {
 	return "the effective sshd config could not be read"
 }
 
-// printSSHDFixHint prints the manual change that would make this account's key
-// login work, for an operator who would rather do it themselves.
+// printSSHDFixHint prints the manual change that would make the effective config
+// admit this account's key, for an operator who would rather do it themselves.
 //
 // It renders the same per-account Match block the tool would have written, not a
 // global directive. The blocker is often something other than the pubkey switch
@@ -781,8 +848,8 @@ func (a *App) printSSHDFixHint(username string, rep sysinfo.LoginReport) {
 // "no" could ever have meant is "do not create the account", which typing
 // anything but YES already achieves. A --yes run keeps the old rule — install
 // only with --install-deps — since it has no YES gate to stand in.
-func (a *App) planDeps(needSudo, installDeps, noInstallDeps, yes bool) ([]string, bool) {
-	missing := sysinfo.MissingDeps(needSudo)
+func (a *App) planDeps(needSudo, needPassword, installDeps, noInstallDeps, yes bool) ([]string, bool) {
+	missing := sysinfo.MissingDeps(needSudo, needPassword)
 	if len(missing) == 0 {
 		return nil, true
 	}
@@ -815,7 +882,7 @@ func (a *App) planDeps(needSudo, installDeps, noInstallDeps, yes bool) ([]string
 
 // installDeps installs the packages planDeps selected and confirms the tools are
 // now present. It is a no-op for an empty list.
-func (a *App) installDeps(needSudo bool, pkgs []string) bool {
+func (a *App) installDeps(needSudo, needPassword bool, pkgs []string) bool {
 	if len(pkgs) == 0 {
 		return true
 	}
@@ -824,7 +891,7 @@ func (a *App) installDeps(needSudo bool, pkgs []string) bool {
 		a.errorf("%s: %v", a.P.M("安装依赖失败", "dependency install failed"), err)
 		return false
 	}
-	if still := sysinfo.MissingDeps(needSudo); len(still) > 0 {
+	if still := sysinfo.MissingDeps(needSudo, needPassword); len(still) > 0 {
 		a.errorf("%s %v", a.P.M("安装后仍缺少：", "still missing after install:"), still)
 		return false
 	}
@@ -874,13 +941,16 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		fingerprint = kp.Fingerprint
 	}
 	permanent := !wantAuto
+	createdAt := a.Now()
+	var revokeDeadline time.Time
 	expiresDisplay := a.P.M("永久（不会过期，也不会自动删除）", "never (does not expire or auto-delete)")
 	if !permanent {
-		expiresDisplay = expiry.DisplayLocal(a.Now(), hours)
+		revokeDeadline = expiry.Deadline(createdAt, hours)
+		expiresDisplay = expiry.DisplayLocal(revokeDeadline)
 	}
 	rec := registry.Record{
 		User:          username,
-		Created:       a.Now().Format("2006-01-02 15:04:05 MST"),
+		Created:       createdAt.Format("2006-01-02 15:04:05 MST"),
 		Expires:       expiresDisplay,
 		Sudo:          wantSudo,
 		Host:          host,
@@ -899,6 +969,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// disappears out of band.
 	sudoRemovalConfirmed := true
 	sshdRemovalConfirmed := true
+	accountCleanupConfirmed := true
 	confirmSudoRemoved := func() error {
 		err := a.removeSudoGrant(username)
 		if err == nil {
@@ -958,6 +1029,21 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			"an account with this name already exists locally or in NSS; refusing creation: "+username))
 		return 1
 	}
+	// A previous revoke/rollback may have reached userdel and left a durable
+	// recovery witness. Never consume that witness as a side effect of creating a
+	// replacement account: the operator must finish the old transaction through
+	// revoke, where its recovery state is visible and auditable. In particular,
+	// creating a new generation must not depend on an invite-time mail cleanup and
+	// then overwrite the only evidence needed to retry it.
+	staleRec, staleRegistered, err := a.Registry.Lookup(username)
+	if err != nil {
+		return failf("%s: %v", a.P.M("读取同名账号的旧删除状态失败", "reading prior deletion state for this username failed"), err)
+	}
+	if staleRegistered && staleRec.DeletionStarted {
+		return failf("%s", a.P.M(
+			"同名账号存在未完成的删除恢复见证；拒绝复用用户名或覆盖登记。请先运行 revoke --user "+username+" 完成恢复。",
+			"an unfinished deletion-recovery witness exists for this username; refusing to reuse the name or overwrite the registry. Run revoke --user "+username+" first to complete recovery."))
+	}
 	if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
 		return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
 	}
@@ -971,7 +1057,23 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	if err := a.Scheduler.Cancel(username, staleUnit); err != nil {
 		return failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
 	}
-
+	// Cancel can remove queued work, but an older at/systemd command may already be
+	// executing an old binary and waiting for this transaction's lifecycle lock. It
+	// has no UID/generation arguments, so letting it resume after a same-name invite
+	// would apply the old deletion intent to the new account. Refuse reuse while that
+	// exact root-owned command is still visible. New binaries also make this legacy
+	// command shape take a nonblocking shared barrier for the username; invite owns
+	// the exclusive side, closing the start-after-scan interval without suppressing
+	// revokes delayed by unrelated lifecycle work.
+	legacyRevoke, err := a.runningLegacyRevoke(username)
+	if err != nil {
+		return failf("%s: %v", a.P.M("无法检查正在运行的旧版撤销任务，拒绝复用用户名", "cannot inspect running legacy revoke tasks; refusing username reuse"), err)
+	}
+	if legacyRevoke {
+		return failf("%s", a.P.M(
+			"检测到该用户名的旧版无世代绑定撤销进程仍在运行；已拒绝复用，请等待其退出并重新运行。",
+			"a legacy revoke process without a generation binding is still running for this username; reuse was refused; wait for it to exit and retry."))
+	}
 	// Persist the account intent before useradd. A kill or power loss after account
 	// creation must leave a registry witness even if no sudo/sshd/schedule artifact
 	// exists. UID 0 means pending and is replaced immediately after lookup.
@@ -989,6 +1091,9 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		if !sshdRemovalConfirmed {
 			unconfirmed = append(unconfirmed, fmt.Errorf("sshd removal is unconfirmed; keeping registry record"))
 		}
+		if !accountCleanupConfirmed {
+			unconfirmed = append(unconfirmed, fmt.Errorf("account artifact cleanup is unconfirmed; keeping registry record"))
+		}
 		if err := errors.Join(unconfirmed...); err != nil {
 			return err
 		}
@@ -999,12 +1104,22 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		if exists {
 			return fmt.Errorf("account still exists; keeping registry record")
 		}
-		return a.Registry.Remove(username)
+		return a.releaseRegistryAfterCleanup(username)
 	})
 
-	if err := a.Users.CreatePending(username, resolveShell(), generation); err != nil {
+	// useradd can create the account (and Home) before reporting an
+	// error. Close the registry-removal gate before invoking the helper: until a
+	// complete passwd identity is captured, rollback cannot prove which artifacts
+	// are safe to delete, so the pending row must remain as the recovery witness.
+	accountCleanupConfirmed = false
+	pw, err := a.Users.CreatePendingIdentity(username, resolveShell(), generation)
+	if err != nil {
 		return failf("%s: %v", a.P.M("创建用户失败", "create user failed"), err)
 	}
+	// Keep a separately named rollback witness. A failed MarkManagedExpected call
+	// may return a zero Passwd even after usermod partially ran; overwriting this
+	// value would discard the last complete identity that this transaction proved.
+	rollbackIdentity := pw
 	cleanups = append(cleanups, func() error {
 		var causes []error
 		if !sudoRemovalConfirmed {
@@ -1014,16 +1129,13 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			causes = append(causes, fmt.Errorf("sshd removal is unconfirmed; account disabled and retained"))
 		}
 		mayDelete := sudoRemovalConfirmed && sshdRemovalConfirmed
-		return errors.Join(errors.Join(causes...), a.rollbackInviteAccount(username, rec, mayDelete))
+		cleanupErr := errors.Join(errors.Join(causes...), a.rollbackInviteAccount(username, rec, rollbackIdentity, mayDelete))
+		if cleanupErr == nil {
+			accountCleanupConfirmed = true
+		}
+		return cleanupErr
 	})
 
-	pw, ok, lookupErr := a.lookupUser(username)
-	if lookupErr != nil {
-		return failf("%s: %v", a.P.M("读取新账号信息失败", "reading the new account failed"), lookupErr)
-	}
-	if !ok {
-		return failf("%s", a.P.M("无法定位新用户家目录", "cannot locate new user's home"))
-	}
 	rec.UID = pw.UID
 	// Persist the UID while the passwd entry still carries PendingGECOS. An older
 	// binary ignores the appended Pending field, but it does understand that this
@@ -1032,9 +1144,84 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	if err := a.Registry.Record(rec); err != nil {
 		return failf("%s: %v", a.P.M("登记新账号身份失败", "recording the new account identity failed"), err)
 	}
-	if err := a.Users.MarkManaged(username, generation); err != nil {
+	// Put an account-level login gate in place before any deferred work is
+	// drained, the pending marker is promoted, or a credential is installed.
+	// useradd's initial password lock is not enough for a key-based account: a
+	// public key bypasses that lock, while an account expiry is enforced for both
+	// key and password authentication. If this process is killed at any later
+	// setup boundary, the account therefore remains unusable until a subsequent
+	// successful invite installs its requested lifetime below.
+	if err := a.Users.DisableLogin(username); err != nil {
+		return failf("%s: %v", a.P.M("建立新账号的安全失效状态失败", "establishing the new account's fail-closed login state failed"), err)
+	}
+	// A previously deleted account can leave a same-name personal crontab or an at
+	// job carrying the numeric UID that useradd just selected. The pending account
+	// is expired, password-locked, and has no credential yet; it keeps that identity
+	// occupied while two clear/kill passes wait out daemon-cached work. Do this
+	// before the managed marker, password, key, or sudo policy exists, so inherited
+	// deferred work never reaches a grant.
+	if err := a.quiesceScheduledAccount(username, pw); err != nil {
+		return failf("%s: %v", a.P.M("无法清除同名账号或复用 UID 的遗留 cron/at 任务", "cannot clear cron/at work left by the reused username or UID"), err)
+	}
+	// The drain intentionally gives daemon-cached work a full polling cycle to
+	// start. Re-scan now, while the account is still expired, password-locked,
+	// credential-less, and marked pending. A legacy command found here triggers the
+	// ordinary rollback before this identity can become usable.
+	legacyRevoke, err = a.runningLegacyRevoke(username)
+	if err != nil {
+		return failf("%s: %v", a.P.M("任务清场后无法复查正在运行的旧版撤销任务", "cannot recheck running legacy revoke tasks after deferred-job cleanup"), err)
+	}
+	if legacyRevoke {
+		return failf("%s", a.P.M(
+			"任务清场期间启动了该用户名的旧版无世代绑定撤销进程；已回滚新账号，请等待旧任务退出后重试。",
+			"a legacy revoke process without a generation binding started during deferred-job cleanup; the new account was rolled back; wait for the old task to exit before retrying."))
+	}
+	// Delivery can recreate /var/mail/USER during the deliberate daemon drain even
+	// though pending-account creation swept an older generation's spool. Run the
+	// same identity-checked cleanup again while this account is still expired,
+	// password-locked, pending, credential-less, and without a Home.
+	if err := a.Users.ClearManagedMailExpected(username, pw); err != nil {
+		return failf("%s: %v", a.P.M(
+			"任务清场后无法安全清除同名旧邮件，拒绝激活账号",
+			"cannot safely clear same-name stale mail after deferred-job cleanup; refusing to activate the account"), err)
+	}
+	if err := a.accountStillMatches(username, pw); err != nil {
+		return failf("%s: %v", a.P.M(
+			"创建账号目录前账号身份发生变化",
+			"the account identity changed before creating its Home"), err)
+	}
+	// Keep the Home absent until every inherited cron/at job and residual process
+	// has been drained. A previous account generation therefore has nowhere to
+	// plant authorized_keys or shell startup files that the new identity can inherit.
+	if err := a.Users.CreateManagedHomeExpected(username, pw); err != nil {
+		return failf("%s: %v", a.P.M(
+			"任务清场后无法安全创建账号目录，拒绝激活账号",
+			"cannot safely create the account Home after deferred-job cleanup; refusing to activate the account"), err)
+	}
+	if err := a.accountStillMatches(username, pw); err != nil {
+		return failf("%s: %v", a.P.M(
+			"创建账号目录期间账号身份发生变化",
+			"the account identity changed while creating its Home"), err)
+	}
+	// The requested lifetime starts only after the deliberate deferred-job drain;
+	// otherwise that safety wait would shorten a nominal one-hour invite. Persist
+	// the adjusted display and absolute target while the account is still pending.
+	createdAt = a.Now()
+	rec.Created = createdAt.Format("2006-01-02 15:04:05 MST")
+	if !permanent {
+		revokeDeadline = expiry.Deadline(createdAt, hours)
+		expiresDisplay = expiry.DisplayLocal(revokeDeadline)
+		rec.Expires = expiresDisplay
+	}
+	if err := a.Registry.Record(rec); err != nil {
+		return failf("%s: %v", a.P.M("登记任务清场后的账号时间失败", "recording the account time after deferred-job cleanup failed"), err)
+	}
+	managedIdentity, err := a.Users.MarkManagedExpected(username, generation, pw)
+	if err != nil {
 		return failf("%s: %v", a.P.M("完成新账号身份标记失败", "finalizing the new account identity marker failed"), err)
 	}
+	pw = managedIdentity
+	rollbackIdentity = managedIdentity
 	completed := rec
 	completed.Pending = false
 	if err := a.Registry.Record(completed); err != nil {
@@ -1045,17 +1232,23 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// The preflight had to PREDICT this account's groups, because it ran before the
 	// account existed. Now they are real — and sshd decides AllowGroups/DenyGroups
 	// on exactly them. Re-run the same check against the real group set before
-	// anything is printed: `useradd -m` only gives the account a group of its own
+	// anything is printed: `useradd` only gives the account a group of its own
 	// name when USERGROUPS_ENAB is on, and on a host that puts new accounts in a
 	// shared group instead (openSUSE ships GROUP=100 "users"), a `DenyGroups users`
-	// rule would refuse this login while the invite claimed it was verified.
+	// rule would block the credential while the invite claimed config verification.
 	groups, groupsErr := user.Groups(pw)
 	if groupsErr != nil {
 		return failf("%s: %v", a.P.M("无法可靠读取新账号的用户组", "cannot reliably read the new account's groups"), groupsErr)
 	}
+	if err := a.accountStillMatches(username, pw); err != nil {
+		return failf("%s: %v", a.P.M("读取用户组期间账号身份发生变化", "the account identity changed while resolving its groups"), err)
+	}
 	if !a.confirmLogin(username, groups, &plan) {
-		return failf("%s", a.P.M("按该账号的真实用户组复核后，sshd 不会接受此登录",
-			"re-checked against the account's real groups: sshd would not accept this login"))
+		return failf("%s", a.P.M("按该账号的真实用户组复核后，sshd 有效配置检查发现此凭据的阻碍",
+			"re-checked against the account's real groups: the effective sshd config check found a blocker for this credential"))
+	}
+	if err := a.accountStillMatches(username, pw); err != nil {
+		return failf("%s: %v", a.P.M("复核 sshd 配置期间账号身份发生变化", "the account identity changed during the sshd configuration check"), err)
 	}
 
 	if plan.password {
@@ -1072,8 +1265,8 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	}
 
 	// The sshd exception goes in only once the account (and its key) exist, and it
-	// is proved effective against the account's real groups before sshd is
-	// reloaded. Grant attempts its own rollback on failure; the CLI retries removal
+	// is confirmed in the effective config against the account's real groups before
+	// sshd is reloaded. Grant attempts its own rollback on failure; the CLI retries removal
 	// independently before account rollback can free the username.
 	sshdDropIn := ""
 	if plan.fixSSHD {
@@ -1085,12 +1278,12 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		}
 		sshdDropIn = res.Path
 		cleanups = append(cleanups, confirmSSHDRemoved)
-		a.success(a.P.M("已为该账号单独开启公钥登录（全局策略未改动）："+res.Path,
-			"public-key login enabled for this account only (the global policy is untouched): "+res.Path))
+		a.success(a.P.M("已在 sshd 配置中为该账号单独开启公钥认证（全局策略未改动）："+res.Path,
+			"public-key authentication enabled in the sshd config for this account only (the global policy is untouched): "+res.Path))
 		// Two independent things must both hold before the invite may say "verified":
-		//   1. the running daemon adopted the change (res.Reloaded). `sshd -t` forks a
-		//      fresh sshd to parse the file, which says nothing about the one already
-		//      serving the port, so a reload we could not get through means unverified.
+		//   1. the reload request succeeded (res.Reloaded). `sshd -t` forks a fresh sshd
+		//      to parse the file, which says nothing about the one already serving the
+		//      port, so a reload request we could not complete means unverified.
 		//   2. nothing about this login remained unevaluable (report.Unverifiable): the
 		//      drop-in lifts the blockers we understood, but an address-qualified
 		//      AllowUsers we could not evaluate still stands, and the invitee's source
@@ -1099,25 +1292,14 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		case !res.Reloaded:
 			plan.verified = false
 			plan.unverified = "sshd could not be asked to re-read its configuration; reload it yourself"
-			a.warnf("%s", a.P.M("未能通知正在运行的 sshd 重新读取配置。若 sshd 是常驻进程，请手动 `sshd -t && systemctl reload ssh` 后此邀请才会生效（socket 激活的 sshd 无需 reload）。",
-				"could not ask the running sshd to re-read its configuration. If sshd is a long-running process, run `sshd -t && systemctl reload ssh` yourself before this invite will work (a socket-activated sshd needs no reload)."))
+			a.warnf("%s", a.P.M("未能通知正在运行的 sshd 重新读取配置。若 sshd 是常驻进程，请手动运行 `sshd -t && systemctl reload ssh`，使配置变更生效（socket 激活的 sshd 无需 reload）。",
+				"could not ask the running sshd to re-read its configuration. If sshd is a long-running process, run `sshd -t && systemctl reload ssh` yourself so the configuration change takes effect (a socket-activated sshd needs no reload)."))
 		case len(plan.report.Unverifiable) > 0:
 			plan.verified = false
 			plan.unverified = plan.report.Unverifiable[0]
 		default:
 			plan.verified = true
 			plan.unverified = ""
-		}
-	}
-
-	// Expiry is set only when the account will auto-delete. Without auto-delete the
-	// account is permanent — no chage expiry, no deletion — which is what "not
-	// auto-deleting" now means; the old behaviour (login expires via chage but the
-	// account is never deleted) was neither temporary nor permanent, and surprised
-	// operators who read "no auto-delete" as "keep it".
-	if !permanent {
-		if err := a.Users.SetExpiry(username, expiry.Date(a.Now(), hours)); err != nil {
-			return failf("%s: %v", a.P.M("设置到期失败", "set expiry failed"), err)
 		}
 	}
 
@@ -1168,7 +1350,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		if err := fsutil.RootSafeFile(a.InstallPath); err != nil {
 			return failf("%s: %v", a.P.M("稳定命令不安全", "the stable command is unsafe"), err)
 		}
-		unit, err := a.Scheduler.Schedule(username, pw.UID, generation, hours)
+		unit, err := a.Scheduler.Schedule(username, pw.UID, generation, revokeDeadline)
 		if err != nil {
 			return failf("%s: %v", a.P.M("自动删除任务创建失败，已拒绝创建临时账号", "auto-delete scheduling failed; refusing to create the temporary account"), err)
 		}
@@ -1178,6 +1360,24 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 		rec.AutoUnit = unit
 		if err := a.Registry.Record(rec); err != nil {
 			return failf("%s: %v", a.P.M("登记自动删除任务失败", "recording the auto-delete task failed"), err)
+		}
+	}
+
+	// The pending account was deliberately expired and password-locked before the
+	// deferred-job drain. Credentials replace the password lock, but the past-date
+	// expiry remains the authentication-method-neutral gate until sudo/sshd policy,
+	// the durable registry state, and any automatic revoke task are all complete.
+	// This is the transaction's activation point: install either the requested
+	// expiry or an explicit never-expire value only after every rollback witness is
+	// in place. Skipping it for a permanent invite would leave the credential
+	// unusable forever.
+	if permanent {
+		if err := a.Users.ClearExpiry(username); err != nil {
+			return failf("%s: %v", a.P.M("恢复永久账号的登录有效期失败", "restoring never-expire login state for the permanent account failed"), err)
+		}
+	} else {
+		if err := a.Users.SetExpiry(username, expiry.Date(revokeDeadline)); err != nil {
+			return failf("%s: %v", a.P.M("设置到期失败", "set expiry failed"), err)
 		}
 	}
 
@@ -1213,36 +1413,60 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 // name-scoped grants are confirmed gone, login is disabled, and every process
 // carrying the UID is confirmed terminated. Any uncertainty retains both the
 // account and the registry witness for manual recovery.
-func (a *App) rollbackInviteAccount(username string, rec registry.Record, mayDelete bool) error {
-	if rec.Pending || rec.UID < 1 || !rec.IdentityBound || !validate.Generation(rec.Generation) {
-		return fmt.Errorf("account identity is still pending; account and registry record retained")
+func (a *App) rollbackInviteAccount(username string, rec registry.Record, expected user.Passwd, mayDelete bool) error {
+	if rec.User != username || !rec.IdentityBound || !validate.Generation(rec.Generation) ||
+		expected.Name != username || !validate.AccountID(expected.UID) || !validate.AccountID(expected.GID) ||
+		!validate.ManagedHome(username, expected.Home) || expected.Shell == "" {
+		return fmt.Errorf("account identity is incomplete; account and registry record retained")
+	}
+	if rec.UID > 0 && rec.UID != expected.UID {
+		return fmt.Errorf("account identity differs from the durable registry witness; account and registry record retained")
+	}
+	marker := expected.GECOS
+	if i := strings.IndexByte(marker, ','); i >= 0 {
+		marker = marker[:i]
+	}
+	pendingMarker := config.PendingGenerationGECOSPrefix + rec.Generation
+	managedMarker := config.ManagedGenerationGECOSPrefix + rec.Generation
+	if marker != managedMarker && (marker != pendingMarker || !rec.Pending) {
+		return fmt.Errorf("account generation marker does not match rollback state; account and registry record retained")
 	}
 	pw, exists, err := a.lookupUser(username)
 	if err != nil {
 		return fmt.Errorf("verify rollback account identity: %w", err)
 	}
 	if !exists {
+		if rec.DeletionStarted {
+			if !mayDelete {
+				return nil
+			}
+			return a.reconcileDeletionStarted(rec)
+		}
+		if mayDelete {
+			return a.Users.DeleteExpected(username, expected, func() error {
+				return a.finalScheduledAccountCheck(username, expected)
+			})
+		}
 		return nil
 	}
-	if pw.UID != rec.UID || !user.MatchesManagedGeneration(pw, rec.Generation) {
+	if pw != expected {
 		return fmt.Errorf("account identity changed before rollback; account and registry record retained")
 	}
 	if !mayDelete {
+		if err := a.accountStillMatches(username, expected); err != nil {
+			return fmt.Errorf("verify retained account before login disable: %w", err)
+		}
 		if err := a.Users.DisableLogin(username); err != nil {
 			return fmt.Errorf("disable retained account: %w", err)
 		}
-		if err := a.accountStillMatches(username, pw); err != nil {
-			return fmt.Errorf("verify retained account before process termination: %w", err)
-		}
-		if err := a.terminateProcesses(rec.UID); err != nil {
-			return fmt.Errorf("terminate retained account processes: %w", err)
-		}
-		if err := a.accountStillMatches(username, pw); err != nil {
-			return fmt.Errorf("verify retained account after process termination: %w", err)
+		if err := a.quiesceScheduledAccount(username, expected); err != nil {
+			return fmt.Errorf("quiesce retained account cron/at work and processes: %w", err)
 		}
 		return nil
 	}
-	stage, err := a.teardownLocalAccount(username, pw)
+	stage, err := a.teardownLocalAccount(username, expected, func() error {
+		return a.persistDeletionStarted(rec, true, expected)
+	})
 	if err != nil {
 		return fmt.Errorf("fail-closed account teardown stopped at stage %d: %w", stage, err)
 	}
@@ -1273,7 +1497,7 @@ type inviteBundle struct {
 	kp          *sshkey.KeyPair // nil for a password invite
 	password    string          // empty for a key invite
 	sshdDropIn  string          // empty when sshd was not touched
-	verified    bool            // sshd's effective config confirms this login works
+	verified    bool            // the effective-config check completed without a blocker or unknown
 	unverified  string          // why it could not be confirmed; set exactly when verified is false
 }
 
@@ -1470,23 +1694,23 @@ func resolveShell() string {
 	return "/bin/sh"
 }
 
-// detectOrPromptHost resolves the invite's Host. Local interfaces and cloud
-// metadata never leave this host or its link, so they are probed silently. The
-// external echo services would disclose this server's address to a third party,
-// so they stay behind an explicit yes: a root-run tool must not phone home
-// unasked. Either way the result is offered as a default the operator can
-// override, because a multi-homed box can present the wrong public IP and a
-// wrong Host silently produces an invite nobody can connect with.
+// detectOrPromptHost resolves the invite's Host. Local-interface inspection sends
+// no traffic. Fixed-address cloud metadata probes avoid DNS, redirects, and
+// environment proxies, but may traverse the local or cloud-provider network. The
+// external echo services disclose this server's address to a public third party,
+// so they stay behind an explicit yes. Either way the result is offered as a
+// default the operator must confirm or override. Metadata is unauthenticated and
+// a multi-homed box can present the wrong public IP, so silently accepting either
+// source could direct the invite (and a password) to the wrong SSH server.
 func (a *App) detectOrPromptHost() string {
-	// A locally-detected public IP is authoritative — it comes from cloud metadata
-	// or a routable address on one of this host's own interfaces — so take it
-	// without a prompt. `--host` overrides it when the operator wants a domain or a
-	// specific address; the summary below prints the Host, so a wrong guess is
-	// still visible before anything is created.
+	// A local result can come from an unauthenticated HTTP metadata response or a
+	// routable address on one of this host's interfaces. Neither proves that the
+	// address is the SSH endpoint the invitee should use, so require an explicit
+	// prompt and treat it only as the default.
 	if ip, ok := a.Detector.LocalPublicIP(2 * time.Second); ok {
 		a.info(fmt.Sprintf(a.P.M("使用探测到的公网 IP：%s（如需域名或其他地址请用 --host）",
 			"using the detected public IP: %s (use --host for a domain or a different address)"), ip))
-		return ip
+		return a.promptHost(ip)
 	}
 	queryExternal, answered := a.promptYesNo(a.P.M("本机未探测到公网 IP。是否向外部服务查询？[y/N]: ",
 		"No public IP found locally. Ask an external service? [y/N]: "), false)

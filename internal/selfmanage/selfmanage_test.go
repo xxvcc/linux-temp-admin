@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -689,6 +690,39 @@ func TestDownloadRetriesTransientStatus(t *testing.T) {
 	}
 	if m.allowPrivateDial.Load() {
 		t.Fatal("private-address dial exception remained enabled after download")
+	}
+}
+
+func TestDownloadRetryWaitHonorsContextCancellation(t *testing.T) {
+	requested := make(chan struct{})
+	var once sync.Once
+	m := &Manager{
+		Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			once.Do(func() { close(requested) })
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("retry")),
+				Request:    req,
+			}, nil
+		})},
+		RetryDelay: time.Hour,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.downloadContextWithPolicy(ctx, "https://example.invalid/asset", 16, 2, downloadPolicy{})
+		done <- err
+	}()
+	<-requested
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !IsTransportFailure(err) || !strings.Contains(err.Error(), "deadline exceeded") {
+			t.Fatalf("cancelled retry wait error=%v, want bounded transport failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled retry wait did not return")
 	}
 }
 

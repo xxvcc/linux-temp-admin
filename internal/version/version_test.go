@@ -17,6 +17,8 @@ func TestGreater(t *testing.T) {
 		{"1.2.0", "nope", false},          // unparseable older => false
 		{"1.2.3-rc10", "1.2.3-rc9", true}, // numeric-aware suffix: rc10 > rc9
 		{"1.2.3-rc9", "1.2.3-rc10", false},
+		{"1.2.3-rc1", "1.2.3-rc01", true}, // equal numeric runs remain distinct and byte-ordered
+		{"1.2.3-rc01", "1.2.3-rc1", false},
 		{"1.2.3-rc2", "1.2.3-rc2", false},                                    // identical prerelease is not greater
 		{"1.2.10", "1.2.9", true},                                            // numeric core, not lexical
 		{"1.0.0-beta", "1.0.0-alpha", true},                                  // non-numeric suffix still compares

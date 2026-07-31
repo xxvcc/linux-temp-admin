@@ -123,24 +123,27 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          lookup="$(mktemp)"
-          set +e
-          timeout -k 5 60 gh api --include "repos/${GH_REPO}/releases/tags/${TAG}" >"$lookup" 2>&1
-          lookup_status=$?
-          set -e
-          if [[ "$lookup_status" -eq 0 ]]; then
+          # The tag-specific REST endpoint exposes only published releases. The
+          # authenticated list also exposes drafts to this write-capable token,
+          # so enumerate every page and refuse any existing use of the tag.
+          release_records="$(timeout -k 5 60 gh api --paginate \
+            "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | [.tag_name, (.id|tostring)] | @tsv')" || {
+              echo "could not prove release $TAG is absent" >&2
+              exit 1
+            }
+          match_count=0
+          if [[ -n "$release_records" ]]; then
+            while IFS=$'\t' read -r actual_tag release_id extra; do
+              [[ -z "$extra" && -n "$actual_tag" && "$release_id" =~ ^[1-9][0-9]*$ ]] \
+                || { echo "release enumeration returned malformed identity data" >&2; exit 1; }
+              [[ "$actual_tag" != "$TAG" ]] || match_count=$((match_count + 1))
+            done <<<"$release_records"
+          fi
+          (( match_count == 0 )) || {
             echo "release or draft $TAG already exists; refusing to refresh any remote asset" >&2
             exit 1
-          fi
-          [[ "$lookup_status" -eq 1 ]] \
-            || { echo "release lookup failed with unexpected status $lookup_status" >&2; exit 1; }
-          [[ "$(grep -Ec '^HTTP/[0-9.]+ [0-9]{3}([[:space:]]|$)' "$lookup")" -eq 1 \
-             && "$(grep -Ec '^HTTP/[0-9.]+ 404([[:space:]]|$)' "$lookup")" -eq 1 ]] || {
-            cat "$lookup" >&2
-            echo "could not prove release $TAG is absent" >&2
-            exit 1
           }
-          rm -f -- "$lookup"
 
           # Re-resolve the protected tag immediately before the first write;
           # neither queueing nor an environment delay can make it stale.

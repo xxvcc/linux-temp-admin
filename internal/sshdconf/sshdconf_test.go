@@ -3,6 +3,7 @@ package sshdconf
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -277,6 +278,30 @@ func TestSSHDMasterIdentityRejectsStalePIDAndSessionChild(t *testing.T) {
 	}
 }
 
+func TestSSHDProcessStartTimeRejectsOverflow(t *testing.T) {
+	oldRoot := sshdProcRoot
+	t.Cleanup(func() { sshdProcRoot = oldRoot })
+
+	for _, tc := range []struct {
+		name        string
+		bootSeconds int64
+		startTicks  uint64
+		want        string
+	}{
+		{"ticks exceed signed range", 1_000, math.MaxUint64, "malformed process start time"},
+		{"boot plus uptime overflows", math.MaxInt64, 100, "overflows kernel boot time"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			procRoot := filepath.Join(t.TempDir(), "proc")
+			sshdProcRoot = procRoot
+			writeFakeSSHDProcess(t, procRoot, 42, true, tc.bootSeconds, tc.startTicks)
+			if _, err := sshdProcessStartTime(42); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("sshdProcessStartTime error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSignalSSHDDoesNotHUPStalePIDReuse(t *testing.T) {
 	root := t.TempDir()
 	pidFile := filepath.Join(root, "sshd.pid")
@@ -491,6 +516,54 @@ func TestGrantRefusesWhatItCannotFix(t *testing.T) {
 	}
 	if _, err := m.Grant(acct, []string{acct}, report("pubkeyauthentication yes\n")); err == nil {
 		t.Error("Grant must refuse when nothing is blocking: it would write a pointless file")
+	}
+}
+
+func TestGrantFailsClosedWithoutRequiredProbes(t *testing.T) {
+	blockedReport := report("pubkeyauthentication no\n")
+	valid := func() error { return nil }
+	effective := func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\n"), nil
+	}
+	reload := func() error { return nil }
+
+	for _, tc := range []struct {
+		name string
+		m    *Manager
+	}{
+		{"validator", &Manager{Dir: t.TempDir(), Effective: effective, Reload: reload}},
+		{"effective config", &Manager{Dir: t.TempDir(), Validate: valid, Reload: reload}},
+		{"reload", &Manager{Dir: t.TempDir(), Validate: valid, Effective: effective}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.m.Grant(acct, []string{acct}, blockedReport); err == nil {
+				t.Fatal("Grant accepted an incomplete probe configuration")
+			}
+			if _, err := os.Lstat(tc.m.FilePath(acct)); !os.IsNotExist(err) {
+				t.Fatalf("Grant wrote a drop-in before rejecting missing probes: %v", err)
+			}
+		})
+	}
+}
+
+func TestGrantRollsBackWhenEffectiveProbeReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	m := &Manager{
+		Dir:      dir,
+		Validate: func() error { return nil },
+		Effective: func(string) (*sysinfo.SSHDConfig, error) {
+			return nil, nil
+		},
+		Reload: func() error { return nil },
+	}
+	if _, err := m.Grant(acct, []string{acct}, report("pubkeyauthentication no\n")); err == nil {
+		t.Fatal("Grant accepted a nil effective configuration")
+	}
+	if _, err := os.Lstat(m.FilePath(acct)); !os.IsNotExist(err) {
+		t.Fatalf("Grant left a drop-in after the nil effective result: %v", err)
+	}
+	if _, err := os.Lstat(m.FilePath(acct) + removePendingSuffix); !os.IsNotExist(err) {
+		t.Fatalf("Grant left a pending-removal marker after rollback: %v", err)
 	}
 }
 

@@ -35,13 +35,13 @@ The interactive flow:
 3. grants sudo by default, with an option for a regular account;
 4. asks whether to auto-delete and then asks the lifetime only when enabled;
 5. shows the complete summary for confirmation;
-6. creates the account, grants, and revoke task before printing the invite credential.
+6. creates the account and grants, creates a task when automatic revocation is enabled, and only then prints the invite credential.
 
-Before creating anything, the tool evaluates the effective sshd configuration to rehearse whether the new account can log in. A definite blocker refuses creation; incomplete knowledge is reported as `UNVERIFIED` rather than presented as a verified result.
+Before creating anything, the tool checks whether the planned credential is compatible with the effective sshd configuration. An unresolved blocker reported by the check refuses creation, and incomplete knowledge is reported as `UNVERIFIED`. "Verified against the effective sshd config" means only that this configuration check completed without a known blocker or unevaluated rule; it is not end-to-end proof of the network, firewall, PAM, SELinux, or running sshd state. Test the invite through the intended connection path before delivery.
 
 ### Host detection
 
-Without `--host`, interactive mode first checks cloud metadata and local interfaces; these checks do not leave the host or local link. Only when no public address is found does it ask permission to query a public IP service, which exposes the server's egress address to that third party.
+Without `--host`, interactive mode first queries fixed-address cloud metadata endpoints and inspects local interfaces. Interface inspection sends no traffic; metadata uses plaintext HTTP and avoids DNS, redirects, and environment proxies, but it may traverse the local or cloud-provider network and its response is unauthenticated. The detected value is only a default that the operator must confirm or replace. Especially for password login, verify the Host first through the cloud console, DNS, or another independent channel so the invitee is not directed to submit the password to the wrong SSH server. Only when no public address is found does the tool ask permission to query a public IP service, which exposes the server's egress address to that third party; that result also requires confirmation.
 
 `--yes` mode never queries a public IP service and requires an explicit `--host`. The host accepts a plain domain, IPv4, or IPv6 value; pass the port separately with `--port`.
 
@@ -64,6 +64,8 @@ Without `--host`, interactive mode first checks cloud metadata and local interfa
 ```
 
 With automatic removal disabled, only `revoke` deletes the account and `--hours` is ignored.
+
+The account-database entry is past-date expired and password-locked from `useradd`, and `/etc/skel` is not copied. After the tool verifies the complete identity and finds no residual process for the new UID, the Home remains absent while it clears the same-name crontab, `at`/`batch` jobs for the reused UID, and any due job a daemon may already have read. When a cron/at command or running daemon is detected, this credential-less, still-expired pending account remains allocated for a 65-second drain; an unreliable process inventory also takes the conservative wait. An empty mode-`0700` Home is created only after cleanup and repeated checks pass, and the account is activated only after its password/key, grants, registry state, and automatic revoke task are complete. The requested lifetime starts after this cleanup, so the wait does not shorten the access requested by `--hours`.
 
 ## Deliver the invite
 
@@ -99,7 +101,7 @@ Unattended mode never installs dependencies or changes sshd implicitly; pass `--
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin status --user xxvcc-a1b2c3d4e5
 ```
 
-Status reports account identity, UID, expiry, auto-delete task, and registry anomalies. `doctor` also reports orphaned sudoers files, sshd exceptions, revoke tasks, and missing schedulers.
+Status reports account identity, UID, expiry, auto-delete task, and registry anomalies. `doctor` also reports orphaned sudoers files and sshd exceptions, plus orphaned, missing, or invalid registered revoke tasks; with no account awaiting a schedule, it does not independently prove that the systemd or `at` backend is available.
 
 ## Revoke an account
 
@@ -111,9 +113,17 @@ Status reports account identity, UID, expiry, auto-delete task, and registry ano
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin revoke --user xxvcc-a1b2c3d4e5
 ```
 
-Revoke removes the account, home directory, public key, sudoers grant, account-scoped sshd exception, and automatic task. If a name-scoped grant cannot be removed safely, the tool retains and disables the account and returns nonzero so username reuse cannot reactivate a leftover grant.
+When the complete identity can still be checked, revoke first disables login; removes and verifies the personal crontab and target-UID `at`/`batch` jobs; waits for a 65-second daemon drain; repeats job/process cleanup; and then removes the account, deterministic `/home/<username>` directory, any UID-matched conventional mail spool, public key, sudoers grant, account-scoped sshd exception, and automatic task. If the account disappeared outside the tool, it cleans only the registry, name-scoped grants, and tasks that remain safely identifiable. Recursive Home cleanup proceeds only for a real directory owned by the registered account's UID/GID with no mount boundary underneath; a mail spool must likewise be a non-symlink regular file in an accepted system mail directory and is swept again after account absence is confirmed. Home cleanup uses directory descriptors and rejects a symlink at the Home root; an internal symlink is unlinked without following its target. Traversal checks cooperative budgets of 100,000 entries, 128 levels, and two minutes between filesystem calls, so the deadline cannot interrupt one blocked filesystem call. Cron/at and process results are repeated snapshots, not an atomic freeze. If a safety condition, resource limit, job/process inventory, or name-scoped grant cannot be confirmed, revoke attempts to disable the account, retains any surviving account and the registry witness, and returns nonzero so username reuse cannot inherit old data, deferred work, or privilege.
 
-Deleting an unregistered account requires explicit `--force` and an additional username confirmation. Root, UID 0, low-UID system accounts, and real accounts without the tool's exact marker are never treated as managed accounts.
+Before deleting an `at` job, the tool rereads its body and rechecks the UID or exact revoke command so a reused job ID cannot authorize deletion of an unrelated task. `at` has no atomic compare-and-delete interface, so a very short local-root trust-boundary interval remains between that read and `atrm`.
+
+For compatibility with old automatic tasks, a `revoke --yes` command without UID/generation arguments cannot prove that its old deletion intent still names the same account if it collides with a concurrent same-name `invite`. The command warns explicitly, deletes no account, and exits successfully so systemd cannot retry the old task against the new generation; a manually issued non-interactive command of the same shape follows the same rule. After the concurrent operation finishes, run `doctor` and invoke `revoke` again against the current account.
+
+An account reported by `doctor` as `legacy-unverified` carries an old fixed identity marker, so same-name/same-UID reuse cannot be excluded. After manual inspection, it can be recovered only by running `revoke --user <name> --force` in an interactive terminal and typing the complete username. The historical timer's `--yes --force --confirm-force` arguments and every other non-interactive invocation are denied deletion authority for this account class. `doctor` reports any surviving old task as orphaned, and `cleanup-expired --compact` cancels that task while retaining the live account and registry row for manual handling.
+
+After every pre-deletion check passes, the tool persists a deletion-recovery witness before invoking `userdel`. If account deletion, the post-deletion mail-spool sweep, or task cleanup is interrupted, `status` and `doctor` show the recovery state, a same-name `invite` refuses to overwrite the witness, and `cleanup-expired --compact` does not discard the witness. When the account is absent or still exactly matches the recorded generation, run `revoke --user <name>` to resume. An identifiable automatic task is retained in either state, but only a systemd job retries automatically under its restart policy; `at` and legacy one-shot jobs require a manual retry. Legacy, unregistered, and pending-rollback paths retain only a UID witness. If that account is still live, inspect it and run `revoke --user <name> --force` in an interactive terminal, then type the complete username; every non-interactive invocation is refused. The old automatic task for such a live account is treated as orphaned and cancelled, while the registry witness remains for manual recovery.
+
+Deleting an unregistered account requires explicit `--force` and an additional username confirmation; it does not override protection for reserved names, UID 0, or unregistered/legacy-identity low-UID accounts. If a system assigns a new tool-created account a low UID, it remains normally revocable only while the current registry UID, random generation, and exact GECOS marker are fully bound. A real account without the tool's exact marker is never treated as managed.
 
 ## Clean anomalous state
 
@@ -125,7 +135,7 @@ Deleting an unregistered account requires explicit `--force` and an additional u
 
 ## Public-key login is disabled
 
-If sshd disables public-key login, changes the `authorized_keys` path, or uses an AllowUsers list, the tool detects the problem before creation and refuses the invite.
+If sshd disables public-key login, changes the `authorized_keys` path, or uses an AllowUsers list, the tool reports it before creation; an unresolved blocker refuses the invite.
 
 The preferred repair is an exception scoped only to the new account:
 
@@ -133,7 +143,7 @@ The preferred repair is an exception scoped only to the new account:
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo --fix-sshd
 ```
 
-This option writes an account-scoped sshd drop-in without changing global policy. It validates the file with `sshd -t` and `sshd -T -C user=...`, then reloads rather than restarts sshd. Any failure removes the file and aborts; `revoke` removes the exception and reloads again. Explicit `DenyUsers` and `DenyGroups` rules are never bypassed.
+This option writes an account-scoped sshd drop-in without changing global policy. It checks syntax with `sshd -t`, then checks the effective configuration with `sshd -T -C user=...`. When a running sshd can be reached, it requests a reload and never a restart. If no running daemon can be notified, the file remains for socket activation or the next start, but the invite says `UNVERIFIED`. Other grant failures attempt to remove the file and abort; a failed removal or restorative reload returns nonzero and retains recovery evidence. A successful `revoke` removes the exception and requests another reload. Explicit `DenyUsers` and `DenyGroups` rules are never bypassed.
 
 When public keys cannot be used, password login can be selected explicitly:
 
@@ -141,18 +151,18 @@ When public keys cannot be used, password login can be selected explicitly:
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo --password-login
 ```
 
-The tool first verifies that sshd accepts passwords, then creates a random password shown once. This is the weaker grant because the password can be attacked over the network throughout its lifetime; prefer public keys.
+The tool creates a random password shown once only after the effective sshd configuration check finds neither a password-credential blocker nor an unevaluated rule. This is still not an end-to-end login test. Passwords are the weaker grant because they can be attacked over the network throughout their lifetime; prefer public keys.
 
-## Expiry and automatic removal
+## Expiry and automatic revocation
 
-The default lifetime is 24 hours with automatic removal enabled. A persistent systemd timer is preferred; an existing `at`/`atd` service is the fallback when systemd is unavailable. `at` is never installed automatically. If neither backend can schedule removal, the entire invite rolls back.
+The default lifetime is 24 hours with automatic revocation scheduled. A persistent systemd timer is preferred; an existing `at`/`atd` service is used only when systemd is unavailable or its failed scheduling attempt was safely rolled back. `at` is never installed automatically. If neither backend can schedule revocation successfully, the invite enters fail-closed rollback. If account, grant, or task cleanup cannot be confirmed, the command returns nonzero and, when necessary, retains a disabled account and registry witness for manual recovery instead of reporting an incomplete cleanup as success.
 
-`chage -E` provides only a day-granularity lock fallback and can be later than the displayed expiry; the revoke task enforces the exact deadline. The task binds the original UID, random generation token, and registry record, refusing to delete an account that has been removed and recreated or no longer matches.
+The lifetime is computed once after deferred-job cleanup for the new UID and the 65-second daemon drain complete, then rounded upward to a whole minute: the safety wait does not shorten the requested duration and rounding adds less than one minute. Display, systemd, and `at` share that absolute target; `at` uses an absolute UTC minute so daylight-saving changes cannot make it run early. `chage -E` provides only a possibly later, day-granularity lock fallback. Scheduler load, host downtime, and retries can delay actual removal; revoke access manually as soon as it is no longer needed. The task binds the original UID, random generation token, and registry record, refusing to delete an account that has been removed and recreated or no longer matches.
 
 ## Uninstall
 
 ```bash
-# Interactive: show the complete inventory, then type YES
+# Interactive: scan and show the uninstall inventory, then type YES
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin uninstall
 
 # Non-interactive; managed accounts require explicit removal authorization
@@ -162,9 +172,9 @@ The default lifetime is 24 hours with automatic removal enabled. A persistent sy
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin uninstall --yes --remove-users --purge-audit
 ```
 
-Uninstall removes managed accounts and their grants, exceptions, and tasks before deleting state and the program. A failure to delete any account aborts the uninstall instead of leaving a sudo-capable account without its management command. Running uninstall from the temporary account's own session is refused.
+Uninstall first applies the same identity checks and cleanup as a normal `revoke` to each account in the inventory. It deletes state and the program only after confirming that every account, grant, exception, and task is gone. Any item that cannot be confirmed during account cleanup aborts the uninstall and keeps the management command and state. Running uninstall from the temporary account's own session is refused.
 
-The audit log remains at `/var/log/linux-temp-admin/audit.log` by default. The lifecycle lock and uninstall marker also remain to prevent already queued old processes from recreating state; an explicit reinstall handles the marker.
+The audit log remains at `/var/log/linux-temp-admin/audit.log` by default. The lifecycle lock and uninstall marker also remain; current binaries check the marker after taking the lock and refuse to recreate state. A previously loaded binary from before this protocol may not check it, so the marker does not guarantee control over every historically queued process. An explicit reinstall handles the marker.
 
 ## Written paths
 

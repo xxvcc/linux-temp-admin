@@ -417,59 +417,272 @@ current_latest_tag() {
   return 1
 }
 
-require_latest_exact() {
-  local expected=$1 context=$2 actual expected_display actual_display
-  actual="$(current_latest_tag)" || return 1
-  expected_display=${expected:-<none>}
-  actual_display=${actual:-<none>}
-  [[ "$actual" == "$expected" ]] \
-    || { echo "$context: Latest is $actual_display, expected exactly $expected_display" >&2; return 1; }
+current_latest_release() {
+  local latest state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  latest="$(current_latest_tag)" || return 1
+  if [[ -z "$latest" ]]; then
+    printf '\n'
+    return 0
+  fi
+  state="$(gh_with_timeout api "repos/${REPO}/releases/latest" \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
+    || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$latest" \
+    && "$actual_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+    && "$actual_draft" == false && "$actual_prerelease" == false \
+    && "$actual_immutable" == true && "$actual_id" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "Latest is not one immutable published stable Release: $state" >&2; return 1; }
+  printf '%s %s\n' "$actual_tag" "$actual_id"
+}
+
+require_latest_release_exact() {
+  local expected_tag=$1 expected_id=$2 context=$3 state actual_tag="" actual_id="" extra
+  if [[ -n "$expected_tag" ]]; then
+    [[ "$expected_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+      && "$expected_id" =~ ^[1-9][0-9]*$ ]] \
+      || { echo "$context: invalid expected Latest identity" >&2; return 1; }
+  else
+    [[ -z "$expected_id" ]] \
+      || { echo "$context: an empty Latest tag cannot have a Release identity" >&2; return 1; }
+  fi
+  state="$(current_latest_release)" || return 1
+  if [[ -n "$state" ]]; then
+    read -r actual_tag actual_id extra <<<"$state"
+    [[ -z "$extra" && "$state" == "$actual_tag $actual_id" ]] \
+      || { echo "$context: malformed Latest identity: $state" >&2; return 1; }
+  fi
+  [[ "$actual_tag" == "$expected_tag" && "$actual_id" == "$expected_id" ]] \
+    || { echo "$context: Latest is ${actual_tag:-<none>} (${actual_id:-no-id}), expected exactly ${expected_tag:-<none>} (${expected_id:-no-id})" >&2; return 1; }
 }
 
 restore_latest_after_failed_promotion() {
-  local expected
+  local expected expected_id="" current current_tag current_id extra confirmed_highest
   expected="$(highest_stable_release_excluding "$TAG")" \
     || { echo "could not enumerate the stable release to restore" >&2; return 1; }
   if [[ -n "$expected" ]]; then
-    gh_with_timeout release edit "$expected" --repo "$REPO" --latest \
+    expected_id="$(resolve_published_stable_release_id "$expected")" \
+      || { echo "could not bind $expected to a numeric GitHub Release identity" >&2; return 1; }
+    set_latest_by_release_id "$expected_id" "$expected" true \
       || { echo "could not restore $expected as Latest" >&2; return 1; }
   else
-    gh_with_timeout release edit "$TAG" --repo "$REPO" --latest=false \
-      || { echo "could not clear Latest when no other stable release exists" >&2; return 1; }
+    current="$(current_latest_release)" \
+      || { echo "could not determine whether Latest needs to be cleared" >&2; return 1; }
+    if [[ -n "$current" ]]; then
+      read -r current_tag current_id extra <<<"$current"
+      [[ -z "$extra" && "$current" == "$current_tag $current_id" \
+        && "$current_tag" == "$TAG" && "$current_id" == "$EXPECTED_RELEASE_ID" ]] \
+        || { echo "Latest unexpectedly points to $current while no stable fallback was enumerated" >&2; return 1; }
+      set_latest_by_release_id "$EXPECTED_RELEASE_ID" "$TAG" false \
+        || { echo "could not clear Latest when no other stable release exists" >&2; return 1; }
+    fi
   fi
-  require_latest_exact "$expected" "Latest restoration failed" || return 1
+  require_latest_release_exact "$expected" "$expected_id" "Latest restoration failed" || return 1
+  confirmed_highest="$(highest_stable_release_excluding "$TAG")" \
+    || { echo "could not re-enumerate stable releases after Latest restoration" >&2; return 1; }
+  [[ "$confirmed_highest" == "$expected" ]] \
+    || { echo "the highest stable release changed during Latest restoration: now ${confirmed_highest:-<none>}, restored ${expected:-<none>}" >&2; return 1; }
   echo "restored Latest to ${expected:-<none>}" >&2
 }
 
-release_state() {
-  gh_with_timeout release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease,tagName \
-    --jq '. | (.isDraft|tostring) + " " + (.isPrerelease|tostring) + " " + .tagName'
+initial_release_state() {
+  local records actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  local match_count=0 match_state=""
+  # The tag-specific REST endpoint exposes published releases only. The
+  # authenticated list endpoint also exposes drafts to this write-capable token,
+  # and lets us reject an ambiguous duplicate tag before binding its numeric ID.
+  records="$(gh_with_timeout api --paginate "repos/${REPO}/releases?per_page=100" \
+    --jq '.[] | [.tag_name, (.draft|tostring), (.prerelease|tostring), (.immutable|tostring), (.id|tostring)] | @tsv')" \
+    || return 1
+  if [[ -n "$records" ]]; then
+    while IFS=$'\t' read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra; do
+      [[ -n "$actual_tag" ]] || continue
+      [[ -z "$extra" && "$actual_id" =~ ^[1-9][0-9]*$ \
+        && ( "$actual_draft" == true || "$actual_draft" == false ) \
+        && ( "$actual_prerelease" == true || "$actual_prerelease" == false ) \
+        && ( "$actual_immutable" == true || "$actual_immutable" == false ) ]] \
+        || { echo "GitHub returned a malformed Release while binding tag $TAG" >&2; return 1; }
+      [[ "$actual_tag" == "$TAG" ]] || continue
+      match_count=$((match_count + 1))
+      match_state="$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id"
+    done <<<"$records"
+  fi
+  (( match_count == 1 )) \
+    || { echo "tag $TAG does not resolve to exactly one visible GitHub Release" >&2; return 1; }
+  printf '%s\n' "$match_state"
+}
+
+bound_release_state() {
+  [[ "${EXPECTED_RELEASE_ID:-}" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "initial GitHub Release identity was not bound" >&2; return 1; }
+  gh_with_timeout api "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)'
+}
+
+bind_initial_release() {
+  local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  state="$(initial_release_state)" || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_id" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "GitHub Release has no valid numeric identity: $state" >&2; return 1; }
+  case "$actual_tag $actual_draft $actual_prerelease $actual_immutable" in
+    "$TAG true false false"|"$TAG true true false") RELEASE_WAS_DRAFT=1 ;;
+    "$TAG false $expected_prerelease true") RELEASE_WAS_DRAFT=0 ;;
+    *)
+      echo "release is neither the expected mutable draft nor the expected immutable published release: $state" >&2
+      return 1
+      ;;
+  esac
+  EXPECTED_RELEASE_ID=$actual_id
+}
+
+require_immutable_release() {
+  local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  state="$(bound_release_state)" || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$TAG" && "$actual_draft" == false \
+    && "$actual_prerelease" == "$expected_prerelease" && "$actual_immutable" == true \
+    && "$actual_id" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "published release is not the expected immutable GitHub Release: $state" >&2; return 1; }
+  if [[ "$actual_id" != "$EXPECTED_RELEASE_ID" ]]; then
+    echo "immutable GitHub Release identity changed: $actual_id, expected $EXPECTED_RELEASE_ID" >&2
+    return 1
+  fi
 }
 
 require_draft() {
-  [[ "$(gh_with_timeout release view "$TAG" --repo "$REPO" --json isDraft,tagName --jq '. | (.isDraft|tostring) + " " + .tagName')" == "true $TAG" ]] \
-    || { echo "release is no longer the expected draft" >&2; exit 1; }
+  local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  state="$(bound_release_state)" || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_draft" == true && "$actual_immutable" == false \
+    && "$actual_tag" == "$TAG" && "$actual_id" =~ ^[1-9][0-9]*$ \
+    && ( "$actual_prerelease" == true || "$actual_prerelease" == false ) ]] \
+    || { echo "release is no longer the expected mutable draft: $state" >&2; return 1; }
+  [[ "$actual_id" == "$EXPECTED_RELEASE_ID" ]] \
+    || { echo "draft GitHub Release identity changed: $actual_id, expected $EXPECTED_RELEASE_ID" >&2; return 1; }
+}
+
+publish_bound_release() {
+  local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+    -F draft=false -F "prerelease=${expected_prerelease}" -f make_latest=false \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
+    || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$TAG" && "$actual_draft" == false \
+    && "$actual_prerelease" == "$expected_prerelease" \
+    && ( "$actual_immutable" == true || "$actual_immutable" == false ) \
+    && "$actual_id" == "$EXPECTED_RELEASE_ID" ]] \
+    || { echo "GitHub returned an unexpected state after publishing bound Release $EXPECTED_RELEASE_ID: $state" >&2; return 1; }
+}
+
+secure_failed_publication_state() {
+  local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra rollback_state
+  state="$(bound_release_state)" \
+    || { echo "cannot confirm whether bound Release $EXPECTED_RELEASE_ID became public" >&2; return 1; }
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$TAG" && "$actual_id" == "$EXPECTED_RELEASE_ID" \
+    && ( "$actual_draft" == true || "$actual_draft" == false ) \
+    && ( "$actual_prerelease" == true || "$actual_prerelease" == false ) \
+    && ( "$actual_immutable" == true || "$actual_immutable" == false ) ]] \
+    || { echo "cannot safely classify bound Release after publication failure: $state" >&2; return 1; }
+
+  if [[ "$actual_draft" == true && "$actual_immutable" == false ]]; then
+    echo "bound Release $EXPECTED_RELEASE_ID remained a mutable draft" >&2
+    return 0
+  fi
+  if [[ "$actual_draft" == false && "$actual_immutable" == true \
+        && "$actual_prerelease" == "$expected_prerelease" ]]; then
+    echo "bound Release $EXPECTED_RELEASE_ID is already immutable; leaving it unannounced" >&2
+    return 0
+  fi
+  if [[ "$actual_draft" != false || "$actual_immutable" != false ]]; then
+    echo "bound Release has an unsafe state that cannot be rolled back automatically: $state" >&2
+    return 1
+  fi
+
+  rollback_state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+    -F draft=true -F "prerelease=${expected_prerelease}" -f make_latest=false \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
+    || { echo "could not return mutable Release $EXPECTED_RELEASE_ID to draft" >&2; return 1; }
+  [[ "$rollback_state" == "$TAG true $expected_prerelease false $EXPECTED_RELEASE_ID" ]] \
+    || { echo "GitHub returned an unexpected state after mutable-release rollback: $rollback_state" >&2; return 1; }
+  require_draft || return 1
+  echo "returned mutable Release $EXPECTED_RELEASE_ID to draft after publication failure" >&2
+}
+
+resolve_published_stable_release_id() {
+  local tag=$1 state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || { echo "cannot resolve non-canonical stable tag: $tag" >&2; return 1; }
+  state="$(gh_with_timeout api "repos/${REPO}/releases/tags/${tag}" \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
+    || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$tag" && "$actual_draft" == false && "$actual_prerelease" == false \
+    && "$actual_immutable" == true \
+    && "$actual_id" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "stable tag $tag does not resolve to one published GitHub Release: $state" >&2; return 1; }
+  printf '%s\n' "$actual_id"
+}
+
+set_latest_by_release_id() {
+  local release_id=$1 tag=$2 make_latest=$3 state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
+  [[ "$release_id" =~ ^[1-9][0-9]*$ && "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+    && ( "$make_latest" == true || "$make_latest" == false ) ]] \
+    || { echo "invalid bound Release identity for Latest update" >&2; return 1; }
+  state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${release_id}" \
+    -f "make_latest=${make_latest}" \
+    --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
+    || return 1
+  read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
+  [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
+    && "$actual_tag" == "$tag" && "$actual_draft" == false && "$actual_prerelease" == false \
+    && "$actual_immutable" == true \
+    && "$actual_id" == "$release_id" ]] \
+    || { echo "GitHub returned an unexpected state after Latest update: $state" >&2; return 1; }
 }
 require_remote_tag_object() {
   [[ "$(gh_with_timeout api "repos/${REPO}/git/ref/tags/${TAG}" --jq '.object.sha')" == "$tag_object" ]] \
     || { echo "GitHub tag object changed during publication" >&2; exit 1; }
 }
 remote_asset_names() {
-  gh_with_timeout release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | LC_ALL=C sort
+  gh_with_timeout api --paginate "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+    --jq '.[].name' | LC_ALL=C sort
 }
-require_initial_remote_assets() {
+require_recoverable_draft_assets() {
   local got
-  got="$(remote_asset_names)"
+  got="$(remote_asset_names)" || return 1
   printf '%s\n' "$got" | awk '
     $0 == "SHA256SUMS" || $0 == "linux-temp-admin-linux-amd64" ||
       $0 == "linux-temp-admin-linux-amd64.sig" || $0 == "linux-temp-admin-linux-arm64" ||
-      $0 == "linux-temp-admin-linux-arm64.sig" { seen[$0]=1; next }
+      $0 == "linux-temp-admin-linux-arm64.sig" {
+        if (seen[$0]++) invalid=1
+        next
+    }
     { invalid=1 }
     END {
-      if (invalid || !seen["SHA256SUMS"] || !seen["linux-temp-admin-linux-amd64"] ||
-          !seen["linux-temp-admin-linux-arm64"]) exit 1
+      core=seen["SHA256SUMS"] + seen["linux-temp-admin-linux-amd64"]
+      core += seen["linux-temp-admin-linux-arm64"]
+      signatures=seen["linux-temp-admin-linux-amd64.sig"]
+      signatures += seen["linux-temp-admin-linux-arm64.sig"]
+      total=core + signatures
+      staged=(total == 3 && core == 3)
+      interrupted=(total == 4 || total == 5)
+      if (invalid || (!staged && !interrupted)) exit 1
     }
-  ' || { echo "release is missing a core unsigned asset or contains an unexpected asset" >&2; printf '%s\n' "$got" >&2; exit 1; }
+  ' || {
+    echo "draft assets are neither the staged set nor a recoverable one-asset interruption" >&2
+    printf '%s\n' "$got" >&2
+    return 1
+  }
 }
 require_exact_signed_assets() {
   local got expected
@@ -480,8 +693,8 @@ require_exact_signed_assets() {
 }
 require_remote_asset_digests() {
   local got expected name digest size
-  got="$(gh_with_timeout release view "$TAG" --repo "$REPO" --json assets \
-    --jq '.assets[] | [.name, (.digest // ""), (.size|tostring)] | @tsv' | LC_ALL=C sort)"
+  got="$(gh_with_timeout api --paginate "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+    --jq '.[] | [.name, (.digest // ""), (.size|tostring)] | @tsv' | LC_ALL=C sort)"
   expected="$({
     for name in SHA256SUMS linux-temp-admin-linux-amd64 linux-temp-admin-linux-amd64.sig \
       linux-temp-admin-linux-arm64 linux-temp-admin-linux-arm64.sig; do
@@ -495,8 +708,8 @@ require_remote_asset_digests() {
 }
 download_draft_asset() {
   local name=$1 max=$2 out=$3 record advertised_size api_url blocks actual_size
-  record="$(gh_with_timeout release view "$TAG" --repo "$REPO" --json assets \
-    --jq ".assets[] | select(.name == \"$name\") | [(.size|tostring), .apiUrl] | @tsv")"
+  record="$(gh_with_timeout api --paginate "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+    --jq ".[] | select(.name == \"$name\") | [(.size|tostring), .url] | @tsv")"
   IFS=$'\t' read -r advertised_size api_url <<<"$record"
   [[ "$advertised_size" =~ ^[0-9]+$ && "$advertised_size" -gt 0 && "$advertised_size" -le "$max" ]] \
     || { echo "invalid or oversized advertised draft asset: $name" >&2; return 1; }
@@ -509,32 +722,121 @@ download_draft_asset() {
   [[ "$actual_size" -eq "$advertised_size" && "$actual_size" -le "$max" ]] \
     || { echo "draft asset size changed during download: $name" >&2; return 1; }
 }
+
+replace_bound_draft_assets() {
+  local records name asset_id api_url extra upload_template upload_endpoint result
+  local actual_id actual_name actual_size actual_url expected_size record_count=0 core_count=0
+  local -A seen_names=() seen_ids=()
+  records="$(gh_with_timeout api --paginate "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets?per_page=100" \
+    --jq '.[] | [.name, (.id|tostring), .url] | @tsv' | LC_ALL=C sort)" || return 1
+  if [[ -n "$records" ]]; then
+    while IFS=$'\t' read -r name asset_id api_url extra; do
+      case "$name" in
+        SHA256SUMS|linux-temp-admin-linux-amd64|linux-temp-admin-linux-arm64)
+          core_count=$((core_count + 1))
+          ;;
+        linux-temp-admin-linux-amd64.sig|linux-temp-admin-linux-arm64.sig) ;;
+        *) echo "bound draft contains an unexpected asset: $name" >&2; return 1 ;;
+      esac
+      [[ -z "$extra" && "$asset_id" =~ ^[1-9][0-9]*$ \
+        && "$api_url" == "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}" ]] \
+        || { echo "bound draft asset has invalid identity: $name $asset_id $api_url" >&2; return 1; }
+      [[ -z "${seen_names[$name]+present}" && -z "${seen_ids[$asset_id]+present}" ]] \
+        || { echo "bound draft repeats an asset name or identity: $name $asset_id" >&2; return 1; }
+      seen_names[$name]=1
+      seen_ids[$asset_id]=1
+      record_count=$((record_count + 1))
+    done <<<"$records"
+  fi
+  (( (record_count == 3 && core_count == 3) || record_count == 4 || record_count == 5 )) \
+    || { echo "bound draft is neither the staged set nor a recoverable one-asset interruption" >&2; return 1; }
+
+  upload_template="$(gh_with_timeout api "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" --jq '.upload_url')" \
+    || return 1
+  [[ "$upload_template" == "https://uploads.github.com/repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets{?name,label}" ]] \
+    || { echo "bound Release returned an unexpected upload URL: $upload_template" >&2; return 1; }
+  upload_endpoint="https://uploads.github.com/repos/${REPO}/releases/${EXPECTED_RELEASE_ID}/assets"
+
+  # Fill every absent asset first. Once the set is complete, each old asset is
+  # deleted immediately before its replacement, so an interrupted run can leave
+  # at most one of the five final assets absent and is safe to resume.
+  for name in linux-temp-admin-linux-amd64 linux-temp-admin-linux-amd64.sig \
+    linux-temp-admin-linux-arm64 linux-temp-admin-linux-arm64.sig SHA256SUMS; do
+    [[ -z "${seen_names[$name]+present}" ]] || continue
+    require_draft || return 1
+    expected_size="$(wc -c < "$BUNDLE_DIR/$name")"
+    result="$(gh_with_timeout api --method POST -H 'Content-Type: application/octet-stream' \
+      "${upload_endpoint}?name=${name}" --input "$BUNDLE_DIR/$name" \
+      --jq '[.id, .name, (.size|tostring), .url] | @tsv')" \
+      || { echo "could not upload bound draft asset: $name" >&2; return 1; }
+    IFS=$'\t' read -r actual_id actual_name actual_size actual_url extra <<<"$result"
+    [[ -z "$extra" && "$result" == "$actual_id"$'\t'"$actual_name"$'\t'"$actual_size"$'\t'"$actual_url" \
+      && "$actual_id" =~ ^[1-9][0-9]*$ && "$actual_name" == "$name" \
+      && "$actual_size" == "$expected_size" \
+      && "$actual_url" == "https://api.github.com/repos/${REPO}/releases/assets/${actual_id}" ]] \
+      || { echo "GitHub returned an unexpected uploaded asset identity: $result" >&2; return 1; }
+    require_draft || return 1
+  done
+
+  # Re-list the bound draft before the first deletion. This turns a stale or
+  # misleading upload response into a non-destructive failure.
+  require_exact_signed_assets \
+    || { echo "bound draft is not complete before destructive asset replacement" >&2; return 1; }
+  [[ -n "$records" ]] || return 0
+  while IFS=$'\t' read -r name asset_id api_url extra; do
+    require_draft || return 1
+    gh_with_timeout api --method DELETE "repos/${REPO}/releases/assets/${asset_id}" --silent \
+      || { echo "could not delete bound draft asset $name ($asset_id)" >&2; return 1; }
+    require_draft || return 1
+    expected_size="$(wc -c < "$BUNDLE_DIR/$name")"
+    result="$(gh_with_timeout api --method POST -H 'Content-Type: application/octet-stream' \
+      "${upload_endpoint}?name=${name}" --input "$BUNDLE_DIR/$name" \
+      --jq '[.id, .name, (.size|tostring), .url] | @tsv')" \
+      || { echo "could not upload replacement for bound draft asset: $name" >&2; return 1; }
+    IFS=$'\t' read -r actual_id actual_name actual_size actual_url extra <<<"$result"
+    [[ -z "$extra" && "$result" == "$actual_id"$'\t'"$actual_name"$'\t'"$actual_size"$'\t'"$actual_url" \
+      && "$actual_id" =~ ^[1-9][0-9]*$ && "$actual_name" == "$name" \
+      && "$actual_size" == "$expected_size" \
+      && "$actual_url" == "https://api.github.com/repos/${REPO}/releases/assets/${actual_id}" ]] \
+      || { echo "GitHub returned an unexpected replacement asset identity: $result" >&2; return 1; }
+    require_draft || return 1
+  done <<<"$records"
+}
 if [[ "$TAG" == *-* ]]; then
   expected_prerelease=true
 else
   expected_prerelease=false
 fi
 
-REMOTE_RELEASE_STATE="$(release_state)"
-case "$REMOTE_RELEASE_STATE" in
-  "true false $TAG"|"true true $TAG") RELEASE_WAS_DRAFT=1 ;;
-  "false $expected_prerelease $TAG") RELEASE_WAS_DRAFT=0 ;;
-  *)
-    echo "release is neither the expected draft nor an exactly matching published release: $REMOTE_RELEASE_STATE" >&2
-    exit 1
-    ;;
-esac
+bind_initial_release
+readonly EXPECTED_RELEASE_ID RELEASE_WAS_DRAFT
 
 BASELINE_HIGHEST_TAG="$(highest_stable_release_excluding "$TAG")"
-BASELINE_LATEST_TAG="$(current_latest_tag)"
+BASELINE_HIGHEST_ID=""
+if [[ -n "$BASELINE_HIGHEST_TAG" ]]; then
+  BASELINE_HIGHEST_ID="$(resolve_published_stable_release_id "$BASELINE_HIGHEST_TAG")"
+fi
+BASELINE_LATEST_RELEASE="$(current_latest_release)"
+BASELINE_LATEST_TAG=""
+BASELINE_LATEST_ID=""
+if [[ -n "$BASELINE_LATEST_RELEASE" ]]; then
+  read -r BASELINE_LATEST_TAG BASELINE_LATEST_ID BASELINE_LATEST_EXTRA <<<"$BASELINE_LATEST_RELEASE"
+  [[ -z "$BASELINE_LATEST_EXTRA" \
+    && "$BASELINE_LATEST_RELEASE" == "$BASELINE_LATEST_TAG $BASELINE_LATEST_ID" ]] \
+    || { echo "could not bind the initial Latest Release identity: $BASELINE_LATEST_RELEASE" >&2; exit 1; }
+fi
 RESUMING_ALREADY_LATEST=0
 if [[ "$TAG" != *-* && "$RELEASE_WAS_DRAFT" -eq 0 && "$BASELINE_LATEST_TAG" == "$TAG" ]]; then
+  [[ "$BASELINE_LATEST_ID" == "$EXPECTED_RELEASE_ID" ]] \
+    || { echo "Latest tag $TAG points to Release $BASELINE_LATEST_ID, expected bound Release $EXPECTED_RELEASE_ID" >&2; exit 1; }
   # A previous run completed the promotion. Verification failures during this
   # read-only resume must not demote a release that was already Latest at entry.
   RESUMING_ALREADY_LATEST=1
 else
-  require_latest_exact "$BASELINE_HIGHEST_TAG" "invalid publication baseline"
+  require_latest_release_exact "$BASELINE_HIGHEST_TAG" "$BASELINE_HIGHEST_ID" "invalid publication baseline"
 fi
+readonly BASELINE_HIGHEST_TAG BASELINE_HIGHEST_ID BASELINE_LATEST_RELEASE \
+  BASELINE_LATEST_TAG BASELINE_LATEST_ID
 if [[ "$TAG" != *-* && -n "$BASELINE_HIGHEST_TAG" ]]; then
   stable_tag_gt "$TAG" "$BASELINE_HIGHEST_TAG" \
     || { echo "stable release $TAG must be newer than highest other release $BASELINE_HIGHEST_TAG" >&2; exit 1; }
@@ -542,12 +844,9 @@ fi
 
 if (( RELEASE_WAS_DRAFT == 1 )); then
   require_draft
-  require_initial_remote_assets
+  require_recoverable_draft_assets
   echo ">> [publish 1/4] replace draft with the exact signed bytes"
-  gh_with_timeout release upload "$TAG" --repo "$REPO" --clobber \
-    "$BUNDLE_DIR/linux-temp-admin-linux-amd64" "$BUNDLE_DIR/linux-temp-admin-linux-amd64.sig" \
-    "$BUNDLE_DIR/linux-temp-admin-linux-arm64" "$BUNDLE_DIR/linux-temp-admin-linux-arm64.sig" \
-    "$BUNDLE_DIR/SHA256SUMS"
+  replace_bound_draft_assets
   require_draft
   require_exact_signed_assets
   mkdir "$work/draft"
@@ -565,16 +864,21 @@ if (( RELEASE_WAS_DRAFT == 1 )); then
   require_exact_signed_assets
   require_remote_asset_digests
   require_remote_tag_object
-  require_latest_exact "$BASELINE_HIGHEST_TAG" "Latest changed during publication preparation"
-  if [[ "$TAG" == *-* ]]; then
-    gh_with_timeout release edit "$TAG" --repo "$REPO" --draft=false --prerelease --latest=false
-  else
+  require_latest_release_exact "$BASELINE_HIGHEST_TAG" "$BASELINE_HIGHEST_ID" \
+    "Latest changed during publication preparation"
+  if [[ "$TAG" != *-* ]]; then
     # Keep the new stable version off Latest until its public versioned route
     # has passed byte-for-byte and signature verification. Set the restoration
     # guard before the call because a failed response can still follow an
     # applied server-side mutation.
     LATEST_PROMOTION_ATTEMPTED=1
-    gh_with_timeout release edit "$TAG" --repo "$REPO" --draft=false --prerelease=false --latest=false
+  fi
+  if ! publish_bound_release; then
+    echo "publishing bound Release $EXPECTED_RELEASE_ID failed or returned an invalid response" >&2
+    if ! secure_failed_publication_state; then
+      echo "CRITICAL: could not confirm or roll back the failed publication; keep it unannounced" >&2
+    fi
+    exit 1
   fi
 else
   echo ">> [publish 1/4] resume exactly matching published release (no asset mutation)"
@@ -583,8 +887,13 @@ else
   echo ">> [publish 2/4] published state already present; continue independent verification"
 fi
 
-[[ "$(release_state)" == "false $expected_prerelease $TAG" ]] \
-  || { echo "release did not publish as expected" >&2; exit 1; }
+if ! require_immutable_release; then
+  echo "bound Release $EXPECTED_RELEASE_ID did not become the expected immutable publication" >&2
+  if ! secure_failed_publication_state; then
+    echo "CRITICAL: could not confirm or roll back the mutable publication; keep it unannounced" >&2
+  fi
+  exit 1
+fi
 require_remote_tag_object
 require_exact_signed_assets
 require_remote_asset_digests
@@ -634,7 +943,8 @@ verify_public_set "https://github.com/${REPO}/releases/download/${TAG}" "$work/p
 if [[ "$TAG" != *-* ]]; then
   echo ">> [publish 4/4] promote and independently verify the stable Latest route"
   if (( RESUMING_ALREADY_LATEST == 0 )); then
-    require_latest_exact "$BASELINE_HIGHEST_TAG" "Latest changed before final promotion; refusing to overwrite it"
+    require_latest_release_exact "$BASELINE_HIGHEST_TAG" "$BASELINE_HIGHEST_ID" \
+      "Latest changed before final promotion; refusing to overwrite it"
     [[ "$(highest_stable_release_excluding "$TAG")" == "$BASELINE_HIGHEST_TAG" ]] \
       || { echo "the stable release baseline changed before final promotion" >&2; exit 1; }
     [[ "$(highest_stable_release_excluding "")" == "$TAG" ]] \
@@ -642,7 +952,8 @@ if [[ "$TAG" != *-* ]]; then
     # Set this before the mutating call: gh can fail after the server applied
     # the update. The EXIT trap must restore even in that ambiguous outcome.
     LATEST_PROMOTION_ATTEMPTED=1
-    gh_with_timeout release edit "$TAG" --repo "$REPO" --latest
+    require_immutable_release
+    set_latest_by_release_id "$EXPECTED_RELEASE_ID" "$TAG" true
   else
     echo "resuming a previously promoted $TAG after exact asset verification"
   fi
@@ -658,7 +969,8 @@ if [[ "$TAG" != *-* ]]; then
     fi
     exit 1
   fi
-  require_latest_exact "$TAG" "published stable release did not become Latest"
+  require_latest_release_exact "$TAG" "$EXPECTED_RELEASE_ID" \
+    "published stable release did not become Latest"
   verify_public_set "https://github.com/${REPO}/releases/latest/download" "$work/public-latest"
   require_remote_tag_object
   require_exact_signed_assets
@@ -674,15 +986,18 @@ if [[ "$TAG" != *-* ]]; then
     fi
     exit 1
   fi
-  require_latest_exact "$TAG" "Latest changed during final verification"
+  require_latest_release_exact "$TAG" "$EXPECTED_RELEASE_ID" \
+    "Latest changed during final verification"
 else
   require_remote_tag_object
   require_exact_signed_assets
   require_remote_asset_digests
   [[ "$(highest_stable_release_excluding "$TAG")" == "$BASELINE_HIGHEST_TAG" ]] \
-    || { echo "the stable release set changed while publishing a prerelease" >&2; exit 1; }
-  require_latest_exact "$BASELINE_HIGHEST_TAG" "publishing a prerelease unexpectedly changed Latest"
+    || { echo "the highest stable release changed while publishing a prerelease" >&2; exit 1; }
+  require_latest_release_exact "$BASELINE_HIGHEST_TAG" "$BASELINE_HIGHEST_ID" \
+    "publishing a prerelease unexpectedly changed Latest"
   echo ">> [publish 4/4] prerelease correctly excluded from Latest verification"
 fi
+require_immutable_release
 PUBLISH_COMPLETE=1
 echo "published and independently verified: $TAG"

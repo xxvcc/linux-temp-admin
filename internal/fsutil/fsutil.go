@@ -90,12 +90,23 @@ func checkRootOwnedNotWritable(path string, fi os.FileInfo) error {
 	return nil
 }
 
-// EnsureDir creates path (and parents) component by component, refusing symlinks
-// anywhere in the path. A newly created directory is synced before its parent
-// directory entry, and the leaf is synced after ownership/mode repair.
+// EnsureDir creates an absolute path (and parents) component by component,
+// refusing traversal components and symlinks anywhere in the path. Every
+// component created by this call receives the exact mode; new parents retain
+// the creating process's ownership, existing ancestors are left unchanged, and
+// the leaf is always repaired to the requested owner and mode. A newly created
+// directory is synced before its parent directory entry.
 func EnsureDir(path string, mode os.FileMode, uid, gid int) error {
 	if path == "" {
 		return fmt.Errorf("empty directory path")
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("directory path must be absolute: %q", path)
+	}
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if part == "." || part == ".." {
+			return fmt.Errorf("unsafe directory component %q in %s", part, path)
+		}
 	}
 	if !validate.KernelID(uid) || !validate.KernelID(gid) {
 		return fmt.Errorf("invalid directory owner %d:%d", uid, gid)
@@ -111,27 +122,49 @@ func EnsureDir(path string, mode os.FileMode, uid, gid int) error {
 		}
 	}
 
-	start := "."
-	if filepath.IsAbs(clean) {
-		start = string(filepath.Separator)
-	}
+	start := string(filepath.Separator)
 	rootFD, err := unix.Open(start, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("open directory traversal root %s: %w", start, err)
 	}
 	parent := os.NewFile(uintptr(rootFD), start)
-	defer func() { _ = parent.Close() }()
+	var grandparent *os.File
+	defer func() {
+		if parent != nil {
+			_ = parent.Close()
+		}
+		if grandparent != nil {
+			_ = grandparent.Close()
+		}
+	}()
 
+	creatingSuffix := false
 	for i, part := range parts {
-		created := false
+		entryAppeared := false
+		createdByUs := false
 		childFD, openErr := unix.Openat(int(parent.Fd()), part,
 			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		if openErr == unix.ENOENT {
-			if mkdirErr := unix.Mkdirat(int(parent.Fd()), part, uint32(mode.Perm())); mkdirErr == nil {
-				created = true
-			} else if mkdirErr != unix.EEXIST {
+			// A previous call can have made parent visible and then failed to
+			// fsync either the new directory inode or its parent entry. Before
+			// extending the first missing suffix, finish those durability steps in
+			// child-before-parent order. Components created below it in this call
+			// are already covered by the normal syncs.
+			if !creatingSuffix && grandparent != nil {
+				if err := syncDirectory(parent); err != nil {
+					return &DurabilityError{Operation: "directory metadata update", Err: err}
+				}
+				if err := syncDirectory(grandparent); err != nil {
+					return &DurabilityError{Operation: "mkdir", Err: err}
+				}
+			}
+			creatingSuffix = true
+			entryAppeared = true
+			mkdirErr := unix.Mkdirat(int(parent.Fd()), part, uint32(mode.Perm()))
+			if mkdirErr != nil && mkdirErr != unix.EEXIST {
 				return fmt.Errorf("create directory component %s: %w", part, mkdirErr)
 			}
+			createdByUs = mkdirErr == nil
 			childFD, openErr = unix.Openat(int(parent.Fd()), part,
 				unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		}
@@ -143,30 +176,45 @@ func EnsureDir(path string, mode os.FileMode, uid, gid int) error {
 		if last {
 			if err := child.Chown(uid, gid); err != nil {
 				_ = child.Close()
-				return fmt.Errorf("set directory owner for %s: %w", path, err)
-			}
-			if err := child.Chmod(mode); err != nil {
-				_ = child.Close()
-				return fmt.Errorf("set directory mode for %s: %w", path, err)
+				return fmt.Errorf("set directory owner for %s: %w", child.Name(), err)
 			}
 		}
-		if created || last {
+		if createdByUs || last {
+			if err := child.Chmod(mode); err != nil {
+				_ = child.Close()
+				return fmt.Errorf("set directory mode for %s: %w", child.Name(), err)
+			}
+		}
+		if entryAppeared || last {
 			if err := syncDirectory(child); err != nil {
 				_ = child.Close()
 				return &DurabilityError{Operation: "directory metadata update", Err: err}
 			}
 		}
-		if created {
+		// Sync an existing leaf's parent as well: it may be the visible result
+		// of an earlier mkdir whose parent sync failed.
+		if entryAppeared || last {
 			if err := syncDirectory(parent); err != nil {
 				_ = child.Close()
 				return &DurabilityError{Operation: "mkdir", Err: err}
 			}
 		}
-		if err := parent.Close(); err != nil {
-			_ = child.Close()
+		if grandparent != nil {
+			if err := grandparent.Close(); err != nil {
+				grandparent = nil
+				_ = child.Close()
+				return fmt.Errorf("close directory component: %w", err)
+			}
+		}
+		grandparent = parent
+		parent = child
+	}
+	if grandparent != nil {
+		if err := grandparent.Close(); err != nil {
+			grandparent = nil
 			return fmt.Errorf("close directory component: %w", err)
 		}
-		parent = child
+		grandparent = nil
 	}
 	return nil
 }
@@ -301,10 +349,14 @@ func AtomicWriteFileAt(dir *os.File, name string, content []byte, mode os.FileMo
 	return nil
 }
 
+// unlinkFileAt is indirected so a unit test can force the stat/unlink race.
+var unlinkFileAt = unix.Unlinkat
+
 // RemoveFile unlinks one non-directory entry relative to a pinned parent
 // directory and syncs that directory before returning success. It never follows
-// a symlink at either the parent or target. An absent target is already removed
-// and is therefore success.
+// a symlink at either the parent or target. When the target is already absent,
+// it still syncs an existing parent so a retry can finish an earlier unlink
+// whose directory sync failed.
 func RemoveFile(path string) error {
 	dirPath := filepath.Dir(path)
 	name := filepath.Base(path)
@@ -319,27 +371,30 @@ func RemoveFile(path string) error {
 		return fmt.Errorf("open parent directory %s: %w", dirPath, err)
 	}
 	defer dir.Close()
+	syncParent := func() error {
+		if err := syncDirectory(dir); err != nil {
+			return &DurabilityError{Operation: "unlink", Err: err}
+		}
+		return nil
+	}
 
 	var st unix.Stat_t
 	if err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		if err == unix.ENOENT {
-			return nil
+			return syncParent()
 		}
 		return fmt.Errorf("stat removal target %s: %w", path, err)
 	}
 	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
 		return fmt.Errorf("refusing to unlink directory %s", path)
 	}
-	if err := unix.Unlinkat(int(dir.Fd()), name, 0); err != nil {
+	if err := unlinkFileAt(int(dir.Fd()), name, 0); err != nil {
 		if err == unix.ENOENT {
-			return nil
+			return syncParent()
 		}
 		return fmt.Errorf("unlink %s: %w", path, err)
 	}
-	if err := syncDirectory(dir); err != nil {
-		return &DurabilityError{Operation: "unlink", Err: err}
-	}
-	return nil
+	return syncParent()
 }
 
 func createTempAt(dir *os.File, target string) (string, *os.File, error) {

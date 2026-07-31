@@ -695,9 +695,10 @@ func (m *Manager) downloadContextWithPolicy(ctx context.Context, url string, max
 			select {
 			case <-timer.C:
 			case <-ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
-				}
+				// Since Go 1.23, receiving after Stop is guaranteed to block.
+				// Do not use the pre-1.23 drain pattern when the deadline and
+				// timer become ready together.
+				timer.Stop()
 				return nil, markTransportFailure(fmt.Errorf("download source deadline exceeded"))
 			}
 		}

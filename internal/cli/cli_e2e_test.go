@@ -39,23 +39,25 @@ const (
 // fakeSched satisfies schedule.System without touching real systemd/at.
 type fakeSched struct{}
 
-func (fakeSched) HasSystemctl() bool                     { return false }
-func (fakeSched) Systemctl(...string) error              { return nil }
-func (fakeSched) HasAt() bool                            { return true }
-func (fakeSched) ScheduleAt(string, int) (string, error) { return "1", nil }
-func (fakeSched) RemoveAtJobsFor(string) error           { return nil }
-func (fakeSched) AtrmJob(string) error                   { return nil }
-func (fakeSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+func (fakeSched) HasSystemctl() bool                           { return false }
+func (fakeSched) Systemctl(...string) error                    { return nil }
+func (fakeSched) HasAt() bool                                  { return true }
+func (fakeSched) ScheduleAt(string, time.Time) (string, error) { return "1", nil }
+func (fakeSched) RemoveAtJobsFor(string) error                 { return nil }
+func (fakeSched) AtrmJob(string) error                         { return nil }
+func (fakeSched) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
 
 type unavailableSched struct{}
 
-func (unavailableSched) HasSystemctl() bool                     { return false }
-func (unavailableSched) Systemctl(...string) error              { return nil }
-func (unavailableSched) HasAt() bool                            { return false }
-func (unavailableSched) ScheduleAt(string, int) (string, error) { return "", errors.New("unavailable") }
-func (unavailableSched) RemoveAtJobsFor(string) error           { return nil }
-func (unavailableSched) AtrmJob(string) error                   { return nil }
-func (unavailableSched) AtJobs() ([]schedule.AtJob, error)      { return nil, nil }
+func (unavailableSched) HasSystemctl() bool        { return false }
+func (unavailableSched) Systemctl(...string) error { return nil }
+func (unavailableSched) HasAt() bool               { return false }
+func (unavailableSched) ScheduleAt(string, time.Time) (string, error) {
+	return "", errors.New("unavailable")
+}
+func (unavailableSched) RemoveAtJobsFor(string) error      { return nil }
+func (unavailableSched) AtrmJob(string) error              { return nil }
+func (unavailableSched) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
 
 type trackingSched struct {
 	jobs           map[string]string
@@ -69,7 +71,7 @@ func newTrackingSched() *trackingSched { return &trackingSched{jobs: map[string]
 func (*trackingSched) HasSystemctl() bool        { return false }
 func (*trackingSched) Systemctl(...string) error { return nil }
 func (*trackingSched) HasAt() bool               { return true }
-func (s *trackingSched) ScheduleAt(command string, _ int) (string, error) {
+func (s *trackingSched) ScheduleAt(command string, _ time.Time) (string, error) {
 	if s.beforeSchedule != nil {
 		if err := s.beforeSchedule(command); err != nil {
 			return "", err
@@ -145,6 +147,13 @@ func rootDir(t *testing.T, mode os.FileMode) string {
 	return d
 }
 
+// These account-lifecycle tests isolate the scheduler with fakeSched and do not
+// exercise the host's personal cron/at queues. The dedicated userjobs suite owns
+// that behavior; make the isolation explicit so App's production fail-closed nil
+// checks do not turn an unrelated fixture omission into an account leak.
+func noDeferredJobs(string, int) error { return nil }
+func noDeferredJobDrain() error        { return nil }
+
 func TestInviteThenRevokeEndToEnd(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
@@ -184,10 +193,10 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
 			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		},
-		SSHDConfig:                   func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		SSHDHasConnectionScopedMatch: func() bool { return false },
-		Detector:                     netdetect.New(),
-		Selfmanage:                   &selfmanage.Manager{InstallPath: installPath},
+		SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		Detector:                 netdetect.New(),
+		Selfmanage:               &selfmanage.Manager{InstallPath: installPath},
 		Audit: &audit.Logger{
 			Dir: filepath.Dir(auditFile), File: auditFile, Now: now,
 			Actor: func() (string, int) { return "e2e", 0 },
@@ -201,9 +210,11 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			}
 			return "abcdef0123", nil
 		},
-		StdoutIsTTY: func() bool { return true },
-		StdinIsTTY:  func() bool { return false },
-		Geteuid:     func() int { return 0 },
+		StdoutIsTTY:        func() bool { return true },
+		StdinIsTTY:         func() bool { return false },
+		Geteuid:            func() int { return 0 },
+		ClearScheduledJobs: noDeferredJobs,
+		DrainScheduledJobs: noDeferredJobDrain,
 	}
 
 	// --- invite ---
@@ -491,8 +502,8 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Effective: effective,
 			Reload: func() error { reloads++; return nil },
 		},
-		SSHDConfig:                   effective,
-		SSHDHasConnectionScopedMatch: func() bool { return false },
+		SSHDConfig:               effective,
+		SSHDHasUnverifiableMatch: func(bool) bool { return false },
 		Scheduler: &schedule.Scheduler{
 			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
@@ -511,9 +522,11 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 			}
 			return "abcdef0123", nil
 		},
-		StdoutIsTTY: func() bool { return true },
-		StdinIsTTY:  func() bool { return false },
-		Geteuid:     func() int { return 0 },
+		StdoutIsTTY:        func() bool { return true },
+		StdinIsTTY:         func() bool { return false },
+		Geteuid:            func() int { return 0 },
+		ClearScheduledJobs: noDeferredJobs,
+		DrainScheduledJobs: noDeferredJobDrain,
 	}
 
 	// Without --fix-sshd, a non-interactive invite must refuse and change nothing:

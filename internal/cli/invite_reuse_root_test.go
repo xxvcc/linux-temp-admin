@@ -61,26 +61,28 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 			UnitPrefix: config.AutoRevokeUnitPrefix, LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
 			Now: now, Sys: fakeSched{},
 		},
-		Registry:                     &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
-		SSHD:                         sshdMgr,
-		SSHDConfig:                   func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		SSHDHasConnectionScopedMatch: func() bool { return false },
-		Detector:                     netdetect.New(),
-		Selfmanage:                   &selfmanage.Manager{InstallPath: installPath},
-		Audit:                        &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
-		InstallPath:                  installPath,
-		Executable:                   func() (string, error) { return installPath, nil },
-		Now:                          now,
+		Registry:                 &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
+		SSHD:                     sshdMgr,
+		SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+		SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		Detector:                 netdetect.New(),
+		Selfmanage:               &selfmanage.Manager{InstallPath: installPath},
+		Audit:                    &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
+		InstallPath:              installPath,
+		Executable:               func() (string, error) { return installPath, nil },
+		Now:                      now,
 		RandHex: func(n int) (string, error) {
 			if n == 16 {
 				return "0123456789abcdef0123456789abcdef", nil
 			}
 			return "abcdef0123", nil
 		},
-		RandPassword: func(int) (string, error) { return "pw-abcdefgh", nil },
-		StdoutIsTTY:  func() bool { return true },
-		StdinIsTTY:   func() bool { return false },
-		Geteuid:      func() int { return 0 },
+		RandPassword:       func(int) (string, error) { return "pw-abcdefgh", nil },
+		StdoutIsTTY:        func() bool { return true },
+		StdinIsTTY:         func() bool { return false },
+		Geteuid:            func() int { return 0 },
+		ClearScheduledJobs: noDeferredJobs,
+		DrainScheduledJobs: noDeferredJobDrain,
 	}
 	return a, sudoMgr, sshdMgr, installPath
 }
@@ -411,16 +413,36 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 		t.Fatal("scheduled revoke deleted a legacy account")
 	}
 	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force"}); rc == 0 {
-		t.Fatal("legacy revoke without --confirm-force succeeded")
+		t.Fatal("unconfirmed legacy revoke succeeded")
 	}
 	if !mustExternalUserExists(t, name) {
 		t.Fatal("unconfirmed legacy revoke deleted the account")
 	}
-	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force", "--confirm-force", name}); rc != 0 {
-		t.Fatalf("direct confirmed legacy revoke rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	// v2.6.1 through v2.7.0 emitted exactly this unattended command. It must not
+	// become deletion authority merely because the current binary sees it as an
+	// externally dispatched CLI invocation.
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force", "--confirm-force", name}); rc == 0 {
+		t.Fatal("historical eight-argument timer command accepted a legacy identity")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("historical eight-argument timer command deleted the legacy account")
+	}
+	// App intentionally reuses one buffered reader across prompts. Feed both
+	// confirmations up front so this external-package test does not reach into
+	// private reader state between dispatches.
+	a.In = strings.NewReader(name + "\n" + name + "\n")
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--force"}); rc == 0 {
+		t.Fatal("piped full-name confirmation accepted a legacy identity")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("piped full-name confirmation deleted the legacy account")
+	}
+	a.StdinIsTTY = func() bool { return true }
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--force"}); rc != 0 {
+		t.Fatalf("interactive confirmed legacy revoke rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
 	}
 	if mustExternalUserExists(t, name) {
-		t.Fatal("direct confirmed legacy revoke did not delete the account")
+		t.Fatal("interactive confirmed legacy revoke did not delete the account")
 	}
 }
 
@@ -506,7 +528,12 @@ func TestInviteOutputFailureRetainsAccountWhenProcessCleanupIsUncertain(t *testi
 
 	partial := &partialFailingWriter{}
 	a.Out = partial
-	a.TerminateProcesses = func(int) error { return errors.New("injected rollback process uncertainty") }
+	a.TerminateProcesses = func(int) error {
+		if partial.wrote == 0 {
+			return nil
+		}
+		return errors.New("injected rollback process uncertainty")
+	}
 
 	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--no-sudo", "--no-fix-sshd", "--no-auto-revoke", "--yes"})
@@ -625,6 +652,50 @@ func TestInviteRetainsAccountWhenLaterSudoRollbackCannotRemoveGrant(t *testing.T
 	}
 	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "sudo removal is unconfirmed; account disabled and retained") {
 		t.Fatalf("rollback did not report the retained account:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+}
+
+func TestInviteRetainsRegistryWhenPostDeleteMailCleanupFails(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	a.Scheduler.Sys = unavailableSched{}
+	const name = "xxvcc-mailhold1"
+	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	remove()
+	t.Cleanup(remove)
+
+	wantErr := errors.New("injected final mail cleanup failure")
+	mailCalls := 0
+	postDeleteCalls := 0
+	a.Users.RemoveManagedMail = func(user.Passwd) error {
+		mailCalls++
+		exists, err := user.Exists(name)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			postDeleteCalls++
+			return wantErr
+		}
+		return nil
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--no-sudo", "--auto-revoke", "--no-fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want scheduling/rollback failure\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("account helper did not remove the failed invite account")
+	}
+	if mailCalls < 2 || postDeleteCalls != 1 {
+		t.Fatalf("mail cleanup calls=%d post-delete=%d, want at least one bound-identity sweep and one post-account sweep", mailCalls, postDeleteCalls)
+	}
+	if present, err := a.Registry.Contains(name); err != nil || !present {
+		t.Fatalf("registry witness was removed after final mail cleanup failed: present=%v err=%v", present, err)
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), wantErr.Error()) ||
+		!strings.Contains(a.Err.(*bytes.Buffer).String(), "account artifact cleanup is unconfirmed; keeping registry record") {
+		t.Fatalf("rollback did not report retained artifact witness:\n%s", a.Err.(*bytes.Buffer).String())
 	}
 }
 
@@ -771,10 +842,10 @@ func mustWriteInvite(t *testing.T, path, content string) {
 	}
 }
 
-// TestInvitePermanentWhenNoAutoRevoke pins the new "no auto-delete = permanent"
-// semantics: no chage expiry is set (SetExpiry not called), no auto-delete task,
+// TestInvitePermanentWhenNoAutoRevoke pins the "no auto-delete = permanent"
+// semantics: the safety-drain expiry is cleared, no auto-delete task is created,
 // and the bundle says permanent. Previously even a --no-auto-revoke account got a
-// chage login-expiry; now it is genuinely permanent.
+// lasting chage login-expiry; now it is genuinely permanent.
 func TestInvitePermanentWhenNoAutoRevoke(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	out := a.Out.(*bytes.Buffer)
@@ -788,7 +859,7 @@ func TestInvitePermanentWhenNoAutoRevoke(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("invite rc=%d: %s", rc, a.Err.(*bytes.Buffer).String())
 	}
-	// No chage expiry: the shadow expiry field must be empty (never set).
+	// chage -E -1 represents never-expire as an empty shadow expiry field.
 	if line := passwdExpiryField(t, name); line != "" {
 		t.Errorf("a permanent account must have no chage expiry; shadow expire field = %q", line)
 	}

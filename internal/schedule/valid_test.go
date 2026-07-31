@@ -52,7 +52,8 @@ func TestValidScheduleRejectsReservedLinuxUID(t *testing.T) {
 	}
 	sys := &fakeSystem{atJobsErr: errors.New("must not inventory")}
 	s := newScheduler(t.TempDir(), sys)
-	valid, err := s.ValidSchedule("xxvcc-a1", int(uint64(^uint32(0))), testGeneration, "at:42")
+	reservedKernelID := uint64(^uint32(0))
+	valid, err := s.ValidSchedule("xxvcc-a1", int(reservedKernelID), testGeneration, "at:42")
 	if err != nil || valid {
 		t.Fatalf("ValidSchedule reserved UID = %v, %v; want false, nil", valid, err)
 	}
@@ -100,6 +101,27 @@ func TestValidScheduleAcceptsExactRootOwnedSystemdPair(t *testing.T) {
 	}
 	if !valid {
 		t.Fatal("exact root-owned systemd pair was reported invalid")
+	}
+}
+
+func TestValidScheduleAcceptsLegacyOneMinuteAccuracyTimer(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("valid systemd schedule files must be root-owned")
+	}
+	dir := t.TempDir()
+	s := newScheduler(dir, &fakeSystem{})
+	unit := s.UnitName("xxvcc-a1")
+	trigger := s.Now().Add(time.Hour)
+	writeSchedulePair(t, s, "xxvcc-a1", 1001, testGeneration, trigger)
+	timerPath := filepath.Join(dir, unit+".timer")
+	calendar := trigger.UTC().Format("2006-01-02 15:04:05 UTC")
+	if err := os.WriteFile(timerPath, []byte(legacyTimerContent(unit, calendar)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	valid, err := s.ValidSchedule("xxvcc-a1", 1001, testGeneration, unit)
+	if err != nil || !valid {
+		t.Fatalf("legacy timer validity = %v, %v; want true", valid, err)
 	}
 }
 
@@ -249,6 +271,21 @@ func TestValidScheduleRejectsTamperedOrExpiredSystemdPair(t *testing.T) {
 			},
 		},
 		{
+			name: "unknown accuracy window",
+			mutate: func(t *testing.T, s *Scheduler, unit string) {
+				t.Helper()
+				path := filepath.Join(s.SystemdDir, unit+".timer")
+				b, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				b = []byte(strings.ReplaceAll(string(b), "AccuracySec=1us", "AccuracySec=5min"))
+				if err := os.WriteFile(path, b, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			name: "unsafe mode",
 			mutate: func(t *testing.T, s *Scheduler, unit string) {
 				t.Helper()
@@ -349,6 +386,14 @@ func TestValidScheduleRejectsUnexpectedRecordedUnit(t *testing.T) {
 		if valid {
 			t.Fatalf("recorded unit %q was accepted", recorded)
 		}
+	}
+}
+
+func TestValidScheduleRejectsNilSchedulerWithoutPanicking(t *testing.T) {
+	var s *Scheduler
+	valid, err := s.ValidSchedule("xxvcc-a1", 1001, testGeneration, "at:42")
+	if err == nil || valid || !strings.Contains(err.Error(), "no scheduler configured") {
+		t.Fatalf("nil ValidSchedule = %v, %v", valid, err)
 	}
 }
 

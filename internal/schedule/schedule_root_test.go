@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScheduleWritesSystemdUnits(t *testing.T) {
@@ -23,7 +24,8 @@ func TestScheduleWritesSystemdUnits(t *testing.T) {
 	sys := &fakeSystem{hasSystemctl: true}
 	s := newScheduler(dir, sys)
 
-	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", 24)
+	deadline := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	unit, err := s.Schedule("xxvcc-a1", 1001, "0123456789abcdef0123456789abcdef", deadline)
 	if err != nil {
 		t.Fatal(err)
 	}

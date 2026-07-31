@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
@@ -28,20 +30,20 @@ func (a *App) revoke(args []string) int {
 		return 1
 	}
 	if !opts.yes {
-		_, registered, err := a.Registry.Lookup(opts.username)
+		rec, registered, err := a.Registry.Lookup(opts.username)
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("读取注册表失败，拒绝继续", "reading registry failed; refusing to continue"), err)
 			return 1
 		}
-		_, exists, err := a.lookupUser(opts.username)
+		pw, exists, err := a.lookupUser(opts.username)
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝继续", "reading account database failed; refusing to continue"), err)
 			return 1
 		}
 		if exists {
 			if opts.force && !registered {
-				a.warnf("%s", a.P.M("危险：用户 "+opts.username+" 未登记，--force 将删除真实系统用户及其家目录。",
-					"DANGER: "+opts.username+" is not registered; --force will delete a real system user and its home directory."))
+				a.warnf("%s", a.P.M("危险：用户 "+opts.username+" 未登记；只有其余受管身份检查也通过时，--force 才会删除该账号及其确定的家目录。",
+					"DANGER: "+opts.username+" is not registered; --force deletes the account and its deterministic home only if the remaining managed-identity checks also pass."))
 			}
 			if a.prompt(a.P.M("请输入完整用户名 "+opts.username+" 以确认删除: ",
 				"type the full username "+opts.username+" to confirm deletion: ")) != opts.username {
@@ -49,20 +51,62 @@ func (a *App) revoke(args []string) int {
 				return 0
 			}
 			opts.liveConfirmed = true
+			opts.confirmedIdentity = &revokeIdentitySnapshot{
+				registered: registered,
+				record:     rec,
+				passwd:     pw,
+			}
 		}
 	}
-	return a.withLifecycleLock(func() int { return a.revokeOptionsLocked(opts) })
+	run := func() int {
+		return a.withLifecycleLock(func() int { return a.revokeOptionsLocked(opts) })
+	}
+	// Releases before generation-bound scheduling emitted the same unattended
+	// command for every account generation. Such a process must never queue behind
+	// an invite for the same username: after invite releases its exclusive barrier,
+	// the old name-only intent could otherwise target the new account. A nonblocking
+	// shared acquisition makes only that collision a successful stale-job skip.
+	// Unrelated lifecycle work still queues under the global lock, and current
+	// generation-bound or interactive revokes use ordinary blocking semantics.
+	if opts.yes && opts.expectedUID == 0 && opts.generation == "" {
+		rc, busy := a.withAccountTrySharedLock(opts.username, run)
+		if busy {
+			a.warnf("%s", a.P.M(
+				"旧版无世代绑定的撤销命令与同名账号创建冲突，无法证明原删除意图仍指向当前账号；本次未撤销账号并以成功状态跳过，以免旧任务重试误删新世代。请在当前操作完成后运行 doctor，并按当前身份重新执行 revoke。",
+				"a legacy revoke command without a generation binding collided with creation of the same account name, so its original deletion intent can no longer be proved to target the current account; no account was revoked and this run was skipped successfully to keep an old job from retrying against a new generation. Run doctor and invoke revoke again against the current identity after the in-flight operation finishes."))
+			a.audit("account.delete", opts.username, "skip", "legacy unbound revoke collided with same-name invite", nil)
+			return 0
+		}
+		return rc
+	}
+	return a.withAccountSharedLock(opts.username, run)
 }
 
 type revokeOptions struct {
-	username         string
-	confirmForce     string
-	expectedUID      int
-	generation       string
-	yes              bool
-	force            bool
-	liveConfirmed    bool
-	manualInvocation bool
+	username          string
+	confirmForce      string
+	expectedUID       int
+	generation        string
+	yes               bool
+	force             bool
+	liveConfirmed     bool
+	manualInvocation  bool
+	confirmedIdentity *revokeIdentitySnapshot
+}
+
+// revokeIdentitySnapshot binds an interactive full-name confirmation to the
+// complete account generation that was visible before the prompt. The account
+// lock is intentionally acquired only after human input, so the locked path must
+// reject a same-name replacement instead of applying the old confirmation to it.
+type revokeIdentitySnapshot struct {
+	registered bool
+	record     registry.Record
+	passwd     user.Passwd
+}
+
+func legacyRecoveryAuthorized(identityBound bool, opts revokeOptions, stdinTTY bool) bool {
+	return !identityBound && stdinTTY && opts.manualInvocation && opts.force &&
+		opts.generation == "" && opts.expectedUID == 0 && !opts.yes && opts.liveConfirmed
 }
 
 func (a *App) parseRevokeArgs(args []string) (revokeOptions, bool) {
@@ -146,9 +190,25 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝清理状态", "reading account database failed; refusing state cleanup"), err)
 		return 1
 	}
+	if confirmed := opts.confirmedIdentity; confirmed != nil &&
+		(!exists || registered != confirmed.registered || rec != confirmed.record || pw != confirmed.passwd) {
+		a.errorf("%s", a.P.M(
+			"输入确认后账号或登记身份发生变化；未清理授权、禁用或删除任何账号，请重新运行并确认当前世代。",
+			"the account or registry identity changed after confirmation; no grant was cleaned and no account was disabled or deleted; rerun and confirm the current generation."))
+		a.audit("account.delete", username, "fail", "account identity changed after interactive confirmation", nil)
+		return 1
+	}
 	if !exists {
 		a.warnf("%s", a.P.M("用户不存在，清理登记/sudoers/sshd 例外/自动删除任务："+username,
 			"user does not exist; cleaning up registry/sudoers/sshd exception/auto-delete task: "+username))
+		if registered && rec.DeletionStarted {
+			if err := a.reconcileDeletionStarted(rec); err != nil {
+				a.errorf("%s: %v", a.P.M(
+					"账号删除已开始，但删除后的邮件清扫尚未安全完成；保留登记供重试",
+					"account deletion had started, but post-deletion mail cleanup could not be completed safely; keeping the registry record for retry"), err)
+				return 1
+			}
+		}
 		var cleanupErrs []error
 		if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
 			cleanupErrs = append(cleanupErrs, err)
@@ -163,7 +223,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 			a.errorf("%s: %v", a.P.M("账号虽不存在，但残留授权或任务未清除；保留登记", "the account is absent, but grants or schedules remain; keeping the registry record"), err)
 			return 1
 		}
-		if err := a.Registry.Remove(username); err != nil {
+		if err := a.releaseRegistryAfterCleanup(username); err != nil {
 			a.errorf("%s: %v", a.P.M("清理登记失败", "registry cleanup failed"), err)
 			return 1
 		}
@@ -176,17 +236,14 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		return 1
 	}
 
-	// A pending row was written before useradd and never completed with a durable
-	// UID. The current account may be the half-created account, or an unrelated
-	// account that later reused the name; neither can be proved. Strip any
-	// name-scoped leftovers, but never turn this incomplete intent into authority to
-	// delete a live account and its home directory.
+	// A pending row was written before useradd and never became an active account
+	// record, so it cannot authorize deletion. Failed-invite rollback converts the
+	// row to a non-pending UID-only deletion witness immediately before userdel; if
+	// that attempt crashes while the account is still live, recovery deliberately
+	// comes back through the interactive --force path below rather than this branch.
 	if registered && rec.Pending {
-		cleanupErr := errors.Join(
-			a.removeSudoGrant(username),
-			a.removeSSHDException(username),
-			a.Scheduler.Cancel(username, rec.AutoUnit),
-		)
+		grantCleanupErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
+		cleanupErr := errors.Join(grantCleanupErr, a.Scheduler.Cancel(username, rec.AutoUnit))
 		a.errorf("%s", a.P.M(
 			"该登记仍处于创建中的 pending 状态，无法证明当前同名账号的身份；已保留账号和登记，请人工核查后处理。",
 			"the registry row is still a pending creation intent, so the current account's identity cannot be proved; the account and registry record were retained for manual recovery."))
@@ -209,20 +266,34 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 
 	// Released v2 rows used one fixed GECOS marker, so username+UID+marker still
 	// cannot distinguish the original account from a same-name/same-UID replacement.
-	// Only a direct operator invocation with --force and an explicit full-name
-	// confirmation may recover such an account. Scheduled and uninstall-internal
-	// invocations never receive this exception even though they carry --force.
-	allowLegacy := registered && !rec.IdentityBound && opts.manualInvocation && opts.force &&
-		opts.generation == "" && opts.expectedUID == 0 &&
-		((!opts.yes && opts.liveConfirmed) || (opts.yes && opts.confirmForce == username))
+	// Only a direct interactive operator invocation with --force and an explicit
+	// full-name confirmation may recover such an account. Historical unattended
+	// timers used the same --yes --force --confirm-force argv that an operator could
+	// type, so no non-interactive invocation receives this exception. Scheduled and
+	// uninstall-internal invocations remain blocked even though they carry --force.
+	stdinTTY := a.StdinIsTTY != nil && a.StdinIsTTY()
+	allowLegacy := legacyRecoveryAuthorized(rec.IdentityBound, opts, stdinTTY)
 	protected := user.IsProtectedRevokeEntry(username, pw, true, registered, rec.UID, rec.Generation, allowLegacy)
+	manualOnlyRecovery := registered && rec.DeletionStarted &&
+		(!rec.IdentityBound || !deletionRecordMatchesPasswd(rec, pw))
+	if registered && rec.DeletionStarted && rec.IdentityBound && !deletionRecordMatchesPasswd(rec, pw) {
+		protected = true
+	}
+	if registered && rec.DeletionStarted && !rec.IdentityBound && allowLegacy {
+		protected = !uidOnlyDeletionCandidateMatches(rec, pw)
+	}
 	if protected {
 		a.errorf("%s", a.P.M("拒绝删除受保护或系统用户："+username,
 			"refusing to delete a protected or system user: "+username))
-		if registered && !rec.IdentityBound && user.IsLegacyManagedEntry(pw) {
+		if !rec.IdentityBound && user.IsLegacyManagedEntry(pw) {
 			a.errorf("%s", a.P.M(
-				"该账号使用旧版固定身份标记，无法证明它仍是原账号。请人工核查后直接运行 revoke --user "+username+" --force，并输入完整用户名确认；非交互调用还必须传入 --yes --confirm-force "+username+"。",
-				"this account uses a legacy fixed identity marker and cannot be proved to be the original account. After manual inspection, invoke revoke --user "+username+" --force directly and type the full username; a non-interactive invocation must also pass --yes --confirm-force "+username+"."))
+				"该账号使用旧版固定身份标记，无法证明它仍是原账号。请人工核查后在交互终端直接运行 revoke --user "+username+" --force，并输入完整用户名确认；为避免旧版自动任务获得删除授权，非交互调用始终拒绝删除此类账号。",
+				"this account uses a legacy fixed identity marker and cannot be proved to be the original account. After manual inspection, invoke revoke --user "+username+" --force directly in an interactive terminal and type the full username; non-interactive deletion is always refused so a historical automatic task cannot gain this authority."))
+		}
+		if rec.DeletionStarted && !rec.IdentityBound {
+			a.errorf("%s", a.P.M(
+				"该账号只有 UID 删除恢复见证，不能证明当前同名账号就是原删除目标。自动任务、--yes 和卸载批量删除始终拒绝；请人工核查后在交互终端直接运行 revoke --user "+username+" --force，并输入完整用户名。",
+				"this account has only a UID-bound deletion-recovery witness, which cannot prove that the current same-name account is the original deletion target. Automatic jobs, --yes, and uninstall bulk deletion always refuse it; after manual inspection, invoke revoke --user "+username+" --force directly in an interactive terminal and type the full username."))
 		}
 		// Name the tamper if that is why: an account that rewrote its own UID (most
 		// dangerously to 0) is now protected by the very check meant to shield real
@@ -235,8 +306,20 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		if grantErr != nil {
 			a.errorf("%s: %v", a.P.M("账号受保护且授权未完全移除", "the account is protected and its grants were not fully removed"), grantErr)
 		}
-		a.warnf("%s", a.P.M("自动删除任务保留；systemd 任务会按策略重试，at 和旧的一次性任务需人工核查。",
-			"the auto-delete task is retained; systemd jobs retry by policy, while at and legacy one-shot jobs require manual inspection."))
+		if manualOnlyRecovery {
+			if a.Scheduler != nil {
+				if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+					a.errorf("%s: %v", a.P.M("该恢复状态只允许人工处理，但自动删除任务未能完整解除；登记已保留，请立即人工清理任务",
+						"this recovery state is manual-only, but its auto-delete task could not be fully cancelled; the registry witness was retained; remove the task manually"), err)
+				} else {
+					a.warnf("%s", a.P.M("该恢复状态只允许人工处理；自动删除任务已解除，登记已保留。",
+						"this recovery state is manual-only; its auto-delete task was cancelled and the registry witness was retained."))
+				}
+			}
+		} else {
+			a.warnf("%s", a.P.M("自动删除任务保留；systemd 任务会按策略重试，at 和旧的一次性任务需人工核查。",
+				"the auto-delete task is retained; systemd jobs retry by policy, while at and legacy one-shot jobs require manual inspection."))
+		}
 		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
 		return 1
 	}
@@ -257,25 +340,41 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	}
 	pw = current
 
-	if grantErr != nil {
-		// Do not free the username while a name-scoped privilege file survives.
+	var artifactErr error
+	expectedHome, homeErr := user.DefaultHome(username)
+	switch {
+	case homeErr != nil:
+		artifactErr = fmt.Errorf("determine managed home: %w", homeErr)
+	case pw.Home != expectedHome:
+		artifactErr = fmt.Errorf("account home %q differs from managed path %q", pw.Home, expectedHome)
+	}
+
+	preDeleteErr := errors.Join(grantErr, artifactErr)
+	if preDeleteErr != nil {
+		// Do not free the username while a name-scoped privilege file survives or
+		// while an account artifact cannot be removed under its captured identity.
+		// The complete passwd entry was just re-checked, so disable this exact
+		// identity before retaining it for operator recovery.
 		disableErr := a.Users.DisableLogin(username)
 		if disableErr == nil {
 			identityErr := a.accountStillMatches(username, pw)
 			if identityErr != nil {
-				a.errorf("%s: %v", a.P.M("授权未完全移除；账号身份在禁用登录后发生变化，拒绝按旧 UID 终止进程",
-					"grants were not fully removed; the account identity changed after login disable, so processes were not terminated under the old UID"), errors.Join(grantErr, identityErr))
+				combined := errors.Join(preDeleteErr, identityErr)
+				a.errorf("%s: %v", a.P.M("删除前的授权或账号文件无法安全清理；账号身份在禁用登录后发生变化，拒绝按旧身份清理 cron/at 任务或终止进程",
+					"a grant or account artifact could not be safely cleaned before deletion; the account identity changed after login disable, so cron/at cleanup and process termination under the old identity were refused"), combined)
+				a.audit("account.delete", username, "fail", "pre-delete cleanup unsafe and identity changed after login disable: "+combined.Error(), nil)
 				return 1
 			}
-			terminateErr := a.terminateProcesses(pw.UID)
-			if terminateErr == nil {
-				terminateErr = a.accountStillMatches(username, pw)
-			}
-			a.errorf("%s: %v", a.P.M("授权未完全移除；账号已禁用但不会删除，以免残留授权在用户名复用时重新生效",
-				"grants were not fully removed; the account was disabled but not deleted so a surviving name-scoped grant cannot re-arm on reuse"), errors.Join(grantErr, terminateErr))
+			quiesceErr := a.quiesceScheduledAccount(username, pw)
+			combined := errors.Join(preDeleteErr, quiesceErr)
+			a.errorf("%s: %v", a.P.M("删除前的授权或账号文件无法安全清理；账号已禁用但不会删除，账号和登记已保留供人工恢复",
+				"a grant or account artifact could not be safely cleaned before deletion; the account was disabled but not deleted, and the account and registry witness were retained for manual recovery"), combined)
+			a.audit("account.delete", username, "fail", "pre-delete cleanup unsafe; account disabled and retained: "+combined.Error(), nil)
 		} else {
-			a.errorf("%s: %v", a.P.M("授权未完全移除，且禁用登录也失败；账号和登记均已保留，请立即人工处理",
-				"grants were not fully removed and disabling login also failed; the account and registry were retained for immediate manual recovery"), errors.Join(grantErr, disableErr))
+			combined := errors.Join(preDeleteErr, disableErr)
+			a.errorf("%s: %v", a.P.M("删除前的授权或账号文件无法安全清理，且禁用登录也失败；账号和登记均已保留，请立即人工处理",
+				"a grant or account artifact could not be safely cleaned before deletion, and disabling login also failed; the account and registry were retained for immediate manual recovery"), combined)
+			a.audit("account.delete", username, "fail", "pre-delete cleanup unsafe and login disable incomplete: "+combined.Error(), nil)
 		}
 		return 1
 	}
@@ -284,17 +383,18 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	// locking land, the account may still be SSH-reachable: in particular, a failed
 	// chage leaves public-key login open even when usermod -L succeeded. Never create
 	// a scan-then-delete race by continuing from a partial disable.
-	stage, teardownErr := a.teardownLocalAccount(username, pw)
+	persistDeletion := func() error { return a.persistDeletionStarted(rec, registered, pw) }
+	stage, teardownErr := a.teardownLocalAccount(username, pw, persistDeletion)
 	switch stage {
 	case revokeDisableLogin:
 		a.errorf("%s: %v", a.P.M("无法完整禁用登录；保留账号、登记和自动删除任务，未终止进程或删除账号，请立即人工处理",
 			"could not fully disable the login; the account, registry record, and auto-delete task were retained, and no processes were terminated or account deleted; inspect immediately"), teardownErr)
 		a.audit("account.delete", username, "fail", "disable login incomplete: "+teardownErr.Error(), nil)
 		return 1
-	case revokeTerminateProcesses:
-		a.errorf("%s: %v", a.P.M("无法确认该 UID 的所有进程已终止；账号已禁用，保留账号、登记和自动删除任务，避免 UID 复用继承残留进程",
-			"could not confirm that every process for this UID was terminated; the account is disabled and its account, registry record, and auto-delete task were retained to prevent residual processes crossing a UID reuse"), teardownErr)
-		a.audit("account.delete", username, "fail", "process termination incomplete: "+teardownErr.Error(), nil)
+	case revokeQuiesceAccount:
+		a.errorf("%s: %v", a.P.M("无法确认该账号的 cron/at 任务及 UID 进程均已清空；账号已禁用，保留账号、登记和自动删除任务，避免任务或进程跨越身份复用",
+			"could not confirm that the account's cron/at jobs and UID processes were empty; the account is disabled and its account, registry record, and auto-delete task were retained to prevent deferred work or processes crossing an identity reuse"), teardownErr)
+		a.audit("account.delete", username, "fail", "account quiescence incomplete: "+teardownErr.Error(), nil)
 		return 1
 	case revokeDeleteAccount:
 		a.errorf("%s: %v", a.P.M("删除用户失败", "delete user failed"), teardownErr)
@@ -314,7 +414,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		a.errorf("%s: %v", a.P.M("用户已删除，但自动删除任务清理失败；保留登记", "user deleted, but schedule cleanup failed; keeping the registry record"), err)
 		return 1
 	}
-	if err := a.Registry.Remove(username); err != nil {
+	if err := a.releaseRegistryAfterCleanup(username); err != nil {
 		a.errorf("%s: %v", a.P.M("用户已删除，但清理登记失败", "user deleted, but registry cleanup failed"), err)
 		return 1
 	}
@@ -327,7 +427,7 @@ type revokeAccountStage uint8
 
 const (
 	revokeDisableLogin revokeAccountStage = iota
-	revokeTerminateProcesses
+	revokeQuiesceAccount
 	revokeDeleteAccount
 	revokeAccountRemoved
 )
@@ -335,35 +435,250 @@ const (
 // teardownLocalAccount preserves the ordering that makes UID reuse safe. A
 // stage is returned with the error so revoke can explain precisely which recovery
 // state was retained without repeating these security-sensitive calls.
-func (a *App) teardownLocalAccount(username string, expected user.Passwd) (revokeAccountStage, error) {
+func (a *App) teardownLocalAccount(username string, expected user.Passwd, persistDeletion func() error) (revokeAccountStage, error) {
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return revokeDisableLogin, err
+	}
 	if err := a.Users.DisableLogin(username); err != nil {
 		return revokeDisableLogin, err
 	}
 	if err := a.accountStillMatches(username, expected); err != nil {
-		return revokeTerminateProcesses, err
+		return revokeQuiesceAccount, err
 	}
-	if err := a.terminateProcesses(expected.UID); err != nil {
-		return revokeTerminateProcesses, err
+	if err := a.quiesceScheduledAccount(username, expected); err != nil {
+		return revokeQuiesceAccount, err
 	}
 	if err := a.accountStillMatches(username, expected); err != nil {
 		return revokeDeleteAccount, err
 	}
-	if err := a.Users.Delete(username); err != nil {
+	if err := a.Users.DeleteExpected(username, expected, func() error {
+		if err := a.finalScheduledAccountCheck(username, expected); err != nil {
+			return err
+		}
+		if persistDeletion == nil {
+			return fmt.Errorf("deletion recovery persistence is not configured")
+		}
+		if err := persistDeletion(); err != nil {
+			return fmt.Errorf("persist deletion-started recovery state: %w", err)
+		}
+		return nil
+	}); err != nil {
 		return revokeDeleteAccount, err
 	}
 	return revokeAccountRemoved, nil
 }
 
-// accountStillMatches prevents a multi-stage teardown from carrying facts from
-// the invited account across an out-of-band delete/recreate. userdel itself is
-// name-based, so re-check immediately before it as well as before the UID sweep.
+// uidOnlyDeletionCandidateMatches is the final local-shape check before a
+// legacy, unregistered, or rollback-pending account receives a UID-only deletion
+// witness. It is intentionally not identity proof: UID and lifecycle markers can
+// be reproduced. The interactive --force/full-name gate supplies the authority
+// for a live recovery; this predicate only prevents that authority from reaching
+// a reserved/root identity, an unsafe Home, or an account with no tool marker.
+func uidOnlyDeletionCandidateMatches(rec registry.Record, pw user.Passwd) bool {
+	if rec.User != pw.Name || user.IsReservedName(pw.Name) || !validate.AccountID(pw.UID) ||
+		!validate.AccountID(pw.GID) || (rec.UID != 0 && rec.UID != pw.UID) ||
+		!validate.ManagedHome(pw.Name, pw.Home) || pw.Shell == "" {
+		return false
+	}
+	return user.HasLifecycleMarker(pw)
+}
+
+// deletionRecordMatchesPasswd is the exact identity predicate used before a
+// deletion phase is persisted or resumed. Pending and completed markers are
+// deliberately distinct; neither a bare managed-looking GECOS nor UID equality
+// on its own is sufficient.
+func deletionRecordMatchesPasswd(rec registry.Record, pw user.Passwd) bool {
+	if rec.User != pw.Name || user.IsReservedName(rec.User) || !rec.IdentityBound || !validate.AccountID(rec.UID) ||
+		rec.UID != pw.UID || !validate.AccountID(pw.GID) || !validate.Generation(rec.Generation) ||
+		!validate.ManagedHome(rec.User, pw.Home) || pw.Shell == "" {
+		return false
+	}
+	marker := pw.GECOS
+	if i := strings.IndexByte(marker, ','); i >= 0 {
+		marker = marker[:i]
+	}
+	wantPrefix := config.ManagedGenerationGECOSPrefix
+	if rec.Pending {
+		wantPrefix = config.PendingGenerationGECOSPrefix
+	}
+	return marker == wantPrefix+rec.Generation
+}
+
+// persistDeletionStarted writes the mandatory pre-userdel witness. Completed
+// generation-bound accounts retain that exact generation; legacy, unregistered,
+// and pending rollback paths deliberately receive only a UID witness. Any change
+// between the policy decision and this final transition stops before userdel can
+// release the name or UID.
+func (a *App) persistDeletionStarted(rec registry.Record, registered bool, expected user.Passwd) error {
+	if a.Registry == nil {
+		return fmt.Errorf("registry is not configured")
+	}
+	if rec.User == "" {
+		rec.User = expected.Name
+	}
+	if rec.User != expected.Name {
+		return fmt.Errorf("deletion target changed before persistence")
+	}
+	current, found, err := a.Registry.Lookup(expected.Name)
+	if err != nil {
+		return fmt.Errorf("read current registry identity: %w", err)
+	}
+	if found != registered {
+		return fmt.Errorf("registry identity changed before deletion")
+	}
+	generation := ""
+	if registered {
+		if current.User != rec.User || current.UID != rec.UID || current.Generation != rec.Generation ||
+			current.IdentityBound != rec.IdentityBound || current.Pending != rec.Pending ||
+			current.DeletionStarted != rec.DeletionStarted {
+			return fmt.Errorf("registry identity changed before deletion")
+		}
+		if current.IdentityBound {
+			check := current
+			if check.Pending && check.UID == 0 {
+				check.UID = expected.UID
+			}
+			if !deletionRecordMatchesPasswd(check, expected) {
+				return fmt.Errorf("account no longer matches the registry deletion identity")
+			}
+			if !current.Pending {
+				generation = current.Generation
+			}
+		} else if !uidOnlyDeletionCandidateMatches(current, expected) {
+			return fmt.Errorf("account no longer matches the UID-only deletion candidate")
+		}
+	} else {
+		candidate := registry.Record{User: expected.Name, UID: expected.UID}
+		if !uidOnlyDeletionCandidateMatches(candidate, expected) {
+			return fmt.Errorf("account no longer matches the unregistered deletion candidate")
+		}
+	}
+	if err := a.Registry.BeginDeletion(expected.Name, expected.UID, generation); err != nil {
+		return fmt.Errorf("write deletion-started registry state: %w", err)
+	}
+	return nil
+}
+
+// releaseRegistryAfterCleanup removes an ordinary stale row by name, but an
+// in-progress deletion only through the exact identity transition. Looking up
+// again also lets invite rollback use the durable phase written inside userdel's
+// pre-delete callback rather than a stale in-memory copy of the record.
+func (a *App) releaseRegistryAfterCleanup(username string) error {
+	if a.Registry == nil {
+		return fmt.Errorf("registry is not configured")
+	}
+	rec, found, err := a.Registry.Lookup(username)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if rec.DeletionStarted {
+		return a.Registry.FinishDeletionRecovery(rec.User, rec.UID, rec.Generation)
+	}
+	return a.Registry.Remove(username)
+}
+
+// reconcileDeletionStarted performs the only artifact cleanup authorized after
+// the passwd entry is gone: an owner-checked same-name mail spool sweep. Home is
+// intentionally excluded. Ordinary absent rows never call this function.
+func (a *App) reconcileDeletionStarted(rec registry.Record) error {
+	if !rec.DeletionStarted || rec.Pending || !validate.AccountID(rec.UID) ||
+		(rec.IdentityBound != validate.Generation(rec.Generation)) {
+		return fmt.Errorf("incomplete deletion-started registry state")
+	}
+	if a.Users == nil {
+		return fmt.Errorf("account manager is not configured")
+	}
+	return a.Users.ReconcileManagedMailAfterDeletion(rec.User, rec.UID)
+}
+
+// quiesceScheduledAccount reaches a fixed point before the numeric UID and
+// username can be released. Each pass terminates processes before clearing jobs:
+// otherwise a process can enqueue work after the inventory and before it dies,
+// leaving that work behind as the last action of the pass. The drain interval
+// lets cron/at daemons finish a due job they had already read, and the second pass
+// terminates anything the daemon started before performing the authoritative job
+// inventory. Transient first-pass failures are contained by the still-live,
+// disabled account and must be resolved by the final verification.
+func (a *App) quiesceScheduledAccount(username string, expected user.Passwd) error {
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return err
+	}
+	var firstPass []error
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		firstPass = append(firstPass, fmt.Errorf("initial process termination: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(firstPass...), err)
+	}
+	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
+		firstPass = append(firstPass, fmt.Errorf("initial scheduled-job cleanup: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(firstPass...), err)
+	}
+	if err := a.drainScheduledJobs(); err != nil {
+		return errors.Join(errors.Join(firstPass...), fmt.Errorf("drain deferred jobs: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(firstPass...), err)
+	}
+	var finalPass []error
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		finalPass = append(finalPass, fmt.Errorf("final process termination: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(firstPass...), errors.Join(finalPass...), err)
+	}
+	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
+		finalPass = append(finalPass, fmt.Errorf("final scheduled-job cleanup: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(firstPass...), errors.Join(finalPass...), err)
+	}
+	if err := errors.Join(finalPass...); err != nil {
+		return errors.Join(errors.Join(firstPass...), err)
+	}
+	return nil
+}
+
+// finalScheduledAccountCheck runs after controlled Home/mail cleanup and just
+// before userdel. The earlier drain already waited out daemon-side cached work;
+// this last pass terminates processes first, then closes jobs raced in during
+// filesystem cleanup without imposing a second polling-cycle delay.
+func (a *App) finalScheduledAccountCheck(username string, expected user.Passwd) error {
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return err
+	}
+	var errs []error
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("process termination: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(errs...), err)
+	}
+	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("scheduled-job cleanup: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// accountStillMatches prevents a multi-stage operation from carrying facts from
+// the invited account across an out-of-band delete/recreate. System account
+// helpers remain name-based, so callers re-check around each security-sensitive
+// stage even though those checks cannot make the helper an atomic compare-and-swap.
 func (a *App) accountStillMatches(username string, expected user.Passwd) error {
 	current, exists, err := a.lookupUser(username)
 	if err != nil {
 		return fmt.Errorf("re-read account identity: %w", err)
 	}
 	if !exists || current != expected {
-		return fmt.Errorf("account identity changed during teardown")
+		return fmt.Errorf("account identity changed during the operation")
 	}
 	return nil
 }

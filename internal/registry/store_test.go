@@ -3,6 +3,7 @@ package registry
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +45,7 @@ func TestMissingStoreRemovalAndCompactAreNoOps(t *testing.T) {
 		t.Fatalf("Remove on a fully absent store: %v", err)
 	}
 	called := false
-	removed, err := s.Compact(func(string) (bool, error) {
+	removed, err := s.Compact(func(Record) (bool, error) {
 		called = true
 		return false, nil
 	})
@@ -76,5 +77,199 @@ func TestWriteAllRejectsOutputAboveRegistryLimit(t *testing.T) {
 	}
 	if _, err := os.Lstat(s.File); !os.IsNotExist(err) {
 		t.Fatalf("oversized registry write created output: %v", err)
+	}
+}
+
+func TestValidateLayoutRequiresDedicatedSiblingPaths(t *testing.T) {
+	dir := t.TempDir()
+	valid := &Store{
+		Dir:  dir,
+		File: filepath.Join(dir, "registry.tsv"),
+		Lock: filepath.Join(dir, "registry.lock"),
+	}
+	if err := valid.validateLayout(); err != nil {
+		t.Fatalf("valid registry layout rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Store){
+		"relative directory": func(s *Store) { s.Dir = "relative" },
+		"file outside":       func(s *Store) { s.File = filepath.Join(filepath.Dir(dir), "outside.tsv") },
+		"lock outside":       func(s *Store) { s.Lock = filepath.Join(filepath.Dir(dir), "outside.lock") },
+		"nested file":        func(s *Store) { s.File = filepath.Join(dir, "nested", "registry.tsv") },
+		"same path":          func(s *Store) { s.Lock = s.File },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *valid
+			mutate(&candidate)
+			if err := candidate.validateLayout(); err == nil {
+				t.Fatal("unsafe registry layout was accepted")
+			}
+		})
+	}
+}
+
+func TestBeginDeletionRecordsSupportsBoundAndUIDOnlyRecovery(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	tests := []struct {
+		name       string
+		in         []Record
+		user       string
+		generation string
+		check      func(*testing.T, []Record)
+	}{
+		{
+			name: "generation bound",
+			in: []Record{{
+				User: "xxvcc-bound", Port: 22, UID: 1001,
+				Generation: generation, IdentityBound: true,
+			}},
+			user: "xxvcc-bound", generation: generation,
+			check: func(t *testing.T, got []Record) {
+				if len(got) != 1 || !got[0].DeletionStarted || !got[0].IdentityBound ||
+					got[0].Generation != generation || got[0].UID != 1001 || got[0].Pending {
+					t.Fatalf("bound transition = %+v", got)
+				}
+			},
+		},
+		{
+			name: "registered legacy",
+			in: []Record{{
+				User: "xxvcc-legacy", Port: 2222, UID: 1001,
+				Generation: generation, AutoUnit: "legacy.timer",
+			}},
+			user: "xxvcc-legacy",
+			check: func(t *testing.T, got []Record) {
+				if len(got) != 1 || !got[0].DeletionStarted || got[0].IdentityBound ||
+					got[0].Generation != "" || got[0].Pending || got[0].UID != 1001 ||
+					got[0].Port != 2222 || got[0].AutoUnit != "legacy.timer" {
+					t.Fatalf("legacy transition = %+v", got)
+				}
+			},
+		},
+		{
+			name: "unregistered",
+			user: "xxvcc-unregistered",
+			check: func(t *testing.T, got []Record) {
+				want := Record{User: "xxvcc-unregistered", UID: 1001, DeletionStarted: true}
+				if !reflect.DeepEqual(got, []Record{want}) {
+					t.Fatalf("unregistered transition = %+v, want %+v", got, want)
+				}
+			},
+		},
+		{
+			name: "pending rollback becomes recovery only",
+			in: []Record{{
+				User: "xxvcc-pending", Port: 22, Generation: generation,
+				IdentityBound: true, Pending: true,
+			}},
+			user: "xxvcc-pending",
+			check: func(t *testing.T, got []Record) {
+				if len(got) != 1 || !got[0].DeletionStarted || got[0].Pending ||
+					got[0].IdentityBound || got[0].Generation != "" || got[0].UID != 1001 {
+					t.Fatalf("pending rollback transition = %+v", got)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, changed, err := beginDeletionRecords(test.in, test.user, 1001, test.generation)
+			if err != nil || !changed {
+				t.Fatalf("beginDeletionRecords changed=%v err=%v", changed, err)
+			}
+			test.check(t, got)
+			again, changed, err := beginDeletionRecords(got, test.user, 1001, test.generation)
+			if err != nil || changed || !reflect.DeepEqual(again, got) {
+				t.Fatalf("idempotent begin changed=%v got=%+v err=%v", changed, again, err)
+			}
+		})
+	}
+}
+
+func TestBeginDeletionRecordsRejectsIdentityMismatchWithoutMutation(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	const otherGeneration = "fedcba9876543210fedcba9876543210"
+	tests := []struct {
+		name       string
+		recs       []Record
+		user       string
+		uid        int
+		generation string
+	}{
+		{
+			name: "bound row cannot be downgraded",
+			recs: []Record{{User: "xxvcc-a1", Port: 22, UID: 1001, Generation: generation, IdentityBound: true}},
+			user: "xxvcc-a1", uid: 1001,
+		},
+		{
+			name: "wrong bound generation",
+			recs: []Record{{User: "xxvcc-a1", Port: 22, UID: 1001, Generation: generation, IdentityBound: true}},
+			user: "xxvcc-a1", uid: 1001, generation: otherGeneration,
+		},
+		{
+			name: "bound identity missing",
+			user: "xxvcc-a1", uid: 1001, generation: generation,
+		},
+		{
+			name: "legacy UID mismatch",
+			recs: []Record{{User: "xxvcc-a1", Port: 22, UID: 1002}},
+			user: "xxvcc-a1", uid: 1001,
+		},
+		{
+			name: "invalid UID",
+			user: "xxvcc-a1", uid: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before := append([]Record(nil), test.recs...)
+			if _, _, err := beginDeletionRecords(test.recs, test.user, test.uid, test.generation); err == nil {
+				t.Fatal("mismatched deletion transition was accepted")
+			}
+			if !reflect.DeepEqual(test.recs, before) {
+				t.Fatalf("failed transition mutated input: got %+v want %+v", test.recs, before)
+			}
+		})
+	}
+}
+
+func TestFinishDeletionRecoveryRecordsRequiresExactModeAndIdentity(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	bound := Record{
+		User: "xxvcc-bound", Port: 22, UID: 1001, Generation: generation,
+		IdentityBound: true, DeletionStarted: true,
+	}
+	uidOnly := Record{User: "xxvcc-uid", UID: 1002, DeletionStarted: true}
+	recs := []Record{bound, uidOnly}
+
+	for _, test := range []struct {
+		name       string
+		user       string
+		uid        int
+		generation string
+	}{
+		{name: "bound without generation", user: bound.User, uid: bound.UID},
+		{name: "bound wrong UID", user: bound.User, uid: bound.UID + 1, generation: generation},
+		{name: "uid-only with generation", user: uidOnly.User, uid: uidOnly.UID, generation: generation},
+		{name: "uid-only wrong UID", user: uidOnly.User, uid: uidOnly.UID + 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := finishDeletionRecoveryRecords(recs, test.user, test.uid, test.generation); err == nil {
+				t.Fatal("mismatched recovery completion was accepted")
+			}
+		})
+	}
+
+	afterBound, changed, err := finishDeletionRecoveryRecords(recs, bound.User, bound.UID, generation)
+	if err != nil || !changed || !reflect.DeepEqual(afterBound, []Record{uidOnly}) {
+		t.Fatalf("finish bound = changed %v records %+v err %v", changed, afterBound, err)
+	}
+	afterUID, changed, err := finishDeletionRecoveryRecords(recs, uidOnly.User, uidOnly.UID, "")
+	if err != nil || !changed || !reflect.DeepEqual(afterUID, []Record{bound}) {
+		t.Fatalf("finish UID-only = changed %v records %+v err %v", changed, afterUID, err)
+	}
+	missing, changed, err := finishDeletionRecoveryRecords(recs, "xxvcc-missing", 1003, "")
+	if err != nil || changed || !reflect.DeepEqual(missing, recs) {
+		t.Fatalf("idempotent missing finish = changed %v records %+v err %v", changed, missing, err)
 	}
 }
