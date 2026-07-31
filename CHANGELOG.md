@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ## v2.9.2 - 2026-08-01
 
-- Validate conventional mail-pool roots before `useradd`, then reopen and
+- Validate conventional mail-spool roots before `useradd`, then reopen and
   revalidate them during cleanup bound to the newly selected UID. Accept the
   root-owned layouts used by supported systems, including `root:mail 3777` and
   Arch Linux's `root:root 1777`; a world-writable root now requires sticky-bit

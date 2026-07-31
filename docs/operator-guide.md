@@ -115,7 +115,7 @@ ssh -i ./USER.key -p PORT USER@HOST
 
 对于仍可用完整身份核对的账号，撤销会先禁用登录，删除并复核个人 crontab 和目标 UID 的 `at`/`batch` 任务，等待 65 秒的 daemon drain 后重复任务/进程清理，再删除账号、确定的 `/home/<用户名>` 家目录、UID 匹配的常规 mail spool、公钥、sudoers、账号专属 sshd 例外和自动删除任务；账号若已在程序外消失，只清理仍可安全识别的登记、按用户名授权和任务，以及已有删除恢复见证授权的窄范围 mail spool。只有 Home 是真实目录、属于登记账号的 UID/GID 且不包含挂载边界时才会递归清理。Home 清理使用目录描述符，不接受链接形式的 Home 根；内部链接只删除链接本身而不跟随目标。遍历会在文件系统调用之间检查 100,000 个条目、128 层和两分钟的协作式预算，因此单次阻塞的文件系统调用不能被该期限中断。cron/at 和进程结果是重复快照，不是原子冻结。任一安全条件、资源上限、任务/进程盘点或按用户名授权无法确认时，都会尝试禁用账号，保留仍存在的账号和登记并返回非零，避免用户名复用后继承旧数据、任务或权限。
 
-邮件专用清理只处理 `/var/mail/<用户名>` 或 `/var/spool/mail/<用户名>` 的传统单文件 mbox。存在的邮件池必须由 root 所有、不得带 setuid；world-writable 时必须带 sticky bit，所以 `root:mail 3777` 和 Arch Linux 的 `root:root 1777` 可用，而无 sticky 的 `0777`/`2777`、`mail:mail` 等非 root 属主都会失败关闭。目标 mailbox 还必须是 UID 匹配的非链接普通文件。`invite` 会在 `useradd` 前检查邮件池，并在 UID 已确定后重新检查；前置失败不会留下账号，helper 后的失败则会尝试回滚，无法确认时保留过期锁定、无凭据的账号和登记供恢复。专用逻辑不搜索或遍历 Maildir，也不触碰宝塔 `/www/vmail`；若 Maildir 位于本工具管理的 Home 内，完整撤销仍会按 Home 规则删除整个 Home。
+邮件专用清理只处理 `/var/mail/<用户名>` 或 `/var/spool/mail/<用户名>` 的传统单文件 mbox。存在的系统邮箱目录必须由 root 所有、不得带 setuid；world-writable 时必须带 sticky bit，所以 `root:mail 3777` 和 Arch Linux 的 `root:root 1777` 可用，而无 sticky 的 `0777`/`2777`、`mail:mail` 等非 root 属主都会失败关闭。目标 mailbox 还必须是 UID 匹配的非链接普通文件。`invite` 会在 `useradd` 前检查系统邮箱目录，并在 UID 已确定后重新检查；前置失败不会留下账号，helper 后的失败则会尝试回滚，无法确认时保留过期锁定、无凭据的账号和登记供恢复。专用逻辑不搜索或遍历 Maildir，也不触碰宝塔 `/www/vmail`；若 Maildir 位于本工具管理的 Home 内，完整撤销仍会按 Home 规则删除整个 Home。
 
 删除 `at` 作业前会重新读取作业正文并再次核对 UID 或精确撤销命令，避免已复用的作业 ID 指向无关任务；`at` 没有原子的比较删除接口，因此重新读取到 `atrm` 之间仍存在本机 root 信任边界内的极短窗口。
 

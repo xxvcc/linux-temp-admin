@@ -15,20 +15,20 @@
 
 二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`、`userdel`、`usermod` 和 `chage`；密码登录还需要 `chpasswd`，授予 sudo 时还需要 `sudo` 和用于写入前策略校验的 `visudo`。程序不回退到发行版 `adduser`/`deluser` 或任意 BusyBox 账号 applet：这些实现的参数、配置及编译期 shadow/group 语义不能仅凭命令名证明与 shadow 工具链等价。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装。
 
-### 传统邮件池兼容边界
+### 传统系统邮箱目录兼容边界
 
 账号创建与撤销会检查 `/var/mail` 和 `/var/spool/mail` 的实际元数据，而不是只按发行版名称放行。FHS 没有规定这些目录的属主和模式；以下是本次核验到的常见布局，不代表其他自定义布局自动受支持：
 
-| 发行版/系列 | 实际邮件池 | 另一路径 | 已核验属主与模式 |
+| 发行版/系列 | 实际邮箱目录 | 另一路径 | 已核验属主与模式 |
 | --- | --- | --- | --- |
 | Debian 12/13、Ubuntu 22.04/24.04 | `/var/mail` | `/var/spool/mail -> ../mail` | `root:mail 2775` |
 | RHEL、Rocky、Alma、Oracle Linux、Fedora、CentOS、Amazon Linux 系 | `/var/spool/mail` | `/var/mail -> spool/mail` | `root:mail 0775` |
 | Alpine | `/var/mail` | 依具体安装而定 | `root:root 0755` |
 | Arch Linux 当前 `filesystem` 包 | `/var/spool/mail` | `/var/mail -> spool/mail` | `root:root 1777` |
 
-产品策略只接受 root-owned 的真实邮件池目录；目录可以属于 `mail` 组并带 setgid，world-writable 时则必须有 sticky bit，同时任何 setuid 都会拒绝。因此现场可见的 `root:mail 3777` 和 Arch 的 `root:root 1777` 均兼容，而无 sticky 的 `0777`/`2777`、`mail:mail` 等非 root 属主及逃出上述两个路径的符号链接会在 `useradd` 前失败关闭。邮件投递服务和获准写入该目录的本地身份属于信任边界。
+产品策略只接受 root-owned 的真实系统邮箱目录；目录可以属于 `mail` 组并带 setgid，world-writable 时则必须有 sticky bit，同时任何 setuid 都会拒绝。因此现场可见的 `root:mail 3777` 和 Arch 的 `root:root 1777` 均兼容，而无 sticky 的 `0777`/`2777`、`mail:mail` 等非 root 属主及逃出上述两个路径的符号链接会在 `useradd` 前失败关闭。邮件投递服务和获准写入该目录的本地身份属于信任边界。
 
-这里的兼容性只针对 `/var/mail/<用户名>` 或 `/var/spool/mail/<用户名>` 的传统单文件 mbox；程序不会把 Maildir 或宝塔 `/www/vmail` 当作邮件池遍历。完整撤销仍会按独立的 Home 安全规则清理本工具管理的整个 Home。
+这里的兼容性只针对 `/var/mail/<用户名>` 或 `/var/spool/mail/<用户名>` 的传统单文件 mbox；程序不会把 Maildir 或宝塔 `/www/vmail` 当作系统邮箱目录遍历。完整撤销仍会按独立的 Home 安全规则清理本工具管理的整个 Home。
 
 Arch Linux 不允许安全的部分升级，而 `pacman -Syu` 会升级整个系统，因此本工具不会在创建账号时自动运行 pacman。请根据提示由管理员先完成完整升级和依赖安装。
 
