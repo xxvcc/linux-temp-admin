@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+import ctypes
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -49,6 +53,21 @@ CHECKSUM_FILES = (
     "linux-temp-admin-linux-arm64.sig",
 )
 STABLE_FILES = ("install.sh", "latest.json")
+VersionKey = tuple[tuple[int, str], tuple[int, str], tuple[int, str]]
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+LIBC = ctypes.CDLL(None, use_errno=True)
+RENAMEAT2 = getattr(LIBC, "renameat2", None)
+if RENAMEAT2 is not None:
+    RENAMEAT2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    RENAMEAT2.restype = ctypes.c_int
 
 
 class ReceiverError(RuntimeError):
@@ -57,6 +76,35 @@ class ReceiverError(RuntimeError):
 
 def fail(message: str) -> None:
     raise ReceiverError(message)
+
+
+@contextmanager
+def unmasked_creation() -> Iterator[None]:
+    # The receiver is single-threaded. Set exact modes at creation so a crash
+    # cannot preserve an object whose permissions were reduced by the caller's
+    # umask before the following metadata validation runs.
+    previous_umask = os.umask(0)
+    try:
+        yield
+    finally:
+        os.umask(previous_umask)
+
+
+def release_version_tuple(
+    tag: str, *, stable: bool
+) -> VersionKey:
+    match = VERSION_PATTERN.fullmatch(tag)
+    if match is None or (stable and match.group(4) is not None):
+        kind = "stable metadata" if stable else "release destination"
+        fail(f"{kind} must name a canonical {'non-prerelease ' if stable else ''}tag")
+    major = match.group(1)
+    if major in ("0", "1"):
+        fail("release versions below v2 are not accepted")
+    # Canonical numeric components have no leading zeroes, so length followed by
+    # lexical bytes is arbitrary-precision numeric order without Python's
+    # interpreter-dependent decimal-to-int digit limit.
+    components = tuple(match.group(index) for index in range(1, 4))
+    return tuple((len(component), component) for component in components)
 
 
 def lstat(path: Path) -> os.stat_result:
@@ -159,12 +207,9 @@ def parse_request(command: str) -> tuple[str, str]:
         expected_long_options = ["--delay-updates"]
     else:
         version = destination[:-1] if destination.endswith("/") else destination
-        version_match = VERSION_PATTERN.fullmatch(version)
-        if version_match is None:
+        if VERSION_PATTERN.fullmatch(version) is None:
             fail("destination is not an allowed stable file or canonical version directory")
-        major = version_match.group(1)
-        if len(major) == 1 and int(major) < 2:
-            fail("release versions below v2 are not accepted")
+        release_version_tuple(version, stable=False)
         if destination != f"{version}/":
             fail("version uploads must be directory-scoped")
         request_type = "version"
@@ -234,11 +279,10 @@ def validate_version(directory: Path, *, owner: int, published: bool = False) ->
                 fail(f"published release file mode is not 0644: {directory / name}")
 
 
-def stable_version_tuple(tag: str) -> tuple[int, int, int]:
-    match = VERSION_PATTERN.fullmatch(tag)
-    if match is None or match.group(4) is not None:
-        fail("stable metadata must name a canonical non-prerelease tag")
-    return tuple(int(match.group(index)) for index in range(1, 4))
+def stable_version_tuple(
+    tag: str,
+) -> VersionKey:
+    return release_version_tuple(tag, stable=True)
 
 
 def parse_latest(path: Path, *, owner: int) -> tuple[dict[str, str], bytes]:
@@ -288,7 +332,7 @@ def validate_latest(path: Path, *, owner: int, project_root: Path) -> dict[str, 
 
 def current_latest_state(
     project_root: Path, *, owner: int
-) -> tuple[tuple[int, int, int], bytes] | None:
+) -> tuple[VersionKey, bytes] | None:
     latest = project_root / "latest.json"
     if not latest.exists() and not latest.is_symlink():
         return None
@@ -313,13 +357,79 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def rename_noreplace(source: Path, destination: Path) -> None:
+    if RENAMEAT2 is None:
+        fail("renameat2(RENAME_NOREPLACE) is unavailable on the mirror host")
+    ctypes.set_errno(0)
+    result = RENAMEAT2(
+        AT_FDCWD,
+        os.fsencode(source),
+        AT_FDCWD,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            fail(f"immutable release file appeared concurrently: {destination}")
+        fail(
+            "cannot atomically publish immutable release file "
+            f"{destination}: {os.strerror(error_number)}"
+        )
+
+
+def cleanup_private_temps(directory: Path, labels: tuple[str, ...], *, owner: int) -> None:
+    patterns = {
+        label: re.compile(rf"[.]mirror-{re.escape(label)}-[0-9a-f]{{32}}")
+        for label in labels
+    }
+    cleaned = False
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            label = next(
+                (name for name, pattern in patterns.items() if pattern.fullmatch(entry.name)),
+                None,
+            )
+            if label is None:
+                continue
+            path = directory / entry.name
+            info = lstat(path)
+            maximum = MAX_BINARY_BYTES if label in (
+                "linux-temp-admin-linux-amd64",
+                "linux-temp-admin-linux-arm64",
+            ) else MAX_METADATA_BYTES
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or path.is_symlink()
+                or info.st_uid != owner
+                or stat.S_IMODE(info.st_mode) not in (0o600, 0o644)
+                or info.st_size < 0
+                or info.st_size > maximum
+                or info.st_nlink not in (1, 2)
+            ):
+                fail(f"unsafe stale mirror temporary file: {path}")
+            if info.st_nlink == 2:
+                destination_info = lstat(directory / label)
+                if (
+                    not stat.S_ISREG(destination_info.st_mode)
+                    or destination_info.st_dev != info.st_dev
+                    or destination_info.st_ino != info.st_ino
+                ):
+                    fail(f"stale mirror temporary file has an unexpected hard link: {path}")
+            path.unlink()
+            cleaned = True
+    if cleaned:
+        fsync_directory(directory)
+
+
 def copy_to_private_temp(source: Path, directory: Path, label: str) -> Path:
     temporary = directory / f".mirror-{label}-{secrets.token_hex(16)}"
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
+    with unmasked_creation():
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
     try:
         with source.open("rb", buffering=0) as source_handle, os.fdopen(
             descriptor, "wb", buffering=0, closefd=False
@@ -340,12 +450,14 @@ def copy_to_private_temp(source: Path, directory: Path, label: str) -> Path:
 
 
 def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
+    release_version_tuple(destination.name, stable=False)
     validate_version(staged, owner=owner)
     for name in EXPECTED_VERSION_FILES:
         os.chmod(staged / name, 0o644, follow_symlinks=False)
         fsync_file(staged / name)
     if destination.exists() or destination.is_symlink():
         require_directory(destination, owner=owner, mode=0o755)
+        cleanup_private_temps(destination, EXPECTED_VERSION_FILES, owner=owner)
         existing = sorted(entry.name for entry in os.scandir(destination))
         if not set(existing).issubset(EXPECTED_VERSION_FILES):
             fail(f"version directory contains a non-release path: {destination}")
@@ -365,20 +477,21 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
                 )
     else:
         try:
-            os.mkdir(destination, 0o755)
+            with unmasked_creation():
+                os.mkdir(destination, 0o755)
         except FileExistsError:
             fail(f"version destination appeared concurrently: {destination}")
-        os.chmod(destination, 0o755, follow_symlinks=False)
         require_directory(destination, owner=owner, mode=0o755)
-        fsync_directory(destination.parent)
+    # Repeat this for an existing directory too: it may be the visible but not
+    # yet durable result of an interrupted mkdir from the previous invocation.
+    fsync_directory(destination.parent)
     try:
         for name in EXPECTED_VERSION_FILES:
             if (destination / name).exists() or (destination / name).is_symlink():
                 continue
             temporary = copy_to_private_temp(staged / name, destination, name)
             try:
-                os.link(temporary, destination / name, follow_symlinks=False)
-                temporary.unlink()
+                rename_noreplace(temporary, destination / name)
                 fsync_directory(destination)
             finally:
                 try:
@@ -387,21 +500,25 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
                     pass
         validate_version(destination, owner=owner, published=True)
     except BaseException:
-        # Valid files already linked into an incomplete version are deliberately
-        # retained. A retry may fill the missing files but can never replace one.
+        # Valid files already committed into an incomplete version are deliberately
+        # retained. A retry may fill the missing files but can never replace one;
+        # narrowly validated private temporaries from an interrupted commit are
+        # removed under the deployment lock before that retry validates the directory.
         raise
     fsync_directory(destination)
 
 
 def matching_stable_installer_versions(
     project_root: Path, installer: Path, *, owner: int
-) -> list[tuple[int, int, int]]:
-    matches: list[tuple[int, int, int]] = []
+) -> list[VersionKey]:
+    matches: list[VersionKey] = []
     with os.scandir(project_root) as entries:
         for entry in entries:
-            version_match = VERSION_PATTERN.fullmatch(entry.name)
-            if (not entry.is_dir(follow_symlinks=False) or version_match is None
-                    or version_match.group(4) is not None):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                version = stable_version_tuple(entry.name)
+            except ReceiverError:
                 continue
             version_dir = project_root / entry.name
             try:
@@ -409,7 +526,7 @@ def matching_stable_installer_versions(
             except ReceiverError:
                 continue
             if files_equal(installer, version_dir / "install.sh"):
-                matches.append(tuple(int(version_match.group(index)) for index in range(1, 4)))
+                matches.append(version)
     return matches
 
 
@@ -417,6 +534,7 @@ def atomic_replace(staged: Path, destination: Path, *, project_root: Path, owner
     require_regular(staged, owner=owner, maximum=MAX_METADATA_BYTES)
     os.chmod(staged, 0o644, follow_symlinks=False)
     fsync_file(staged)
+    cleanup_private_temps(project_root, (destination.name,), owner=owner)
     if destination.exists() or destination.is_symlink():
         require_regular(destination, owner=owner, maximum=MAX_METADATA_BYTES)
     temporary = copy_to_private_temp(staged, project_root, destination.name)
@@ -490,7 +608,10 @@ def run_rrsync(stage: Path, original_command: str) -> None:
 
 
 def open_lock(path: Path, *, owner: int) -> int:
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with unmasked_creation():
+        descriptor = os.open(
+            path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+        )
     info = os.fstat(descriptor)
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner
             or stat.S_IMODE(info.st_mode) != 0o600):
@@ -510,8 +631,9 @@ def main() -> int:
 
     original_command = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     request_type, destination = parse_request(original_command)
-    stage = Path(tempfile.mkdtemp(prefix="transfer-", dir=INCOMING_ROOT))
-    os.chmod(stage, 0o700)
+    with unmasked_creation():
+        stage = Path(tempfile.mkdtemp(prefix="transfer-", dir=INCOMING_ROOT))
+    require_directory(stage, owner=owner, mode=0o700)
     try:
         run_rrsync(stage, original_command)
         root_entries = sorted(entry.name for entry in os.scandir(stage))
