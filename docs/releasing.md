@@ -906,6 +906,10 @@ been revalidated:
 - `/www/wwwroot/dl.ll.cd/linux-temp-admin` is owned `ltamirror:www`, mode
   `0755`. Its parent directories remain root-owned and not group/world
   writable.
+- The mirror host's Linux kernel and C library expose
+  `renameat2(RENAME_NOREPLACE)`, and an actual no-replace probe succeeds on the
+  filesystem containing the document root; immutable version-file publication
+  fails closed if that primitive is unavailable there.
 - [`deploy/nginx/linux-temp-admin.conf`](../deploy/nginx/linux-temp-admin.conf)
   is installed as
   `/www/server/panel/vhost/nginx/extension/dl.ll.cd/linux-temp-admin.conf`,
@@ -929,8 +933,25 @@ complete staged checksum set. It rejects reads, traversal, arbitrary rsync
 modes, links, special files, and every other destination. Stable `install.sh`
 must match a complete non-prerelease version, and canonical `latest.json` is
 published last. The receiver refuses a stable downgrade or altered metadata for
-the current version. The client-side `--ignore-existing` flag is not itself an
-immutability boundary.
+the current version, and both version uploads and stable selection reject tags
+below v2. The client-side `--ignore-existing` flag is not itself an immutability
+boundary.
+
+Each missing immutable file is copied to a same-directory private temporary,
+synced, and committed with `renameat2(RENAME_NOREPLACE)` before the directory is
+synced. A crash therefore leaves either the final name or a private temporary,
+never a newly created two-link commit state. Under the persistent deployment
+lock, a retry removes only a temporary whose exact name, owner, mode, size, and
+link count match the receiver's private format. It also recognizes and repairs
+the exact final-name hard link left by the older `link`/`unlink` implementation;
+an unexpected link target or any other extra path still fails closed. New
+version directories are created atomically with mode `0755`, and private
+temporaries, incoming stages, and the deployment lock likewise receive their
+final safe modes at creation independent of the receiver process umask. An
+interruption therefore cannot strand a more restrictive object that retries
+would reject. Every invocation also syncs the document root after accepting or
+creating the version directory, so a retry makes an interrupted `mkdir` durable
+before it publishes files inside that directory.
 
 The Nginx include claims the complete `/linux-temp-admin/` namespace before the
 virtual host's generic regular-expression locations. It serves only the two
@@ -954,7 +975,9 @@ set -Eeuo pipefail
 python3 -B -m unittest -v scripts/mirror_receiver_test.py
 receiver_dir=/usr/local/libexec
 receiver_path="$receiver_dir/linux-temp-admin-mirror-receiver"
+project_root=/www/wwwroot/dl.ll.cd/linux-temp-admin
 [[ "$(sudo stat -Lc '%F %U %G %a' -- "$receiver_dir")" == 'directory root root 755' ]]
+[[ "$(sudo stat -Lc '%F %U %G %a' -- "$project_root")" == 'directory ltamirror www 755' ]]
 receiver_tmp="$(sudo mktemp "$receiver_dir/.linux-temp-admin-mirror-receiver.XXXXXXXXXX")"
 cleanup_receiver_tmp() {
   if [[ -n "$receiver_tmp" ]] && sudo test -e "$receiver_tmp"; then
@@ -964,6 +987,48 @@ cleanup_receiver_tmp() {
 trap cleanup_receiver_tmp EXIT
 sudo install -o root -g root -m 0755 -- scripts/mirror-receiver.py "$receiver_tmp"
 [[ "$(sudo stat -Lc '%F %U %G %a' -- "$receiver_tmp")" == 'regular file root root 755' ]]
+sudo -u ltamirror -- python3 -B - "$receiver_tmp" "$project_root" <<'PY'
+import importlib.util
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+source_path, project_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("mirror_receiver_probe", source_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load candidate mirror receiver")
+receiver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(receiver)
+project = Path(project_path)
+with receiver.unmasked_creation():
+    probe = Path(tempfile.mkdtemp(prefix=".renameat2-probe-", dir=project))
+source = probe / "source"
+destination = probe / "destination"
+try:
+    source.write_bytes(b"first")
+    receiver.rename_noreplace(source, destination)
+    if source.exists() or destination.read_bytes() != b"first":
+        raise SystemExit("successful no-replace rename had an unexpected result")
+    source.write_bytes(b"second")
+    try:
+        receiver.rename_noreplace(source, destination)
+    except receiver.ReceiverError as exc:
+        if "appeared concurrently" not in str(exc):
+            raise
+    else:
+        raise SystemExit("no-replace rename overwrote an existing destination")
+    if source.read_bytes() != b"second" or destination.read_bytes() != b"first":
+        raise SystemExit("failed no-replace rename changed file bytes")
+finally:
+    for path in (source, destination):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    probe.rmdir()
+    receiver.fsync_directory(project)
+PY
 sudo sync -f "$receiver_tmp"
 sudo mv -fT -- "$receiver_tmp" "$receiver_path"
 receiver_tmp=
@@ -983,8 +1048,9 @@ reload, and keep the release gate closed.
 Recovery is deliberately narrow:
 
 1. If a transfer stopped before all six immutable files arrived, dispatch the
-   mirror workflow again for the same immutable GitHub tag. The receiver checks
-   every existing byte and fills only the missing files.
+   mirror workflow again for the same immutable GitHub tag. Under the deployment
+   lock, the receiver first recovers only its strictly validated private commit
+   state, then checks every existing release byte and fills only missing files.
 2. If `install.sh` changed but `latest.json` did not, rerun the current GitHub
    Latest tag. The workflow republishes the installer first and the manifest
    last; clients remain signature-verified during the interrupted state.

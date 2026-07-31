@@ -86,6 +86,14 @@ class ParseRequestTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(mirror_receiver.ReceiverError):
                 mirror_receiver.parse_request(command)
 
+    def test_orders_unbounded_version_components_without_integer_conversion(self) -> None:
+        smaller = "v2." + "9" * 4999 + ".0"
+        larger = "v2." + "9" * 5000 + ".0"
+        self.assertGreater(
+            mirror_receiver.release_version_tuple(larger, stable=False),
+            mirror_receiver.release_version_tuple(smaller, stable=False),
+        )
+
 
 class TrustedExecutableTests(unittest.TestCase):
     def test_requires_canonical_owned_nonwritable_executable(self) -> None:
@@ -141,6 +149,148 @@ class ReceiverPolicyTests(unittest.TestCase):
             (destination / "linux-temp-admin-linux-amd64").read_bytes(), b"amd64-binary"
         )
 
+    def test_version_recovers_interrupted_private_commit_states(self) -> None:
+        staged = make_version(self.temporary / "interrupted")
+        destination = self.project / "v2.8.0"
+        destination.mkdir(mode=0o755)
+
+        partial = destination / (
+            ".mirror-linux-temp-admin-linux-amd64-" + "0" * 32
+        )
+        partial.write_bytes(b"partial")
+        partial.chmod(0o600)
+
+        linked = destination / (
+            ".mirror-linux-temp-admin-linux-arm64.sig-" + "1" * 32
+        )
+        linked.write_bytes((staged / "linux-temp-admin-linux-arm64.sig").read_bytes())
+        linked.chmod(0o644)
+        os.link(linked, destination / "linux-temp-admin-linux-arm64.sig")
+        self.assertEqual(linked.stat().st_nlink, 2)
+
+        mirror_receiver.publish_version(staged, destination, owner=self.owner)
+
+        mirror_receiver.validate_version(destination, owner=self.owner, published=True)
+        self.assertFalse(
+            any(entry.name.startswith(".mirror-") for entry in os.scandir(destination))
+        )
+        self.assertEqual((destination / "linux-temp-admin-linux-arm64.sig").stat().st_nlink, 1)
+
+    def test_no_replace_commit_never_overwrites_existing_bytes(self) -> None:
+        source = self.temporary / "no-replace-source"
+        destination = self.temporary / "no-replace-destination"
+        source.write_bytes(b"new")
+        destination.write_bytes(b"existing")
+
+        with self.assertRaisesRegex(
+            mirror_receiver.ReceiverError, "appeared concurrently"
+        ):
+            mirror_receiver.rename_noreplace(source, destination)
+
+        self.assertEqual(destination.read_bytes(), b"existing")
+        self.assertEqual(source.read_bytes(), b"new")
+
+    def test_no_replace_fails_closed_when_primitive_is_unavailable(self) -> None:
+        source = self.temporary / "unsupported-source"
+        destination = self.temporary / "unsupported-destination"
+        source.write_bytes(b"source")
+        original_renameat2 = mirror_receiver.RENAMEAT2
+        try:
+            mirror_receiver.RENAMEAT2 = None
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "is unavailable"
+            ):
+                mirror_receiver.rename_noreplace(source, destination)
+
+            class UnsupportedRename:
+                def __call__(self, *args) -> int:
+                    mirror_receiver.ctypes.set_errno(mirror_receiver.errno.EOPNOTSUPP)
+                    return -1
+
+            mirror_receiver.RENAMEAT2 = UnsupportedRename()
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "cannot atomically publish"
+            ):
+                mirror_receiver.rename_noreplace(source, destination)
+        finally:
+            mirror_receiver.RENAMEAT2 = original_renameat2
+
+        self.assertEqual(source.read_bytes(), b"source")
+        self.assertFalse(destination.exists())
+
+    def test_version_retry_after_commit_before_directory_sync(self) -> None:
+        staged = make_version(self.temporary / "sync-interruption")
+        destination = self.project / "v2.8.0"
+        original_fsync_directory = mirror_receiver.fsync_directory
+        interrupted = False
+
+        def fail_first_version_sync(path: Path) -> None:
+            nonlocal interrupted
+            if path == destination and not interrupted:
+                interrupted = True
+                raise OSError("simulated interruption after no-replace commit")
+            original_fsync_directory(path)
+
+        mirror_receiver.fsync_directory = fail_first_version_sync
+        try:
+            with self.assertRaisesRegex(OSError, "simulated interruption"):
+                mirror_receiver.publish_version(staged, destination, owner=self.owner)
+        finally:
+            mirror_receiver.fsync_directory = original_fsync_directory
+
+        self.assertTrue(interrupted)
+        self.assertFalse(
+            any(entry.name.startswith(".mirror-") for entry in os.scandir(destination))
+        )
+        mirror_receiver.publish_version(staged, destination, owner=self.owner)
+        mirror_receiver.validate_version(destination, owner=self.owner, published=True)
+
+    def test_version_rejects_unsafe_stale_private_temp(self) -> None:
+        staged = make_version(self.temporary / "unsafe-private-temp")
+        destination = self.project / "v2.8.0"
+        destination.mkdir(mode=0o755)
+        temporary = destination / (
+            ".mirror-linux-temp-admin-linux-amd64-" + "2" * 32
+        )
+        temporary.symlink_to(staged / "linux-temp-admin-linux-amd64")
+
+        with self.assertRaisesRegex(
+            mirror_receiver.ReceiverError, "unsafe stale mirror temporary file"
+        ):
+            mirror_receiver.publish_version(staged, destination, owner=self.owner)
+        self.assertTrue(temporary.is_symlink())
+
+    def test_version_rejects_unexpected_private_temp_hardlinks(self) -> None:
+        staged = make_version(self.temporary / "unsafe-hardlinks")
+
+        wrong_target = self.project / "v2.8.0"
+        wrong_target.mkdir(mode=0o755)
+        linked_elsewhere = wrong_target / (
+            ".mirror-linux-temp-admin-linux-amd64-" + "4" * 32
+        )
+        linked_elsewhere.write_bytes(b"partial")
+        linked_elsewhere.chmod(0o644)
+        outside = self.temporary / "unexpected-link"
+        os.link(linked_elsewhere, outside)
+        with self.assertRaises(mirror_receiver.ReceiverError):
+            mirror_receiver.publish_version(staged, wrong_target, owner=self.owner)
+        self.assertTrue(linked_elsewhere.exists())
+        self.assertTrue(outside.exists())
+
+        too_many = self.project / "v2.8.1"
+        too_many.mkdir(mode=0o755)
+        private = too_many / (".mirror-SHA256SUMS-" + "5" * 32)
+        private.write_bytes(b"partial")
+        private.chmod(0o644)
+        os.link(private, too_many / "SHA256SUMS")
+        third = self.temporary / "third-link"
+        os.link(private, third)
+        with self.assertRaisesRegex(
+            mirror_receiver.ReceiverError, "unsafe stale mirror temporary file"
+        ):
+            mirror_receiver.publish_version(staged, too_many, owner=self.owner)
+        self.assertEqual(private.stat().st_nlink, 3)
+
     def test_new_version_directory_ignores_restrictive_process_umask(self) -> None:
         staged = make_version(self.temporary / "restrictive-umask")
         destination = self.project / "v2.8.0"
@@ -152,6 +302,96 @@ class ReceiverPolicyTests(unittest.TestCase):
 
         self.assertEqual(destination.stat().st_mode & 0o7777, 0o755)
         mirror_receiver.validate_version(destination, owner=self.owner, published=True)
+
+    def test_version_retry_after_crash_immediately_after_directory_creation(self) -> None:
+        staged = make_version(self.temporary / "mkdir-interruption")
+        destination = self.project / "v2.8.0"
+        child = os.fork()
+        if child == 0:
+            try:
+                original_require_directory = mirror_receiver.require_directory
+
+                def stop_after_mkdir(
+                    path: Path, *, owner: int, mode: int | None = None
+                ) -> None:
+                    if path == destination:
+                        os._exit(93)
+                    original_require_directory(path, owner=owner, mode=mode)
+
+                mirror_receiver.require_directory = stop_after_mkdir
+                os.umask(0o077)
+                mirror_receiver.publish_version(staged, destination, owner=self.owner)
+            except BaseException:
+                os._exit(95)
+            os._exit(94)
+
+        waited, status = os.waitpid(child, 0)
+        self.assertEqual(waited, child)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 93)
+        self.assertEqual(destination.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(list(destination.iterdir()), [])
+
+        synced = []
+        original_fsync_directory = mirror_receiver.fsync_directory
+
+        def record_directory_sync(path: Path) -> None:
+            synced.append(path)
+            original_fsync_directory(path)
+
+        mirror_receiver.fsync_directory = record_directory_sync
+        try:
+            mirror_receiver.publish_version(staged, destination, owner=self.owner)
+        finally:
+            mirror_receiver.fsync_directory = original_fsync_directory
+        self.assertIn(self.project, synced)
+        mirror_receiver.validate_version(destination, owner=self.owner, published=True)
+
+    def test_version_retry_after_crash_during_private_copy_with_extreme_umask(self) -> None:
+        staged = make_version(self.temporary / "copy-interruption")
+        destination = self.project / "v2.8.0"
+        destination.mkdir(mode=0o755)
+        child = os.fork()
+        if child == 0:
+            try:
+                mirror_receiver.secrets.token_hex = lambda size: "3" * (size * 2)
+
+                def stop_during_copy(source, target, length=0) -> None:
+                    target.write(b"partial")
+                    target.flush()
+                    os._exit(93)
+
+                mirror_receiver.shutil.copyfileobj = stop_during_copy
+                os.umask(0o777)
+                mirror_receiver.copy_to_private_temp(
+                    staged / "SHA256SUMS", destination, "SHA256SUMS"
+                )
+            except BaseException:
+                os._exit(95)
+            os._exit(94)
+
+        waited, status = os.waitpid(child, 0)
+        self.assertEqual(waited, child)
+        self.assertTrue(os.WIFEXITED(status))
+        self.assertEqual(os.WEXITSTATUS(status), 93)
+        temporary = destination / (".mirror-SHA256SUMS-" + "3" * 32)
+        self.assertEqual(temporary.stat().st_mode & 0o7777, 0o600)
+
+        mirror_receiver.publish_version(staged, destination, owner=self.owner)
+        mirror_receiver.validate_version(destination, owner=self.owner, published=True)
+
+    def test_deployment_lock_creation_ignores_extreme_umask(self) -> None:
+        lock = self.temporary / ".deploy.lock"
+        previous_umask = os.umask(0o777)
+        try:
+            descriptor = mirror_receiver.open_lock(lock, owner=self.owner)
+        finally:
+            os.umask(previous_umask)
+        os.close(descriptor)
+
+        self.assertEqual(lock.stat().st_mode & 0o7777, 0o600)
+        descriptor = mirror_receiver.open_lock(lock, owner=self.owner)
+        os.close(descriptor)
 
     def test_version_rejects_extra_paths_and_bad_checksums(self) -> None:
         extra = make_version(self.temporary / "extra")
@@ -191,6 +431,33 @@ class ReceiverPolicyTests(unittest.TestCase):
                 wrong, "install.sh", project_root=self.project, owner=self.owner
             )
 
+    def test_stable_publication_recovers_private_temporaries(self) -> None:
+        staged_version = make_version(self.temporary / "stable-recovery")
+        mirror_receiver.publish_version(
+            staged_version, self.project / "v2.8.0", owner=self.owner
+        )
+
+        installer_temp = self.project / (".mirror-install.sh-" + "6" * 32)
+        installer_temp.write_bytes(b"partial")
+        installer_temp.chmod(0o600)
+        mirror_receiver.publish_stable(
+            staged_version / "install.sh",
+            "install.sh",
+            project_root=self.project,
+            owner=self.owner,
+        )
+        self.assertFalse(installer_temp.exists())
+
+        latest_temp = self.project / (".mirror-latest.json-" + "7" * 32)
+        latest_temp.write_bytes(b"partial")
+        latest_temp.chmod(0o600)
+        latest = make_latest(self.temporary / "stable-recovery.json", "v2.8.0")
+        mirror_receiver.publish_stable(
+            latest, "latest.json", project_root=self.project, owner=self.owner
+        )
+        self.assertFalse(latest_temp.exists())
+        self.assertEqual((self.project / "latest.json").read_bytes(), latest.read_bytes())
+
     def test_latest_rejects_noncanonical_or_inconsistent_content(self) -> None:
         staged_version = make_version(self.temporary / "version")
         mirror_receiver.publish_version(staged_version, self.project / "v2.8.0", owner=self.owner)
@@ -217,6 +484,30 @@ class ReceiverPolicyTests(unittest.TestCase):
         (self.project / "install.sh").chmod(0o644)
         latest = make_latest(self.temporary / "prerelease-latest.json", "v2.9.0-rc.1")
         with self.assertRaises(mirror_receiver.ReceiverError):
+            mirror_receiver.validate_latest(latest, owner=self.owner, project_root=self.project)
+
+    def test_release_and_stable_metadata_reject_versions_below_v2(self) -> None:
+        staged_version = make_version(self.temporary / "v1-version", tag="v1.9.9")
+        with self.assertRaisesRegex(mirror_receiver.ReceiverError, "below v2"):
+            mirror_receiver.publish_version(
+                staged_version, self.project / "v1.9.9", owner=self.owner
+            )
+
+        published_version = self.project / "v1.9.9"
+        shutil.copytree(staged_version, published_version)
+        published_version.chmod(0o755)
+        staged_installer = self.temporary / "v1-install.sh"
+        shutil.copyfile(staged_version / "install.sh", staged_installer)
+        staged_installer.chmod(0o644)
+        with self.assertRaisesRegex(
+            mirror_receiver.ReceiverError, "not byte-identical to a complete stable version"
+        ):
+            mirror_receiver.publish_stable(
+                staged_installer, "install.sh", project_root=self.project, owner=self.owner
+            )
+
+        latest = make_latest(self.temporary / "v1-latest.json", "v1.9.9")
+        with self.assertRaisesRegex(mirror_receiver.ReceiverError, "below v2"):
             mirror_receiver.validate_latest(latest, owner=self.owner, project_root=self.project)
 
     def test_stable_files_cannot_roll_back_or_mutate_current_metadata(self) -> None:

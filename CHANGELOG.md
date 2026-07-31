@@ -30,6 +30,20 @@ All notable changes to this project are documented here.
   same-name NSS identity or a mailbox recreated during durability confirmation
   now stops cleanup and retains the recovery witness instead of being reported as
   a completed deletion.
+- Make immutable mirror-file publication crash-recoverable: commit each missing
+  version file with Linux `renameat2(RENAME_NOREPLACE)` instead of a transient
+  two-link state, and recover only strictly named, owner/mode/size/link-checked
+  private temporaries under the deployment lock. This also repairs the exact
+  double-hard-link state an interrupted older receiver could leave. Create new
+  version directories, private temporaries, incoming stages, and the deployment
+  lock with their final safe modes so even an extreme process umask cannot leave
+  an unrecoverable crash state. Require an actual no-replace probe on the mirror
+  document-root filesystem before receiver installation, and repeat the parent
+  directory sync when resuming a visible version directory whose original
+  `mkdir` may not have become durable. Reject release and stable metadata below
+  v2 consistently, including when selecting a stable installer from complete
+  version directories; compare arbitrary-length numeric components without an
+  interpreter-dependent integer conversion.
 
 ## v2.9.1 - 2026-08-01
 
