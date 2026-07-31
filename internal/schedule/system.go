@@ -127,10 +127,12 @@ func parseLoadedSystemdUnits(out string) ([]string, error) {
 	return units, nil
 }
 
-// systemctlUnitFileMissing reports only the exact failure produced when
+// systemctlUnitFileMissing reports only the exact C-locale failures produced when
 // `systemctl disable --now` races with (or follows) removal of its target unit.
-// It is not success by itself: systemctl returns from the disable phase before
-// --now reaches stop, so callers must independently confirm the timer is inactive.
+// systemd 256 and later dropped "file" and the final period from this diagnostic.
+// Neither form is success by itself: systemctl returns from the disable phase
+// before --now reaches stop, so callers must independently confirm the timer is
+// inactive.
 func systemctlUnitFileMissing(err error, unit string) bool {
 	var commandErr *systemctlError
 	if !errors.As(err, &commandErr) || len(commandErr.args) != 3 {
@@ -139,8 +141,9 @@ func systemctlUnitFileMissing(err error, unit string) bool {
 	if commandErr.args[0] != "disable" || commandErr.args[1] != "--now" || commandErr.args[2] != unit {
 		return false
 	}
-	want := fmt.Sprintf("Failed to disable unit: Unit file %s does not exist.", unit)
-	return commandErr.output == want
+	oldDiagnostic := fmt.Sprintf("Failed to disable unit: Unit file %s does not exist.", unit)
+	modernDiagnostic := fmt.Sprintf("Failed to disable unit: Unit %s does not exist", unit)
+	return commandErr.output == oldDiagnostic || commandErr.output == modernDiagnostic
 }
 
 func systemctlStopUnitNotLoaded(err error, unit string) bool {

@@ -65,29 +65,77 @@ func TestAtrmJobReportsFailureForStillQueuedJob(t *testing.T) {
 }
 
 func TestSystemctlMissingUnitErrorIsPreciselyClassified(t *testing.T) {
-	dir := t.TempDir()
 	const unit = "linux-temp-admin-v2-revoke-xxvcc-a1.timer"
-	writeCommand(t, dir, "systemctl", "echo 'Failed to disable unit: Unit file "+unit+" does not exist.' >&2; exit 1")
-	t.Setenv("PATH", dir)
-
-	err := (realSystem{}).Systemctl("disable", "--now", unit)
-	if !systemctlUnitFileMissing(err, unit) {
-		t.Fatalf("systemctlUnitFileMissing(%v) = false, want true", err)
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{
+			name:   "systemd 255 and earlier",
+			output: "Failed to disable unit: Unit file " + unit + " does not exist.",
+		},
+		{
+			name:   "systemd 256 and later",
+			output: "Failed to disable unit: Unit " + unit + " does not exist",
+		},
 	}
-	if systemctlUnitFileMissing(err, "different.timer") {
-		t.Fatal("a missing-unit error must only match its exact target")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeCommand(t, dir, "systemctl", "echo '"+tt.output+"' >&2; exit 1")
+			t.Setenv("PATH", dir)
+
+			err := (realSystem{}).Systemctl("disable", "--now", unit)
+			if !systemctlUnitFileMissing(err, unit) {
+				t.Fatalf("systemctlUnitFileMissing(%v) = false, want true", err)
+			}
+			if systemctlUnitFileMissing(err, "different.timer") {
+				t.Fatal("a missing-unit error must only match its exact target")
+			}
+		})
 	}
 }
 
 func TestSystemctlOtherFailureIsNotClassifiedAsMissingUnit(t *testing.T) {
-	dir := t.TempDir()
 	const unit = "linux-temp-admin-v2-revoke-xxvcc-a1.timer"
-	writeCommand(t, dir, "systemctl", "echo 'Failed to connect to bus: Permission denied' >&2; exit 1")
-	t.Setenv("PATH", dir)
-
-	err := (realSystem{}).Systemctl("disable", "--now", unit)
-	if systemctlUnitFileMissing(err, unit) {
-		t.Fatalf("permission failure was misclassified as a missing unit: %v", err)
+	tests := []struct {
+		name   string
+		args   []string
+		output string
+	}{
+		{
+			name:   "permission failure",
+			args:   []string{"disable", "--now", unit},
+			output: "Failed to connect to bus: Permission denied",
+		},
+		{
+			name:   "unavailable D-Bus",
+			args:   []string{"disable", "--now", unit},
+			output: "Failed to connect to bus: No such file or directory",
+		},
+		{
+			name:   "unrecognized punctuation",
+			args:   []string{"disable", "--now", unit},
+			output: "Failed to disable unit: Unit " + unit + " does not exist.",
+		},
+		{
+			name:   "additional diagnostic",
+			args:   []string{"disable", "--now", unit},
+			output: "Failed to disable unit: Unit " + unit + " does not exist\nFailed to connect to bus: Permission denied",
+		},
+		{
+			name:   "different command",
+			args:   []string{"enable", "--now", unit},
+			output: "Failed to disable unit: Unit " + unit + " does not exist",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &systemctlError{args: tt.args, err: errors.New("exit status 1"), output: tt.output}
+			if systemctlUnitFileMissing(err, unit) {
+				t.Fatalf("non-exact failure was misclassified as a missing unit: %v", err)
+			}
+		})
 	}
 }
 

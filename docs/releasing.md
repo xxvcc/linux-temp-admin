@@ -431,10 +431,10 @@ git -c user.name='XXV.CC' \
     -c user.signingkey="${TAG_SIGNING_FPR}!" \
     -c gpg.format=openpgp \
     -c gpg.program=/usr/bin/gpg \
-    tag -s v2.9.0 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.9.0'
+    tag -s v2.9.1 "$RELEASE_COMMIT" -m 'linux-temp-admin v2.9.1'
 git -c gpg.format=openpgp -c gpg.program=/usr/bin/gpg \
-    verify-tag --raw v2.9.0
-git push origin v2.9.0
+    verify-tag --raw v2.9.1
+git push origin v2.9.1
 ```
 
 Before pushing, the `VALIDSIG` record from `verify-tag --raw` must identify the
@@ -501,7 +501,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/prepare-release.sh \
-  v2.9.0 /srv/linux-temp-admin /srv/release-transfer/v2.9.0-prepared
+  v2.9.1 /srv/linux-temp-admin /srv/release-transfer/v2.9.1-prepared
 LTA_PREPARE_RELEASE
 ```
 
@@ -521,7 +521,7 @@ the candidate or transfer media:
 LTA_SIGN_KEY=/offline/keys/release-v1.key
 LTA_TRUSTED_SIGNER=/opt/lta-release-tools/lta-release
 LTA_TRUSTED_SIGNER_SHA256='<offline-recorded signer sha256>'
-LTA_EXPECTED_TAG=v2.9.0
+LTA_EXPECTED_TAG=v2.9.1
 LTA_EXPECTED_COMMIT='<independently recorded 40-hex commit>'
 LTA_EXPECTED_PREPARED_MANIFEST_SHA256='<independently recorded sha256>'
 LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public key>'
@@ -533,7 +533,7 @@ LTA_EXPECTED_RELEASE_SIGNER_PUBKEY='<independently recorded 64-hex OLD public ke
   LTA_EXPECTED_PREPARED_MANIFEST_SHA256="$LTA_EXPECTED_PREPARED_MANIFEST_SHA256" \
   LTA_EXPECTED_RELEASE_SIGNER_PUBKEY="$LTA_EXPECTED_RELEASE_SIGNER_PUBKEY" \
   /opt/lta-release-tools/offline-sign-release.sh \
-  /media/in/v2.9.0-prepared /media/out/v2.9.0-signed
+  /media/in/v2.9.1-prepared /media/out/v2.9.1-signed
 ```
 
 The script copies the removable input into a size-bounded private local snapshot
@@ -584,7 +584,7 @@ printf '\n' >/dev/tty
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 export GH_TOKEN
 exec /opt/lta-release-tools/publish-release.sh \
-  /srv/release-transfer/v2.9.0-signed /srv/linux-temp-admin
+  /srv/release-transfer/v2.9.1-signed /srv/linux-temp-admin
 LTA_PUBLISH_RELEASE
 ```
 
@@ -684,7 +684,7 @@ noncanonical stable tag or mutable recovery target, excludes the failed `TAG`,
 and binds both the mutation and resulting Latest state to one numeric Release ID:
 
 ```bash
-TAG=v2.9.0  # the failed release; verify this value before running
+TAG=v2.9.1  # the failed release; verify this value before running
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   TAG="$TAG" /bin/bash -p <<'LTA_LATEST_RECOVERY'
@@ -849,7 +849,7 @@ announcement:
 
 ```bash
 gh workflow run mirror-release.yml --repo xxvcc/linux-temp-admin \
-  --ref main -f tag=v2.9.0
+  --ref main -f tag=v2.9.1
 gh run list --repo xxvcc/linux-temp-admin \
   --workflow mirror-release.yml --event workflow_dispatch --limit 1
 ```
@@ -1080,7 +1080,7 @@ the release audit/signing record and a separate authenticated channel, then run:
 ```bash
 INSTALLER_COMMIT='replace-with-the-audited-40-hex-commit'
 INSTALLER_SHA256='replace-with-the-independent-64-hex-script-hash'
-LTA_RELEASE_TAG='v2.9.0'
+LTA_RELEASE_TAG='v2.9.1'
 /usr/bin/sudo /usr/bin/env -i \
   HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
   INSTALLER_COMMIT="$INSTALLER_COMMIT" INSTALLER_SHA256="$INSTALLER_SHA256" \
