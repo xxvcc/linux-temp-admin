@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
@@ -20,14 +21,19 @@ const maxRegistryBytes = int64(16 << 20)
 // be absolute; File and Lock must be distinct direct children. Paths are fields
 // so tests can point the complete layout at a temporary directory.
 type Store struct {
-	Dir  string
-	File string
-	Lock string
+	Dir      string
+	File     string
+	Lock     string
+	Sequence string
+	Now      func() time.Time
 }
 
 // Default returns a Store using the configured registry paths.
 func Default() *Store {
-	return &Store{Dir: config.RegistryDir, File: config.RegistryFile, Lock: config.RegistryLockFile}
+	return &Store{
+		Dir: config.RegistryDir, File: config.RegistryFile, Lock: config.RegistryLockFile,
+		Sequence: config.IdentitySequenceFile, Now: time.Now,
+	}
 }
 
 // Init creates the registry directory (0700 root), the registry file (with the
@@ -80,9 +86,22 @@ func (s *Store) Init() error {
 		return &fsutil.DurabilityError{Operation: "registry lock directory entry", Err: err}
 	}
 
+	// The sequence is committed before a fresh v5 registry or a legacy-to-v5
+	// migration. Once the v5 header is visible, a missing sequence is corruption:
+	// recreating it from only live rows could reuse an already-retired identity.
+	_, registryErr := os.Lstat(s.File)
+	registryMissing := os.IsNotExist(registryErr)
+	if registryErr != nil && !registryMissing {
+		return registryErr
+	}
+	if registryMissing {
+		if err := s.ensureIdentitySequence(0, true, time.Time{}); err != nil {
+			return err
+		}
+	}
 	// Upgrade deployed registries only while holding their lock. New writes use a
-	// v4 header that older binaries reject, preventing them from dropping the
-	// deletion recovery phase during a delayed rewrite.
+	// v5 header that older binaries reject, preventing them from dropping the
+	// deletion quarantine or monotonic identity marker during a delayed rewrite.
 	if err := ensureFile(s.File, []byte(Header+"\n")); err != nil {
 		return err
 	}
@@ -90,10 +109,27 @@ func (s *Store) Init() error {
 	if err != nil {
 		return err
 	}
-	if header == legacyHeaderV2 || header == legacyHeaderV3 {
+	if header == legacyHeaderV2 || header == legacyHeaderV3 || header == legacyHeaderV4 {
+		highest := 0
+		for _, rec := range recs {
+			if rec.UID > highest {
+				highest = rec.UID
+			}
+		}
+		safeAfter := s.now().Add(time.Duration(config.IdentityQuarantineSeconds) * time.Second).UTC()
+		if err := s.ensureIdentitySequence(highest, true, safeAfter); err != nil {
+			return err
+		}
 		return s.writeAll(recs)
 	}
-	return nil
+	return s.ensureIdentitySequence(0, false, time.Time{})
+}
+
+func (s *Store) now() time.Time {
+	if s != nil && s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func (s *Store) validateLayout() error {
@@ -104,16 +140,27 @@ func (s *Store) validateLayout() error {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) || dir != s.Dir || dir == string(filepath.Separator) {
 		return fmt.Errorf("unsafe registry directory %q", s.Dir)
 	}
-	for label, path := range map[string]string{"file": s.File, "lock": s.Lock} {
+	sequence := s.sequencePath()
+	for label, path := range map[string]string{"file": s.File, "lock": s.Lock, "sequence": sequence} {
 		clean := filepath.Clean(path)
 		if path == "" || !filepath.IsAbs(path) || clean != path || filepath.Dir(clean) != dir || clean == dir {
 			return fmt.Errorf("registry %s %q must be a direct child of %s", label, path, dir)
 		}
 	}
-	if s.File == s.Lock {
-		return fmt.Errorf("registry file and lock must be different paths")
+	if s.File == s.Lock || s.File == sequence || s.Lock == sequence {
+		return fmt.Errorf("registry file, lock, and identity sequence must be different paths")
 	}
 	return nil
+}
+
+func (s *Store) sequencePath() string {
+	if s != nil && s.Sequence != "" {
+		return s.Sequence
+	}
+	if s == nil || s.Dir == "" {
+		return ""
+	}
+	return filepath.Join(s.Dir, "identity-sequence")
 }
 
 func openOrCreateLockAt(dir *os.File, name, path string) (*os.File, error) {
@@ -207,7 +254,7 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 		return nil, "", fmt.Errorf("registry exceeds %d bytes", maxRegistryBytes)
 	}
 	lines := strings.Split(string(b), "\n")
-	if len(lines) == 0 || (lines[0] != Header && lines[0] != legacyHeaderV3 && lines[0] != legacyHeaderV2) {
+	if len(lines) == 0 || (lines[0] != Header && lines[0] != legacyHeaderV4 && lines[0] != legacyHeaderV3 && lines[0] != legacyHeaderV2) {
 		return nil, "", fmt.Errorf("registry header is missing or unsupported")
 	}
 	header := lines[0]
@@ -215,7 +262,7 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 	seenUsers := make(map[string]int)
 	for i, line := range lines[1:] {
 		lineNumber := i + 2
-		if line == Header || line == legacyHeaderV3 || line == legacyHeaderV2 {
+		if line == Header || line == legacyHeaderV4 || line == legacyHeaderV3 || line == legacyHeaderV2 {
 			return nil, "", fmt.Errorf("registry line %d: duplicate schema header", lineNumber)
 		}
 		var r Record
@@ -224,6 +271,8 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 		switch header {
 		case Header:
 			r, ok, err = ParseLine(line)
+		case legacyHeaderV4:
+			r, ok, err = parseLegacyV4Line(line)
 		case legacyHeaderV3:
 			r, ok, err = parseLegacyV3Line(line)
 		case legacyHeaderV2:
@@ -367,6 +416,61 @@ func (s *Store) BeginDeletion(user string, uid int, generation string) error {
 	})
 }
 
+// BeginQuarantine converts an exact generation-bound account into a durable
+// deletion row while the disabled passwd entry still holds its name, UID, and
+// GID. A pending creation recovery may enter only after its caller has proved the
+// complete pending passwd shape; keeping Pending records which marker retries
+// must verify. The systemd finalizer may complete deletion after one full
+// deferred-job polling window without keeping the invoking terminal blocked.
+func (s *Store) BeginQuarantine(user string, uid int, generation string, deadline time.Time, unit string) error {
+	if err := validateDeletionIdentity(user, uid, generation); err != nil || generation == "" {
+		return fmt.Errorf("invalid quarantine identity")
+	}
+	if deadline.IsZero() || deadline.Location() != time.UTC || deadline.Nanosecond() != 0 {
+		return fmt.Errorf("invalid quarantine deadline")
+	}
+	if unit != config.QuarantineUnitPrefix+user {
+		return fmt.Errorf("invalid quarantine unit %q", unit)
+	}
+	return s.withLock(func() error {
+		recs, err := s.readAll()
+		if err != nil {
+			return err
+		}
+		out := append([]Record(nil), recs...)
+		for i := range out {
+			current := out[i]
+			if current.User != user {
+				continue
+			}
+			deadlineText := deadline.Format(time.RFC3339)
+			if current.DeletionStarted {
+				if current.UID == uid && current.IdentityBound && current.Generation == generation &&
+					current.QuarantineUntil == deadlineText && current.QuarantineUnit == unit {
+					return nil
+				}
+				return fmt.Errorf("registry deletion recovery identity changed")
+			}
+			if !current.IdentityBound || (current.UID != 0 && current.UID != uid) || current.Generation != generation {
+				return fmt.Errorf("registry identity changed before quarantine")
+			}
+			current.UID = uid
+			current.DeletionStarted = true
+			current.QuarantineUntil = deadlineText
+			current.QuarantineUnit = unit
+			if _, ok, err := ParseLine(current.TSV()); err != nil || !ok {
+				if err == nil {
+					err = fmt.Errorf("quarantine transition did not produce a data row")
+				}
+				return fmt.Errorf("invalid quarantine transition: %w", err)
+			}
+			out[i] = current
+			return s.writeAll(out)
+		}
+		return fmt.Errorf("registry identity disappeared before quarantine")
+	})
+}
+
 func validateDeletionIdentity(user string, uid int, generation string) error {
 	if !validate.Username(user) || !validate.AccountID(uid) ||
 		(generation != "" && !validate.Generation(generation)) {
@@ -416,6 +520,7 @@ func beginDeletionRecords(recs []Record, user string, uid int, generation string
 			current.UID = uid
 			current.Generation = ""
 			current.IdentityBound = false
+			current.SequentialID = false
 			current.Pending = false
 			current.DeletionStarted = true
 		}
@@ -624,7 +729,7 @@ func (s *Store) Compact(keep func(Record) (bool, error)) (int, error) {
 // paired with an existing lock is a valid empty store; an existing data file
 // without its lock is damaged and must still fail in withLock.
 func (s *Store) completelyAbsent() (bool, error) {
-	for _, path := range []string{s.File, s.Lock} {
+	for _, path := range []string{s.File, s.Lock, s.sequencePath()} {
 		if _, err := os.Lstat(path); err == nil {
 			return false, nil
 		} else if !os.IsNotExist(err) {

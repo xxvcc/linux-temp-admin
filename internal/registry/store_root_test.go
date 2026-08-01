@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 )
@@ -30,6 +31,7 @@ func newStore(t *testing.T) *registry.Store {
 		Dir:  dir,
 		File: filepath.Join(dir, "registry.tsv"),
 		Lock: filepath.Join(dir, "registry.lock"),
+		Now:  func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
 	}
 	if err := s.Init(); err != nil {
 		t.Fatalf("Init: %v", err)
@@ -109,7 +111,7 @@ func TestConcurrentFirstInitUsesOneRegistryAndLock(t *testing.T) {
 	}
 }
 
-func TestInitMigratesV2RegistryToV4UnderLock(t *testing.T) {
+func TestInitMigratesV2RegistryToV5UnderLock(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
 	}
@@ -120,7 +122,8 @@ func TestInitMigratesV2RegistryToV4UnderLock(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock")}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"), Now: func() time.Time { return now }}
 	v2row := strings.Join([]string{
 		"xxvcc-v2", "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
 		"yes", "203.0.113.5", "22", "SHA256:abc", "yes", "unit.timer",
@@ -140,15 +143,20 @@ func TestInitMigratesV2RegistryToV4UnderLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(string(b), registry.Header+"\n") {
-		t.Fatalf("registry was not migrated to v4: %q", b)
+		t.Fatalf("registry was not migrated to v5: %q", b)
 	}
 	recs, err := s.List()
 	if err != nil || len(recs) != 1 || recs[0].UID != 1001 || recs[0].Pending || recs[0].IdentityBound {
 		t.Fatalf("migrated records=%+v err=%v", recs, err)
 	}
+	sequence, err := os.ReadFile(filepath.Join(dir, "identity-sequence"))
+	if err != nil || !strings.Contains(string(sequence), "highest\t1001\n") ||
+		!strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:05Z\n") {
+		t.Fatalf("migrated identity sequence = %q err=%v", sequence, err)
+	}
 }
 
-func TestInitMigratesReleasedV3RowsToV4(t *testing.T) {
+func TestInitMigratesReleasedV3RowsToV5(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
 	}
@@ -159,7 +167,8 @@ func TestInitMigratesReleasedV3RowsToV4(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock")}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"), Now: func() time.Time { return now }}
 	const generation = "0123456789abcdef0123456789abcdef"
 	active := strings.Join([]string{
 		"xxvcc-v3a", "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
@@ -185,7 +194,7 @@ func TestInitMigratesReleasedV3RowsToV4(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(string(b), registry.Header+"\n") {
-		t.Fatalf("registry was not migrated to v4: %q", b)
+		t.Fatalf("registry was not migrated to v5: %q", b)
 	}
 	recs, err := s.List()
 	if err != nil || len(recs) != 2 {
@@ -198,6 +207,185 @@ func TestInitMigratesReleasedV3RowsToV4(t *testing.T) {
 	if recs[1].User != "xxvcc-v3p" || recs[1].UID != 0 || recs[1].Generation != generation ||
 		!recs[1].Pending || !recs[1].IdentityBound || recs[1].DeletionStarted || recs[1].Port != 2222 {
 		t.Fatalf("pending v3 row changed during migration: %+v", recs[1])
+	}
+}
+
+func TestInitMigratesReleasedV4RowsBeforePublishingV5Header(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"), Now: func() time.Time { return now }}
+	const generation = "0123456789abcdef0123456789abcdef"
+	row := strings.Join([]string{
+		"xxvcc-v4", "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
+		"yes", "203.0.113.5", "22", "SHA256:active", "yes", "active.timer",
+		"1777", generation, "no", "yes", "no",
+	}, "\t")
+	if err := os.WriteFile(s.File, []byte("# linux-temp-admin registry v4\n"+row+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	sequence, err := os.ReadFile(filepath.Join(dir, "identity-sequence"))
+	if err != nil || !strings.Contains(string(sequence), "highest\t1777\n") ||
+		!strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:05Z\n") {
+		t.Fatalf("v4 migration sequence = %q err=%v", sequence, err)
+	}
+	b, err := os.ReadFile(s.File)
+	if err != nil || !strings.HasPrefix(string(b), registry.Header+"\n") {
+		t.Fatalf("v4 migration registry = %q err=%v", b, err)
+	}
+}
+
+func TestV5RegistryRequiresItsDurableIdentitySequence(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock")}
+	if err := os.WriteFile(s.File, []byte(registry.Header+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Init(); err == nil || !strings.Contains(err.Error(), "identity sequence") {
+		t.Fatalf("Init without v5 identity sequence error = %v", err)
+	}
+}
+
+func TestReserveIdentityIsMonotonicAndFailsClosedAtLimit(t *testing.T) {
+	s := newStore(t)
+	for want := 1000; want <= 1002; want++ {
+		got, isolated, err := s.ReserveIdentity(1000, 1002)
+		if err != nil || got != want || !isolated {
+			t.Fatalf("reserve #%d = %d isolated=%v err=%v", want-999, got, isolated, err)
+		}
+	}
+	if _, _, err := s.ReserveIdentity(1000, 1002); err == nil || !strings.Contains(err.Error(), "exhausted") {
+		t.Fatalf("exhausted sequence error = %v", err)
+	}
+}
+
+func TestMigratedIdentitySequenceRequiresOneIsolationWindow(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	s := &registry.Store{
+		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),
+		Now: func() time.Time { return now },
+	}
+	if err := os.WriteFile(s.File, []byte("# linux-temp-admin registry v4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if got, isolated, err := s.ReserveIdentity(1000, 1002); err != nil || got != 1000 || isolated {
+		t.Fatalf("first migrated reserve = %d isolated=%v err=%v", got, isolated, err)
+	}
+	now = now.Add(65 * time.Second)
+	if got, isolated, err := s.ReserveIdentity(1000, 1002); err != nil || got != 1001 || !isolated {
+		t.Fatalf("post-isolation reserve = %d isolated=%v err=%v", got, isolated, err)
+	}
+	sequence, err := os.ReadFile(filepath.Join(dir, "identity-sequence"))
+	if err != nil || !strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:05Z\n") {
+		t.Fatalf("isolation deadline was not preserved: %q err=%v", sequence, err)
+	}
+}
+
+func TestBeginQuarantineBindsCompletedAndPendingGenerations(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	deadline := time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC)
+	for _, pending := range []bool{false, true} {
+		t.Run(fmt.Sprintf("pending=%v", pending), func(t *testing.T) {
+			s := newStore(t)
+			name := "xxvcc-bound"
+			uid := 1001
+			recordedUID := uid
+			if pending {
+				name = "xxvcc-pending"
+				recordedUID = 0
+			}
+			rec := registry.Record{
+				User: name, Port: 22, UID: recordedUID, Generation: generation,
+				IdentityBound: true, Pending: pending,
+			}
+			if err := s.Record(rec); err != nil {
+				t.Fatal(err)
+			}
+			unit := "linux-temp-admin-v2-quarantine-" + name
+			if err := s.BeginQuarantine(name, uid, generation, deadline, unit); err != nil {
+				t.Fatal(err)
+			}
+			got, found, err := s.Lookup(name)
+			if err != nil || !found || !got.DeletionStarted || got.UID != uid || got.Pending != pending ||
+				got.QuarantineUntil != deadline.Format(time.RFC3339) || got.QuarantineUnit != unit {
+				t.Fatalf("quarantine transition = found=%v rec=%+v err=%v", found, got, err)
+			}
+			if err := s.BeginQuarantine(name, uid, generation, deadline, unit); err != nil {
+				t.Fatalf("idempotent BeginQuarantine: %v", err)
+			}
+		})
+	}
+}
+
+func TestIdentitySequenceRejectsUnsafeOrCorruptFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, path string)
+	}{
+		{name: "symlink", make: func(t *testing.T, path string) {
+			if err := os.Symlink("/etc/passwd", path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "malformed", make: func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("not a sequence\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			path := filepath.Join(s.Dir, "identity-sequence")
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			tc.make(t, path)
+			if _, _, err := s.ReserveIdentity(1000, 2000); err == nil {
+				t.Fatal("unsafe identity sequence was accepted")
+			}
+		})
 	}
 }
 

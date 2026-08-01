@@ -72,7 +72,7 @@ func New() *Scheduler {
 		// v1's units are still findable, never written. v1 installed to the same path
 		// this binary occupies, so its timers invoke THIS code and its accounts strand
 		// exactly like v2's would.
-		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
+		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix, config.QuarantineUnitPrefix},
 		Now:                time.Now,
 		Sys:                realSystem{},
 	}
@@ -194,6 +194,62 @@ func (s *Scheduler) Schedule(user string, uid int, generation string, deadline t
 	}
 	return unit, atErr
 }
+
+// ScheduleQuarantine creates a systemd-only finalizer in a separate namespace.
+// The original expiry task may be firing while revoke performs this handoff, so
+// the two unit names must coexist until the quarantine row is durable. Hosts
+// without a reliable systemd backend use the synchronous drain fallback instead.
+func (s *Scheduler) ScheduleQuarantine(user string, uid int, generation string, deadline time.Time) (string, error) {
+	if !validate.Username(user) || !validate.AccountID(uid) || !validate.Generation(generation) {
+		return "", fmt.Errorf("invalid quarantine schedule identity")
+	}
+	if s == nil || s.Sys == nil || !s.Sys.HasSystemctl() {
+		return "", fmt.Errorf("persistent systemd quarantine is unavailable")
+	}
+	if !validDeadline(s.now(), deadline) {
+		return "", fmt.Errorf("invalid quarantine deadline %s", deadline.Format(time.RFC3339Nano))
+	}
+	q := *s
+	q.UnitPrefix = config.QuarantineUnitPrefix
+	q.LegacyUnitPrefixes = nil
+	return q.scheduleSystemd(user, uid, generation, deadline.UTC())
+}
+
+// CancelAuto removes only expiry-era namespaces, leaving a just-created
+// quarantine finalizer intact during the handoff.
+func (s *Scheduler) CancelAuto(user, recordedUnit string) error {
+	if s == nil {
+		return fmt.Errorf("no scheduler backend configured")
+	}
+	auto := *s
+	auto.LegacyUnitPrefixes = []string{config.V1AutoRevokeUnitPrefix}
+	return auto.Cancel(user, recordedUnit)
+}
+
+// CancelQuarantine removes only the asynchronous deletion finalizer namespace.
+func (s *Scheduler) CancelQuarantine(user, recordedUnit string) error {
+	if s == nil || s.Sys == nil {
+		return fmt.Errorf("no scheduler backend configured")
+	}
+	q := *s
+	q.UnitPrefix = config.QuarantineUnitPrefix
+	q.LegacyUnitPrefixes = nil
+	q.Sys = systemdOnlySystem{System: s.Sys}
+	return q.Cancel(user, recordedUnit)
+}
+
+// systemdOnlySystem prevents quarantine cleanup from sweeping an unrelated
+// expiry-era at job. Quarantine scheduling never uses at; the wrapper retains
+// only the systemd operations needed by Cancel.
+type systemdOnlySystem struct{ System }
+
+func (s systemdOnlySystem) HasAt() bool { return false }
+func (s systemdOnlySystem) ScheduleAt(string, time.Time) (string, error) {
+	return "", fmt.Errorf("at is disabled for identity quarantine")
+}
+func (s systemdOnlySystem) RemoveAtJobsFor(string) error { return nil }
+func (s systemdOnlySystem) AtrmJob(string) error         { return nil }
+func (s systemdOnlySystem) AtJobs() ([]AtJob, error)     { return nil, nil }
 
 func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, deadline time.Time) (string, error) {
 	if !validManagedUnitPrefix(s.UnitPrefix) {

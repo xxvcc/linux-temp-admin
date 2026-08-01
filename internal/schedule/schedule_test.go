@@ -128,6 +128,44 @@ func TestScheduleNoBackend(t *testing.T) {
 	}
 }
 
+func TestScheduleQuarantineUsesSeparateSystemdNamespaceWithoutAtFallback(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
+	s := newScheduler(dir, sys)
+	deadline := s.Now().Add(2 * time.Minute)
+	unit, err := s.ScheduleQuarantine("xxvcc-a1", 1001, testGeneration, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUnit := config.QuarantineUnitPrefix + "xxvcc-a1"
+	if unit != wantUnit || sys.atCommand != "" {
+		t.Fatalf("quarantine schedule = %q at=%q, want %q and no at fallback", unit, sys.atCommand, wantUnit)
+	}
+	for _, suffix := range []string{".service", ".timer"} {
+		if _, err := os.Stat(filepath.Join(dir, wantUnit+suffix)); err != nil {
+			t.Fatalf("quarantine %s missing: %v", suffix, err)
+		}
+	}
+}
+
+func TestCancelQuarantineNeverSweepsExpiryAtJobs(t *testing.T) {
+	dir := t.TempDir()
+	sys := &fakeSystem{hasSystemctl: true, hasAt: true}
+	s := newScheduler(dir, sys)
+	unit := config.QuarantineUnitPrefix + "xxvcc-a1"
+	for _, suffix := range []string{".service", ".timer"} {
+		if err := os.WriteFile(filepath.Join(dir, unit+suffix), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.CancelQuarantine("xxvcc-a1", unit); err != nil {
+		t.Fatal(err)
+	}
+	if len(sys.removedFor) != 0 || len(sys.atrmd) != 0 {
+		t.Fatalf("quarantine cleanup touched at jobs: sweep=%v atrm=%v", sys.removedFor, sys.atrmd)
+	}
+}
+
 func TestScheduleRefusesAtFallbackAfterDeadlinePasses(t *testing.T) {
 	base := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	deadline := base.Add(time.Minute)

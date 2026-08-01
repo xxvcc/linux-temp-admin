@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.3 - 2026-08-01
+
+- Replace the normal invite's foreground 65-second deferred-job drain with a
+  durable monotonic UID/GID allocator. The allocator advances a root-owned
+  high-water file before `useradd`, pins the account and its private group to the
+  same explicit ID, and never returns a burned ID to this tool after rollback or
+  deletion. Default generated usernames use substantially more entropy and take
+  two immediate process/job cleanup passes before activation. An explicit
+  `--user` can reuse historical name-keyed cron state, so that exceptional path
+  retains the synchronous drain and says why. Upgrading a pre-v5 registry starts
+  one 65-second isolation window for identities that older releases may already
+  have retired; a generated-name invite attempted inside that one-time window
+  still drains synchronously, while later generated-name invites do not wait.
+- Make ordinary revoke return promptly without releasing a possibly reusable
+  identity too early. It immediately strips sudo and sshd grants, disables login,
+  terminates UID processes, and clears cron/at work, then keeps the passwd name,
+  UID, and GID in a durable systemd-backed quarantine for at least one daemon
+  polling cycle. A separate persistent timer repeats the checks and finishes
+  Home/mail/account deletion after the deadline, including after reboot. Hosts
+  without systemd retain the fail-closed synchronous drain. Before handing work
+  to that timer, revoke installs or verifies a sufficiently new stable command;
+  if it cannot, deletion stays synchronous. Uninstall likewise finalizes
+  synchronously before removing the command required by the timer.
+- Upgrade the registry to v5 with the monotonic-identity and quarantine state,
+  separate expiry and quarantine unit namespaces, exact `doctor` validation,
+  menu recovery for proved pending generations, and status output for
+  quarantined or externally removed accounts. A v5 registry whose high-water
+  file is missing fails closed rather than reconstructing a value that could
+  reuse an already retired identity.
+
 ## v2.9.2 - 2026-08-01
 
 - Validate conventional mail-spool roots before `useradd`, then reopen and

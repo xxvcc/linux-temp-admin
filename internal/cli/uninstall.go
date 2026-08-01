@@ -554,7 +554,7 @@ func liveTeardownAccountAuthorized(acc teardownAccount) bool {
 		return false
 	}
 	state := classifyRegisteredAccount(acc.registryRecord, acc.passwd, true, nil)
-	return state == registeredActive || state == registeredRecoveryBound
+	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryBound
 }
 
 func sameTeardownPlan(a, b teardownPlan) bool {

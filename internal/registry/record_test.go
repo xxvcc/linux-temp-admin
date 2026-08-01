@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 )
@@ -120,7 +121,7 @@ func TestParseLineRequiresUIDAndNonPendingStateForDeletionStarted(t *testing.T) 
 		{User: "xxvcc-a1", Port: 22, UID: 1001, Pending: true, DeletionStarted: true},
 		{User: "xxvcc-a1", Port: 22, UID: 1001, Generation: "0123456789abcdef0123456789abcdef", DeletionStarted: true},
 	} {
-		if _, _, err := ParseLine(rec.TSV()); err == nil || !strings.Contains(err.Error(), "deletion-started") {
+		if _, _, err := ParseLine(rec.TSV()); err == nil {
 			t.Fatalf("ParseLine(%+v) error = %v, want incomplete deletion witness refusal", rec, err)
 		}
 	}
@@ -141,6 +142,51 @@ func TestParseLineRequiresUIDAndNonPendingStateForDeletionStarted(t *testing.T) 
 	}
 	if _, _, err := ParseLine(boundWithoutPort.TSV()); err == nil || !strings.Contains(err.Error(), "invalid port") {
 		t.Fatalf("generation-bound recovery with port 0 error = %v, want invalid port refusal", err)
+	}
+}
+
+func TestParseLineAcceptsOnlyDurablePendingDeletionQuarantine(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	rec := Record{
+		User: "xxvcc-pending", Port: 22, UID: 1001, Generation: generation,
+		IdentityBound: true, Pending: true, DeletionStarted: true,
+		QuarantineUntil: time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC).Format(time.RFC3339),
+		QuarantineUnit:  config.QuarantineUnitPrefix + "xxvcc-pending",
+	}
+	got, ok, err := ParseLine(rec.TSV())
+	if err != nil || !ok || got != rec {
+		t.Fatalf("pending quarantine round trip = ok %v record %+v err %v", ok, got, err)
+	}
+
+	for _, mutate := range []func(*Record){
+		func(r *Record) { r.QuarantineUntil = ""; r.QuarantineUnit = "" },
+		func(r *Record) { r.IdentityBound = false; r.Generation = "" },
+		func(r *Record) { r.QuarantineUnit = config.QuarantineUnitPrefix + "xxvcc-other" },
+	} {
+		bad := rec
+		mutate(&bad)
+		if _, _, err := ParseLine(bad.TSV()); err == nil {
+			t.Fatalf("invalid pending quarantine was accepted: %+v", bad)
+		}
+	}
+}
+
+func TestParseLineRequiresSequentialIdentityBinding(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	valid := Record{
+		User: "xxvcc-sequence", Port: 22, UID: 1001, Generation: generation,
+		IdentityBound: true, SequentialID: true,
+	}
+	if _, ok, err := ParseLine(valid.TSV()); err != nil || !ok {
+		t.Fatalf("valid sequential identity rejected: ok=%v err=%v", ok, err)
+	}
+	for _, bad := range []Record{
+		{User: "xxvcc-sequence", Port: 22, UID: 1001, SequentialID: true},
+		{User: "xxvcc-sequence", Port: 22, Generation: generation, IdentityBound: true, SequentialID: true, Pending: true},
+	} {
+		if _, _, err := ParseLine(bad.TSV()); err == nil {
+			t.Fatalf("unbound sequential identity accepted: %+v", bad)
+		}
 	}
 }
 
@@ -208,7 +254,7 @@ func TestParseLegacyV3RowDefaultsDeletionPhase(t *testing.T) {
 func TestV4SchemaStopsOlderWriters(t *testing.T) {
 	line := Record{User: "xxvcc-a1", Port: 22, UID: 1001, AutoUnit: "u.timer", Pending: true}.TSV()
 	f := strings.Split(line, "\t")
-	if Header == legacyHeaderV2 || Header == legacyHeaderV3 {
+	if Header == legacyHeaderV2 || Header == legacyHeaderV3 || Header == legacyHeaderV4 {
 		t.Fatal("current and legacy registry headers must differ")
 	}
 	if len(f) != currentFieldCount {
@@ -219,5 +265,8 @@ func TestV4SchemaStopsOlderWriters(t *testing.T) {
 	}
 	if _, _, err := parseLegacyV3Line(line); err == nil {
 		t.Fatal("v3 parser accepted a v4 row and could silently discard deletion state")
+	}
+	if _, _, err := parseLegacyV4Line(line); err == nil {
+		t.Fatal("v4 parser accepted a v5 row and could silently discard identity quarantine state")
 	}
 }

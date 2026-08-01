@@ -29,8 +29,12 @@ import (
 
 // passwdPath is the account database; overridable in tests.
 var passwdPath = "/etc/passwd"
+var groupPath = "/etc/group"
+var loginDefsPath = "/etc/login.defs"
 
 const maxLocalPasswdBytes = 64 << 20
+const maxLocalGroupBytes = 64 << 20
+const maxLoginDefsBytes = 1 << 20
 
 var (
 	// ErrAccountCreationNotStarted marks failures that happened before useradd was
@@ -133,6 +137,107 @@ func readPasswdDatabase(path string, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s exceeds %d-byte limit", path, maxBytes)
 	}
 	return b, nil
+}
+
+// IdentityAllocationRange returns the first numeric identity above every local
+// UID and GID in the ordinary login.defs account range, plus that range's upper
+// bound. The registry's durable high-water mark is applied separately, under its
+// own lock, immediately before useradd.
+func IdentityAllocationRange() (minimum, maximum int, err error) {
+	uidMin, uidMax, gidMin, gidMax, err := loginIdentityBounds()
+	if err != nil {
+		return 0, 0, err
+	}
+	lower := uidMin
+	if gidMin > lower {
+		lower = gidMin
+	}
+	upper := uidMax
+	if gidMax < upper {
+		upper = gidMax
+	}
+	if !validate.AccountID(lower) || !validate.AccountID(upper) || lower > upper {
+		return 0, 0, fmt.Errorf("UID/GID allocation ranges do not overlap safely")
+	}
+	highest := lower - 1
+	passwd, err := readPasswdDatabase(passwdPath, maxLocalPasswdBytes)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read passwd database for identity allocation: %w", err)
+	}
+	for i, line := range strings.Split(string(passwd), "\n") {
+		if line == "" {
+			continue
+		}
+		pw, err := parsePasswdEntry(line)
+		if err != nil {
+			return 0, 0, fmt.Errorf("scan passwd identity at line %d: %w", i+1, err)
+		}
+		for _, id := range []int{pw.UID, pw.GID} {
+			if id >= lower && id <= upper && id > highest {
+				highest = id
+			}
+		}
+	}
+	groups, err := readPasswdDatabase(groupPath, maxLocalGroupBytes)
+	if err != nil {
+		return 0, 0, fmt.Errorf("read group database for identity allocation: %w", err)
+	}
+	for i, line := range strings.Split(string(groups), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) != 4 || parts[0] == "" {
+			return 0, 0, fmt.Errorf("malformed group entry at line %d", i+1)
+		}
+		gid, parseErr := strconv.Atoi(parts[2])
+		if parseErr != nil || !validate.KernelID(gid) {
+			return 0, 0, fmt.Errorf("malformed group GID at line %d", i+1)
+		}
+		if gid >= lower && gid <= upper && gid > highest {
+			highest = gid
+		}
+	}
+	if highest >= upper {
+		return 0, 0, fmt.Errorf("UID/GID allocation range %d..%d is exhausted", lower, upper)
+	}
+	return highest + 1, upper, nil
+}
+
+func loginIdentityBounds() (uidMin, uidMax, gidMin, gidMax int, err error) {
+	uidMin, uidMax, gidMin, gidMax = 1000, 60000, 1000, 60000
+	b, err := readPasswdDatabase(loginDefsPath, maxLoginDefsBytes)
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("read login.defs: %w", err)
+	}
+	values := map[string]*int{
+		"UID_MIN": &uidMin, "UID_MAX": &uidMax, "GID_MIN": &gidMin, "GID_MAX": &gidMax,
+	}
+	seen := make(map[string]bool)
+	for i, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSpace(strings.SplitN(raw, "#", 2)[0])
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		dst, wanted := values[fields[0]]
+		if !wanted {
+			continue
+		}
+		if len(fields) != 2 || seen[fields[0]] {
+			return 0, 0, 0, 0, fmt.Errorf("invalid or duplicate %s at login.defs line %d", fields[0], i+1)
+		}
+		value, parseErr := strconv.Atoi(fields[1])
+		if parseErr != nil || !validate.AccountID(value) {
+			return 0, 0, 0, 0, fmt.Errorf("invalid %s at login.defs line %d", fields[0], i+1)
+		}
+		*dst = value
+		seen[fields[0]] = true
+	}
+	return uidMin, uidMax, gidMin, gidMax, nil
 }
 
 // Exists reports whether name is a local account.
@@ -490,7 +595,7 @@ func (m *Manager) Create(name, shell, generation string) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.create(name, shell, gecos, true)
+	_, err = m.create(name, shell, gecos, true, 0)
 	return err
 }
 
@@ -503,7 +608,7 @@ func (m *Manager) CreatePending(name, shell, generation string) error {
 	if err != nil {
 		return err
 	}
-	_, err = m.create(name, shell, gecos, true)
+	_, err = m.create(name, shell, gecos, true, 0)
 	return err
 }
 
@@ -516,7 +621,21 @@ func (m *Manager) CreatePendingIdentity(name, shell, generation string) (Passwd,
 	if err != nil {
 		return Passwd{}, err
 	}
-	return m.create(name, shell, gecos, false)
+	return m.create(name, shell, gecos, false, 0)
+}
+
+// CreatePendingIdentityWithID creates the pending account with an explicitly
+// reserved UID/GID pair. -U makes the private group deterministic; the complete
+// passwd snapshot is rejected unless both numeric identities equal reservedID.
+func (m *Manager) CreatePendingIdentityWithID(name, shell, generation string, reservedID int) (Passwd, error) {
+	if !validate.AccountID(reservedID) {
+		return Passwd{}, fmt.Errorf("%w: invalid reserved UID/GID %d", ErrAccountCreationNotStarted, reservedID)
+	}
+	gecos, err := pendingGECOSForGeneration(generation)
+	if err != nil {
+		return Passwd{}, err
+	}
+	return m.create(name, shell, gecos, false, reservedID)
 }
 
 var managedHomeRoot = "/home"
@@ -536,7 +655,7 @@ func DefaultHome(name string) (string, error) {
 	return managedHome(name), nil
 }
 
-func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Passwd, error) {
+func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool, reservedID int) (Passwd, error) {
 	if err := validateMutationName(name); err != nil {
 		return Passwd{}, fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
 	}
@@ -566,13 +685,30 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Pass
 		// depends on a later chage/usermod call for its initial login gate. -M also
 		// prevents /etc/skel (including any locally provisioned SSH credential) from
 		// being copied before the selected UID has been proved idle.
-		err = m.Runner.Run("useradd", "-M", "-d", home, "-s", shell, "-c", gecos,
-			"-e", expiredDate, "-p", initialLockedPasswordHash, name)
+		args := []string{"-M", "-d", home, "-s", shell, "-c", gecos,
+			"-e", expiredDate, "-p", initialLockedPasswordHash}
+		if reservedID > 0 {
+			id := strconv.Itoa(reservedID)
+			// Pin the private-group allocator to the same already-reserved number.
+			// -U normally prefers UID==GID, but login.defs gaps and concurrent local
+			// administration can otherwise make that an implementation detail. The
+			// post-create passwd check remains authoritative.
+			args = append(args, "-U", "-u", id, "-K", "GID_MIN="+id, "-K", "GID_MAX="+id)
+		}
+		args = append(args, name)
+		err = m.Runner.Run("useradd", args...)
 	default:
 		return Passwd{}, fmt.Errorf("%w: useradd not available", ErrAccountCreationNotStarted)
 	}
 	if err != nil {
-		return Passwd{}, err
+		pw, exists, lookupErr := m.lookup(name)
+		if lookupErr != nil {
+			return Passwd{}, errors.Join(err, fmt.Errorf("inspect account after failed useradd: %w", lookupErr))
+		}
+		if !exists {
+			return Passwd{}, fmt.Errorf("%w: useradd failed without creating an account: %v", ErrAccountCreationNotStarted, err)
+		}
+		return pw, fmt.Errorf("useradd reported failure after creating an account: %w", err)
 	}
 
 	// useradd chooses a numeric UID automatically. A process left behind after an
@@ -596,6 +732,10 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool) (Pass
 			fmt.Errorf("newly created account %s has no safe local UID/GID", name),
 			fmt.Errorf("account was retained for manual recovery because identity %d:%d is unsafe", pw.UID, pw.GID),
 		)
+	}
+	if reservedID > 0 && (pw.UID != reservedID || pw.GID != reservedID) {
+		return pw, fmt.Errorf("newly created account received identity %d:%d, want reserved %d:%d; account retained for rollback or manual recovery",
+			pw.UID, pw.GID, reservedID, reservedID)
 	}
 	if pw.Name != name || pw.Home != home || pw.Shell != shell || gecosFullName(pw.GECOS) != gecos {
 		return Passwd{}, fmt.Errorf("newly created account identity does not match the requested name, home, shell, and marker; account retained for manual recovery")

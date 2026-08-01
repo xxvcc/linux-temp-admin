@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
@@ -63,6 +64,9 @@ func (a *App) status(args []string) int {
 				if rec.AutoUnit != "" {
 					a.printf("auto-revoke unit=%s", rec.AutoUnit)
 				}
+				if rec.QuarantineUntil != "" {
+					a.printf("quarantine-until=%s unit=%s", rec.QuarantineUntil, rec.QuarantineUnit)
+				}
 				return 0
 			}
 			a.errorf("%s", a.P.M("用户不存在："+u, "user does not exist: "+u))
@@ -76,6 +80,8 @@ func (a *App) status(args []string) int {
 				managed, identity = true, "generation-bound"
 			case registeredRecoveryBound:
 				identity = "deletion-recovery-bound"
+			case registeredQuarantine:
+				identity = "quarantined"
 			case registeredRecoveryManual:
 				identity = "deletion-recovery-manual"
 			case registeredLegacyIdentity:
@@ -96,6 +102,9 @@ func (a *App) status(args []string) int {
 			pw.Name, pw.UID, pw.GID, pw.Home, pw.Shell, managed, identity)
 		if found && rec.AutoUnit != "" {
 			a.printf("auto-revoke unit=%s", rec.AutoUnit)
+		}
+		if found && rec.QuarantineUntil != "" {
+			a.printf("quarantine-until=%s unit=%s", rec.QuarantineUntil, rec.QuarantineUnit)
 		}
 		return 0
 	}
@@ -165,6 +174,8 @@ func (a *App) userCells(r registry.Record) []string {
 		state = a.P.M("删除后恢复", "post-delete recovery")
 	case registeredRecoveryBound:
 		state = a.P.M("删除恢复（可续删）", "deletion recovery (bound retry)")
+	case registeredQuarantine:
+		state = a.P.M("已撤权，隔离待删", "access revoked; quarantined")
 	case registeredRecoveryManual:
 		state = a.P.M("删除恢复（需人工）", "deletion recovery (manual)")
 	case registeredPending:
@@ -280,6 +291,7 @@ const (
 	registeredUnknown
 	registeredRecoveryAbsent
 	registeredRecoveryBound
+	registeredQuarantine
 	registeredRecoveryManual
 	registeredPending
 	registeredIdentityUnverified
@@ -296,6 +308,8 @@ func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool,
 		return registeredUnknown
 	case rec.DeletionStarted && !exists:
 		return registeredRecoveryAbsent
+	case rec.QuarantineUntil != "" && rec.DeletionStarted && rec.IdentityBound && deletionRecordMatchesPasswd(rec, pw):
+		return registeredQuarantine
 	case rec.DeletionStarted && rec.IdentityBound && deletionRecordMatchesPasswd(rec, pw):
 		return registeredRecoveryBound
 	case rec.DeletionStarted:
@@ -422,7 +436,15 @@ func (a *App) manageUsers() int {
 		}
 		name = recs[n-1].User
 	}
-	return a.revoke([]string{"--user", name})
+	args := []string{"--user", name}
+	if rec, found, err := a.Registry.Lookup(name); err == nil && found && rec.Pending {
+		// Pending recovery is still protected by the direct TTY, full-name prompt,
+		// generation/GECOS/UID/Home checks, and manual-invocation gate. Supplying
+		// --force here makes the menu's advertised revoke action usable without
+		// weakening any of those checks.
+		args = append(args, "--force")
+	}
+	return a.revoke(args)
 }
 
 func (a *App) cleanupExpired(args []string) int {
@@ -487,7 +509,7 @@ func (a *App) accountIsOursAndLive(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
-	return state == registeredActive || state == registeredLegacyIdentity, nil
+	return state == registeredActive || state == registeredQuarantine || state == registeredLegacyIdentity, nil
 }
 
 // accountNeedsAutoRevoke reports whether a managed auto-revoke task must be
@@ -509,7 +531,7 @@ func (a *App) accountNeedsAutoRevoke(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
-	return state == registeredActive || state == registeredRecoveryAbsent ||
+	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryAbsent ||
 		state == registeredRecoveryBound, nil
 }
 
@@ -537,7 +559,7 @@ func (a *App) completedAccountIdentity(name string) (ours, live bool, err error)
 		return false, true, nil
 	}
 	state := classifyRegisteredAccount(rec, pw, true, nil)
-	return state == registeredActive || state == registeredRecoveryBound, true, nil
+	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryBound, true, nil
 }
 
 // installedCommandVersion best-effort reads the version of the binary at
@@ -855,6 +877,10 @@ func (a *App) doctor(args []string) int {
 						"活账号与已持久化的删除世代精确匹配；这是可重试的中断删除，请运行 revoke 完成：",
 						"the live account exactly matches a durably started deletion generation; this interrupted deletion can be retried with revoke: "), rec.User)
 					rc = 1
+				case registeredQuarantine:
+					a.info(a.P.M(
+						"账号访问已撤销，用户名和 UID 正隔离至 "+rec.QuarantineUntil+"，之后由持久化任务完成删除：",
+						"account access is revoked; its name and UID are quarantined until "+rec.QuarantineUntil+" and a persistent task will then finish deletion: ") + rec.User)
 				case registeredRecoveryManual:
 					a.warnf("%s%s", a.P.M(
 						"活账号的删除恢复见证未绑定当前世代或已不匹配；自动删除、--yes 和卸载批量删除均被拒绝。人工核查后，请直接运行 revoke --force 并输入完整用户名：",
@@ -982,12 +1008,30 @@ func (a *App) doctor(args []string) int {
 	// is not health: a stale unit/job can target another account generation, and a
 	// modified service body can run something else entirely.
 	if a.Scheduler != nil && a.Registry != nil && registryReadable {
-		var stranded []string
+		var strandedAuto, strandedQuarantine []string
 		for _, r := range registryRecords {
-			exists, existsErr := user.Exists(r.User)
+			_, exists, existsErr := a.lookupUser(r.User)
 			if existsErr != nil {
 				a.warnf("%s %s: %v", a.P.M("无法确认账号状态：", "cannot determine account state:"), r.User, existsErr)
 				rc = 1
+				continue
+			}
+			if r.QuarantineUntil != "" && exists {
+				deadline, parseErr := time.Parse(time.RFC3339, r.QuarantineUntil)
+				if parseErr != nil {
+					a.warnf("%s %s: %v", a.P.M("无法验证身份隔离任务：", "cannot verify identity-quarantine task:"), r.User, parseErr)
+					rc = 1
+					continue
+				}
+				valid, err := a.Scheduler.ValidQuarantine(r.User, r.UID, r.Generation, r.QuarantineUnit, deadline)
+				if err != nil {
+					a.warnf("%s %s: %v", a.P.M("无法验证身份隔离任务：", "cannot verify identity-quarantine task:"), r.User, err)
+					rc = 1
+					continue
+				}
+				if !valid {
+					strandedQuarantine = append(strandedQuarantine, r.User)
+				}
 				continue
 			}
 			if !r.AutoRevoke || !exists {
@@ -1000,16 +1044,27 @@ func (a *App) doctor(args []string) int {
 				continue
 			}
 			if !valid {
-				stranded = append(stranded, r.User)
+				strandedAuto = append(strandedAuto, r.User)
 			}
 		}
-		if len(stranded) > 0 {
-			for _, u := range stranded {
+		if len(strandedAuto) > 0 {
+			for _, u := range strandedAuto {
 				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无可验证的对应任务（任务必须匹配 UID、世代、记录的 unit 和正文；chage 仅提供按天粒度的较晚兜底锁定）：",
 					"account set to auto-delete but has no valid task left to do it (the UID, generation, recorded unit, and body must all match; chage only provides a later, day-granularity lockout backstop): "), u)
 			}
 			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
 				"remove them with `revoke --user <name>` once expired."))
+			rc = 1
+		}
+		if len(strandedQuarantine) > 0 {
+			for _, u := range strandedQuarantine {
+				a.warnf("%s%s", a.P.M(
+					"账号访问已撤销且身份仍在隔离，但已无可验证的后台终删任务（任务必须匹配 UID、世代、隔离截止时间、记录的 unit 和正文）：",
+					"account access is revoked and its identity remains quarantined, but no valid background finalizer remains (the UID, generation, quarantine deadline, recorded unit, and body must all match): "), u)
+			}
+			a.warnf("%s", a.P.M(
+				"请运行 `revoke --user <名>`；隔离截止时间已到时会立即续删，尚未到时会确认账号仍保持禁用。",
+				"run `revoke --user <name>`; after the quarantine deadline it resumes deletion immediately, and before the deadline it reconfirms that access remains disabled."))
 			rc = 1
 		}
 	}

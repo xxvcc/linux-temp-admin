@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,9 +23,10 @@ type orderedTeardownRunner struct {
 
 type revokeTestScheduleSystem struct {
 	removeAtCalls *int
+	hasSystemctl  bool
 }
 
-func (revokeTestScheduleSystem) HasSystemctl() bool                           { return false }
+func (s revokeTestScheduleSystem) HasSystemctl() bool                         { return s.hasSystemctl }
 func (revokeTestScheduleSystem) Systemctl(...string) error                    { return nil }
 func (revokeTestScheduleSystem) HasAt() bool                                  { return true }
 func (revokeTestScheduleSystem) ScheduleAt(string, time.Time) (string, error) { return "1", nil }
@@ -436,6 +438,158 @@ func TestInteractivePendingCreationRecoveryPersistsUIDWitnessBeforeUserdel(t *te
 	if found, err := a.Registry.Contains(username); err != nil || found {
 		t.Fatalf("completed pending recovery witness: found=%v err=%v", found, err)
 	}
+}
+
+func TestInteractivePendingRecoveryReturnsAfterDurableIdentityQuarantine(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-pendingq"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	pw := user.Passwd{
+		Name: username, UID: 1001, GID: 1001,
+		GECOS: config.PendingGenerationGECOSPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+	rec := registry.Record{
+		User: username, Generation: generation, IdentityBound: true, Pending: true, Port: 22,
+	}
+	a, _, _ := newTestApp(t, "")
+	a.StdinIsTTY = func() bool { return true }
+	setTestRegistryRecord(t, a, rec)
+
+	present := true
+	events := []string{}
+	lookup := func(string) (user.Passwd, bool, error) {
+		if !present {
+			return user.Passwd{}, false, nil
+		}
+		return pw, true, nil
+	}
+	runner := &orderedTeardownRunner{events: &events, present: &present}
+	a.Users = &user.Manager{
+		Runner: runner, LookupUser: lookup,
+		NameInUse:         func(string) (bool, error) { return false, nil },
+		RemoveManagedMail: func(user.Passwd) error { events = append(events, "mail"); return nil },
+		RemoveManagedHome: func(user.Passwd) error { events = append(events, "home"); return nil },
+	}
+	a.LookupUser = lookup
+	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
+	a.ClearScheduledJobs = func(string, int) error { events = append(events, "clear"); return nil }
+	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
+	now := time.Date(2026, 8, 1, 12, 0, 1, 0, time.UTC)
+	a.Now = func() time.Time { return now }
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: t.TempDir() + "/linux-temp-admin",
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now,
+		Sys: revokeTestScheduleSystem{hasSystemctl: true},
+	}
+	ensureCalls := 0
+	a.EnsureScheduledCommand = func() error {
+		ensureCalls++
+		return nil
+	}
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, force: true, manualInvocation: true, liveConfirmed: true,
+	}); rc != 0 {
+		t.Fatalf("pending quarantine revoke rc = %d", rc)
+	}
+	stored, found, err := a.Registry.Lookup(username)
+	if err != nil || !found || !stored.Pending || !stored.DeletionStarted || stored.UID != pw.UID ||
+		stored.QuarantineUnit != config.QuarantineUnitPrefix+username {
+		t.Fatalf("pending quarantine state: found=%v rec=%+v err=%v", found, stored, err)
+	}
+	if !present || strings.Contains(strings.Join(events, ","), "drain") || strings.Contains(strings.Join(events, ","), "userdel") {
+		t.Fatalf("foreground pending revoke did not return in quarantine: present=%v events=%v", present, events)
+	}
+	if ensureCalls != 1 {
+		t.Fatalf("stable finalizer command preflight calls = %d, want 1", ensureCalls)
+	}
+	if got := strings.Join(events, ","); !strings.Contains(got, "kill,clear,kill,clear") {
+		t.Fatalf("immediate quarantine cleanup missed its final queue pass: %v", events)
+	}
+
+	deadline, err := time.Parse(time.RFC3339, stored.QuarantineUntil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduled := revokeOptions{
+		username: username, yes: true, force: true, confirmForce: username,
+		expectedUID: pw.UID, generation: generation,
+	}
+	now = deadline.Add(-time.Second)
+	if rc := a.revokeOptionsLocked(scheduled); rc != 0 || !present {
+		t.Fatalf("pre-deadline finalizer rc=%d present=%v", rc, present)
+	}
+	now = deadline.Add(time.Second)
+	if rc := a.revokeOptionsLocked(scheduled); rc != 0 || present {
+		t.Fatalf("mature finalizer rc=%d present=%v events=%v", rc, present, events)
+	}
+	if found, err := a.Registry.Contains(username); err != nil || found {
+		t.Fatalf("mature quarantine retained registry: found=%v err=%v", found, err)
+	}
+	for _, suffix := range []string{".service", ".timer"} {
+		path := filepath.Join(a.Scheduler.SystemdDir, config.QuarantineUnitPrefix+username+suffix)
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("mature quarantine retained %s: %v", path, err)
+		}
+	}
+}
+
+func TestRevokeFallsBackToSynchronousDeletionWhenFinalizerCommandIsUnavailable(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-commandq"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	pw := user.Passwd{
+		Name: username, UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+	a, _, _ := newTestApp(t, "")
+	ordered, events, present := newOrderedTeardownApp(t, pw, 0, nil)
+	a.Users = ordered.Users
+	a.LookupUser = ordered.LookupUser
+	a.ClearScheduledJobs = ordered.ClearScheduledJobs
+	a.DrainScheduledJobs = ordered.DrainScheduledJobs
+	a.TerminateProcesses = ordered.TerminateProcesses
+	a.StdinIsTTY = func() bool { return true }
+	setTestRegistryRecord(t, a, registry.Record{
+		User: username, UID: pw.UID, Port: 22, Generation: generation, IdentityBound: true,
+	})
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: t.TempDir() + "/linux-temp-admin",
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: time.Now,
+		Sys: revokeTestScheduleSystem{hasSystemctl: true},
+	}
+	preflightErr := errors.New("installed command is missing")
+	a.EnsureScheduledCommand = func() error { return preflightErr }
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, manualInvocation: true, liveConfirmed: true,
+	}); rc != 0 {
+		t.Fatalf("synchronous fallback revoke rc = %d", rc)
+	}
+	if *present {
+		t.Fatal("synchronous fallback retained the account")
+	}
+	if got := strings.Join(*events, ","); !strings.Contains(got, "drain") || !strings.Contains(got, "userdel") {
+		t.Fatalf("synchronous fallback events = %v, want drain and userdel", *events)
+	}
+	if found, err := a.Registry.Contains(username); err != nil || found {
+		t.Fatalf("synchronous fallback retained registry row: found=%v err=%v", found, err)
+	}
+}
+
+func TestImmediateQuiescenceEndsWithASecondQueueSweep(t *testing.T) {
+	pw := user.Passwd{Name: "xxvcc-immediate", UID: 1001, GID: 1001, Home: "/home/xxvcc-immediate", Shell: "/bin/sh"}
+	a, events, _ := newOrderedTeardownApp(t, pw, 0, nil)
+	if err := a.quiesceScheduledAccountImmediate(pw.Name, pw); err != nil {
+		t.Fatal(err)
+	}
+	requireTeardownEvents(t, *events, "kill", "clear", "kill", "clear")
 }
 
 func TestUnregisteredDeletionWitnessWriteFailureBlocksUserdel(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -101,6 +102,39 @@ func TestValidScheduleAcceptsExactRootOwnedSystemdPair(t *testing.T) {
 	}
 	if !valid {
 		t.Fatal("exact root-owned systemd pair was reported invalid")
+	}
+}
+
+func TestValidQuarantineRequiresExactNamespaceIdentityAndDeadline(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("valid systemd schedule files must be root-owned")
+	}
+	dir := t.TempDir()
+	sys := &fakeSystem{}
+	s := newScheduler(dir, sys)
+	deadline := s.Now().Add(2 * time.Minute)
+	q := *s
+	q.UnitPrefix = config.QuarantineUnitPrefix
+	writeSchedulePair(t, &q, "xxvcc-a1", 1001, testGeneration, deadline)
+	unit := q.UnitName("xxvcc-a1")
+	valid, err := s.ValidQuarantine("xxvcc-a1", 1001, testGeneration, unit, deadline)
+	if err != nil || !valid {
+		t.Fatalf("ValidQuarantine exact pair = %v, %v", valid, err)
+	}
+	for _, tc := range []struct {
+		uid      int
+		unit     string
+		deadline time.Time
+	}{
+		{uid: 1002, unit: unit, deadline: deadline},
+		{uid: 1001, unit: s.UnitName("xxvcc-a1"), deadline: deadline},
+		{uid: 1001, unit: unit, deadline: deadline.Add(time.Minute)},
+		{uid: 1001, unit: unit, deadline: s.Now()},
+	} {
+		valid, err := s.ValidQuarantine("xxvcc-a1", tc.uid, testGeneration, tc.unit, tc.deadline)
+		if err != nil || valid {
+			t.Fatalf("mismatched quarantine accepted: %+v valid=%v err=%v", tc, valid, err)
+		}
 	}
 }
 

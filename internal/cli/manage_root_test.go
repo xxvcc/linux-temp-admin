@@ -184,7 +184,7 @@ func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
 		return "abcdef0123", nil
 	}
 
-	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}); rc != 1 {
+	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}, false); rc != 1 {
 		t.Fatalf("runInvite rc=%d, want preflight failure", rc)
 	}
 	if found, err := a.Registry.Contains(username); err != nil || found {
@@ -219,10 +219,19 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 		Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
 	}
 	a.Users = &user.Manager{
-		Runner:             failedCreateRunner{},
+		Runner: failedCreateRunner{},
+		LookupUser: func(string) (user.Passwd, bool, error) {
+			return user.Passwd{
+				Name: username, UID: 4242, GID: 4242,
+				GECOS: config.PendingGenerationGECOSPrefix + "0123456789abcdef0123456789abcdef",
+				Home:  "/home/" + username, Shell: resolveShell(),
+			}, true, nil
+		},
 		PrepareManagedHome: func(string) error { return nil },
 		CreateManagedHome:  func(user.Passwd) error { return nil },
 	}
+	a.LookupUser = a.Users.LookupUser
+	a.IdentityAllocationRange = func() (int, int, error) { return 4242, 4242, nil }
 	createdAt := time.Date(2026, 7, 7, 12, 34, 59, 0, time.FixedZone("test", 8*60*60))
 	clockCalls := 0
 	a.Now = func() time.Time {
@@ -240,14 +249,14 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 		return "abcdef0123", nil
 	}
 
-	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}); rc != 1 {
+	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}, false); rc != 1 {
 		t.Fatalf("runInvite rc=%d, want helper failure", rc)
 	}
 	rec, found, err := a.Registry.Lookup(username)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !found || !rec.Pending || rec.UID != 0 || !rec.IdentityBound {
+	if !found || !rec.Pending || rec.UID != 4242 || !rec.IdentityBound || !rec.SequentialID {
 		t.Fatalf("pending recovery witness was removed after ambiguous helper failure: found=%v rec=%+v", found, rec)
 	}
 	if clockCalls != 1 {
@@ -332,6 +341,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 		RemoveManagedHome: func(user.Passwd) error { return nil },
 	}
 	a.LookupUser = runner.lookup
+	a.IdentityAllocationRange = func() (int, int, error) { return uid, uid, nil }
 
 	t0 := time.Date(2026, 7, 7, 12, 0, 0, 0, time.FixedZone("test", 8*60*60))
 	t1 := t0.Add(65 * time.Second)
@@ -376,7 +386,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
-	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, true, loginPlan{password: true, verified: true}); rc != 1 {
+	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{password: true, verified: true}, false); rc != 1 {
 		t.Fatalf("runInvite rc = %d, want injected credential failure", rc)
 	}
 	if !strings.Contains(errb.String(), stopErr.Error()) {
@@ -402,6 +412,114 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	}
 	if beforeDrainClockCalls != 1 || afterDrainClockCalls != 1 {
 		t.Fatalf("clock calls before/after drain = %d/%d, want 1/1", beforeDrainClockCalls, afterDrainClockCalls)
+	}
+}
+
+func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
+	const (
+		generation = "0123456789abcdef0123456789abcdef"
+		uid        = 4_000_010
+	)
+	migratedAt := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name      string
+		now       time.Time
+		wantDrain bool
+	}{
+		{name: "inside migration isolation window", now: migratedAt, wantDrain: true},
+		{name: "after migration isolation window", now: migratedAt.Add(65 * time.Second), wantDrain: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			username := "xxvcc-migrate1"
+			if _, exists, err := user.Lookup(username); err != nil {
+				t.Fatal(err)
+			} else if exists {
+				t.Fatalf("test username %s already exists", username)
+			}
+
+			baseDir := rootOwnedDir(t)
+			regDir := filepath.Join(baseDir, "registry")
+			if err := os.Mkdir(regDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			store := &registry.Store{
+				Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+				Now: func() time.Time { return migratedAt },
+			}
+			if err := os.WriteFile(store.File, []byte("# linux-temp-admin registry v4\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Init(); err != nil {
+				t.Fatal(err)
+			}
+			store.Now = func() time.Time { return tc.now }
+
+			a, out, errb := newTestApp(t, "")
+			a.Registry = store
+			a.Scheduler = &schedule.Scheduler{
+				SystemdDir: filepath.Join(baseDir, "systemd"), InstallPath: filepath.Join(baseDir, "linux-temp-admin"),
+				UnitPrefix: config.AutoRevokeUnitPrefix, Sys: fakeSys{},
+			}
+			events := []string{}
+			runner := &inviteTimingRunner{
+				account: user.Passwd{UID: uid, GID: uid}, events: &events, registry: store,
+			}
+			a.Users = &user.Manager{
+				Runner:             runner,
+				LookupUser:         runner.lookup,
+				PrepareManagedHome: func(string) error { return nil },
+				CreateManagedHome: func(user.Passwd) error {
+					events = append(events, "home")
+					return errors.New("stop after identity isolation check")
+				},
+				RemoveManagedMail: func(user.Passwd) error { return nil },
+				RemoveManagedHome: func(user.Passwd) error { return nil },
+			}
+			a.LookupUser = runner.lookup
+			a.IdentityAllocationRange = func() (int, int, error) { return uid, uid, nil }
+			a.Now = func() time.Time { return tc.now }
+			a.Scheduler.Now = a.Now
+			a.ClearScheduledJobs = func(string, int) error {
+				events = append(events, "clear")
+				return nil
+			}
+			a.TerminateProcesses = func(int) error {
+				events = append(events, "kill")
+				return nil
+			}
+			a.DrainScheduledJobs = func() error {
+				events = append(events, "drain")
+				return nil
+			}
+			a.RandHex = func(n int) (string, error) {
+				if n != 16 {
+					return "", fmt.Errorf("unexpected random byte count %d", n)
+				}
+				return generation, nil
+			}
+			a.RandPassword = func(int) (string, error) { return "password-for-migration-test", nil }
+			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
+			}
+
+			if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false,
+				loginPlan{password: true, verified: true}, true); rc != 1 {
+				t.Fatalf("runInviteWithIdentityPolicy rc=%d, want injected Home failure", rc)
+			}
+			joinedEvents := strings.Join(events, ",")
+			drainAt, homeAt := strings.Index(joinedEvents, "drain"), strings.Index(joinedEvents, "home")
+			drainedBeforeHome := drainAt >= 0 && homeAt >= 0 && drainAt < homeAt
+			if drainedBeforeHome != tc.wantDrain {
+				t.Fatalf("pre-Home drain called=%v, want %v; events=%v; stderr=%q", drainedBeforeHome, tc.wantDrain, events, errb.String())
+			}
+			if tc.wantDrain && !strings.Contains(out.String(), "one-time isolation window") {
+				t.Fatalf("migration wait was not explained: %q", out.String())
+			}
+			if strings.Contains(errb.String(), "rollback did not complete") {
+				t.Fatalf("injected failure left incomplete rollback: %q", errb.String())
+			}
+		})
 	}
 }
 
@@ -462,6 +580,7 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 		RemoveManagedHome: func(user.Passwd) error { return nil },
 	}
 	a.LookupUser = runner.lookup
+	a.IdentityAllocationRange = func() (int, int, error) { return uid, uid, nil }
 	a.ClearScheduledJobs = func(string, int) error { events = append(events, "clear"); return nil }
 	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
@@ -470,7 +589,7 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
-	if rc := a.runInvite(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}); rc != 0 {
+	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}, false); rc != 0 {
 		t.Fatalf("permanent runInvite rc = %d: %s", rc, errb.String())
 	}
 	want := "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
