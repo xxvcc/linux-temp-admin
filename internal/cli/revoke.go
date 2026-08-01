@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
+
+var errPersistentQuarantineUnavailable = errors.New("persistent identity quarantine unavailable")
 
 func (a *App) revoke(args []string) int {
 	if !a.requireRoot() {
@@ -83,15 +86,18 @@ func (a *App) revoke(args []string) int {
 }
 
 type revokeOptions struct {
-	username          string
-	confirmForce      string
-	expectedUID       int
-	generation        string
-	yes               bool
-	force             bool
-	liveConfirmed     bool
-	manualInvocation  bool
-	confirmedIdentity *revokeIdentitySnapshot
+	username         string
+	confirmForce     string
+	expectedUID      int
+	generation       string
+	yes              bool
+	force            bool
+	liveConfirmed    bool
+	manualInvocation bool
+	// synchronousFinalization is used only by uninstall, which cannot remove the
+	// installed finalizer while an account still depends on it.
+	synchronousFinalization bool
+	confirmedIdentity       *revokeIdentitySnapshot
 }
 
 // revokeIdentitySnapshot binds an interactive full-name confirmation to the
@@ -147,6 +153,7 @@ func (a *App) revokeLocked(args []string) int {
 		return 1
 	}
 	opts.liveConfirmed = true
+	opts.synchronousFinalization = true
 	return a.revokeOptionsLocked(opts)
 }
 
@@ -215,7 +222,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 			}
 		}
 		var cleanupErrs []error
-		if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+		if err := a.cancelAccountSchedules(username, rec); err != nil {
 			cleanupErrs = append(cleanupErrs, err)
 		}
 		if err := a.removeSudoGrant(username); err != nil {
@@ -251,7 +258,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	// generation and persists only a UID recovery witness before artifact cleanup.
 	pendingRecovery := registered && rec.Pending && pendingRecoveryAuthorized(opts, stdinTTY) &&
 		pendingCreationRecordMatchesPasswd(rec, pw)
-	if registered && rec.Pending && !pendingRecovery {
+	if registered && rec.Pending && !rec.DeletionStarted && !pendingRecovery {
 		grantCleanupErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 		cleanupErr := errors.Join(grantCleanupErr, a.Scheduler.Cancel(username, rec.AutoUnit))
 		a.errorf("%s", a.P.M(
@@ -291,6 +298,9 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	if registered && rec.DeletionStarted && rec.IdentityBound && !deletionRecordMatchesPasswd(rec, pw) {
 		protected = true
 	}
+	if registered && rec.DeletionStarted && rec.IdentityBound && deletionRecordMatchesPasswd(rec, pw) {
+		protected = false
+	}
 	if registered && rec.DeletionStarted && !rec.IdentityBound && allowLegacy {
 		protected = !uidOnlyDeletionCandidateMatches(rec, pw)
 	}
@@ -320,7 +330,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		}
 		if manualOnlyRecovery {
 			if a.Scheduler != nil {
-				if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+				if err := a.cancelAccountSchedules(username, rec); err != nil {
 					a.errorf("%s: %v", a.P.M("该恢复状态只允许人工处理，但自动删除任务未能完整解除；登记已保留，请立即人工清理任务",
 						"this recovery state is manual-only, but its auto-delete task could not be fully cancelled; the registry witness was retained; remove the task manually"), err)
 				} else {
@@ -334,6 +344,30 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		}
 		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
 		return 1
+	}
+
+	if rec.QuarantineUntil != "" {
+		deadline, parseErr := time.Parse(time.RFC3339, rec.QuarantineUntil)
+		if parseErr != nil {
+			a.errorf("%s: %v", a.P.M("隔离删除截止时间损坏，拒绝继续", "quarantine deletion deadline is corrupt; refusing to continue"), parseErr)
+			return 1
+		}
+		if a.Now().Before(deadline) && !opts.synchronousFinalization {
+			// An old expiry task may race the new quarantine finalizer. Reassert the
+			// access gates, but never release the name or UID before the durable deadline.
+			err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username), a.Users.DisableLogin(username))
+			if err != nil {
+				a.errorf("%s: %v", a.P.M("账号处于身份隔离期，但无法重新确认全部访问门已关闭", "the account is quarantined, but not every access gate could be reconfirmed closed"), err)
+				return 1
+			}
+			a.info(a.P.M("账号访问已撤销，用户名和 UID 隔离保留至：", "account access is revoked; name and UID remain quarantined until: ") + deadline.Local().Format("2006-01-02 15:04:05 MST"))
+			return 0
+		}
+		if a.Now().Before(deadline) {
+			a.info(a.P.M(
+				"卸载必须在移除命令前完成账号删除；将同步等待一个任务轮询周期后释放隔离身份。",
+				"uninstall must finish account deletion before removing the command; waiting one deferred-job polling cycle before releasing the quarantined identity."))
+		}
 	}
 
 	// Removing grants and reloading sshd can take long enough for an out-of-band
@@ -391,12 +425,45 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		return 1
 	}
 
+	// A completed generation-bound account can hand deletion to a persistent
+	// systemd quarantine. The live but disabled passwd entry holds both its name and
+	// numeric identity for one full deferred-job cycle, so the invoking terminal
+	// does not have to wait. Legacy/pending recovery and hosts without reliable
+	// systemd retain the synchronous fail-closed path below.
+	if registered && rec.IdentityBound && !rec.DeletionStarted && (!rec.Pending || pendingRecovery) &&
+		(opts.manualInvocation || opts.generation != "") {
+		started, quarantineErr := a.beginIdentityQuarantine(rec, pw)
+		if started {
+			if quarantineErr != nil {
+				a.warnf("%s: %v", a.P.M("身份隔离已建立，但旧自动删除任务清理未完整确认", "identity quarantine is active, but cleanup of the old auto-delete task was not fully confirmed"), quarantineErr)
+			}
+			a.audit("account.quarantine", username, "ok", "access revoked; identity held for asynchronous deletion", nil)
+			return 0
+		}
+		if quarantineErr != nil && !errors.Is(quarantineErr, errPersistentQuarantineUnavailable) {
+			a.errorf("%s: %v", a.P.M("无法安全建立身份隔离；账号已禁用并保留", "cannot safely establish identity quarantine; the account is disabled and retained"), quarantineErr)
+			return 1
+		}
+		if quarantineErr != nil {
+			a.info(a.P.M("持久化身份隔离不可用；将同步等待约 65 秒后完成删除。", "persistent identity quarantine is unavailable; waiting about 65 seconds to finish deletion synchronously."))
+		}
+	}
+
 	// Shut the door before taking the account apart. Until both expiry and password
 	// locking land, the account may still be SSH-reachable: in particular, a failed
 	// chage leaves public-key login open even when usermod -L succeeded. Never create
 	// a scan-then-delete race by continuing from a partial disable.
 	persistDeletion := func() error { return a.persistDeletionStarted(rec, registered, pw) }
-	stage, teardownErr := a.teardownLocalAccount(username, pw, persistDeletion)
+	teardown := a.teardownLocalAccount
+	if rec.QuarantineUntil != "" && !opts.synchronousFinalization {
+		teardown = a.teardownQuarantinedAccount
+	} else if rec.QuarantineUntil != "" {
+		deadline, _ := time.Parse(time.RFC3339, rec.QuarantineUntil)
+		if !a.Now().Before(deadline) {
+			teardown = a.teardownQuarantinedAccount
+		}
+	}
+	stage, teardownErr := teardown(username, pw, persistDeletion)
 	switch stage {
 	case revokeDisableLogin:
 		a.errorf("%s: %v", a.P.M("无法完整禁用登录；保留账号、登记和自动删除任务，未终止进程或删除账号，请立即人工处理",
@@ -422,7 +489,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	}
 
 	// Only now that the account is provably gone is the fallback safe to remove.
-	if err := a.Scheduler.Cancel(username, rec.AutoUnit); err != nil {
+	if err := a.cancelAccountSchedules(username, rec); err != nil {
 		a.errorf("%s: %v", a.P.M("用户已删除，但自动删除任务清理失败；保留登记", "user deleted, but schedule cleanup failed; keeping the registry record"), err)
 		return 1
 	}
@@ -433,6 +500,77 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(opts.force), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
 	return 0
+}
+
+// cancelAccountSchedules removes expiry and identity-quarantine tasks through
+// their separate namespaces. This does not depend on Scheduler.New having added
+// quarantine to its inventory prefixes, which keeps injected schedulers and
+// recovery paths from accidentally stranding the finalizer.
+func (a *App) cancelAccountSchedules(username string, rec registry.Record) error {
+	if a.Scheduler == nil {
+		return fmt.Errorf("scheduler is not configured")
+	}
+	return errors.Join(
+		a.Scheduler.CancelAuto(username, rec.AutoUnit),
+		a.Scheduler.CancelQuarantine(username, rec.QuarantineUnit),
+	)
+}
+
+func quarantineDeadline(now time.Time) time.Time {
+	target := now.Add(time.Duration(config.IdentityQuarantineSeconds) * time.Second).UTC()
+	minute := target.Truncate(time.Minute)
+	if target.Equal(minute) {
+		return minute
+	}
+	return minute.Add(time.Minute)
+}
+
+// beginIdentityQuarantine performs the immediate access revocation, schedules a
+// separate finalizer, and only then commits the quarantine row. The finalizer
+// namespace can coexist with a currently-running expiry service, closing the
+// schedule handoff crash window.
+func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd) (bool, error) {
+	if a.Scheduler == nil || a.Scheduler.Sys == nil || !a.Scheduler.Sys.HasSystemctl() {
+		return false, errPersistentQuarantineUnavailable
+	}
+	// The finalizer executes InstallPath, not this process. A standalone newer
+	// binary may be running while that path is absent or still contains an older
+	// release that cannot read the v5 quarantine row. Establish the same stable
+	// command guarantee used before invite schedules auto-revoke; if it cannot be
+	// proved, retain the foreground synchronous deletion path below.
+	ensureCommand := a.ensureStableInstalled
+	if a.EnsureScheduledCommand != nil {
+		ensureCommand = a.EnsureScheduledCommand
+	}
+	if err := ensureCommand(); err != nil {
+		return false, fmt.Errorf("%w: finalizer command is unavailable: %v", errPersistentQuarantineUnavailable, err)
+	}
+	if err := a.Users.DisableLogin(rec.User); err != nil {
+		return false, err
+	}
+	if err := a.accountStillMatches(rec.User, expected); err != nil {
+		return false, err
+	}
+	if err := a.quiesceScheduledAccountImmediate(rec.User, expected); err != nil {
+		return false, err
+	}
+	deadline := quarantineDeadline(a.Now())
+	unit, err := a.Scheduler.ScheduleQuarantine(rec.User, expected.UID, rec.Generation, deadline)
+	if err != nil {
+		return false, fmt.Errorf("%w: %v", errPersistentQuarantineUnavailable, err)
+	}
+	if err := a.Registry.BeginQuarantine(rec.User, expected.UID, rec.Generation, deadline, unit); err != nil {
+		cancelErr := a.Scheduler.CancelQuarantine(rec.User, unit)
+		return false, errors.Join(err, cancelErr)
+	}
+	// The quarantine timer is now the durable retry path. Failure to remove an old
+	// expiry task is non-fatal: an early duplicate invocation observes the deadline
+	// and exits without releasing the identity.
+	cleanupErr := a.Scheduler.CancelAuto(rec.User, rec.AutoUnit)
+	a.success(a.P.M(
+		"访问已撤销；账号身份隔离至 "+deadline.Local().Format("2006-01-02 15:04:05 MST")+"，届时自动完成删除。",
+		"access revoked; account identity is quarantined until "+deadline.Local().Format("2006-01-02 15:04:05 MST")+" and will then be deleted automatically."))
+	return true, cleanupErr
 }
 
 type revokeAccountStage uint8
@@ -467,6 +605,30 @@ func (a *App) teardownLocalAccount(username string, expected user.Passwd, persis
 	// account can disappear out of band at any later syscall boundary; without this
 	// witness, a failed post-disappearance mail fsync could be mistaken on retry for
 	// an ordinary stale row and discarded without completing the narrow cleanup.
+	if persistDeletion == nil {
+		return revokeDeleteAccount, fmt.Errorf("deletion recovery persistence is not configured")
+	}
+	if err := persistDeletion(); err != nil {
+		return revokeDeleteAccount, fmt.Errorf("persist deletion-started recovery state: %w", err)
+	}
+	if err := a.Users.DeleteExpected(username, expected, func() error {
+		return a.finalScheduledAccountCheck(username, expected)
+	}); err != nil {
+		return revokeDeleteAccount, err
+	}
+	return revokeAccountRemoved, nil
+}
+
+func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, persistDeletion func() error) (revokeAccountStage, error) {
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return revokeDisableLogin, err
+	}
+	if err := a.Users.DisableLogin(username); err != nil {
+		return revokeDisableLogin, err
+	}
+	if err := a.quiesceScheduledAccountImmediate(username, expected); err != nil {
+		return revokeQuiesceAccount, err
+	}
 	if persistDeletion == nil {
 		return revokeDeleteAccount, fmt.Errorf("deletion recovery persistence is not configured")
 	}
@@ -553,7 +715,8 @@ func (a *App) persistDeletionStarted(rec registry.Record, registered bool, expec
 	if registered {
 		if current.User != rec.User || current.UID != rec.UID || current.Generation != rec.Generation ||
 			current.IdentityBound != rec.IdentityBound || current.Pending != rec.Pending ||
-			current.DeletionStarted != rec.DeletionStarted {
+			current.DeletionStarted != rec.DeletionStarted || current.SequentialID != rec.SequentialID ||
+			current.QuarantineUntil != rec.QuarantineUntil || current.QuarantineUnit != rec.QuarantineUnit {
 			return fmt.Errorf("registry identity changed before deletion")
 		}
 		if current.IdentityBound {
@@ -564,7 +727,7 @@ func (a *App) persistDeletionStarted(rec registry.Record, registered bool, expec
 			if !deletionRecordMatchesPasswd(check, expected) {
 				return fmt.Errorf("account no longer matches the registry deletion identity")
 			}
-			if !current.Pending {
+			if !current.Pending || current.DeletionStarted {
 				generation = current.Generation
 			}
 		} else if !uidOnlyDeletionCandidateMatches(current, expected) {
@@ -607,9 +770,12 @@ func (a *App) releaseRegistryAfterCleanup(username string) error {
 // the passwd entry is gone: an owner-checked same-name mail spool sweep. Home is
 // intentionally excluded. Ordinary absent rows never call this function.
 func (a *App) reconcileDeletionStarted(rec registry.Record) error {
-	if !rec.DeletionStarted || rec.Pending || !validate.AccountID(rec.UID) ||
+	if !rec.DeletionStarted || !validate.AccountID(rec.UID) ||
 		(rec.IdentityBound != validate.Generation(rec.Generation)) {
 		return fmt.Errorf("incomplete deletion-started registry state")
+	}
+	if rec.Pending && (rec.QuarantineUntil == "" || !rec.IdentityBound) {
+		return fmt.Errorf("incomplete pending deletion quarantine")
 	}
 	if a.Users == nil {
 		return fmt.Errorf("account manager is not configured")
@@ -665,6 +831,42 @@ func (a *App) quiesceScheduledAccount(username string, expected user.Passwd) err
 		return errors.Join(errors.Join(firstPass...), err)
 	}
 	return nil
+}
+
+// quiesceScheduledAccountImmediate closes process/job races without waiting for
+// a daemon polling cycle. It is safe for a fresh monotonic identity and for the
+// final pass after a live passwd entry has already held an old identity through
+// the complete quarantine window.
+func (a *App) quiesceScheduledAccountImmediate(username string, expected user.Passwd) error {
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return err
+	}
+	var errs []error
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("process termination: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(errs...), err)
+	}
+	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("scheduled-job cleanup: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(errs...), err)
+	}
+	if err := a.terminateProcesses(expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("final process termination: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		return errors.Join(errors.Join(errs...), err)
+	}
+	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
+		errs = append(errs, fmt.Errorf("final scheduled-job cleanup: %w", err))
+	}
+	if err := a.accountStillMatches(username, expected); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // finalScheduledAccountCheck runs after controlled Home/mail cleanup and just

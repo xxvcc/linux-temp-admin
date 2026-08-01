@@ -10,23 +10,26 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
-// Header is the current registry schema. v4 adds a durable deletion phase so a
-// failed post-userdel mail cleanup can be resumed without treating every stale
-// row as authority to remove name-scoped data.
-const Header = "# linux-temp-admin registry v4"
+// Header is the current registry schema. v5 records monotonic identity
+// allocation and the durable asynchronous deletion quarantine.
+const Header = "# linux-temp-admin registry v5"
 
 const legacyHeaderV2 = "# linux-temp-admin registry v2"
 const legacyHeaderV3 = "# linux-temp-admin registry v3"
+const legacyHeaderV4 = "# linux-temp-admin registry v4"
 
 const (
 	legacyFieldCount    = 9
 	legacyMaxFieldCount = 11
 	legacyV3FieldCount  = 13
-	currentFieldCount   = 14
+	legacyV4FieldCount  = 14
+	currentFieldCount   = 17
 )
 
 // Record is one managed temporary account.
@@ -55,11 +58,12 @@ type Record struct {
 	// in its passwd GECOS marker. Migrated v2 rows remain false even when they have
 	// a generation column: released v2 accounts used one shared fixed marker.
 	IdentityBound bool
-	// Pending marks a creation intent written before useradd. It is cleared only
-	// after the new account's UID has been read and durably recorded. A pending row
-	// alone cannot prove the identity of a live same-name account and must never
-	// authorize unattended deletion; the creating process separately retains its
-	// complete passwd snapshot for an immediate rollback.
+	// Pending marks both a creation intent written before useradd and the pending
+	// generation marker left in passwd. It is normally cleared after creation. A
+	// pending row alone cannot authorize unattended deletion; after a direct
+	// interactive recovery proves its full account shape, BeginQuarantine may add a
+	// deletion witness while retaining this bit so later retries verify the right
+	// marker.
 	Pending bool
 	// DeletionStarted is written after the destructive identity policy and the
 	// pre-artifact quiescence checks, before controlled mail/Home cleanup and
@@ -70,6 +74,18 @@ type Record struct {
 	// non-pending UID-only recovery rows. An ordinary stale row for an account
 	// removed outside the tool leaves this false.
 	DeletionStarted bool
+	// SequentialID proves that this account received an explicitly reserved,
+	// monotonically increasing UID/GID pair. Generated-name invites with this bit
+	// can skip the daemon polling delay because neither numeric identity is reused.
+	SequentialID bool
+	// QuarantineUntil is the UTC RFC3339 deadline after which a disabled live
+	// account may be removed without another cron/at polling delay. The account
+	// itself holds both its name and numeric identity until that deadline.
+	QuarantineUntil string
+	// QuarantineUnit records the persistent systemd timer that finishes deletion.
+	// It is separate from AutoUnit so the expiry task and the quarantine handoff
+	// cannot overwrite one another during a crash.
+	QuarantineUnit string
 }
 
 var fieldSanitizer = strings.NewReplacer("\t", " ", "\r", " ", "\n", " ")
@@ -84,12 +100,15 @@ func boolYN(b bool) string {
 	return "no"
 }
 
-// Column indexes are retained while migrating deployed v2/v3 rows to v4.
+// Column indexes are retained while migrating deployed v2/v3/v4 rows to v5.
 const uidField = 9
 const generationField = 10
 const pendingField = 11
 const identityBoundField = 12
 const deletionStartedField = 13
+const sequentialIDField = 14
+const quarantineUntilField = 15
+const quarantineUnitField = 16
 
 // TSV renders the record as one tab-separated line (no trailing newline).
 func (r Record) TSV() string {
@@ -108,12 +127,15 @@ func (r Record) TSV() string {
 		boolYN(r.Pending),
 		boolYN(r.IdentityBound),
 		boolYN(r.DeletionStarted),
+		boolYN(r.SequentialID),
+		sanitize(r.QuarantineUntil),
+		sanitize(r.QuarantineUnit),
 	}, "\t")
 }
 
 // ParseLine parses a current-schema registry line. It returns ok=false only for
 // the exact current header and blank lines. Every other non-empty line, including
-// one beginning with '#', must be a valid 14-column record or is corruption.
+// one beginning with '#', must be a valid 17-column record or is corruption.
 func ParseLine(line string) (Record, bool, error) {
 	if line == "" || line == Header {
 		return Record{}, false, nil
@@ -133,6 +155,13 @@ func parseLegacyV3Line(line string) (Record, bool, error) {
 		return Record{}, false, nil
 	}
 	return parseFields(line, legacyV3FieldCount, legacyV3FieldCount)
+}
+
+func parseLegacyV4Line(line string) (Record, bool, error) {
+	if line == "" {
+		return Record{}, false, nil
+	}
+	return parseFields(line, legacyV4FieldCount, legacyV4FieldCount)
 }
 
 func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
@@ -194,6 +223,18 @@ func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
 		}
 		rec.DeletionStarted = f[deletionStartedField] == "yes"
 	}
+	if len(f) > sequentialIDField {
+		if f[sequentialIDField] != "yes" && f[sequentialIDField] != "no" {
+			return Record{}, false, fmt.Errorf("invalid sequential-id field %q", f[sequentialIDField])
+		}
+		rec.SequentialID = f[sequentialIDField] == "yes"
+	}
+	if len(f) > quarantineUntilField {
+		rec.QuarantineUntil = f[quarantineUntilField]
+	}
+	if len(f) > quarantineUnitField {
+		rec.QuarantineUnit = f[quarantineUnitField]
+	}
 	// UID-only recovery rows created for an unregistered account have no honest
 	// endpoint metadata to preserve. Port 0 is reserved for exactly that state;
 	// every ordinary and migrated account row still requires a real SSH port.
@@ -209,11 +250,30 @@ func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
 	if rec.DeletionStarted && !validate.AccountID(rec.UID) {
 		return Record{}, false, fmt.Errorf("deletion-started record has no valid uid")
 	}
-	if rec.DeletionStarted && rec.Pending {
-		return Record{}, false, fmt.Errorf("deletion-started record cannot remain pending")
-	}
 	if rec.DeletionStarted && !rec.IdentityBound && rec.Generation != "" {
 		return Record{}, false, fmt.Errorf("uid-only deletion-started record carries a generation")
+	}
+	if rec.SequentialID && (!rec.IdentityBound || !validate.AccountID(rec.UID)) {
+		return Record{}, false, fmt.Errorf("sequential identity record is not safely identity-bound")
+	}
+	if rec.QuarantineUntil != "" {
+		deadline, err := time.Parse(time.RFC3339, rec.QuarantineUntil)
+		if err != nil || deadline.Location() != time.UTC {
+			return Record{}, false, fmt.Errorf("invalid quarantine deadline %q", rec.QuarantineUntil)
+		}
+		if !rec.DeletionStarted || !rec.IdentityBound {
+			return Record{}, false, fmt.Errorf("quarantine requires an identity-bound deletion row")
+		}
+		if rec.QuarantineUnit == "" {
+			return Record{}, false, fmt.Errorf("quarantine has no scheduled finalizer")
+		}
+		if rec.QuarantineUnit != config.QuarantineUnitPrefix+rec.User {
+			return Record{}, false, fmt.Errorf("invalid quarantine unit %q", rec.QuarantineUnit)
+		}
+	} else if rec.QuarantineUnit != "" {
+		return Record{}, false, fmt.Errorf("quarantine unit has no deadline")
+	} else if rec.DeletionStarted && rec.Pending {
+		return Record{}, false, fmt.Errorf("pending deletion recovery requires a durable quarantine")
 	}
 	return rec, true, nil
 }

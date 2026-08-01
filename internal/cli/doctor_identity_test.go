@@ -5,9 +5,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
@@ -146,6 +148,65 @@ func TestStatusReportsAbsentDeletionRecovery(t *testing.T) {
 	}
 	if got := out.String(); !strings.Contains(got, "identity=deletion-recovery-absent") || !strings.Contains(got, "uid=1001") {
 		t.Fatalf("status hid absent recovery: %q", got)
+	}
+}
+
+func TestStatusReportsQuarantineFieldsAfterExternalAccountRemoval(t *testing.T) {
+	deadline := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute)
+	rec := registry.Record{
+		User: "xxvcc-quarantine-status", UID: 1001, Port: 22,
+		Generation: "0123456789abcdef0123456789abcdef", IdentityBound: true,
+		DeletionStarted: true, QuarantineUntil: deadline.Format(time.RFC3339),
+		QuarantineUnit: config.QuarantineUnitPrefix + "xxvcc-quarantine-status",
+	}
+	a, out, _ := newTestApp(t, "")
+	setTestRegistryRecord(t, a, rec)
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return user.Passwd{}, false, nil }
+	if rc := a.status([]string{"--user", rec.User}); rc != 0 {
+		t.Fatalf("status rc = %d, want recovery status", rc)
+	}
+	got := out.String()
+	if !strings.Contains(got, "identity=deletion-recovery-absent") ||
+		!strings.Contains(got, "quarantine-until="+rec.QuarantineUntil+" unit="+rec.QuarantineUnit) {
+		t.Fatalf("status hid absent quarantine recovery: %q", got)
+	}
+}
+
+func TestDoctorDistinguishesMissingQuarantineFinalizer(t *testing.T) {
+	const (
+		name       = "xxvcc-quarantine-doctor"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, _, errb := newTestApp(t, "")
+	deadline := a.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute)
+	rec := registry.Record{
+		User: name, UID: 1001, Port: 22, Generation: generation, IdentityBound: true,
+		DeletionStarted: true, SequentialID: true,
+		QuarantineUntil: deadline.Format(time.RFC3339), QuarantineUnit: config.QuarantineUnitPrefix + name,
+	}
+	setTestRegistryRecord(t, a, rec)
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: a.InstallPath,
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now,
+		Sys: revokeTestScheduleSystem{},
+	}
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		return user.Passwd{
+			Name: name, UID: 1001, GID: 1001,
+			GECOS: config.ManagedGenerationGECOSPrefix + generation,
+			Home:  "/home/" + name, Shell: "/bin/sh",
+		}, true, nil
+	}
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc = %d, want missing-finalizer failure", rc)
+	}
+	got := errb.String()
+	if !strings.Contains(got, "identity remains quarantined, but no valid background finalizer remains") ||
+		!strings.Contains(got, name) || strings.Contains(got, "account set to auto-delete but has no valid task left") {
+		t.Fatalf("doctor did not distinguish quarantine finalizer loss: %q", got)
 	}
 }
 

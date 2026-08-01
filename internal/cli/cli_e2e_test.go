@@ -112,6 +112,9 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("output u
 type partialFailingWriter struct{ wrote int }
 
 func (w *partialFailingWriter) Write(p []byte) (int, error) {
+	if !bytes.Contains(p, []byte("----- BEGIN LINUX TEMP ADMIN INVITE -----")) {
+		return len(p), nil
+	}
 	n := len(p) / 2
 	w.wrote += n
 	return n, errors.New("output interrupted after a partial credential write")

@@ -66,13 +66,18 @@ const (
 	RegistryFile = RegistryDir + "/registry.tsv"
 	// RegistryLockFile is the flock file for registry mutations.
 	RegistryLockFile = RegistryDir + "/registry.lock"
+	// IdentitySequenceFile stores the highest numeric UID/GID reserved by the
+	// monotonic allocator. Once the registry is migrated to the matching schema,
+	// this file is mandatory: recreating it from only the currently-live accounts
+	// could reuse an identity that was retired after the last registry compaction.
+	IdentitySequenceFile = RegistryDir + "/identity-sequence"
 	// PrefsFile holds the operator's remembered UI choices (currently just the
 	// language). It shares the tool's state directory rather than /etc: it is a
 	// convenience the tool wrote for itself, not configuration an operator is
 	// expected to hand-edit or ship in a config-management repo.
 	PrefsFile = RegistryDir + "/prefs"
 	// RegistrySchema is written as the registry header's version marker.
-	RegistrySchema = 4
+	RegistrySchema = 5
 
 	// AuditLogDir holds the best-effort JSONL operation audit log (root:root, 0700).
 	AuditLogDir = "/var/log/" + ManagedTag
@@ -93,6 +98,14 @@ const (
 	// load-bearing: it is baked into the unit filenames already written on
 	// deployed hosts, so changing it would orphan their auto-revoke timers.
 	AutoRevokeUnitPrefix = ManagedTag + "-v2-revoke-"
+	// QuarantineUnitPrefix names the short-lived persistent timers that finish an
+	// already-disabled account deletion after the identity-reuse quarantine.
+	QuarantineUnitPrefix = ManagedTag + "-v2-quarantine-"
+	// IdentityQuarantineSeconds covers one complete cron/at polling cycle plus a
+	// small margin. Normal creation avoids this delay with monotonic UID/GID
+	// allocation; revoke holds the disabled passwd identity for this interval and
+	// completes deletion asynchronously when systemd is available.
+	IdentityQuarantineSeconds = 65
 
 	// ReleaseMirrorBaseURL is the official mirror used for normal installation and
 	// upgrades. latest.json selects one immutable version directory below it.

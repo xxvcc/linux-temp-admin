@@ -104,6 +104,14 @@ type App struct {
 	// an older release before invite reuses the username. Production scans /proc;
 	// tests inject the process inventory they intend to exercise.
 	RunningLegacyRevoke func(installPath, username string) (bool, error)
+	// IdentityAllocationRange is the local UID/GID allocation policy probe.
+	// Production scans passwd, group, and login.defs; tests inject a deterministic
+	// range so their account helper and registry sequence agree.
+	IdentityAllocationRange func() (minimum, maximum int, err error)
+	// EnsureScheduledCommand is a test hook for the stable-command preflight used
+	// before a revoke hands final deletion to systemd. Production leaves it nil and
+	// installs or verifies the running binary through ensureStableInstalled.
+	EnsureScheduledCommand func() error
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -151,6 +159,7 @@ func NewApp(lang i18n.Lang) *App {
 		RunningLegacyRevoke: func(installPath, username string) (bool, error) {
 			return runningLegacyRevokeProcess("/proc", installPath, username)
 		},
+		IdentityAllocationRange: user.IdentityAllocationRange,
 	}
 }
 
@@ -173,6 +182,13 @@ func (a *App) runningLegacyRevoke(username string) (bool, error) {
 		return a.RunningLegacyRevoke(a.InstallPath, username)
 	}
 	return runningLegacyRevokeProcess("/proc", a.InstallPath, username)
+}
+
+func (a *App) identityAllocationRange() (int, int, error) {
+	if a.IdentityAllocationRange != nil {
+		return a.IdentityAllocationRange()
+	}
+	return user.IdentityAllocationRange()
 }
 
 func (a *App) terminateProcesses(uid int) error {

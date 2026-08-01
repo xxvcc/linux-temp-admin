@@ -289,3 +289,24 @@ func TestV1RegistryUsersAcceptsHistoricalTabSeparatedRows(t *testing.T) {
 		t.Fatalf("v1RegistryUsers = %v, want %v", users, want)
 	}
 }
+
+func TestQuarantinedAccountRemainsAuthorizedForSynchronousUninstallCleanup(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{
+		Name: "xxvcc-quarantine", UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-quarantine", Shell: "/bin/sh",
+	}
+	rec := registry.Record{
+		User: pw.Name, UID: pw.UID, Port: 22, Generation: generation, IdentityBound: true,
+		DeletionStarted: true, QuarantineUntil: "2026-08-01T12:02:00Z",
+		QuarantineUnit: config.QuarantineUnitPrefix + pw.Name,
+	}
+	acc := teardownAccount{
+		name: pw.Name, exists: true, registryFound: true, registryRecord: rec, passwd: pw,
+		witnesses: []witness{witnessRegistry},
+	}
+	if !liveTeardownAccountAuthorized(acc) {
+		t.Fatal("a valid quarantined account could not be synchronously finalized by uninstall")
+	}
+}

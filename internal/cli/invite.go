@@ -106,6 +106,7 @@ func (a *App) invite(args []string) int {
 		return 1
 	}
 	username := *userFlag
+	generatedUsername := username == ""
 	if username == "" {
 		// Only the generation path uses the prefix. A prefix in the reserved
 		// "systemd-" namespace would generate usernames the revoke path refuses to
@@ -116,8 +117,12 @@ func (a *App) invite(args []string) int {
 				"username prefix is in a reserved namespace (e.g. systemd-) and would create an unrevocable account: "+*prefix))
 			return 1
 		}
+		// Fill the username's remaining Linux-compatible length with entropy. Even
+		// the longest accepted prefix retains the historical 40-bit minimum, while
+		// the default prefix receives 104 bits.
+		suffixBytes := (31 - len(*prefix)) / 2
 		for attempt := 0; attempt < 20; attempt++ {
-			h, err := a.RandHex(5)
+			h, err := a.RandHex(suffixBytes)
 			if err != nil {
 				a.errorf("rand: %v", err)
 				return 1
@@ -315,7 +320,7 @@ func (a *App) invite(args []string) int {
 	}
 	return a.withAccountExclusiveLock(username, func() int {
 		return a.withLifecycleLock(func() int {
-			return a.runInvite(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan)
+			return a.runInviteWithIdentityPolicy(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan, generatedUsername)
 		})
 	})
 }
@@ -898,8 +903,10 @@ func (a *App) installDeps(needSudo, needPassword bool, pkgs []string) bool {
 	return true
 }
 
-// runInvite performs the mutating steps with rollback on any failure.
-func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAuto bool, plan loginPlan) int {
+// runInviteWithIdentityPolicy performs the mutating steps with rollback on any
+// failure. generatedUsername controls whether the fresh-name isolation proof is
+// available for the deferred-job cleanup policy.
+func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int, wantSudo, wantAuto bool, plan loginPlan, generatedUsername bool) int {
 	// Preflight the registry before creating anything, so a broken/unsafe
 	// registry fails fast instead of leaving a stray account behind.
 	if err := a.Registry.Init(); err != nil {
@@ -1074,9 +1081,23 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 			"检测到该用户名的旧版无世代绑定撤销进程仍在运行；已拒绝复用，请等待其退出并重新运行。",
 			"a legacy revoke process without a generation binding is still running for this username; reuse was refused; wait for it to exit and retry."))
 	}
+	// Reserve and durably burn an identity above every currently allocated local UID
+	// and GID. The registry sequence commits before useradd: a crash may waste a
+	// number, but this tool never reuses it for another account generation.
+	minimumID, maximumID, err := a.identityAllocationRange()
+	if err != nil {
+		return failf("%s: %v", a.P.M("无法确定安全的 UID/GID 分配范围", "cannot determine a safe UID/GID allocation range"), err)
+	}
+	reservedID, identityIsolationReady, err := a.Registry.ReserveIdentity(minimumID, maximumID)
+	if err != nil {
+		return failf("%s: %v", a.P.M("无法持久化预留 UID/GID", "cannot durably reserve a UID/GID"), err)
+	}
+	rec.UID = reservedID
+	rec.SequentialID = true
 	// Persist the account intent before useradd. A kill or power loss after account
 	// creation must leave a registry witness even if no sudo/sshd/schedule artifact
-	// exists. UID 0 means pending and is replaced immediately after lookup.
+	// exists. The reserved UID is already known and is verified against passwd as
+	// soon as the helper returns.
 	if err := a.Registry.Record(rec); err != nil {
 		return failf("%s: %v", a.P.M("登记账号创建意图失败", "recording account creation intent failed"), err)
 	}
@@ -1113,7 +1134,7 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	// pending identity, allowing this transaction to attempt the same fail-closed
 	// rollback instead of discarding evidence it already captured.
 	accountCleanupConfirmed = false
-	pw, err := a.Users.CreatePendingIdentity(username, resolveShell(), generation)
+	pw, err := a.Users.CreatePendingIdentityWithID(username, resolveShell(), generation, reservedID)
 	if err != nil && errors.Is(err, user.ErrAccountCreationNotStarted) {
 		// No account helper ran, so there is no ambiguous partial account identity to
 		// recover. The last registry cleanup still confirms local absence before it
@@ -1162,13 +1183,24 @@ func (a *App) runInvite(username, host string, port, hours int, wantSudo, wantAu
 	if err := a.Users.DisableLogin(username); err != nil {
 		return failf("%s: %v", a.P.M("建立新账号的安全失效状态失败", "establishing the new account's fail-closed login state failed"), err)
 	}
-	// A previously deleted account can leave a same-name personal crontab or an at
-	// job carrying the numeric UID that useradd just selected. The pending account
-	// is expired, password-locked, and has no credential yet; it keeps that identity
-	// occupied while two clear/kill passes wait out daemon-cached work. Do this
-	// before the managed marker, password, key, or sudo policy exists, so inherited
-	// deferred work never reaches a grant.
-	if err := a.quiesceScheduledAccount(username, pw); err != nil {
+	// Generated names combine a fresh random suffix with the monotonic UID/GID pair,
+	// so neither name nor numeric identity is being reused by this tool. Clear and
+	// verify once without the old polling-cycle delay. Explicit operator-selected
+	// names retain the full drain because they may intentionally reuse a historical
+	// name even though their numeric identity is fresh.
+	quiesce := a.quiesceScheduledAccount
+	if generatedUsername && rec.SequentialID && identityIsolationReady {
+		quiesce = a.quiesceScheduledAccountImmediate
+	} else if generatedUsername {
+		a.info(a.P.M(
+			"登记刚从旧版迁移，历史已释放 UID 尚未跨过一次性隔离窗口；本次将同步等待约 65 秒，后续自动用户名创建不再等待。",
+			"the registry was just migrated from an older release, so historically released UIDs have not crossed the one-time isolation window; this invite waits about 65 seconds, and later generated-name invites do not."))
+	} else {
+		a.info(a.P.M(
+			"显式用户名可能复用历史名称；为防止旧 cron/at 缓存任务跨世代执行，将同步等待约 65 秒完成清场。",
+			"an explicit username may reuse a historical name; waiting about 65 seconds to prevent cached cron/at work from crossing account generations."))
+	}
+	if err := quiesce(username, pw); err != nil {
 		return failf("%s: %v", a.P.M("无法清除同名账号或复用 UID 的遗留 cron/at 任务", "cannot clear cron/at work left by the reused username or UID"), err)
 	}
 	// The drain intentionally gives daemon-cached work a full polling cycle to

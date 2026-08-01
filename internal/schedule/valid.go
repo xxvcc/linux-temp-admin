@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
 )
@@ -89,6 +90,49 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 		return false, nil
 	}
 	return s.systemdTimerExecutable(unit + ".timer")
+}
+
+// ValidQuarantine reports whether recordedUnit is the exact persistent systemd
+// finalizer for this deletion generation and deadline. Quarantine never uses at,
+// and its namespace is deliberately separate from the account's expiry task.
+func (s *Scheduler) ValidQuarantine(user string, uid int, generation, recordedUnit string, deadline time.Time) (bool, error) {
+	if !validate.Username(user) || !validate.AccountID(uid) || !validate.Generation(generation) ||
+		deadline.IsZero() || deadline.Second() != 0 || deadline.Nanosecond() != 0 {
+		return false, nil
+	}
+	if s == nil {
+		return false, fmt.Errorf("inventory quarantine: no scheduler configured")
+	}
+	q := *s
+	q.UnitPrefix = config.QuarantineUnitPrefix
+	q.LegacyUnitPrefixes = nil
+	unit := q.UnitName(user)
+	if recordedUnit != unit || strings.ContainsAny(unit, "/ ") {
+		return false, nil
+	}
+	service, valid, err := readScheduleFile(filepath.Join(q.SystemdDir, unit+".service"))
+	if err != nil || !valid {
+		return false, err
+	}
+	if string(service) != q.serviceContent(user, uid, generation) {
+		return false, nil
+	}
+	timer, valid, err := readScheduleFile(filepath.Join(q.SystemdDir, unit+".timer"))
+	if err != nil || !valid {
+		return false, err
+	}
+	calendar := OnCalendar(deadline)
+	if string(timer) != timerContent(unit, calendar) {
+		return false, nil
+	}
+	now := time.Now
+	if q.Now != nil {
+		now = q.Now
+	}
+	if !deadline.After(now().UTC()) {
+		return false, nil
+	}
+	return q.systemdTimerExecutable(unit + ".timer")
 }
 
 func (s *Scheduler) systemdTimerExecutable(timer string) (bool, error) {

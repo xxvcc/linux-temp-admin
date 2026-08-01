@@ -121,11 +121,24 @@ func setTestRegistryRecord(t *testing.T, a *App, rec registry.Record) {
 		rec.Port = 22
 	}
 	deletionStarted := rec.DeletionStarted
+	quarantineUntil, quarantineUnit := rec.QuarantineUntil, rec.QuarantineUnit
 	rec.DeletionStarted = false
+	rec.QuarantineUntil = ""
+	rec.QuarantineUnit = ""
 	if err := a.Registry.Record(rec); err != nil {
 		t.Fatal(err)
 	}
 	if deletionStarted {
+		if quarantineUntil != "" {
+			deadline, err := time.Parse(time.RFC3339, quarantineUntil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := a.Registry.BeginQuarantine(rec.User, rec.UID, rec.Generation, deadline, quarantineUnit); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 		generation := rec.Generation
 		if rec.Pending || !rec.IdentityBound {
 			generation = ""

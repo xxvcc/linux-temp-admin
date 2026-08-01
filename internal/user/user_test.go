@@ -31,6 +31,25 @@ func setPasswd(t *testing.T, content string) {
 	t.Cleanup(func() { passwdPath = old })
 }
 
+func setIdentityDatabases(t *testing.T, passwd, group, loginDefs string) {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	oldPasswd, oldGroup, oldLoginDefs := passwdPath, groupPath, loginDefsPath
+	passwdPath = write("passwd", passwd)
+	groupPath = write("group", group)
+	loginDefsPath = write("login.defs", loginDefs)
+	t.Cleanup(func() {
+		passwdPath, groupPath, loginDefsPath = oldPasswd, oldGroup, oldLoginDefs
+	})
+}
+
 func writeUserCommand(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -632,6 +651,65 @@ func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 	}
 	if !reflect.DeepEqual(f.calls, want) {
 		t.Fatalf("pending identity argv = %v, want %v", f.calls, want)
+	}
+}
+
+func TestCreatePendingIdentityPinsReservedUIDAndGID(t *testing.T) {
+	const reserved = 2345
+	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
+	setProcRoot(t, map[int]string{})
+	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	m := managerWithStubbedHomeChecks(f)
+	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, reserved)
+	if err != nil || pw.UID != reserved || pw.GID != reserved {
+		t.Fatalf("reserved identity = %+v err=%v", pw, err)
+	}
+	want := []string{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/bash", "-c", pendingMarker,
+		"-e", expiredDate, "-p", initialLockedPasswordHash,
+		"-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"}
+	if len(f.calls) != 1 || !reflect.DeepEqual(f.calls[0], want) {
+		t.Fatalf("reserved useradd argv = %v, want %v", f.calls, want)
+	}
+}
+
+func TestCreatePendingIdentityRejectsReservedIDMismatch(t *testing.T) {
+	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	setPasswd(t, "xxvcc-a1:x:2345:2346:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
+	setProcRoot(t, map[int]string{})
+	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	m := managerWithStubbedHomeChecks(f)
+	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
+	if err == nil || pw.GID != 2346 || !strings.Contains(err.Error(), "want reserved 2345:2345") {
+		t.Fatalf("reserved mismatch = %+v err=%v", pw, err)
+	}
+}
+
+func TestIdentityAllocationRangeScansLocalUIDsAndGIDs(t *testing.T) {
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1500::/home/alice:/bin/sh\n",
+		"root:x:0:\nalice:x:1500:\nservice:x:1600:\n",
+		"UID_MIN 1000\nUID_MAX 2000\nGID_MIN 1200\nGID_MAX 1900\n")
+	minimum, maximum, err := IdentityAllocationRange()
+	if err != nil || minimum != 1601 || maximum != 1900 {
+		t.Fatalf("IdentityAllocationRange = %d..%d err=%v, want 1601..1900", minimum, maximum, err)
+	}
+}
+
+func TestIdentityAllocationRangeFailsClosedOnInvalidPolicyOrDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name, passwd, group, defs, want string
+	}{
+		{name: "disjoint ranges", passwd: "root:x:0:0::/root:/bin/sh\n", group: "root:x:0:\n", defs: "UID_MIN 1000\nUID_MAX 1100\nGID_MIN 1200\nGID_MAX 1300\n", want: "do not overlap"},
+		{name: "duplicate policy", passwd: "root:x:0:0::/root:/bin/sh\n", group: "root:x:0:\n", defs: "UID_MIN 1000\nUID_MIN 1001\n", want: "duplicate UID_MIN"},
+		{name: "malformed group", passwd: "root:x:0:0::/root:/bin/sh\n", group: "broken:x:not-a-gid:\n", defs: "UID_MIN 1000\n", want: "malformed group GID"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setIdentityDatabases(t, tc.passwd, tc.group, tc.defs)
+			if _, _, err := IdentityAllocationRange(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("IdentityAllocationRange error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
