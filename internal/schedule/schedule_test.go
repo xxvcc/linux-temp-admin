@@ -129,6 +129,9 @@ func TestScheduleNoBackend(t *testing.T) {
 }
 
 func TestScheduleQuarantineUsesSeparateSystemdNamespaceWithoutAtFallback(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("systemd quarantine scheduling requires root-owned fixtures")
+	}
 	dir := t.TempDir()
 	sys := &fakeSystem{hasSystemctl: true, hasAt: true, atID: "42"}
 	s := newScheduler(dir, sys)
