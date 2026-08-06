@@ -1,12 +1,14 @@
 // Package sudoers grants and removes a per-user NOPASSWD sudoers drop-in. A
-// grant is written atomically, syntax-checked with visudo, and confirmed to
-// actually take effect via `sudo -n -l -U <user>`; any failure removes the file.
+// grant is written atomically, syntax-checked with visudo, and confirmed against
+// the effective policy only after proving the local sudoers source is queried;
+// any failure removes the file.
 package sudoers
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,12 +33,16 @@ var sudoProbeOptions = executil.Options{
 	ExtraEnv:  []string{"LC_ALL=C", "LANG=C"},
 }
 
+const maxNSSwitchConfigBytes = int64(1 << 20)
+
+var nsswitchConfigPath = "/etc/nsswitch.conf"
+
 // Manager writes sudoers drop-ins. Its paths and external operations are fields
 // so tests can point at a temporary directory and inject failures.
 type Manager struct {
 	Dir      string
 	Validate func(content []byte) error // syntax check (default: visudo -cf -)
-	Verify   func(user string) error    // effective-policy check (default: sudo -n -l -U)
+	Verify   func(user string) error    // effective-policy check (default: guarded sudo -n -l -U)
 	// RemoveFile defaults to a durable, directory-fsynced unlink. Tests inject
 	// failures here to verify that
 	// callers retain the account while a name-scoped root grant may still exist.
@@ -227,13 +233,195 @@ func visudoValidate(content []byte) error {
 	return nil
 }
 
-// verifyNopasswd confirms the effective policy grants user NOPASSWD sudo.
+// verifyNopasswd confirms the effective policy grants user NOPASSWD sudo. sudo
+// may aggregate `-l` output from multiple NSS sources even when command lookup
+// would stop before the local files source. Prove files is reachable first, then
+// conservatively parse the complete effective-policy listing.
 func verifyNopasswd(user string) error {
+	if err := verifyFilesSudoersSource(nsswitchConfigPath); err != nil {
+		return err
+	}
 	out, err := executil.Output("sudo", []string{"-n", "-l", "-U", user}, sudoProbeOptions)
 	if err != nil {
 		return fmt.Errorf("sudo -n -l -U %s: %w", user, err)
 	}
 	return verifyNopasswdOutput(out)
+}
+
+// verifyFilesSudoersSource proves that every source before files continues for
+// command lookup. sudo's own NSS parser defaults to continuing and recognizes
+// only explicit [SUCCESS=return] and [NOTFOUND=return] control tokens. With no
+// recognized source (or no nsswitch.conf), sudo defaults to local files.
+func verifyFilesSudoersSource(path string) error {
+	spec, found, err := readSudoersNSSConfig(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read sudoers NSS source order: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	if err := requireReachableFilesSource(spec); err != nil {
+		return fmt.Errorf("unsafe sudoers NSS source order: %w", err)
+	}
+	return nil
+}
+
+var readSudoersNSSConfig = readSudoersSourceSpec
+
+func readSudoersSourceSpec(path string) (string, bool, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", false, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return "", false, err
+	}
+	if !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return "", false, fmt.Errorf("%s is not a regular non-symlink file", path)
+	}
+	if fi.Size() > maxNSSwitchConfigBytes {
+		_ = f.Close()
+		return "", false, fmt.Errorf("%s exceeds %d-byte limit", path, maxNSSwitchConfigBytes)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != 0 || fi.Mode().Perm()&0o022 != 0 {
+		_ = f.Close()
+		return "", false, fmt.Errorf("%s must be root-owned and not group/other-writable", path)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, maxNSSwitchConfigBytes+1))
+	closeErr := f.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return "", false, err
+	}
+	if int64(len(data)) > maxNSSwitchConfigBytes {
+		return "", false, fmt.Errorf("%s exceeds %d-byte limit", path, maxNSSwitchConfigBytes)
+	}
+
+	return sudoersSourceSpec(data)
+}
+
+// sudoersSourceSpec mirrors the relevant sudo_parseln behavior conservatively:
+// trim ASCII blank/comment text and use only the first line whose first token is
+// the case-insensitive, colon-attached "sudoers:" database name. sudo_parseln
+// and sudo_read_nss treat only space and tab as token whitespace; using Unicode
+// whitespace rules here could prove a files source that sudo itself never parsed.
+func sudoersSourceSpec(data []byte) (string, bool, error) {
+	for _, b := range data {
+		if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
+			return "", false, fmt.Errorf("nsswitch.conf contains an unsupported control byte")
+		}
+	}
+	for _, raw := range strings.Split(string(data), "\n") {
+		// sudo_parseln removes every physical-line trailing CR/LF byte before
+		// comment handling. The LF was consumed by Split; remove only trailing CR
+		// here. An embedded CR remains part of a token and is never whitespace.
+		line := strings.TrimRight(raw, "\r")
+		if comment := strings.IndexByte(line, '#'); comment >= 0 {
+			line = line[:comment]
+		}
+		line = trimNSSBlanks(line)
+		if line == "" {
+			continue
+		}
+		// sudo_parseln supports escaping and physical-line continuation. Reject
+		// either form instead of interpreting only half of a logical line.
+		if strings.ContainsRune(line, '\\') {
+			return "", false, fmt.Errorf("nsswitch.conf uses unsupported escaping or continuation")
+		}
+		if len(line) >= len("sudoers:") && equalFoldNSSASCII(line[:len("sudoers:")], "sudoers:") {
+			return trimNSSBlanks(line[len("sudoers:"):]), true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func trimNSSBlanks(value string) string {
+	return strings.Trim(value, " \t")
+}
+
+func splitNSSFields(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool { return r == ' ' || r == '\t' })
+}
+
+func lowerNSSASCII(value string) (string, bool) {
+	result := []byte(value)
+	for i, c := range result {
+		if c >= 0x80 {
+			return "", false
+		}
+		if c >= 'A' && c <= 'Z' {
+			result[i] = c + ('a' - 'A')
+		}
+	}
+	return string(result), true
+}
+
+func equalFoldNSSASCII(value, lower string) bool {
+	normalized, ok := lowerNSSASCII(value)
+	return ok && normalized == lower
+}
+
+type sudoNSSSource struct {
+	name             string
+	returnOnSuccess  bool
+	returnOnNotFound bool
+}
+
+// requireReachableFilesSource mirrors sudo 1.9's sudo_read_nss parser. It does
+// not apply glibc's generic NSS defaults or action grammar: sudo recognizes only
+// files/sss/ldap sources, and a control token applies only when it immediately
+// follows a newly recognized source.
+func requireReachableFilesSource(spec string) error {
+	var sources []sudoNSSSource
+	seen := make(map[string]bool, 3)
+	gotMatch := false
+	for _, token := range splitNSSFields(spec) {
+		lower, ascii := lowerNSSASCII(token)
+		if !ascii {
+			gotMatch = false
+			continue
+		}
+		switch lower {
+		case "files", "sss", "ldap":
+			if seen[lower] {
+				gotMatch = false
+				continue
+			}
+			seen[lower] = true
+			sources = append(sources, sudoNSSSource{name: lower})
+			gotMatch = true
+		case "[success=return]":
+			if gotMatch {
+				sources[len(sources)-1].returnOnSuccess = true
+			}
+			gotMatch = false
+		case "[notfound=return]":
+			if gotMatch {
+				sources[len(sources)-1].returnOnNotFound = true
+			}
+			gotMatch = false
+		default:
+			gotMatch = false
+		}
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	for _, source := range sources {
+		if source.name == "files" {
+			return nil
+		}
+		if source.returnOnSuccess || source.returnOnNotFound {
+			return fmt.Errorf("source %q before files can stop the lookup", source.name)
+		}
+	}
+	return fmt.Errorf("local files source is missing")
 }
 
 func verifyNopasswdOutput(out []byte) error {

@@ -149,6 +149,71 @@ func TestInviteNoSudoDoesNotInheritAStaleGrant(t *testing.T) {
 	}
 }
 
+func TestPasswordNoSudoRevokeUsesTrailingWitnessAfterFullNameChange(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		username   string
+		changeName bool
+	}{
+		{name: "unchanged default account", username: "xxvcc-pwdefault"},
+		{name: "full-name field changed", username: "xxvcc-pwfullname", changeName: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.changeName {
+				if _, err := exec.LookPath("chfn"); err != nil {
+					t.Skip("chfn is unavailable")
+				}
+			}
+			a, sudoMgr, sshdMgr, _ := inviteApp(t)
+			remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.username).Run() }
+			remove()
+			t.Cleanup(remove)
+
+			passwordSSHD := "passwordauthentication yes\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
+			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(passwordSSHD), nil }
+			sshdMgr.Effective = a.SSHDConfig
+			if rc := a.Dispatch([]string{"invite", "--user", tc.username, "--host", "203.0.113.5",
+				"--password-login", "--no-sudo", "--no-fix-sshd", "--no-auto-revoke", "--yes"}); rc != 0 {
+				t.Fatalf("password invite rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+			}
+			rec, found, err := a.Registry.Lookup(tc.username)
+			if err != nil || !found {
+				t.Fatalf("registry identity after invite: found=%v rec=%+v err=%v", found, rec, err)
+			}
+			before, exists := mustExternalUserLookup(t, tc.username)
+			if !exists || !user.HasTrailingGenerationWitness(before, rec.Generation) {
+				t.Fatalf("password invite lacks protected trailing witness: exists=%v pw=%+v rec=%+v", exists, before, rec)
+			}
+			if _, err := os.Lstat(sudoMgr.FilePath(tc.username)); !os.IsNotExist(err) {
+				t.Fatalf("--no-sudo password invite created a sudo grant: %v", err)
+			}
+
+			if tc.changeName {
+				if out, err := exec.Command("chfn", "-f", "x", tc.username).CombinedOutput(); err != nil {
+					t.Fatalf("change full-name field: %v: %s", err, out)
+				}
+				after, exists := mustExternalUserLookup(t, tc.username)
+				if !exists || after.GECOS == before.GECOS || !user.MatchesManagedGeneration(after, rec.Generation) ||
+					!user.SameAccountIdentity(before, after) {
+					t.Fatalf("full-name change damaged protected identity: exists=%v before=%+v after=%+v", exists, before, after)
+				}
+			}
+
+			a.Out.(*bytes.Buffer).Reset()
+			a.Err.(*bytes.Buffer).Reset()
+			if rc := a.Dispatch([]string{"revoke", "--user", tc.username, "--yes"}); rc != 0 {
+				t.Fatalf("revoke after full-name policy rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+			}
+			if mustExternalUserExists(t, tc.username) {
+				t.Fatal("password --no-sudo account survived revoke")
+			}
+			if found, err := a.Registry.Contains(tc.username); err != nil || found {
+				t.Fatalf("revoke retained registry identity: found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
 func TestInviteRetriesSSHDGrantCleanupBeforeAccountRollback(t *testing.T) {
 	a, _, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-sshretry1"

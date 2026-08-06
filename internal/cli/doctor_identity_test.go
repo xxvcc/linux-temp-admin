@@ -151,6 +151,39 @@ func TestStatusReportsAbsentDeletionRecovery(t *testing.T) {
 	}
 }
 
+func TestStatusAndDoctorReportDeployedFirstFieldGenerationWitness(t *testing.T) {
+	const (
+		name       = "xxvcc-first-field"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	rec := registry.Record{User: name, UID: 1001, Generation: generation, IdentityBound: true, Port: 22}
+	pw := user.Passwd{
+		Name: name, UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/" + name, Shell: "/bin/sh",
+	}
+	a, out, errb := newTestApp(t, "")
+	setTestRegistryRecord(t, a, rec)
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+
+	if rc := a.status([]string{"--user", name}); rc != 0 {
+		t.Fatalf("status rc=%d", rc)
+	}
+	if got := out.String(); !strings.Contains(got, "identity=generation-bound-first-field-compat") {
+		t.Fatalf("status hid first-field compatibility identity: %q", got)
+	}
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc=%d, want compatibility warning", rc)
+	}
+	if got := errb.String(); !strings.Contains(got, "v2.9.3-and-earlier generation witness") ||
+		!strings.Contains(got, name) {
+		t.Fatalf("doctor hid first-field migration risk: %q", got)
+	}
+}
+
 func TestStatusReportsQuarantineFieldsAfterExternalAccountRemoval(t *testing.T) {
 	deadline := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Minute)
 	rec := registry.Record{

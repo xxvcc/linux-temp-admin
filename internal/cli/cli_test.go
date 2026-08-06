@@ -1253,7 +1253,7 @@ func TestRollbackInviteAccountRequiresCompleteCapturedIdentity(t *testing.T) {
 		{rec: registry.Record{User: "xxvcc-a1", Pending: true}},
 		{rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: "0123456789abcdef0123456789abcdef", IdentityBound: true}},
 	} {
-		if err := a.rollbackInviteAccount("xxvcc-a1", tc.rec, tc.expected, true); err == nil || !strings.Contains(err.Error(), "identity") {
+		if err := a.rollbackInviteAccount("xxvcc-a1", tc.rec, tc.expected, true, false); err == nil || !strings.Contains(err.Error(), "identity") {
 			t.Fatalf("rollbackInviteAccount(%+v) error = %v, want incomplete-identity refusal", tc.rec, err)
 		}
 	}
@@ -1293,7 +1293,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			DrainScheduledJobs: testDrainScheduledJobs,
 		}
 		setTestRegistryRecord(t, a, rec)
-		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true); err != nil {
+		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false); err != nil {
 			t.Fatal(err)
 		}
 		if terminateCalls != 3 || strings.Join(runner.calls, ",") != "chage,usermod,userdel" {
@@ -1311,7 +1311,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			ClearScheduledJobs: testClearScheduledJobs,
 			DrainScheduledJobs: testDrainScheduledJobs,
 		}
-		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true)
+		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false)
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("rollback error = %v, want %v", err, wantErr)
 		}
@@ -1345,7 +1345,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			DrainScheduledJobs: testDrainScheduledJobs,
 		}
 		setTestRegistryRecord(t, a, pendingRec)
-		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, true); err != nil {
+		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, true, false); err != nil {
 			t.Fatal(err)
 		}
 		if got := strings.Join(runner.calls, ","); got != "chage,usermod,userdel" {
@@ -1368,7 +1368,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			ClearScheduledJobs: testClearScheduledJobs,
 			DrainScheduledJobs: testDrainScheduledJobs,
 		}
-		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, false); err != nil {
+		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, false, false); err != nil {
 			t.Fatal(err)
 		}
 		if terminatedUID != pending.UID {
@@ -1399,7 +1399,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			LookupUser: lookup,
 		}
 		setTestRegistryRecord(t, a, rec)
-		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true); err != nil {
+		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false); err != nil {
 			t.Fatal(err)
 		}
 		if len(runner.calls) != 0 {
@@ -1434,12 +1434,61 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 				return nil
 			},
 		}
-		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true)
+		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false)
 		if err == nil || !strings.Contains(err.Error(), "identity changed") {
 			t.Fatalf("rollback error = %v, want replacement refusal", err)
 		}
 		if got := strings.Join(runner.calls, ","); got != "" {
 			t.Fatalf("replacement reached account helper: commands=%q", got)
+		}
+	})
+
+	t.Run("activation attempt selects rollback identity policy", func(t *testing.T) {
+		const currentGeneration = "0123456789abcdef0123456789abcdef"
+		witness := config.ManagedGenerationGECOSWitnessPrefix + currentGeneration
+		expected := user.Passwd{
+			Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: ",,,," + witness,
+			Home: "/home/xxvcc-a1", Shell: "/bin/bash",
+		}
+		current := expected
+		current.GECOS = "Changed Name,room,work,home," + witness
+		current.Shell = "/bin/sh"
+		currentRec := registry.Record{
+			User: expected.Name, UID: expected.UID, Generation: currentGeneration,
+			IdentityBound: true,
+		}
+
+		for _, tc := range []struct {
+			name              string
+			activationStarted bool
+			wantErr           bool
+		}{
+			{name: "before activation", wantErr: true},
+			{name: "activation may have taken effect", activationStarted: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				runner := &revokeRunner{}
+				a := &App{
+					Users:              &user.Manager{Runner: runner},
+					LookupUser:         func(string) (user.Passwd, bool, error) { return current, true, nil },
+					TerminateProcesses: func(int) error { return nil },
+					ClearScheduledJobs: testClearScheduledJobs,
+					DrainScheduledJobs: testDrainScheduledJobs,
+				}
+				err := a.rollbackInviteAccount(expected.Name, currentRec, expected, false, tc.activationStarted)
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("rollback error = %v, wantErr %v", err, tc.wantErr)
+				}
+				if tc.wantErr {
+					if len(runner.calls) != 0 {
+						t.Fatalf("pre-activation identity change reached helpers: %v", runner.calls)
+					}
+					return
+				}
+				if got := strings.Join(runner.calls, ","); got != "chage,usermod" {
+					t.Fatalf("post-activation rollback helpers = %q, want login disable", got)
+				}
+			})
 		}
 	})
 }
@@ -2321,7 +2370,11 @@ func TestPromptYesNoStopsAfterInvalidNonTTYInputAndEOF(t *testing.T) {
 
 func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
-	managed := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: config.ManagedGenerationGECOSPrefix + generation, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
+	marker := config.ManagedGenerationGECOSPrefix + generation
+	witness := config.ManagedGenerationGECOSWitnessPrefix + generation
+	managed := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: ",,,," + witness, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
+	firstField := managed
+	firstField.GECOS = marker
 	legacy := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: config.ManagedGECOS, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
 	rootUID := managed
 	rootUID.UID = 0
@@ -2354,6 +2407,7 @@ func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 		{name: "marker mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true}, pw: user.Passwd{UID: 1001, GID: 1001}, exists: true, want: registeredMarkerMismatch},
 		{name: "generation mismatch", rec: registry.Record{UID: 1001, Generation: "fedcba9876543210fedcba9876543210", IdentityBound: true}, pw: managed, exists: true, want: registeredMarkerMismatch},
 		{name: "home mismatch", rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: generation, IdentityBound: true}, pw: homeMismatch, exists: true, want: registeredHomeMismatch},
+		{name: "deployed first-field witness", rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: generation, IdentityBound: true}, pw: firstField, exists: true, want: registeredFirstFieldWitness},
 		{name: "active", rec: registry.Record{User: "xxvcc-a1", UID: 1001, Generation: generation, IdentityBound: true}, pw: managed, exists: true, want: registeredActive},
 	}
 	for _, tc := range tests {

@@ -554,7 +554,7 @@ func liveTeardownAccountAuthorized(acc teardownAccount) bool {
 		return false
 	}
 	state := classifyRegisteredAccount(acc.registryRecord, acc.passwd, true, nil)
-	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryBound
+	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredRecoveryBound
 }
 
 func sameTeardownPlan(a, b teardownPlan) bool {
@@ -566,7 +566,7 @@ func sameTeardownPlan(a, b teardownPlan) bool {
 		left, right := a.accounts[i], b.accounts[i]
 		if left.name != right.name || left.exists != right.exists || left.recovery != right.recovery ||
 			left.registryFound != right.registryFound || left.registryRecord != right.registryRecord ||
-			left.passwd != right.passwd || len(left.witnesses) != len(right.witnesses) {
+			!user.SameAccountIdentity(left.passwd, right.passwd) || len(left.witnesses) != len(right.witnesses) {
 			return false
 		}
 		for j := range left.witnesses {

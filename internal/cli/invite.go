@@ -977,6 +977,11 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 	sudoRemovalConfirmed := true
 	sshdRemovalConfirmed := true
 	accountCleanupConfirmed := true
+	// The final chage call can make the credential usable before a helper reports
+	// failure. From the instant that helper is invoked, rollback must tolerate the
+	// account holder changing ordinary passwd fields or a partially successful
+	// activation could let chfn/chsh hold cleanup open indefinitely.
+	loginActivationStarted := false
 	confirmSudoRemoved := func() error {
 		err := a.removeSudoGrant(username)
 		if err == nil {
@@ -1155,7 +1160,7 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 			causes = append(causes, fmt.Errorf("sshd removal is unconfirmed; account disabled and retained"))
 		}
 		mayDelete := sudoRemovalConfirmed && sshdRemovalConfirmed
-		cleanupErr := errors.Join(errors.Join(causes...), a.rollbackInviteAccount(username, rec, rollbackIdentity, mayDelete))
+		cleanupErr := errors.Join(errors.Join(causes...), a.rollbackInviteAccount(username, rec, rollbackIdentity, mayDelete, loginActivationStarted))
 		if cleanupErr == nil {
 			accountCleanupConfirmed = true
 		}
@@ -1411,6 +1416,7 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 	// expiry or an explicit never-expire value only after every rollback witness is
 	// in place. Skipping it for a permanent invite would leave the credential
 	// unusable forever.
+	loginActivationStarted = true
 	if permanent {
 		if err := a.Users.ClearExpiry(username); err != nil {
 			return failf("%s: %v", a.P.M("恢复永久账号的登录有效期失败", "restoring never-expire login state for the permanent account failed"), err)
@@ -1453,7 +1459,7 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 // name-scoped grants are confirmed gone, login is disabled, and every process
 // carrying the UID is confirmed terminated. Any uncertainty retains both the
 // account and the registry witness for manual recovery.
-func (a *App) rollbackInviteAccount(username string, rec registry.Record, expected user.Passwd, mayDelete bool) error {
+func (a *App) rollbackInviteAccount(username string, rec registry.Record, expected user.Passwd, mayDelete, loginActivationStarted bool) error {
 	if rec.User != username || !rec.IdentityBound || !validate.Generation(rec.Generation) ||
 		expected.Name != username || !validate.AccountID(expected.UID) || !validate.AccountID(expected.GID) ||
 		!validate.ManagedHome(username, expected.Home) || expected.Shell == "" {
@@ -1462,14 +1468,18 @@ func (a *App) rollbackInviteAccount(username string, rec registry.Record, expect
 	if rec.UID > 0 && rec.UID != expected.UID {
 		return fmt.Errorf("account identity differs from the durable registry witness; account and registry record retained")
 	}
-	marker := expected.GECOS
-	if i := strings.IndexByte(marker, ','); i >= 0 {
-		marker = marker[:i]
-	}
-	pendingMarker := config.PendingGenerationGECOSPrefix + rec.Generation
-	managedMarker := config.ManagedGenerationGECOSPrefix + rec.Generation
-	if marker != managedMarker && (marker != pendingMarker || !rec.Pending) {
+	managedMarker := user.MatchesManagedGeneration(expected, rec.Generation)
+	pendingMarker := rec.Pending && user.MatchesPendingGeneration(expected, rec.Generation)
+	if !managedMarker && !pendingMarker {
 		return fmt.Errorf("account generation marker does not match rollback state; account and registry record retained")
+	}
+	identityMatches := func(expected, current user.Passwd) bool { return expected == current }
+	stillMatches := a.accountStillMatches
+	deleteExpected := a.Users.DeleteExpectedExact
+	if loginActivationStarted {
+		identityMatches = user.SameAccountIdentity
+		stillMatches = a.revokeAccountStillMatches
+		deleteExpected = a.Users.DeleteExpected
 	}
 	pw, exists, err := a.lookupUser(username)
 	if err != nil {
@@ -1489,28 +1499,28 @@ func (a *App) rollbackInviteAccount(username string, rec registry.Record, expect
 			if err := a.persistDeletionStarted(rec, true, expected); err != nil {
 				return fmt.Errorf("persist rollback deletion recovery: %w", err)
 			}
-			return a.Users.DeleteExpected(username, expected, func() error { return nil })
+			return deleteExpected(username, expected, func() error { return nil })
 		}
 		return nil
 	}
-	if pw != expected {
+	if !identityMatches(expected, pw) {
 		return fmt.Errorf("account identity changed before rollback; account and registry record retained")
 	}
 	if !mayDelete {
-		if err := a.accountStillMatches(username, expected); err != nil {
+		if err := stillMatches(username, expected); err != nil {
 			return fmt.Errorf("verify retained account before login disable: %w", err)
 		}
 		if err := a.Users.DisableLogin(username); err != nil {
 			return fmt.Errorf("disable retained account: %w", err)
 		}
-		if err := a.quiesceScheduledAccount(username, expected); err != nil {
+		if err := a.quiesceScheduledAccountWith(username, expected, stillMatches); err != nil {
 			return fmt.Errorf("quiesce retained account cron/at work and processes: %w", err)
 		}
 		return nil
 	}
-	stage, err := a.teardownLocalAccount(username, expected, func() error {
+	stage, err := a.teardownLocalAccountWith(username, expected, func() error {
 		return a.persistDeletionStarted(rec, true, expected)
-	})
+	}, stillMatches, deleteExpected)
 	if err != nil {
 		return fmt.Errorf("fail-closed account teardown stopped at stage %d: %w", stage, err)
 	}

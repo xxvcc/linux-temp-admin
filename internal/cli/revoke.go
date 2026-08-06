@@ -101,13 +101,20 @@ type revokeOptions struct {
 }
 
 // revokeIdentitySnapshot binds an interactive full-name confirmation to the
-// complete account generation that was visible before the prompt. The account
-// lock is intentionally acquired only after human input, so the locked path must
-// reject a same-name replacement instead of applying the old confirmation to it.
+// stable account generation that was visible before the prompt. The account lock
+// is intentionally acquired only after human input, so the locked path must reject
+// a same-name replacement instead of applying the old confirmation to it. Current
+// trailing-witness identities may change their user-writable passwd fields while
+// the operator types; older identities remain byte-for-byte strict.
 type revokeIdentitySnapshot struct {
 	registered bool
 	record     registry.Record
 	passwd     user.Passwd
+}
+
+func (s *revokeIdentitySnapshot) matches(registered bool, record registry.Record, passwd user.Passwd, exists bool) bool {
+	return s != nil && exists && registered == s.registered && record == s.record &&
+		user.SameAccountIdentity(s.passwd, passwd)
 }
 
 func legacyRecoveryAuthorized(identityBound bool, opts revokeOptions, stdinTTY bool) bool {
@@ -202,8 +209,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		a.errorf("%s: %v", a.P.M("读取账号数据库失败，拒绝清理状态", "reading account database failed; refusing state cleanup"), err)
 		return 1
 	}
-	if confirmed := opts.confirmedIdentity; confirmed != nil &&
-		(!exists || registered != confirmed.registered || rec != confirmed.record || pw != confirmed.passwd) {
+	if confirmed := opts.confirmedIdentity; confirmed != nil && !confirmed.matches(registered, rec, pw, exists) {
 		a.errorf("%s", a.P.M(
 			"输入确认后账号或登记身份发生变化；未清理授权、禁用或删除任何账号，请重新运行并确认当前世代。",
 			"the account or registry identity changed after confirmation; no grant was cleaned and no account was disabled or deleted; rerun and confirm the current generation."))
@@ -372,10 +378,11 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 
 	// Removing grants and reloading sshd can take long enough for an out-of-band
 	// administrator to replace the account. Do not disable one generation, signal
-	// another UID, and then userdel a third: require the complete passwd entry to be
-	// unchanged immediately before the destructive teardown.
+	// another UID, and then userdel a third. New accounts can ignore concurrent
+	// edits to user-changeable GECOS/shell fields only while their trailing
+	// generation witness and stable numeric/Home identity remain exact.
 	current, stillExists, identityErr := a.lookupUser(username)
-	if identityErr != nil || !stillExists || current != pw {
+	if identityErr != nil || !stillExists || !user.SameAccountIdentity(pw, current) {
 		if identityErr == nil {
 			identityErr = fmt.Errorf("account identity changed during revoke")
 		}
@@ -399,11 +406,11 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	if preDeleteErr != nil {
 		// Do not free the username while a name-scoped privilege file survives or
 		// while an account artifact cannot be removed under its captured identity.
-		// The complete passwd entry was just re-checked, so disable this exact
-		// identity before retaining it for operator recovery.
+		// The stable passwd identity was just re-checked, so disable this exact
+		// account before retaining it for operator recovery.
 		disableErr := a.Users.DisableLogin(username)
 		if disableErr == nil {
-			identityErr := a.accountStillMatches(username, pw)
+			identityErr := a.revokeAccountStillMatches(username, pw)
 			if identityErr != nil {
 				combined := errors.Join(preDeleteErr, identityErr)
 				a.errorf("%s: %v", a.P.M("删除前的授权或账号文件无法安全清理；账号身份在禁用登录后发生变化，拒绝按旧身份清理 cron/at 任务或终止进程",
@@ -411,7 +418,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 				a.audit("account.delete", username, "fail", "pre-delete cleanup unsafe and identity changed after login disable: "+combined.Error(), nil)
 				return 1
 			}
-			quiesceErr := a.quiesceScheduledAccount(username, pw)
+			quiesceErr := a.quiesceScheduledAccountForRevoke(username, pw)
 			combined := errors.Join(preDeleteErr, quiesceErr)
 			a.errorf("%s: %v", a.P.M("删除前的授权或账号文件无法安全清理；账号已禁用但不会删除，账号和登记已保留供人工恢复",
 				"a grant or account artifact could not be safely cleaned before deletion; the account was disabled but not deleted, and the account and registry witness were retained for manual recovery"), combined)
@@ -548,10 +555,10 @@ func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd)
 	if err := a.Users.DisableLogin(rec.User); err != nil {
 		return false, err
 	}
-	if err := a.accountStillMatches(rec.User, expected); err != nil {
+	if err := a.revokeAccountStillMatches(rec.User, expected); err != nil {
 		return false, err
 	}
-	if err := a.quiesceScheduledAccountImmediate(rec.User, expected); err != nil {
+	if err := a.quiesceScheduledAccountImmediateForRevoke(rec.User, expected); err != nil {
 		return false, err
 	}
 	deadline := quarantineDeadline(a.Now())
@@ -586,19 +593,29 @@ const (
 // stage is returned with the error so revoke can explain precisely which recovery
 // state was retained without repeating these security-sensitive calls.
 func (a *App) teardownLocalAccount(username string, expected user.Passwd, persistDeletion func() error) (revokeAccountStage, error) {
-	if err := a.accountStillMatches(username, expected); err != nil {
+	return a.teardownLocalAccountWith(username, expected, persistDeletion, a.revokeAccountStillMatches, a.Users.DeleteExpected)
+}
+
+func (a *App) teardownLocalAccountWith(
+	username string,
+	expected user.Passwd,
+	persistDeletion func() error,
+	stillMatches func(string, user.Passwd) error,
+	deleteExpected func(string, user.Passwd, func() error) error,
+) (revokeAccountStage, error) {
+	if err := stillMatches(username, expected); err != nil {
 		return revokeDisableLogin, err
 	}
 	if err := a.Users.DisableLogin(username); err != nil {
 		return revokeDisableLogin, err
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return revokeQuiesceAccount, err
 	}
-	if err := a.quiesceScheduledAccount(username, expected); err != nil {
+	if err := a.quiesceScheduledAccountWith(username, expected, stillMatches); err != nil {
 		return revokeQuiesceAccount, err
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return revokeDeleteAccount, err
 	}
 	// Persist recovery authority before controlled mail/Home cleanup begins. The
@@ -611,8 +628,8 @@ func (a *App) teardownLocalAccount(username string, expected user.Passwd, persis
 	if err := persistDeletion(); err != nil {
 		return revokeDeleteAccount, fmt.Errorf("persist deletion-started recovery state: %w", err)
 	}
-	if err := a.Users.DeleteExpected(username, expected, func() error {
-		return a.finalScheduledAccountCheck(username, expected)
+	if err := deleteExpected(username, expected, func() error {
+		return a.finalScheduledAccountCheckWith(username, expected, stillMatches)
 	}); err != nil {
 		return revokeDeleteAccount, err
 	}
@@ -620,13 +637,13 @@ func (a *App) teardownLocalAccount(username string, expected user.Passwd, persis
 }
 
 func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, persistDeletion func() error) (revokeAccountStage, error) {
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := a.revokeAccountStillMatches(username, expected); err != nil {
 		return revokeDisableLogin, err
 	}
 	if err := a.Users.DisableLogin(username); err != nil {
 		return revokeDisableLogin, err
 	}
-	if err := a.quiesceScheduledAccountImmediate(username, expected); err != nil {
+	if err := a.quiesceScheduledAccountImmediateForRevoke(username, expected); err != nil {
 		return revokeQuiesceAccount, err
 	}
 	if persistDeletion == nil {
@@ -668,15 +685,10 @@ func deletionRecordMatchesPasswd(rec registry.Record, pw user.Passwd) bool {
 		!validate.ManagedHome(rec.User, pw.Home) || pw.Shell == "" {
 		return false
 	}
-	marker := pw.GECOS
-	if i := strings.IndexByte(marker, ','); i >= 0 {
-		marker = marker[:i]
-	}
-	wantPrefix := config.ManagedGenerationGECOSPrefix
 	if rec.Pending {
-		wantPrefix = config.PendingGenerationGECOSPrefix
+		return user.MatchesPendingGeneration(pw, rec.Generation)
 	}
-	return marker == wantPrefix+rec.Generation
+	return user.MatchesManagedGeneration(pw, rec.Generation)
 }
 
 func pendingCreationRecordMatchesPasswd(rec registry.Record, pw user.Passwd) bool {
@@ -792,39 +804,47 @@ func (a *App) reconcileDeletionStarted(rec registry.Record) error {
 // inventory. Transient first-pass failures are contained by the still-live,
 // disabled account and must be resolved by the final verification.
 func (a *App) quiesceScheduledAccount(username string, expected user.Passwd) error {
-	if err := a.accountStillMatches(username, expected); err != nil {
+	return a.quiesceScheduledAccountWith(username, expected, a.accountStillMatches)
+}
+
+func (a *App) quiesceScheduledAccountForRevoke(username string, expected user.Passwd) error {
+	return a.quiesceScheduledAccountWith(username, expected, a.revokeAccountStillMatches)
+}
+
+func (a *App) quiesceScheduledAccountWith(username string, expected user.Passwd, stillMatches func(string, user.Passwd) error) error {
+	if err := stillMatches(username, expected); err != nil {
 		return err
 	}
 	var firstPass []error
 	if err := a.terminateProcesses(expected.UID); err != nil {
 		firstPass = append(firstPass, fmt.Errorf("initial process termination: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(firstPass...), err)
 	}
 	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
 		firstPass = append(firstPass, fmt.Errorf("initial scheduled-job cleanup: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(firstPass...), err)
 	}
 	if err := a.drainScheduledJobs(); err != nil {
 		return errors.Join(errors.Join(firstPass...), fmt.Errorf("drain deferred jobs: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(firstPass...), err)
 	}
 	var finalPass []error
 	if err := a.terminateProcesses(expected.UID); err != nil {
 		finalPass = append(finalPass, fmt.Errorf("final process termination: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(firstPass...), errors.Join(finalPass...), err)
 	}
 	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
 		finalPass = append(finalPass, fmt.Errorf("final scheduled-job cleanup: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(firstPass...), errors.Join(finalPass...), err)
 	}
 	if err := errors.Join(finalPass...); err != nil {
@@ -838,32 +858,40 @@ func (a *App) quiesceScheduledAccount(username string, expected user.Passwd) err
 // final pass after a live passwd entry has already held an old identity through
 // the complete quarantine window.
 func (a *App) quiesceScheduledAccountImmediate(username string, expected user.Passwd) error {
-	if err := a.accountStillMatches(username, expected); err != nil {
+	return a.quiesceScheduledAccountImmediateWith(username, expected, a.accountStillMatches)
+}
+
+func (a *App) quiesceScheduledAccountImmediateForRevoke(username string, expected user.Passwd) error {
+	return a.quiesceScheduledAccountImmediateWith(username, expected, a.revokeAccountStillMatches)
+}
+
+func (a *App) quiesceScheduledAccountImmediateWith(username string, expected user.Passwd, stillMatches func(string, user.Passwd) error) error {
+	if err := stillMatches(username, expected); err != nil {
 		return err
 	}
 	var errs []error
 	if err := a.terminateProcesses(expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("process termination: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(errs...), err)
 	}
 	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("scheduled-job cleanup: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(errs...), err)
 	}
 	if err := a.terminateProcesses(expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("final process termination: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(errs...), err)
 	}
 	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("final scheduled-job cleanup: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -874,35 +902,52 @@ func (a *App) quiesceScheduledAccountImmediate(username string, expected user.Pa
 // this last pass terminates processes first, then closes jobs raced in during
 // filesystem cleanup without imposing a second polling-cycle delay.
 func (a *App) finalScheduledAccountCheck(username string, expected user.Passwd) error {
-	if err := a.accountStillMatches(username, expected); err != nil {
+	return a.finalScheduledAccountCheckWith(username, expected, a.revokeAccountStillMatches)
+}
+
+func (a *App) finalScheduledAccountCheckWith(username string, expected user.Passwd, stillMatches func(string, user.Passwd) error) error {
+	if err := stillMatches(username, expected); err != nil {
 		return err
 	}
 	var errs []error
 	if err := a.terminateProcesses(expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("process termination: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		return errors.Join(errors.Join(errs...), err)
 	}
 	if err := a.clearScheduledJobs(username, expected.UID); err != nil {
 		errs = append(errs, fmt.Errorf("scheduled-job cleanup: %w", err))
 	}
-	if err := a.accountStillMatches(username, expected); err != nil {
+	if err := stillMatches(username, expected); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
 
-// accountStillMatches prevents a multi-stage operation from carrying facts from
-// the invited account across an out-of-band delete/recreate. System account
-// helpers remain name-based, so callers re-check around each security-sensitive
-// stage even though those checks cannot make the helper an atomic compare-and-swap.
+// accountStillMatches keeps invite creation bound to the exact passwd snapshot it
+// captured. Before activation, even an ordinarily user-changeable field moving is
+// unexpected and must stop the transaction. Name-based helpers remain non-atomic.
 func (a *App) accountStillMatches(username string, expected user.Passwd) error {
 	current, exists, err := a.lookupUser(username)
 	if err != nil {
 		return fmt.Errorf("re-read account identity: %w", err)
 	}
 	if !exists || current != expected {
+		return fmt.Errorf("account identity changed during the operation")
+	}
+	return nil
+}
+
+// revokeAccountStillMatches keeps destructive work bound to stable identity while
+// allowing an activated invitee to change the passwd fields exposed by chfn/chsh.
+// SameAccountIdentity remains byte-exact for older first-field-only identities.
+func (a *App) revokeAccountStillMatches(username string, expected user.Passwd) error {
+	current, exists, err := a.lookupUser(username)
+	if err != nil {
+		return fmt.Errorf("re-read account identity: %w", err)
+	}
+	if !exists || !user.SameAccountIdentity(expected, current) {
 		return fmt.Errorf("account identity changed during the operation")
 	}
 	return nil
