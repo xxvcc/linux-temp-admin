@@ -17,6 +17,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/expiry"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
 	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -53,6 +54,25 @@ type inviteTimingRunner struct {
 	recordFound            bool
 	recordErr              error
 	stopErr                error
+	activationMutation     func(*user.Passwd)
+	activationErr          error
+}
+
+type inviteBundleFailWriter struct {
+	onBundle func()
+	err      error
+	wrote    int
+}
+
+func (w *inviteBundleFailWriter) Write(p []byte) (int, error) {
+	if !bytes.Contains(p, []byte("----- BEGIN LINUX TEMP ADMIN INVITE -----")) {
+		return len(p), nil
+	}
+	if w.onBundle != nil {
+		w.onBundle()
+	}
+	w.wrote = len(p) / 2
+	return w.wrote, w.err
 }
 
 func (*inviteTimingRunner) Look(name string) bool {
@@ -100,7 +120,14 @@ func (r *inviteTimingRunner) Run(name string, args ...string) error {
 			return fmt.Errorf("unexpected chage arguments: %v", args)
 		}
 		*r.events = append(*r.events, "expiry:"+args[1])
+		if args[1] != "1970-01-01" && (r.activationMutation != nil || r.activationErr != nil) {
+			if r.activationMutation != nil {
+				r.activationMutation(&r.account)
+			}
+			return r.activationErr
+		}
 	case "userdel":
+		*r.events = append(*r.events, "userdel")
 		r.present = false
 	}
 	return nil
@@ -605,6 +632,157 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	}
 	if rec.AutoRevoke || rec.Expires != "never (does not expire or auto-delete)" {
 		t.Fatalf("permanent registry row = %+v", rec)
+	}
+}
+
+func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T) {
+	tests := []struct {
+		name          string
+		username      string
+		uid           int
+		wantAuto      bool
+		activationErr error
+		outputErr     error
+	}{
+		{
+			name:          "permanent activation helper may have succeeded",
+			username:      "xxvcc-actperm",
+			uid:           4_000_101,
+			activationErr: errors.New("activation helper reported failure after applying expiry"),
+		},
+		{
+			name:          "temporary activation helper may have succeeded",
+			username:      "xxvcc-acttemp",
+			uid:           4_000_102,
+			wantAuto:      true,
+			activationErr: errors.New("activation helper reported failure after applying expiry"),
+		},
+		{
+			name:      "credential output fails after activation",
+			username:  "xxvcc-actout",
+			uid:       4_000_103,
+			outputErr: errors.New("credential output stopped after activation"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, exists, err := user.Lookup(tc.username); err != nil {
+				t.Fatal(err)
+			} else if exists {
+				t.Fatalf("test username %s already exists", tc.username)
+			}
+
+			binDir := t.TempDir()
+			idScript := "#!/bin/sh\n" +
+				"if [ \"$1\" = \"-u\" ]; then printf \"id: '%s': no such user\\n\" \"$3\" >&2; exit 1; fi\n" +
+				"if [ \"$1\" = \"-Gn\" ]; then printf '%s\\n' \"$2\"; exit 0; fi\n" +
+				"exit 2\n"
+			if err := os.WriteFile(filepath.Join(binDir, "id"), []byte(idScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir)
+
+			baseDir := rootOwnedDir(t)
+			regDir := filepath.Join(baseDir, "registry")
+			installPath := filepath.Join(baseDir, "linux-temp-admin")
+			if err := os.WriteFile(installPath, []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 0.0.0-dev\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			a, _, errb := newTestApp(t, "")
+			testNow := time.Now().UTC().Truncate(time.Second)
+			a.Now = func() time.Time { return testNow }
+			a.InstallPath = installPath
+			a.Selfmanage = &selfmanage.Manager{InstallPath: installPath}
+			a.Executable = func() (string, error) { return installPath, nil }
+			a.Registry = &registry.Store{
+				Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock"),
+			}
+			a.Scheduler = &schedule.Scheduler{
+				SystemdDir: filepath.Join(baseDir, "systemd"), InstallPath: installPath,
+				UnitPrefix: config.AutoRevokeUnitPrefix, Now: func() time.Time { return testNow }, Sys: revokeTestScheduleSystem{},
+			}
+			events := []string{}
+			runner := &inviteTimingRunner{
+				account: user.Passwd{UID: tc.uid, GID: tc.uid}, events: &events, registry: a.Registry,
+				activationErr: tc.activationErr,
+			}
+			var activationIdentity user.Passwd
+			mutated := false
+			mutateIdentity := func(p *user.Passwd) {
+				activationIdentity = *p
+				parts := strings.SplitN(p.GECOS, ",", 5)
+				if len(parts) != 5 || parts[4] == "" {
+					t.Fatalf("activation identity has no trailing witness: %+v", *p)
+				}
+				p.GECOS = "Changed Name,room,work,home," + parts[4]
+				p.Shell = "/bin/sh"
+				mutated = true
+			}
+			if tc.activationErr != nil {
+				runner.activationMutation = mutateIdentity
+			}
+			a.Users = &user.Manager{
+				Runner:             runner,
+				LookupUser:         runner.lookup,
+				PrepareManagedHome: func(string) error { return nil },
+				CreateManagedHome: func(user.Passwd) error {
+					events = append(events, "home")
+					return nil
+				},
+				ValidateManagedHome: func(user.Passwd) error {
+					events = append(events, "home-validate")
+					return nil
+				},
+				RemoveManagedMail: func(user.Passwd) error {
+					events = append(events, "mail")
+					return nil
+				},
+				RemoveManagedHome: func(user.Passwd) error {
+					events = append(events, "remove-home")
+					return nil
+				},
+			}
+			a.LookupUser = runner.lookup
+			a.IdentityAllocationRange = func() (int, int, error) { return tc.uid, tc.uid, nil }
+			a.ClearScheduledJobs = func(string, int) error { events = append(events, "clear"); return nil }
+			a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
+			a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
+			a.RandHex = func(int) (string, error) { return "fedcba9876543210fedcba9876543210", nil }
+			a.RandPassword = func(int) (string, error) { return "password-for-activation-test", nil }
+			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
+			}
+
+			var outputWriter *inviteBundleFailWriter
+			if tc.outputErr != nil {
+				outputWriter = &inviteBundleFailWriter{onBundle: func() { mutateIdentity(&runner.account) }, err: tc.outputErr}
+				a.Out = outputWriter
+			}
+			if rc := a.runInviteWithIdentityPolicy(tc.username, "192.0.2.1", 22, 1, false, tc.wantAuto,
+				loginPlan{password: true, verified: true}, false); rc != 1 {
+				t.Fatalf("runInviteWithIdentityPolicy rc=%d, want injected failure", rc)
+			}
+			wantErr := tc.activationErr
+			if wantErr == nil {
+				wantErr = tc.outputErr
+			}
+			if !strings.Contains(errb.String(), wantErr.Error()) {
+				t.Fatalf("invite failure did not report %q: %s", wantErr, errb.String())
+			}
+			if !mutated || activationIdentity == runner.account || !user.SameAccountIdentity(activationIdentity, runner.account) {
+				t.Fatalf("fixture did not preserve only the stable identity: before=%+v after=%+v", activationIdentity, runner.account)
+			}
+			if runner.present || !strings.Contains(strings.Join(events, ","), "userdel") {
+				t.Fatalf("activation-aware rollback did not delete the account: present=%v events=%v", runner.present, events)
+			}
+			if found, err := a.Registry.Contains(tc.username); err != nil || found {
+				t.Fatalf("activation-aware rollback retained registry state: found=%v err=%v", found, err)
+			}
+			if outputWriter != nil && outputWriter.wrote == 0 {
+				t.Fatal("output failure did not occur after partial credential output")
+			}
+		})
 	}
 }
 

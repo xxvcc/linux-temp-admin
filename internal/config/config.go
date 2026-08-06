@@ -31,6 +31,13 @@ const (
 	// PendingGenerationGECOSPrefix binds even the incomplete passwd entry to the
 	// creation intent that preceded it.
 	PendingGenerationGECOSPrefix = PendingGECOS + " generation="
+	// ManagedGenerationGECOSWitnessPrefix and PendingGenerationGECOSWitnessPrefix
+	// are compact markers for the fifth GECOS field. Keeping them short leaves room
+	// for regular users to edit earlier fields without hitting chfn's total-length
+	// limit. The distinct phase byte prevents a pending witness from being mistaken
+	// for a completed account.
+	ManagedGenerationGECOSWitnessPrefix = "lta-m="
+	PendingGenerationGECOSWitnessPrefix = "lta-p="
 
 	// --- owned paths and namespaces ---
 

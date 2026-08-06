@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.4 - 2026-08-06
+
+- Prevent ordinary `chfn`/`chsh` changes from postponing revoke indefinitely by
+  storing a compact, phase-specific generation witness in the fifth GECOS field
+  and comparing only the stable name, UID/GID, Home, and witness during teardown.
+  Generation-bound accounts created by v2.9.3 and earlier retain strict
+  first-field-marker and byte-for-byte passwd-snapshot compatibility; a lost old
+  witness remains a manual-inspection boundary.
+- Prevent a false-positive NOPASSWD verification with multiple sudoers NSS
+  sources by first mirroring sudo's own nsswitch stop-control semantics to prove
+  the local `files` source is reachable, then strictly parsing `sudo -n -l -U`.
+- Correct the embedded release-keyring comment: a signature from any one trusted
+  key is accepted, and verification fails closed when none of the keys match.
+
 ## v2.9.3 - 2026-08-01
 
 - Replace the normal invite's foreground 65-second deferred-job drain with a

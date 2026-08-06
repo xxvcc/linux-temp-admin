@@ -193,7 +193,7 @@ func TestSameTeardownPlanBindsRegistryAndPasswdIdentity(t *testing.T) {
 		},
 		passwd: user.Passwd{
 			Name: "xxvcc-plan1", UID: 1001, GID: 1001,
-			GECOS: config.ManagedGenerationGECOSPrefix + generation,
+			GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
 			Home:  "/home/xxvcc-plan1", Shell: "/bin/sh",
 		},
 	}}}
@@ -233,6 +233,24 @@ func TestSameTeardownPlanBindsRegistryAndPasswdIdentity(t *testing.T) {
 				t.Fatal("teardown plan ignored an account identity change")
 			}
 		})
+	}
+
+	mutable := base
+	mutable.accounts = append([]teardownAccount(nil), base.accounts...)
+	mutable.accounts[0].passwd.GECOS = "Changed Name,room,work,home," + config.ManagedGenerationGECOSWitnessPrefix + generation
+	mutable.accounts[0].passwd.Shell = "/bin/bash"
+	if !sameTeardownPlan(base, mutable) {
+		t.Fatal("teardown plan treated current-format user-writable passwd changes as a new identity")
+	}
+
+	old := base
+	old.accounts = append([]teardownAccount(nil), base.accounts...)
+	old.accounts[0].passwd.GECOS = config.ManagedGenerationGECOSPrefix + generation
+	oldChanged := old
+	oldChanged.accounts = append([]teardownAccount(nil), old.accounts...)
+	oldChanged.accounts[0].passwd.Shell = "/bin/bash"
+	if sameTeardownPlan(old, oldChanged) {
+		t.Fatal("teardown plan accepted a changed legacy first-field passwd snapshot")
 	}
 }
 

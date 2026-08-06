@@ -248,9 +248,9 @@ func Exists(name string) (bool, error) {
 
 // LifecycleMarkerAccounts returns local passwd names carrying an exact marker
 // written during this tool's account lifecycle. The result is discovery evidence
-// only: GECOS is root/user writable and must never authorize account deletion.
-// Callers must bind a completed registry row, UID, generation, and passwd snapshot
-// separately before performing any destructive action.
+// only: some GECOS subfields are user-writable and a marker alone must never
+// authorize account deletion. Callers must bind a completed registry row, UID,
+// generation, and passwd snapshot separately before performing destructive work.
 func LifecycleMarkerAccounts() ([]string, error) {
 	data, err := readPasswdDatabase(passwdPath, maxLocalPasswdBytes)
 	if err != nil {
@@ -354,8 +354,7 @@ func IsManagedEntry(pw Passwd) bool {
 }
 
 func hasManagedGenerationMarker(pw Passwd) bool {
-	generation, found := strings.CutPrefix(gecosFullName(pw.GECOS), config.ManagedGenerationGECOSPrefix)
-	return found && validate.Generation(generation)
+	return hasGenerationMarker(pw.GECOS, config.ManagedGenerationGECOSPrefix, config.ManagedGenerationGECOSWitnessPrefix)
 }
 
 // HasLifecycleMarker recognizes exact pending, legacy managed, and
@@ -369,9 +368,7 @@ func HasLifecycleMarker(pw Passwd) bool {
 }
 
 func hasPendingGenerationMarker(pw Passwd) bool {
-	name := gecosFullName(pw.GECOS)
-	generation, found := strings.CutPrefix(name, config.PendingGenerationGECOSPrefix)
-	return found && validate.Generation(generation)
+	return hasGenerationMarker(pw.GECOS, config.PendingGenerationGECOSPrefix, config.PendingGenerationGECOSWitnessPrefix)
 }
 
 // IsLegacyManagedEntry reports whether pw has the fixed marker used by released
@@ -381,26 +378,74 @@ func IsLegacyManagedEntry(pw Passwd) bool {
 }
 
 // MatchesManagedGeneration requires the exact dynamic marker for generation.
-// Matching only the username, UID, and legacy marker is unsafe because all three
-// can be reproduced after an out-of-band account deletion and recreation.
+// New accounts place a compact phase-specific witness in the trailing GECOS
+// field, which supported shadow/util-linux chfn implementations preserve when ordinary users
+// change full-name, room, or phone fields. The first-field fallback is retained
+// only for accounts created by already-deployed releases.
 func MatchesManagedGeneration(pw Passwd, generation string) bool {
-	return validate.Generation(generation) &&
-		gecosFullName(pw.GECOS) == config.ManagedGenerationGECOSPrefix+generation
+	return matchesGenerationMarker(pw.GECOS, config.ManagedGenerationGECOSPrefix, config.ManagedGenerationGECOSWitnessPrefix, generation)
+}
+
+// MatchesPendingGeneration is the pending-account counterpart of
+// MatchesManagedGeneration. It is exported because invite rollback and pending
+// recovery must use exactly the same old/new GECOS compatibility policy as
+// ordinary revoke.
+func MatchesPendingGeneration(pw Passwd, generation string) bool {
+	return matchesGenerationMarker(pw.GECOS, config.PendingGenerationGECOSPrefix, config.PendingGenerationGECOSWitnessPrefix, generation)
+}
+
+// HasTrailingGenerationWitness reports whether the trailing GECOS field carries
+// the exact completed-generation marker. Supported ordinary-user account tools
+// cannot overwrite that field. A false result can still be a valid account
+// created by v2.9.3 or earlier, when the exact marker is present only in the
+// user-changeable full-name field.
+func HasTrailingGenerationWitness(pw Passwd, generation string) bool {
+	if !validate.Generation(generation) {
+		return false
+	}
+	return gecosTrailingInfo(pw.GECOS) == config.ManagedGenerationGECOSWitnessPrefix+generation
+}
+
+// SameAccountIdentity compares passwd snapshots across a multi-stage lifecycle
+// operation. Accounts from older releases have only a user-changeable first-field
+// marker, so every field must remain byte-for-byte identical. For a new account,
+// an exact trailing lifecycle witness lets ordinary chfn/chsh changes proceed
+// without indefinitely postponing revoke: name, UID, GID, Home, and the trailing
+// witness still have to match, while earlier GECOS fields and a non-empty shell
+// may change.
+func SameAccountIdentity(expected, current Passwd) bool {
+	if expected == current {
+		return true
+	}
+	witness, protected := trailingLifecycleWitness(expected.GECOS)
+	if !protected || gecosTrailingInfo(current.GECOS) != witness {
+		return false
+	}
+	return current.Name == expected.Name && current.UID == expected.UID && current.GID == expected.GID &&
+		current.Home == expected.Home && expected.Shell != "" && current.Shell != ""
 }
 
 // ManagedGECOSForGeneration returns the exact completed marker for generation.
 func ManagedGECOSForGeneration(generation string) (string, error) {
-	if !validate.Generation(generation) {
-		return "", fmt.Errorf("invalid account generation %q", generation)
-	}
-	return config.ManagedGenerationGECOSPrefix + generation, nil
+	return generationGECOS(config.ManagedGenerationGECOSWitnessPrefix, generation)
 }
 
 func pendingGECOSForGeneration(generation string) (string, error) {
+	return generationGECOS(config.PendingGenerationGECOSWitnessPrefix, generation)
+}
+
+func generationGECOS(prefix, generation string) (string, error) {
 	if !validate.Generation(generation) {
 		return "", fmt.Errorf("invalid account generation %q", generation)
 	}
-	return config.PendingGenerationGECOSPrefix + generation, nil
+	marker := prefix + generation
+	// Keep the user-changeable fields empty and place a compact identity only in the
+	// fifth field. The deployed long marker leaves no portable room under chfn's
+	// bounded GECOS length once a user fills earlier fields. An older binary sees an
+	// empty full-name marker and safely refuses deletion; the current binary uses the
+	// trailing witness, for which supported helpers expose no ordinary-user
+	// overwrite path.
+	return ",,,," + marker, nil
 }
 
 // gecosFullName returns the first comma-separated GECOS subfield. Account tools
@@ -411,6 +456,50 @@ func gecosFullName(gecos string) string {
 		name = gecos[:i]
 	}
 	return name
+}
+
+// gecosTrailingInfo returns the fifth GECOS subfield. SplitN deliberately keeps
+// every comma after the fourth inside this final value so a malformed extra field
+// cannot be normalized into a valid witness.
+func gecosTrailingInfo(gecos string) string {
+	fields := strings.SplitN(gecos, ",", 5)
+	if len(fields) != 5 {
+		return ""
+	}
+	return fields[4]
+}
+
+func hasGenerationMarker(gecos, deployedPrefix, witnessPrefix string) bool {
+	deployedGeneration, deployed := strings.CutPrefix(gecosFullName(gecos), deployedPrefix)
+	witnessGeneration, witnessed := strings.CutPrefix(gecosTrailingInfo(gecos), witnessPrefix)
+	return (deployed && validate.Generation(deployedGeneration)) ||
+		(witnessed && validate.Generation(witnessGeneration))
+}
+
+func trailingLifecycleWitness(gecos string) (string, bool) {
+	marker := gecosTrailingInfo(gecos)
+	for _, prefix := range []string{config.ManagedGenerationGECOSWitnessPrefix, config.PendingGenerationGECOSWitnessPrefix} {
+		generation, found := strings.CutPrefix(marker, prefix)
+		if found && validate.Generation(generation) {
+			return marker, true
+		}
+	}
+	return "", false
+}
+
+func matchesGenerationMarker(gecos, deployedPrefix, witnessPrefix, generation string) bool {
+	if !validate.Generation(generation) {
+		return false
+	}
+	wantWitness := witnessPrefix + generation
+	trailing := gecosTrailingInfo(gecos)
+	if trailing != "" {
+		// Once a trailing value exists it is authoritative. Refuse a contradictory
+		// value even when the user-changeable full-name copy still looks right.
+		return trailing == wantWitness
+	}
+	// Compatibility for v2.9.3 and earlier generation-bound accounts.
+	return gecosFullName(gecos) == deployedPrefix+generation
 }
 
 // protectedNames are never deletable regardless of registration.
@@ -737,7 +826,7 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool, reser
 		return pw, fmt.Errorf("newly created account received identity %d:%d, want reserved %d:%d; account retained for rollback or manual recovery",
 			pw.UID, pw.GID, reservedID, reservedID)
 	}
-	if pw.Name != name || pw.Home != home || pw.Shell != shell || gecosFullName(pw.GECOS) != gecos {
+	if pw.Name != name || pw.Home != home || pw.Shell != shell || pw.GECOS != gecos {
 		return Passwd{}, fmt.Errorf("newly created account identity does not match the requested name, home, shell, and marker; account retained for manual recovery")
 	}
 	pids, scanErr := processesForUID(pw.UID)
@@ -848,15 +937,11 @@ func (m *Manager) MarkManagedExpected(name, generation string, expected Passwd) 
 	if err != nil {
 		return Passwd{}, err
 	}
-	if expected.Name != name || !validate.AccountID(expected.UID) || !validate.AccountID(expected.GID) || expected.Home != managedHome(name) || expected.Shell == "" || gecosFullName(expected.GECOS) != pending {
+	if expected.Name != name || !validate.AccountID(expected.UID) || !validate.AccountID(expected.GID) || expected.Home != managedHome(name) || expected.Shell == "" || expected.GECOS != pending {
 		return Passwd{}, fmt.Errorf("invalid pending account identity for %q", name)
 	}
-	absent, err := m.deletionState(name, &expected)
-	if err != nil {
+	if err := m.verifyExpectedIdentity(name, expected, "before marking it managed"); err != nil {
 		return Passwd{}, fmt.Errorf("verify pending account before marking managed: %w", err)
-	}
-	if absent {
-		return Passwd{}, fmt.Errorf("pending account %s disappeared before it could be marked managed", name)
 	}
 	if err := m.MarkManaged(name, generation); err != nil {
 		return Passwd{}, err
@@ -974,8 +1059,10 @@ func (m *Manager) DisableLogin(name string) error {
 	return errors.Join(m.SetExpiry(name, expiredDate), m.LockPassword(name))
 }
 
-// DeleteExpected removes name only while its complete passwd entry still
-// matches expected. The caller has already disabled login and reached an initial
+// DeleteExpected removes name only while its stable passwd identity still
+// matches expected. A protected trailing witness permits user-changeable
+// GECOS/shell fields to move; old identities retain byte-for-byte comparison.
+// The caller has already disabled login and reached an initial
 // cron/at/process fixed point. beforeDelete is mandatory and runs after controlled
 // Home/mail cleanup but immediately before the name-scoped account helper, so the
 // caller can repeat its scheduled-work and process checks at the last point where
@@ -986,6 +1073,22 @@ func (m *Manager) DisableLogin(name string) error {
 // their configuration and compiled account-database semantics cannot be proven
 // equivalent to shadow-utils userdel.
 func (m *Manager) DeleteExpected(name string, expected Passwd, beforeDelete func() error) error {
+	return m.deleteExpected(name, expected, beforeDelete, SameAccountIdentity)
+}
+
+// DeleteExpectedExact is the pre-activation rollback counterpart of
+// DeleteExpected. It requires the complete passwd snapshot to remain unchanged,
+// even for a current trailing-witness identity that cannot yet be used by the
+// invitee. Once login activation has been attempted, callers must use
+// DeleteExpected because the helper may have taken effect before reporting an
+// error and a live invitee must not be able to hold rollback open with chfn/chsh.
+func (m *Manager) DeleteExpectedExact(name string, expected Passwd, beforeDelete func() error) error {
+	return m.deleteExpected(name, expected, beforeDelete, func(expected, current Passwd) bool {
+		return expected == current
+	})
+}
+
+func (m *Manager) deleteExpected(name string, expected Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool) error {
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
@@ -995,11 +1098,11 @@ func (m *Manager) DeleteExpected(name string, expected Passwd, beforeDelete func
 	if beforeDelete == nil {
 		return fmt.Errorf("final account quiescence check is not configured")
 	}
-	return m.delete(name, &expected, beforeDelete)
+	return m.delete(name, &expected, beforeDelete, identityMatches)
 }
 
-func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() error) error {
-	absent, err := m.deletionState(name, expected)
+func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool) error {
+	absent, err := m.deletionState(name, expected, identityMatches)
 	if err != nil {
 		return fmt.Errorf("verify account identity before deletion: %w", err)
 	}
@@ -1014,7 +1117,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if err := m.removeManagedMail(*expected); err != nil {
 				return err
 			}
-			absent, err = m.deletionState(name, expected)
+			absent, err = m.deletionState(name, expected, identityMatches)
 			if err != nil {
 				return fmt.Errorf("verify account remained absent after artifact cleanup sweep %d: %w", sweep, err)
 			}
@@ -1049,7 +1152,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 	}
 	var attemptErrs []error
 	for _, helper := range helpers {
-		absent, err := m.deletionState(name, expected)
+		absent, err := m.deletionState(name, expected, identityMatches)
 		if err != nil {
 			return errors.Join(errors.Join(attemptErrs...), fmt.Errorf("verify account before %s: %w", helper.name, err))
 		}
@@ -1057,7 +1160,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if err := m.removeManagedMail(*expected); err != nil {
 				return fmt.Errorf("final managed mail cleanup after account disappearance: %w", err)
 			}
-			absent, err = m.deletionState(name, expected)
+			absent, err = m.deletionState(name, expected, identityMatches)
 			if err != nil {
 				return fmt.Errorf("verify account remained absent after account disappearance: %w", err)
 			}
@@ -1067,7 +1170,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			return nil
 		}
 		runErr := m.Runner.Run(helper.name, helper.args...)
-		absent, stateErr := m.deletionState(name, expected)
+		absent, stateErr := m.deletionState(name, expected, identityMatches)
 		if stateErr != nil {
 			return errors.Join(errors.Join(attemptErrs...), runErr, fmt.Errorf("verify %s removed %s: %w", helper.name, name, stateErr))
 		}
@@ -1076,7 +1179,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			// cleanup is in progress. Once the helper has made the account absent, sweep
 			// one final time before reporting success or releasing the registry witness.
 			mailErr := m.removeManagedMail(*expected)
-			stillAbsent, finalStateErr := m.deletionState(name, expected)
+			stillAbsent, finalStateErr := m.deletionState(name, expected, identityMatches)
 			if finalStateErr == nil && !stillAbsent {
 				finalStateErr = fmt.Errorf("account %s reappeared during final managed mail cleanup", name)
 			}
@@ -1135,22 +1238,14 @@ func (m *Manager) ClearManagedMailExpected(name string, expected Passwd) error {
 		!validate.AccountID(expected.GID) || !isManagedHome(name, expected.Home) || expected.Shell == "" {
 		return fmt.Errorf("invalid expected account identity for mail cleanup")
 	}
-	absent, err := m.deletionState(name, &expected)
-	if err != nil {
+	if err := m.verifyExpectedIdentity(name, expected, "before managed mail cleanup"); err != nil {
 		return fmt.Errorf("verify account before managed mail cleanup: %w", err)
-	}
-	if absent {
-		return fmt.Errorf("account %s disappeared before managed mail cleanup", name)
 	}
 	if err := m.removeManagedMail(expected); err != nil {
 		return err
 	}
-	absent, err = m.deletionState(name, &expected)
-	if err != nil {
+	if err := m.verifyExpectedIdentity(name, expected, "after managed mail cleanup"); err != nil {
 		return fmt.Errorf("verify account after managed mail cleanup: %w", err)
-	}
-	if absent {
-		return fmt.Errorf("account %s disappeared during managed mail cleanup", name)
 	}
 	return nil
 }
@@ -1166,7 +1261,7 @@ func (m *Manager) ReconcileManagedMailAfterDeletion(name string, uid int) error 
 	if !validate.AccountID(uid) {
 		return fmt.Errorf("invalid expected account UID for post-deletion mail cleanup")
 	}
-	absent, err := m.deletionState(name, nil)
+	absent, err := m.deletionState(name, nil, nil)
 	if err != nil {
 		return fmt.Errorf("verify account absence before managed mail cleanup: %w", err)
 	}
@@ -1176,7 +1271,7 @@ func (m *Manager) ReconcileManagedMailAfterDeletion(name string, uid int) error 
 	if err := m.removeManagedMail(Passwd{Name: name, UID: uid}); err != nil {
 		return err
 	}
-	absent, err = m.deletionState(name, nil)
+	absent, err = m.deletionState(name, nil, nil)
 	if err != nil {
 		return fmt.Errorf("verify account absence after managed mail cleanup: %w", err)
 	}
@@ -1687,7 +1782,7 @@ var (
 	removeHomeTree    = removeHomeTreeBounded
 )
 
-func (m *Manager) deletionState(name string, expected *Passwd) (absent bool, err error) {
+func (m *Manager) deletionState(name string, expected *Passwd, identityMatches func(Passwd, Passwd) bool) (absent bool, err error) {
 	current, exists, err := m.lookup(name)
 	if err != nil {
 		return false, err
@@ -1706,7 +1801,7 @@ func (m *Manager) deletionState(name string, expected *Passwd) (absent bool, err
 		}
 		return true, nil
 	}
-	if expected != nil && current != *expected {
+	if expected != nil && (identityMatches == nil || !identityMatches(*expected, current)) {
 		return false, fmt.Errorf("account identity changed during deletion; refusing a name-scoped fallback")
 	}
 	return false, nil

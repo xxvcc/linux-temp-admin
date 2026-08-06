@@ -304,6 +304,59 @@ func TestInteractiveRevokeBindsConfirmationToAccountGeneration(t *testing.T) {
 	}
 }
 
+func TestInteractiveRevokeConfirmationAllowsOnlyCurrentUserWritableFields(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	witness := config.ManagedGenerationGECOSWitnessPrefix + generation
+	expected := user.Passwd{
+		Name: "xxvcc-confirm2", UID: 1001, GID: 1001, GECOS: ",,,," + witness,
+		Home: "/home/xxvcc-confirm2", Shell: "/bin/bash",
+	}
+	rec := registry.Record{
+		User: expected.Name, UID: expected.UID, Generation: generation,
+		IdentityBound: true, Port: 22,
+	}
+
+	for _, tc := range []struct {
+		name        string
+		current     user.Passwd
+		wantMatches bool
+	}{
+		{
+			name: "full-name and shell changed",
+			current: user.Passwd{
+				Name: expected.Name, UID: expected.UID, GID: expected.GID,
+				GECOS: "Changed Name,room,work,home," + witness,
+				Home:  expected.Home, Shell: "/bin/sh",
+			},
+			wantMatches: true,
+		},
+		{
+			name: "protected witness changed",
+			current: user.Passwd{
+				Name: expected.Name, UID: expected.UID, GID: expected.GID,
+				GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + "fedcba9876543210fedcba9876543210",
+				Home:  expected.Home, Shell: expected.Shell,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := &revokeIdentitySnapshot{registered: true, record: rec, passwd: expected}
+			if got := snapshot.matches(true, rec, tc.current, true); got != tc.wantMatches {
+				t.Fatalf("confirmation identity match=%v, want %v", got, tc.wantMatches)
+			}
+		})
+	}
+
+	old := expected
+	old.GECOS = config.ManagedGenerationGECOSPrefix + generation
+	oldChanged := old
+	oldChanged.Shell = "/bin/sh"
+	snapshot := &revokeIdentitySnapshot{registered: true, record: rec, passwd: old}
+	if snapshot.matches(true, rec, oldChanged, true) {
+		t.Fatal("legacy first-field confirmation accepted a changed snapshot")
+	}
+}
+
 func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(t *testing.T) {
 	requireRootRegistryFixture(t)
 	const generation = "0123456789abcdef0123456789abcdef"
@@ -718,6 +771,77 @@ func TestTeardownLocalAccountOrdersFinalCleanupBeforeUserdel(t *testing.T) {
 	)
 }
 
+func TestTeardownContinuesAcrossConcurrentUserWritablePasswdChanges(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	marker := config.ManagedGenerationGECOSWitnessPrefix + generation
+	expected := user.Passwd{
+		Name: "xxvcc-mutable1", UID: 1001, GID: 1001,
+		GECOS: ",,,," + marker,
+		Home:  "/home/xxvcc-mutable1", Shell: "/bin/bash",
+	}
+	events := []string{}
+	present := true
+	lookups := 0
+	lookup := func(string) (user.Passwd, bool, error) {
+		if !present {
+			return user.Passwd{}, false, nil
+		}
+		lookups++
+		current := expected
+		if lookups%2 == 0 {
+			current.GECOS = "Changed Name,office,work,home," + marker
+			current.Shell = "/bin/sh"
+		} else {
+			current.GECOS = "Another Name,room,,," + marker
+		}
+		return current, true, nil
+	}
+	a := &App{
+		Users: &user.Manager{
+			Runner:            &orderedTeardownRunner{events: &events, present: &present},
+			LookupUser:        lookup,
+			NameInUse:         func(string) (bool, error) { return false, nil },
+			RemoveManagedMail: func(user.Passwd) error { events = append(events, "mail"); return nil },
+			RemoveManagedHome: func(user.Passwd) error { events = append(events, "home"); return nil },
+		},
+		LookupUser:         lookup,
+		TerminateProcesses: func(int) error { events = append(events, "kill"); return nil },
+		ClearScheduledJobs: func(string, int) error { events = append(events, "clear"); return nil },
+		DrainScheduledJobs: func() error { events = append(events, "drain"); return nil },
+	}
+
+	stage, err := a.teardownLocalAccount(expected.Name, expected, func() error {
+		events = append(events, "persist")
+		return nil
+	})
+	if err != nil || stage != revokeAccountRemoved {
+		t.Fatalf("teardownLocalAccount = stage %v, err %v; want removal across chfn/chsh changes", stage, err)
+	}
+	if present || lookups < 10 || !strings.Contains(strings.Join(events, ","), "userdel") {
+		t.Fatalf("mutable-field teardown did not complete: present=%v lookups=%d events=%v", present, lookups, events)
+	}
+}
+
+func TestInviteAndRevokeIdentityComparisonsUseDifferentPolicies(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	witness := config.ManagedGenerationGECOSWitnessPrefix + generation
+	expected := user.Passwd{
+		Name: "xxvcc-policy1", UID: 1001, GID: 1001, GECOS: ",,,," + witness,
+		Home: "/home/xxvcc-policy1", Shell: "/bin/bash",
+	}
+	current := expected
+	current.GECOS = "Changed Name,room,work,home," + witness
+	current.Shell = "/bin/sh"
+	a := &App{LookupUser: func(string) (user.Passwd, bool, error) { return current, true, nil }}
+
+	if err := a.accountStillMatches(expected.Name, expected); err == nil {
+		t.Fatal("invite identity comparison accepted a changed passwd snapshot")
+	}
+	if err := a.revokeAccountStillMatches(expected.Name, expected); err != nil {
+		t.Fatalf("revoke identity comparison rejected user-writable field changes: %v", err)
+	}
+}
+
 func TestRollbackInviteAccountUsesOrderedTeardown(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
 	pw := user.Passwd{
@@ -732,7 +856,7 @@ func TestRollbackInviteAccountUsesOrderedTeardown(t *testing.T) {
 	a, events, present := newOrderedTeardownApp(t, pw, 0, nil)
 	setTestRegistryRecord(t, a, rec)
 
-	if err := a.rollbackInviteAccount(pw.Name, rec, pw, true); err != nil {
+	if err := a.rollbackInviteAccount(pw.Name, rec, pw, true, false); err != nil {
 		t.Fatal(err)
 	}
 	if *present {

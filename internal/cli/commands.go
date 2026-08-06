@@ -78,6 +78,8 @@ func (a *App) status(args []string) int {
 			switch classifyRegisteredAccount(rec, pw, true, nil) {
 			case registeredActive:
 				managed, identity = true, "generation-bound"
+			case registeredFirstFieldWitness:
+				managed, identity = true, "generation-bound-first-field-compat"
 			case registeredRecoveryBound:
 				identity = "deletion-recovery-bound"
 			case registeredQuarantine:
@@ -170,6 +172,8 @@ func (a *App) userCells(r registry.Record) []string {
 	switch classifyRegisteredAccount(r, pw, exists, err) {
 	case registeredActive:
 		state = a.P.M("在册", "active")
+	case registeredFirstFieldWitness:
+		state = a.P.M("在册（旧首字段见证）", "active (legacy first-field witness)")
 	case registeredRecoveryAbsent:
 		state = a.P.M("删除后恢复", "post-delete recovery")
 	case registeredRecoveryBound:
@@ -299,6 +303,7 @@ const (
 	registeredUIDMismatch
 	registeredMarkerMismatch
 	registeredHomeMismatch
+	registeredFirstFieldWitness
 	registeredActive
 )
 
@@ -333,6 +338,8 @@ func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool,
 		return registeredMarkerMismatch
 	case !validate.ManagedHome(rec.User, pw.Home):
 		return registeredHomeMismatch
+	case !user.HasTrailingGenerationWitness(pw, rec.Generation):
+		return registeredFirstFieldWitness
 	default:
 		return registeredActive
 	}
@@ -509,7 +516,7 @@ func (a *App) accountIsOursAndLive(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
-	return state == registeredActive || state == registeredQuarantine || state == registeredLegacyIdentity, nil
+	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredLegacyIdentity, nil
 }
 
 // accountNeedsAutoRevoke reports whether a managed auto-revoke task must be
@@ -531,7 +538,7 @@ func (a *App) accountNeedsAutoRevoke(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
-	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryAbsent ||
+	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredRecoveryAbsent ||
 		state == registeredRecoveryBound, nil
 }
 
@@ -559,7 +566,7 @@ func (a *App) completedAccountIdentity(name string) (ours, live bool, err error)
 		return false, true, nil
 	}
 	state := classifyRegisteredAccount(rec, pw, true, nil)
-	return state == registeredActive || state == registeredQuarantine || state == registeredRecoveryBound, true, nil
+	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredRecoveryBound, true, nil
 }
 
 // installedCommandVersion best-effort reads the version of the binary at
@@ -913,6 +920,11 @@ func (a *App) doctor(args []string) int {
 				case registeredHomeMismatch:
 					a.warnf("%s%s", a.P.M("登记账号的家目录不是本工具使用的确定路径；自动删除已禁用：",
 						"registered account home is not the deterministic path used by this tool; automatic deletion is disabled: "), rec.User)
+					rc = 1
+				case registeredFirstFieldWitness:
+					a.warnf("%s%s", a.P.M(
+						"登记账号仍使用 v2.9.3 及更早版本的 GECOS 首字段世代见证；当前精确标记仍可安全撤销，但允许普通用户修改 full-name 的主机可在撤销前丢失该见证。请尽快撤销并按当前版本重新邀请：",
+						"registered account still uses the v2.9.3-and-earlier generation witness in the GECOS full-name field. Its currently exact marker remains revocable, but a host that lets regular users change full-name can lose this witness before revoke. Revoke it promptly and issue a new invite with the current version: "), rec.User)
 					rc = 1
 				}
 			}

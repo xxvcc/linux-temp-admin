@@ -61,6 +61,24 @@ func writeUserCommand(t *testing.T, dir, name, body string) string {
 
 const testGeneration = "0123456789abcdef0123456789abcdef"
 
+func testManagedGenerationGECOS(t *testing.T) string {
+	t.Helper()
+	value, err := ManagedGECOSForGeneration(testGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func testPendingGenerationGECOS(t *testing.T) string {
+	t.Helper()
+	value, err := pendingGECOSForGeneration(testGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
 var noOpBeforeDelete = func() error { return nil }
 
 const samplePasswd = `root:x:0:0:root:/root:/bin/bash
@@ -95,20 +113,32 @@ func TestLookupAndManaged(t *testing.T) {
 
 func TestGenerationBoundManagedMarkers(t *testing.T) {
 	const otherGeneration = "fedcba9876543210fedcba9876543210"
+	managedMarker := config.ManagedGenerationGECOSPrefix + testGeneration
+	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	managedWitness := config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	pendingWitness := config.PendingGenerationGECOSWitnessPrefix + testGeneration
 	tests := []struct {
-		name       string
-		gecos      string
-		managed    bool
-		lifecycle  bool
-		legacy     bool
-		matchesGen bool
+		name           string
+		gecos          string
+		managed        bool
+		lifecycle      bool
+		legacy         bool
+		matchesGen     bool
+		matchesPending bool
+		trailing       bool
 	}{
 		{name: "legacy", gecos: config.ManagedGECOS + ",,,", managed: true, lifecycle: true, legacy: true},
-		{name: "bound", gecos: config.ManagedGenerationGECOSPrefix + testGeneration + ",,,", managed: true, lifecycle: true, matchesGen: true},
+		{name: "deployed first-field marker", gecos: managedMarker + ",,,", managed: true, lifecycle: true, matchesGen: true},
+		{name: "new trailing marker", gecos: ",,,," + managedWitness, managed: true, lifecycle: true, matchesGen: true, trailing: true},
+		{name: "self-service full-name change", gecos: "Changed Name,,,," + managedWitness, managed: true, lifecycle: true, matchesGen: true, trailing: true},
+		{name: "self-service office changes", gecos: "Changed Name,room,work,home," + managedWitness, managed: true, lifecycle: true, matchesGen: true, trailing: true},
+		{name: "trailing witness only", gecos: ",,,," + managedWitness, managed: true, lifecycle: true, matchesGen: true, trailing: true},
+		{name: "contradictory trailing marker", gecos: managedMarker + ",,,," + config.ManagedGenerationGECOSWitnessPrefix + otherGeneration, managed: true, lifecycle: true},
 		{name: "other generation", gecos: config.ManagedGenerationGECOSPrefix + otherGeneration, managed: true, lifecycle: true},
 		{name: "malformed generation", gecos: config.ManagedGenerationGECOSPrefix + "short"},
 		{name: "substring", gecos: "prefix " + config.ManagedGECOS},
-		{name: "pending", gecos: config.PendingGenerationGECOSPrefix + testGeneration, lifecycle: true},
+		{name: "deployed pending", gecos: pendingMarker, lifecycle: true, matchesPending: true},
+		{name: "new pending after full-name change", gecos: "changed,,,," + pendingWitness, lifecycle: true, matchesPending: true},
 		{name: "malformed pending", gecos: config.PendingGenerationGECOSPrefix + "short"},
 	}
 	for _, tc := range tests {
@@ -126,10 +156,66 @@ func TestGenerationBoundManagedMarkers(t *testing.T) {
 			if got := MatchesManagedGeneration(pw, testGeneration); got != tc.matchesGen {
 				t.Errorf("MatchesManagedGeneration = %v, want %v", got, tc.matchesGen)
 			}
+			if got := MatchesPendingGeneration(pw, testGeneration); got != tc.matchesPending {
+				t.Errorf("MatchesPendingGeneration = %v, want %v", got, tc.matchesPending)
+			}
+			if got := HasTrailingGenerationWitness(pw, testGeneration); got != tc.trailing {
+				t.Errorf("HasTrailingGenerationWitness = %v, want %v", got, tc.trailing)
+			}
 		})
+	}
+	if got, err := ManagedGECOSForGeneration(testGeneration); err != nil || got != ",,,,"+managedWitness {
+		t.Fatalf("ManagedGECOSForGeneration = %q, %v; want trailing marker", got, err)
 	}
 	if _, err := ManagedGECOSForGeneration("short"); err == nil {
 		t.Fatal("ManagedGECOSForGeneration accepted an invalid generation")
+	}
+}
+
+func TestSameAccountIdentityUsesOnlyProtectedWitnessForMutableFields(t *testing.T) {
+	managed := testManagedGenerationGECOS(t)
+	base := Passwd{
+		Name: "xxvcc-a1", UID: 1001, GID: 1001, GECOS: managed,
+		Home: "/home/xxvcc-a1", Shell: "/bin/bash",
+	}
+	mutable := base
+	mutable.GECOS = "Changed Name,room,work,home," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	mutable.Shell = "/bin/sh"
+	if !SameAccountIdentity(base, mutable) {
+		t.Fatal("protected trailing witness did not tolerate user-changeable GECOS/shell fields")
+	}
+
+	old := base
+	old.GECOS = config.ManagedGenerationGECOSPrefix + testGeneration
+	oldChanged := old
+	oldChanged.GECOS = "Changed Name"
+	oldChanged.Shell = "/bin/sh"
+	if SameAccountIdentity(old, oldChanged) {
+		t.Fatal("deployed first-field-only identity accepted a changed passwd snapshot")
+	}
+
+	otherGeneration := config.ManagedGenerationGECOSWitnessPrefix + "fedcba9876543210fedcba9876543210"
+	tests := []struct {
+		name   string
+		mutate func(*Passwd)
+	}{
+		{name: "name", mutate: func(p *Passwd) { p.Name = "xxvcc-replacement" }},
+		{name: "uid", mutate: func(p *Passwd) { p.UID++ }},
+		{name: "gid", mutate: func(p *Passwd) { p.GID++ }},
+		{name: "home", mutate: func(p *Passwd) { p.Home = "/srv/replacement" }},
+		{name: "empty shell", mutate: func(p *Passwd) { p.Shell = "" }},
+		{name: "missing trailing witness", mutate: func(p *Passwd) { p.GECOS = config.ManagedGenerationGECOSPrefix + testGeneration }},
+		{name: "changed trailing witness", mutate: func(p *Passwd) { p.GECOS = "Changed,,,," + otherGeneration }},
+		{name: "extra trailing field", mutate: func(p *Passwd) { p.GECOS += ",extra" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			current := base
+			tc.mutate(&current)
+			if SameAccountIdentity(base, current) {
+				t.Fatalf("identity accepted protected-field change: current=%+v", current)
+			}
+		})
 	}
 }
 
@@ -604,7 +690,7 @@ exit 1`)
 }
 
 func TestCreateArgvUseradd(t *testing.T) {
-	marker := config.ManagedGenerationGECOSPrefix + testGeneration
+	marker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true, "adduser": true}}
@@ -620,8 +706,8 @@ func TestCreateArgvUseradd(t *testing.T) {
 }
 
 func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
-	managedMarker := config.ManagedGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
+	managedMarker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
@@ -656,7 +742,7 @@ func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 
 func TestCreatePendingIdentityPinsReservedUIDAndGID(t *testing.T) {
 	const reserved = 2345
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true}}
@@ -674,7 +760,7 @@ func TestCreatePendingIdentityPinsReservedUIDAndGID(t *testing.T) {
 }
 
 func TestCreatePendingIdentityRejectsReservedIDMismatch(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2346:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true}}
@@ -714,7 +800,7 @@ func TestIdentityAllocationRangeFailsClosedOnInvalidPolicyOrDatabase(t *testing.
 }
 
 func TestCreatePendingDefersHomeUntilExpectedIdentityCall(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true}}
@@ -754,7 +840,7 @@ func TestCreatePendingDefersHomeUntilExpectedIdentityCall(t *testing.T) {
 }
 
 func TestCreateStillClearsMatchingMailBeforeCreatingHome(t *testing.T) {
-	marker := config.ManagedGenerationGECOSPrefix + testGeneration
+	marker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	var order []string
@@ -783,7 +869,7 @@ func TestCreateStillClearsMatchingMailBeforeCreatingHome(t *testing.T) {
 }
 
 func TestCreatePendingCompatibilityStillCreatesHome(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
 	var order []string
@@ -812,7 +898,7 @@ func TestCreatePendingCompatibilityStillCreatesHome(t *testing.T) {
 }
 
 func TestCreateManagedHomeExpectedRefusesReplacementBeforeCreation(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 	homeCalls := 0
@@ -846,7 +932,8 @@ func TestCreateManagedHomeExpectedRefusesReplacementBeforeCreation(t *testing.T)
 }
 
 func TestCreateManagedHomeExpectedRefusesIdentityChangeAfterCreation(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
+	changedMarker := "Changed Name,,,," + config.PendingGenerationGECOSWitnessPrefix + testGeneration
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 	var order []string
@@ -856,7 +943,7 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeAfterCreation(t *testing.
 		RemoveManagedMail:  func(Passwd) error { return nil },
 		CreateManagedHome: func(Passwd) error {
 			order = append(order, "home")
-			return os.WriteFile(passwdPath, []byte("xxvcc-a1:x:3456:3456:replacement:/home/xxvcc-a1:/bin/sh\n"), 0o644)
+			return os.WriteFile(passwdPath, []byte("xxvcc-a1:x:2345:2345:"+changedMarker+":/home/xxvcc-a1:/bin/sh\n"), 0o644)
 		},
 		ValidateManagedHome: func(Passwd) error {
 			t.Fatal("replacement identity reached Home validation")
@@ -876,8 +963,26 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeAfterCreation(t *testing.
 	}
 }
 
+func TestClearManagedMailExpectedRejectsUserWritableFieldChange(t *testing.T) {
+	expected := Passwd{
+		Name: "xxvcc-a1", UID: 2345, GID: 2345, GECOS: testPendingGenerationGECOS(t),
+		Home: "/home/xxvcc-a1", Shell: "/bin/sh",
+	}
+	current := expected
+	m := &Manager{
+		LookupUser: func(string) (Passwd, bool, error) { return current, true, nil },
+		RemoveManagedMail: func(Passwd) error {
+			current.GECOS = "Changed Name,,,," + config.PendingGenerationGECOSWitnessPrefix + testGeneration
+			return nil
+		},
+	}
+	if err := m.ClearManagedMailExpected(expected.Name, expected); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("ClearManagedMailExpected error = %v, want strict identity refusal", err)
+	}
+}
+
 func TestCreateManagedHomeExpectedRefusesIdentityChangeDuringValidation(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 	var order []string
@@ -910,7 +1015,7 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeDuringValidation(t *testi
 func TestCreateManagedHomeExpectedChecksIdentityAfterHookErrors(t *testing.T) {
 	for _, stage := range []string{"create", "validate"} {
 		t.Run(stage, func(t *testing.T) {
-			pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+			pendingMarker := testPendingGenerationGECOS(t)
 			setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 			setProcRoot(t, map[int]string{})
 			wantErr := errors.New(stage + " failed")
@@ -1059,7 +1164,7 @@ func TestReconcileManagedMailAfterDeletionRequiresContinuousAbsence(t *testing.T
 }
 
 func TestMarkManagedExpectedRefusesReplacementBeforeUsermod(t *testing.T) {
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
@@ -1076,6 +1181,30 @@ func TestMarkManagedExpectedRefusesReplacementBeforeUsermod(t *testing.T) {
 	}
 	if len(f.calls) != 1 || f.calls[0][0] != "useradd" {
 		t.Fatalf("replacement reached usermod: calls=%v", f.calls)
+	}
+}
+
+func TestMarkManagedExpectedRejectsUserWritableFieldChangeAfterUsermod(t *testing.T) {
+	pendingMarker := testPendingGenerationGECOS(t)
+	managedMarker := testManagedGenerationGECOS(t)
+	changedMarker := "Changed Name,,,," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
+	setProcRoot(t, map[int]string{})
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
+	f.onRun = func(name string) {
+		if name == "usermod" {
+			if err := os.WriteFile(passwdPath, []byte("xxvcc-a1:x:2345:2345:"+changedMarker+":/home/xxvcc-a1:/bin/sh\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m := managerWithStubbedHomeChecks(f)
+	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MarkManagedExpected("xxvcc-a1", testGeneration, pending); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("MarkManagedExpected error = %v, want strict post-usermod identity refusal (exact marker %q)", err, managedMarker)
 	}
 }
 
@@ -1126,7 +1255,7 @@ func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *test
 	if os.Geteuid() != 0 {
 		t.Skip("mail-root ownership and mode transition requires root")
 	}
-	pendingMarker := config.PendingGenerationGECOSPrefix + testGeneration
+	pendingMarker := testPendingGenerationGECOS(t)
 	expected := Passwd{
 		Name: "xxvcc-a1", UID: 2345, GID: 2345, GECOS: pendingMarker,
 		Home: "/home/xxvcc-a1", Shell: "/bin/sh",
@@ -1187,7 +1316,7 @@ func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *test
 }
 
 func TestCreateEnforcesManagedHomeChecks(t *testing.T) {
-	marker := config.ManagedGenerationGECOSPrefix + testGeneration
+	marker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 
@@ -1453,7 +1582,7 @@ func writeProcTask(t *testing.T, tgid, tid int, status string) {
 }
 
 func TestCreateRejectsUIDWithResidualProcess(t *testing.T) {
-	marker := config.ManagedGenerationGECOSPrefix + testGeneration
+	marker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/sh\n")
 	// The target UID appears only in the saved-set UID column. Checking only real
 	// and effective UIDs would miss this process, which can switch back to 2345.
@@ -1471,7 +1600,7 @@ func TestCreateRejectsUIDWithResidualProcess(t *testing.T) {
 }
 
 func TestCreateFailsClosedWhenProcCannotBeScanned(t *testing.T) {
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+config.ManagedGenerationGECOSPrefix+testGeneration+":/home/xxvcc-a1:/bin/sh\n")
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+testManagedGenerationGECOS(t)+":/home/xxvcc-a1:/bin/sh\n")
 	old := procRoot
 	procRoot = filepath.Join(t.TempDir(), "missing")
 	t.Cleanup(func() { procRoot = old })
@@ -2015,6 +2144,136 @@ func TestDeleteExpectedRequiresFinalQuiescenceCallback(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Fatalf("missing quiescence callback reached userdel: %v", f.calls)
+	}
+}
+
+func TestDeleteExpectedExactRejectsCurrentFormatMutableFieldChanges(t *testing.T) {
+	expected := Passwd{
+		Name: "xxvcc-u", UID: 1001, GID: 1001,
+		GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration,
+		Home:  "/home/xxvcc-u", Shell: "/bin/bash",
+	}
+	current := expected
+	current.GECOS = "Changed Name,room,work,home," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	current.Shell = "/bin/sh"
+	f := &fakeRunner{available: map[string]bool{"userdel": true}}
+	artifactCalls := 0
+	m := &Manager{
+		Runner:            f,
+		LookupUser:        func(string) (Passwd, bool, error) { return current, true, nil },
+		RemoveManagedMail: func(Passwd) error { artifactCalls++; return nil },
+		RemoveManagedHome: func(Passwd) error { artifactCalls++; return nil },
+	}
+	err := m.DeleteExpectedExact(expected.Name, expected, noOpBeforeDelete)
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("DeleteExpectedExact error = %v, want exact-identity refusal", err)
+	}
+	if artifactCalls != 0 || len(f.calls) != 0 {
+		t.Fatalf("exact-identity refusal reached cleanup: artifacts=%d helpers=%v", artifactCalls, f.calls)
+	}
+}
+
+func TestDeleteExpectedIdentityPolicyPersistsAcrossLateBoundaries(t *testing.T) {
+	expected := Passwd{
+		Name: "xxvcc-u", UID: 1001, GID: 1001,
+		GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration,
+		Home:  "/home/xxvcc-u", Shell: "/bin/bash",
+	}
+	mutable := expected
+	mutable.GECOS = "Changed Name,room,work,home," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	mutable.Shell = "/bin/sh"
+	if !SameAccountIdentity(expected, mutable) || expected == mutable {
+		t.Fatal("fixture does not isolate user-changeable passwd fields")
+	}
+
+	policies := []struct {
+		name          string
+		delete        func(*Manager, string, Passwd, func() error) error
+		wantIdentity  bool
+		wantSucceeded bool
+	}{
+		{
+			name: "pre-activation exact snapshot",
+			delete: func(m *Manager, name string, expected Passwd, beforeDelete func() error) error {
+				return m.DeleteExpectedExact(name, expected, beforeDelete)
+			},
+			wantIdentity: true,
+		},
+		{
+			name: "activation may have started",
+			delete: func(m *Manager, name string, expected Passwd, beforeDelete func() error) error {
+				return m.DeleteExpected(name, expected, beforeDelete)
+			},
+			wantSucceeded: true,
+		},
+	}
+
+	for _, policy := range policies {
+		t.Run(policy.name+"/after artifact cleanup", func(t *testing.T) {
+			current := expected
+			exists := true
+			f := &fakeRunner{available: map[string]bool{"userdel": true}}
+			f.onRun = func(name string) {
+				if name == "userdel" {
+					exists = false
+				}
+			}
+			m := &Manager{
+				Runner:            f,
+				LookupUser:        func(string) (Passwd, bool, error) { return current, exists, nil },
+				RemoveManagedMail: func(Passwd) error { return nil },
+				RemoveManagedHome: func(Passwd) error {
+					current = mutable
+					return nil
+				},
+			}
+			err := policy.delete(m, expected.Name, expected, noOpBeforeDelete)
+			if policy.wantIdentity {
+				if err == nil || !strings.Contains(err.Error(), "identity changed") {
+					t.Fatalf("delete error = %v, want exact-identity refusal", err)
+				}
+				if len(f.calls) != 0 {
+					t.Fatalf("exact-identity refusal reached userdel: %v", f.calls)
+				}
+				return
+			}
+			if !policy.wantSucceeded || err != nil {
+				t.Fatalf("stable-identity delete error = %v", err)
+			}
+			if exists || len(f.calls) != 1 || f.calls[0][0] != "userdel" {
+				t.Fatalf("stable-identity delete did not finish: exists=%v calls=%v", exists, f.calls)
+			}
+		})
+
+		t.Run(policy.name+"/after account helper", func(t *testing.T) {
+			current := expected
+			f := &fakeRunner{available: map[string]bool{"userdel": true}}
+			f.onRun = func(name string) {
+				if name == "userdel" {
+					current = mutable
+				}
+			}
+			m := &Manager{
+				Runner:            f,
+				LookupUser:        func(string) (Passwd, bool, error) { return current, true, nil },
+				RemoveManagedMail: func(Passwd) error { return nil },
+				RemoveManagedHome: func(Passwd) error { return nil },
+			}
+			err := policy.delete(m, expected.Name, expected, noOpBeforeDelete)
+			if err == nil {
+				t.Fatal("account helper that left the account present was reported as success")
+			}
+			if policy.wantIdentity {
+				if !strings.Contains(err.Error(), "identity changed") {
+					t.Fatalf("delete error = %v, want exact post-helper identity refusal", err)
+				}
+			} else if strings.Contains(err.Error(), "identity changed") || !strings.Contains(err.Error(), "still exists") {
+				t.Fatalf("stable post-helper identity policy was not retained: %v", err)
+			}
+			if len(f.calls) != 1 || f.calls[0][0] != "userdel" {
+				t.Fatalf("post-helper verification calls = %v, want one userdel", f.calls)
+			}
+		})
 	}
 }
 

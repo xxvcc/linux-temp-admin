@@ -6,8 +6,9 @@
 # docs/releasing.md before removing OLD.
 #
 # CONFIGURED: signed self-upgrade is ENABLED. `upgrade` verifies each downloaded
-# release binary against every key before installing it, failing closed on any
-# mismatch. The current v1 key has historical network-host exposure; new keys
+# release binary against the trusted keyring before installing it, accepting a
+# signature from any one trusted key and failing closed if none match. The current
+# v1 key has historical network-host exposure; new keys
 # must follow the air-gapped custody model in docs/releasing.md. Candidate source
 # and online preparation/publication never receive a private-key path.
 #
