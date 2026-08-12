@@ -33,7 +33,9 @@ govulncheck ./...
 The integration suites use fixed disposable account names and shared host account
 databases. Each command serializes package processes with `-p 1`; also run the
 two commands themselves serially, never concurrently, and only on a disposable
-host.
+host. Ordinary `go test` runs must not mutate host account databases or fixed
+system paths. Root installer tests that create temporary destinations below
+`/usr/local/lib` are therefore available only with the `integration` build tag.
 
 **Release/install scripts**, if you touch `scripts/`:
 

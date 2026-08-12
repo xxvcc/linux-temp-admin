@@ -13,7 +13,7 @@ set -eu
 # Some systems link /bin/sh to Bash, which imports exported functions before
 # executing this file. Clear every command name we call before trusting PATH.
 for imported_name in id uname mktemp stat sha256sum openssl timeout awk grep od wc cp chmod chown mv \
-  dirname mkdir rm sleep curl getent nslookup command printf ulimit echo umask export unset set trap exit return break ':' '['; do
+  dirname mkdir rm sleep sync curl getent nslookup command printf ulimit echo umask export unset set trap exit return break ':' '['; do
   unset -f "$imported_name" 2>/dev/null || :
 done
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -40,6 +40,7 @@ MAX_SUMS_BYTES=1048576
 MAX_SIGNATURE_BYTES=256
 MAX_MANIFEST_BYTES=1048576
 MAX_PROBE_BYTES=256
+MAX_RELEASE_VERSION_BYTES=128
 MIRROR_FETCH_ATTEMPTS=2
 MIRROR_FETCH_TIMEOUT_SECONDS=20
 GITHUB_FETCH_ATTEMPTS=4
@@ -59,10 +60,15 @@ for command_name in id uname mktemp stat sha256sum openssl timeout awk grep od w
   dirname mkdir rm sleep curl; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
 done
+if [ "$DEST" != "$MANAGED_DEST" ]; then
+  command -v sync >/dev/null 2>&1 || fail "required command not found: sync"
+fi
 
 case "$release" in
   latest) ;;
   *)
+    [ "${#release}" -le $((MAX_RELEASE_VERSION_BYTES + 1)) ] \
+      || fail "LTA_RELEASE must not exceed 129 ASCII bytes"
     case "$release" in
       '' | *[!v0-9A-Za-z.+-]*) fail "LTA_RELEASE must be latest or an exact vX.Y.Z release tag" ;;
     esac
@@ -691,6 +697,8 @@ if [ "$release" = latest ]; then
       || fail "mirror latest manifest must be NUL-free and newline-terminated"
     expected_version=$(parse_mirror_manifest "$tmp/latest.json") \
       || fail "mirror latest manifest is invalid; refusing to hide a possible integrity incident"
+    [ "${#expected_version}" -le "$MAX_RELEASE_VERSION_BYTES" ] \
+      || fail "mirror latest manifest release version exceeds 128 ASCII bytes"
     printf '%s\n' "$expected_version" \
       | grep -Eq '^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' \
       || fail "mirror latest manifest contains an invalid release version"
@@ -837,9 +845,28 @@ check_safe_dir_chain() {
   done
 }
 
+sync_destination_directory_chain() {
+  sync_dir=$1
+  while :; do
+    timeout -k 5 30 sync "$sync_dir" \
+      || fail "custom destination directory chain could not be made durable: $sync_dir"
+    case "$sync_dir" in
+      / | //) break ;;
+    esac
+    sync_dir=$(dirname -- "$sync_dir")
+  done
+}
+
 check_safe_dir_chain "$existing_ancestor"
 mkdir -p -- "$dest_dir"
 check_safe_dir_chain "$dest_dir"
+if [ "$DEST" != "$MANAGED_DEST" ]; then
+  # Sync every directory inode from the leaf through root, in leaf-to-parent
+  # order. This makes each newly created component's entry durable in its parent
+  # before a custom installation can report success, including on a retry after
+  # an earlier visible mkdir whose parent sync failed.
+  sync_destination_directory_chain "$dest_dir"
+fi
 
 if [ -L "$DEST" ]; then
   fail "destination is a symlink: $DEST"
@@ -893,6 +920,11 @@ if [ "$DEST" = "$MANAGED_DEST" ]; then
   rm -f -- "$stage" || fail "could not remove the verified staging file"
   stage=""
 else
+  # Flush the fully verified inode before its name is committed. Operand-based
+  # sync is supported by both GNU coreutils and BusyBox without relying on their
+  # differing -d/-f option details.
+  timeout -k 5 30 sync "$stage" \
+    || fail "custom destination staging file could not be made durable"
   if mv --help 2>&1 | grep -q -- '--no-target-directory'; then
     mv -fT -- "$stage" "$DEST"
   else
@@ -924,4 +956,10 @@ if ! final_mode=$(stat -c %a -- "$DEST"); then
   fail "cannot inspect installed destination mode"
 fi
 [ "$final_mode" = 755 ] || fail "installed destination mode is not 0755"
+if [ "$DEST" != "$MANAGED_DEST" ]; then
+  timeout -k 5 30 sync "$DEST" \
+    || fail "custom destination is visible but its file durability is unknown"
+  timeout -k 5 30 sync "$dest_dir" \
+    || fail "custom destination is visible but its directory durability is unknown"
+fi
 echo "installed ${DEST} (version ${candidate_version})"

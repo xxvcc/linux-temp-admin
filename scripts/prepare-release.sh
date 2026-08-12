@@ -45,6 +45,7 @@ GO_VERSION="go1.26.5"
 MAX_BINARY_BYTES=67108864
 MAX_METADATA_BYTES=1048576
 MAX_SOURCE_ARCHIVE_BYTES=134217728
+MAX_RELEASE_VERSION_BYTES=128
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 GO_BUILD_TIMEOUT_SECONDS=900
 : "${LTA_EXPECTED_TAG_SIGNER_FINGERPRINT:?set the independently recorded OpenPGP tag-signer fingerprint}"
@@ -130,6 +131,8 @@ require_safe_new_output_path() {
   || { echo "set GH_TOKEN to a short-lived github.com release token" >&2; exit 1; }
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 export GH_TOKEN
+(( ${#TAG} <= MAX_RELEASE_VERSION_BYTES + 1 )) \
+  || { echo "tag exceeds 129 ASCII bytes" >&2; exit 1; }
 [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
   || { echo "tag must be vX.Y.Z or vX.Y.Z-prerelease" >&2; exit 1; }
 major="${BASH_REMATCH[1]}"
@@ -151,9 +154,11 @@ decimal_gt() {
 
 stable_tag_gt() {
   local newer=$1 older=$2 nmajor nminor npatch omajor ominor opatch
-  [[ "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  (( ${#newer} <= MAX_RELEASE_VERSION_BYTES + 1 )) \
+    && [[ "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
   nmajor=${BASH_REMATCH[1]}; nminor=${BASH_REMATCH[2]}; npatch=${BASH_REMATCH[3]}
-  [[ "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  (( ${#older} <= MAX_RELEASE_VERSION_BYTES + 1 )) \
+    && [[ "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
   omajor=${BASH_REMATCH[1]}; ominor=${BASH_REMATCH[2]}; opatch=${BASH_REMATCH[3]}
   for pair in "$nmajor:$omajor" "$nminor:$ominor" "$npatch:$opatch"; do
     local left=${pair%%:*} right=${pair#*:}
@@ -163,7 +168,7 @@ stable_tag_gt() {
   return 1
 }
 
-for command_name in awk chmod cmp cp dirname gh git go grep mkdir mktemp readlink rm sha256sum sort stat tar timeout wc; do
+for command_name in awk chmod cmp cp dirname gh git go grep mkdir mktemp readlink rm sha256sum sort stat sync tar timeout wc; do
   command -v "$command_name" >/dev/null 2>&1 || { echo "required command not found: $command_name" >&2; exit 1; }
 done
 timeout -k 1 1 /bin/true \
@@ -209,7 +214,8 @@ current_latest_tag() {
   local latest response_file api_status status_count not_found_count
   response_file="$work/latest-api-response"
   if latest="$(gh_with_timeout release view --repo "$REPO" --json tagName --jq '.tagName' 2>"$work/latest-view-error")"; then
-    [[ "$latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    [[ ${#latest} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+       && "$latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
       || { echo "Latest has a non-canonical stable tag: $latest" >&2; return 1; }
     printf '%s\n' "$latest"
     return 0
@@ -250,6 +256,20 @@ bounded_copy() {
   size="$(timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" stat -Lc '%s' -- "$destination")" \
     || { echo "copied file could not be measured: $destination" >&2; return 1; }
   (( size <= max )) || { echo "file exceeds its transfer limit: $source" >&2; return 1; }
+}
+
+sync_output_directory() {
+  local directory=$1 label=$2 path parent
+  shift 2
+  for path in "$@"; do
+    local_with_timeout sync -- "$directory/$path" \
+      || { echo "cannot sync $label file: $path" >&2; return 1; }
+  done
+  local_with_timeout sync -- "$directory" \
+    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
+  parent="$(dirname -- "$directory")"
+  local_with_timeout sync -- "$parent" \
+    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
 }
 
 echo ">> [prepare 1/6] authenticate tag, main ancestry, workflow, and draft"
@@ -380,7 +400,7 @@ for arch in amd64 arm64; do
       GOCACHE="$work/go-cache" GOMODCACHE="$work/lta-module-cache" GOPATH="$work/go-path" GOTMPDIR="$work/go-tmp" \
       CGO_ENABLED=0 GOOS=linux GOARCH="$arch" $arch_tune \
       go build -mod=readonly -buildvcs=false -trimpath -tags osusergo,netgo \
-      -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION}" \
+      -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION} -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.ReleaseVersionWitness=LTA_RELEASE_VERSION_V1{${VERSION}}" \
       -o "$work/local/linux-temp-admin-linux-${arch}" ./cmd/linux-temp-admin )
 done
 
@@ -427,6 +447,7 @@ done
   || { echo "prepared output manifest changed during transfer" >&2; exit 1; }
 timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" /bin/sh -c \
   'cd -- "$1" && exec sha256sum -c --strict PREPARED_SHA256SUMS' sh "$OUT_DIR"
+sync_output_directory "$OUT_DIR" "prepared output" "${prepared_output_files[@]}"
 complete=1
 echo "prepared release data: $OUT_DIR"
 echo "release tag: $TAG"

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -442,7 +443,7 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		started, quarantineErr := a.beginIdentityQuarantine(rec, pw)
 		if started {
 			if quarantineErr != nil {
-				a.warnf("%s: %v", a.P.M("身份隔离已建立，但旧自动删除任务清理未完整确认", "identity quarantine is active, but cleanup of the old auto-delete task was not fully confirmed"), quarantineErr)
+				a.warnf("%s: %v", a.P.M("身份隔离已建立，但持久化交接或旧自动删除任务清理未完整确认", "identity quarantine is active, but its durable handoff or cleanup of the old auto-delete task was not fully confirmed"), quarantineErr)
 			}
 			a.audit("account.quarantine", username, "ok", "access revoked; identity held for asynchronous deletion", nil)
 			return 0
@@ -566,9 +567,26 @@ func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd)
 	if err != nil {
 		return false, fmt.Errorf("%w: %v", errPersistentQuarantineUnavailable, err)
 	}
-	if err := a.Registry.BeginQuarantine(rec.User, expected.UID, rec.Generation, deadline, unit); err != nil {
-		cancelErr := a.Scheduler.CancelQuarantine(rec.User, unit)
-		return false, errors.Join(err, cancelErr)
+	beginQuarantine := a.Registry.BeginQuarantine
+	if a.BeginQuarantine != nil {
+		beginQuarantine = a.BeginQuarantine
+	}
+	var handoffErr error
+	if err := beginQuarantine(rec.User, expected.UID, rec.Generation, deadline, unit); err != nil {
+		var committed *fsutil.DurabilityError
+		if !errors.As(err, &committed) {
+			cancelErr := a.Scheduler.CancelQuarantine(rec.User, unit)
+			return false, errors.Join(err, cancelErr)
+		}
+		// DurabilityError means the registry rename is already visible. Cancelling
+		// the finalizer as if nothing committed would strand the disabled identity.
+		// Prove the complete expected row before treating the handoff as active. If
+		// the proof itself fails, preserve both the timer and registry evidence and
+		// fail closed for operator recovery.
+		if verifyErr := a.verifyCommittedQuarantine(rec, expected.UID, deadline, unit); verifyErr != nil {
+			return false, errors.Join(err, fmt.Errorf("verify visible quarantine registry state: %w", verifyErr))
+		}
+		handoffErr = err
 	}
 	// The quarantine timer is now the durable retry path. Failure to remove an old
 	// expiry task is non-fatal: an early duplicate invocation observes the deadline
@@ -577,7 +595,26 @@ func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd)
 	a.success(a.P.M(
 		"访问已撤销；账号身份隔离至 "+deadline.Local().Format("2006-01-02 15:04:05 MST")+"，届时自动完成删除。",
 		"access revoked; account identity is quarantined until "+deadline.Local().Format("2006-01-02 15:04:05 MST")+" and will then be deleted automatically."))
-	return true, cleanupErr
+	return true, errors.Join(handoffErr, cleanupErr)
+}
+
+func (a *App) verifyCommittedQuarantine(rec registry.Record, uid int, deadline time.Time, unit string) error {
+	committed, found, err := a.Registry.Lookup(rec.User)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("registry quarantine row is absent")
+	}
+	want := rec
+	want.UID = uid
+	want.DeletionStarted = true
+	want.QuarantineUntil = deadline.Format(time.RFC3339)
+	want.QuarantineUnit = unit
+	if committed != want {
+		return fmt.Errorf("registry quarantine row does not match the committed handoff")
+	}
+	return nil
 }
 
 type revokeAccountStage uint8

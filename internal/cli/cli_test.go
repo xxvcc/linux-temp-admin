@@ -619,6 +619,37 @@ func TestDispatchRouting(t *testing.T) {
 	}
 }
 
+func TestVersionCommandRejectsIncompleteReleaseMetadata(t *testing.T) {
+	previousVersion := buildinfo.Version
+	previousWitness := buildinfo.ReleaseVersionWitness
+	t.Cleanup(func() {
+		buildinfo.Version = previousVersion
+		buildinfo.ReleaseVersionWitness = previousWitness
+	})
+
+	for _, tc := range []struct {
+		name    string
+		version string
+		witness string
+	}{
+		{name: "missing witness", version: "2.9.5", witness: "unreleased"},
+		{name: "mismatched witness", version: "2.9.5", witness: "LTA_RELEASE_VERSION_V1{2.9.4}"},
+		{name: "invalid witness", version: "2.9.5", witness: "LTA_RELEASE_VERSION_V1{02.9.5}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buildinfo.Version = tc.version
+			buildinfo.ReleaseVersionWitness = tc.witness
+			a, out, errOut := newTestApp(t, "")
+			if rc := a.Dispatch([]string{"version"}); rc != 1 {
+				t.Fatalf("version rc = %d, want 1", rc)
+			}
+			if out.Len() != 0 || !strings.Contains(errOut.String(), "inconsistent build version metadata") {
+				t.Fatalf("version output = %q, error = %q", out.String(), errOut.String())
+			}
+		})
+	}
+}
+
 func TestOrphanScanErrorsAreNotHealthy(t *testing.T) {
 	a, _, errb := newTestApp(t, "")
 	a.Scheduler = &schedule.Scheduler{

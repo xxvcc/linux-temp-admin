@@ -700,6 +700,7 @@ printf '\n' >/dev/tty
 [[ -n "$GH_TOKEN" && "$GH_TOKEN" != *[[:space:]]* ]] \
   || fail "GH_TOKEN must be one non-empty token without whitespace"
 REPO=xxvcc/linux-temp-admin
+[[ ${#TAG} -le 129 ]] || fail "release tag exceeds 129 ASCII bytes"
 [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
 
 work="$(mktemp -d /root/.lta-latest-recovery.XXXXXX)"
@@ -729,9 +730,11 @@ decimal_gt() {
 }
 stable_gt() {
   local newer=$1 older=$2 nmajor nminor npatch omajor ominor opatch pair left right
-  [[ "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+  [[ ${#newer} -le 129 \
+     && "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
   nmajor=${BASH_REMATCH[1]}; nminor=${BASH_REMATCH[2]}; npatch=${BASH_REMATCH[3]}
-  [[ "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+  [[ ${#older} -le 129 \
+     && "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
   omajor=${BASH_REMATCH[1]}; ominor=${BASH_REMATCH[2]}; opatch=${BASH_REMATCH[3]}
   for pair in "$nmajor:$omajor" "$nminor:$ominor" "$npatch:$opatch"; do
     left=${pair%%:*}; right=${pair#*:}
@@ -756,7 +759,8 @@ enumerate_recovery_target() {
     [[ -z "$extra" && "$candidate_id" =~ ^[1-9][0-9]*$ \
        && ( "$candidate_immutable" == true || "$candidate_immutable" == false ) ]] \
       || fail "stable release has no unambiguous identity or immutable state"
-    [[ "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    [[ ${#candidate} -le 129 \
+       && "$candidate" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
       || fail "noncanonical stable tag: $candidate"
     [[ -z "${seen_release_tags[$candidate]+present}" \
        && -z "${seen_release_ids[$candidate_id]+present}" ]] \
@@ -902,10 +906,26 @@ been revalidated:
   non-writable executable.
 - `/var/lib/linux-temp-admin-mirror` is owned `ltamirror:ltamirror`, mode
   `0700`, and contains the persistent `.deploy.lock` plus private transient
-  transfer directories.
+  transfer directories. Under the deployment lock, the receiver applies one
+  aggregate logical/allocated-byte, file, and entry budget to this complete
+  directory before creating a stage, throughout transfer, after transfer, and
+  after cleanup. It refuses new work when residual `transfer-*` state exhausts
+  that budget and reports cleanup failure instead of silently accumulating it.
+  On every catchable receiver failure it terminates and reaps the complete
+  transfer process group before releasing the deployment lock, and reports a
+  failure in that cleanup without hiding the primary error. An uncatchable
+  receiver death can still leave a detached writer, and directory scans cannot
+  account for a file that has already been unlinked but remains open; use a
+  dedicated quota or filesystem when the host requires a kernel-enforced hard
+  bound against either residual case.
 - `/www/wwwroot/dl.ll.cd/linux-temp-admin` is owned `ltamirror:www`, mode
   `0755`. Its parent directories remain root-owned and not group/world
-  writable.
+  writable. The receiver limits this complete project tree to 32 GiB, 8,192
+  files, 16,384 entries, and 1,024 release-version directories, and rejects a
+  publication whose projected copy would leave less than the greater of 1 GiB
+  or 5% of that filesystem's capacity available. These are defense-in-depth
+  limits for a compromised deployment identity, not a replacement for host
+  filesystem quotas.
 - The mirror host's Linux kernel and C library expose
   `renameat2(RENAME_NOREPLACE)`, and an actual no-replace probe succeeds on the
   filesystem containing the document root; immutable version-file publication
@@ -1165,7 +1185,8 @@ ulimit -c 0 || fail "cannot disable core dumps"
     || fail "invalid INSTALLER_COMMIT"
   [[ "$INSTALLER_SHA256" =~ ^[0-9a-f]{64}$ ]] \
     || fail "invalid INSTALLER_SHA256"
-  [[ "$LTA_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
+  [[ ${#LTA_RELEASE_TAG} -le 129 \
+     && "$LTA_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] \
     || fail "invalid LTA_RELEASE_TAG"
 
   if [[ ! -d /tmp || -L /tmp ]]; then
@@ -1269,7 +1290,13 @@ Routine self-upgrade is:
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin upgrade
 ```
 
-The Go upgrader follows the same complete-source rule. It obtains the strict
+The Go upgrader follows the same complete-source rule. Release builds embed one
+canonical version witness inside the signed binary. A non-forced upgrade reads
+that authenticated witness without executing the candidate, applies the
+no-downgrade policy, and only then runs an allowed candidate under the bounded
+version probe; the reported version must match both the witness and selected
+release. Historical signed binaries without a witness require an explicit
+`--force` recovery before they may be probed. It obtains the strict
 mirror manifest, pins its exact tag, and downloads `SHA256SUMS`, the binary, and
 signature from the official mirror. Only a transport failure selects GitHub;
 after a valid manifest, the fallback redownloads the complete same-tag set.
@@ -1286,8 +1313,9 @@ response is hard-limited and transport errors plus 408/425/429/5xx statuses are
 boundedly retried. Structured
 `download=1` cache bypass is limited to later official GitHub Release attempts
 and never modifies a custom URL. The upgrader verifies checksums and the
-detached signature against the embedded keyring, bounds the candidate version
-process, compares versions, and atomically installs root:root `0755`. A
+detached signature against the embedded keyring, compares the static version
+witness before candidate execution, bounds the later version process, and
+atomically installs root:root `0755`. A
 byte-identical existing target is a no-op only if its parent and all target
 metadata are already safe; otherwise it is atomically repaired.
 

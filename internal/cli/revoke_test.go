@@ -5,10 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
@@ -588,6 +590,112 @@ func TestInteractivePendingRecoveryReturnsAfterDurableIdentityQuarantine(t *test
 			t.Fatalf("mature quarantine retained %s: %v", path, err)
 		}
 	}
+}
+
+func TestIdentityQuarantineReconcilesCommittedRegistryDurabilityError(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-qcommit"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	rec := registry.Record{
+		User: username, UID: 1001, Port: 22, Generation: generation, IdentityBound: true,
+	}
+	pw := user.Passwd{
+		Name: username, UID: rec.UID, GID: rec.UID,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+
+	newCase := func(t *testing.T) (*App, string) {
+		t.Helper()
+		a, _, _ := newTestApp(t, "")
+		setTestRegistryRecord(t, a, rec)
+		lookup := func(string) (user.Passwd, bool, error) { return pw, true, nil }
+		a.Users = &user.Manager{Runner: &revokeRunner{}, LookupUser: lookup}
+		a.LookupUser = lookup
+		a.TerminateProcesses = func(int) error { return nil }
+		a.ClearScheduledJobs = func(string, int) error { return nil }
+		a.EnsureScheduledCommand = func() error { return nil }
+		a.Now = func() time.Time { return time.Date(2026, 8, 1, 12, 0, 1, 0, time.UTC) }
+		systemdDir := t.TempDir()
+		a.Scheduler = &schedule.Scheduler{
+			SystemdDir: systemdDir, InstallPath: t.TempDir() + "/linux-temp-admin",
+			UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now,
+			Sys: revokeTestScheduleSystem{hasSystemctl: true},
+		}
+		return a, systemdDir
+	}
+
+	t.Run("visible commit keeps finalizer", func(t *testing.T) {
+		a, systemdDir := newCase(t)
+		a.BeginQuarantine = func(user string, uid int, generation string, deadline time.Time, unit string) error {
+			if err := a.Registry.BeginQuarantine(user, uid, generation, deadline, unit); err != nil {
+				return err
+			}
+			return &fsutil.DurabilityError{Operation: "rename", Err: syscall.EIO}
+		}
+
+		started, err := a.beginIdentityQuarantine(rec, pw)
+		var durability *fsutil.DurabilityError
+		if !started || !errors.As(err, &durability) {
+			t.Fatalf("beginIdentityQuarantine = started=%v err=%v, want active quarantine plus durability warning", started, err)
+		}
+		stored, found, lookupErr := a.Registry.Lookup(username)
+		if lookupErr != nil || !found || !stored.DeletionStarted || stored.UID != pw.UID ||
+			stored.Generation != generation || stored.QuarantineUnit != config.QuarantineUnitPrefix+username {
+			t.Fatalf("committed quarantine row: found=%v rec=%+v err=%v", found, stored, lookupErr)
+		}
+		for _, suffix := range []string{".service", ".timer"} {
+			path := filepath.Join(systemdDir, config.QuarantineUnitPrefix+username+suffix)
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Fatalf("committed quarantine lost finalizer %s: %v", path, statErr)
+			}
+		}
+	})
+
+	t.Run("pre-commit error cancels finalizer", func(t *testing.T) {
+		a, systemdDir := newCase(t)
+		writeErr := errors.New("registry write failed before commit")
+		a.BeginQuarantine = func(string, int, string, time.Time, string) error { return writeErr }
+
+		started, err := a.beginIdentityQuarantine(rec, pw)
+		if started || !errors.Is(err, writeErr) {
+			t.Fatalf("beginIdentityQuarantine = started=%v err=%v, want cancelled pre-commit failure", started, err)
+		}
+		stored, found, lookupErr := a.Registry.Lookup(username)
+		if lookupErr != nil || !found || stored.DeletionStarted {
+			t.Fatalf("pre-commit failure changed registry: found=%v rec=%+v err=%v", found, stored, lookupErr)
+		}
+		for _, suffix := range []string{".service", ".timer"} {
+			path := filepath.Join(systemdDir, config.QuarantineUnitPrefix+username+suffix)
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("pre-commit failure retained finalizer %s: %v", path, statErr)
+			}
+		}
+	})
+
+	t.Run("unverified durability error preserves evidence", func(t *testing.T) {
+		a, systemdDir := newCase(t)
+		a.BeginQuarantine = func(string, int, string, time.Time, string) error {
+			return &fsutil.DurabilityError{Operation: "rename", Err: syscall.EIO}
+		}
+
+		started, err := a.beginIdentityQuarantine(rec, pw)
+		if started || err == nil || !strings.Contains(err.Error(), "does not match the committed handoff") {
+			t.Fatalf("beginIdentityQuarantine = started=%v err=%v, want failed visible-state proof", started, err)
+		}
+		stored, found, lookupErr := a.Registry.Lookup(username)
+		if lookupErr != nil || !found || stored.DeletionStarted {
+			t.Fatalf("unverified durability error changed registry: found=%v rec=%+v err=%v", found, stored, lookupErr)
+		}
+		for _, suffix := range []string{".service", ".timer"} {
+			path := filepath.Join(systemdDir, config.QuarantineUnitPrefix+username+suffix)
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Fatalf("unverified durability error discarded finalizer evidence %s: %v", path, statErr)
+			}
+		}
+	})
 }
 
 func TestRevokeFallsBackToSynchronousDeletionWhenFinalizerCommandIsUnavailable(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,6 +108,87 @@ func TestReleaseArtifactHandoffUsesAuditedNode24Actions(t *testing.T) {
 	} {
 		if !strings.Contains(check.content, check.pin) {
 			t.Errorf("release %s action is not pinned to the audited native Node.js 24 version", name)
+		}
+	}
+}
+
+func TestReleaseBuildsEmbedAuthenticatedStaticVersionWitness(t *testing.T) {
+	const buildFlags = `-ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION} -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.ReleaseVersionWitness=LTA_RELEASE_VERSION_V1{${VERSION}}"`
+	for name, path := range map[string]string{
+		"candidate workflow": "../../.github/workflows/release.yml",
+		"trusted rebuild":    "../../scripts/prepare-release.sh",
+	} {
+		content := readReleaseFile(t, path)
+		if strings.Count(content, buildFlags) != 1 {
+			t.Fatalf("%s must embed exactly one authenticated static version witness", name)
+		}
+	}
+}
+
+func TestReleaseVersionLengthContractIsEnforcedAcrossEveryPipelineBoundary(t *testing.T) {
+	for name, check := range map[string]struct {
+		path     string
+		required []string
+	}{
+		"candidate workflow": {
+			path: "../../.github/workflows/release.yml",
+			required: []string{
+				`version="${GITHUB_REF_NAME#v}"`,
+				`(( ${#version} <= 128 ))`,
+			},
+		},
+		"staging workflow": {
+			path:     "../../.github/workflows/stage-release.yml",
+			required: []string{`(( ${#TAG} <= 129 ))`},
+		},
+		"mirror workflow": {
+			path:     "../../.github/workflows/mirror-release.yml",
+			required: []string{`(( ${#TAG} <= 129 ))`},
+		},
+		"installer": {
+			path: "../../scripts/install.sh",
+			required: []string{
+				"MAX_RELEASE_VERSION_BYTES=128",
+				`[ "${#release}" -le $((MAX_RELEASE_VERSION_BYTES + 1)) ]`,
+				`[ "${#expected_version}" -le "$MAX_RELEASE_VERSION_BYTES" ]`,
+			},
+		},
+		"trusted preparation": {
+			path: "../../scripts/prepare-release.sh",
+			required: []string{
+				"MAX_RELEASE_VERSION_BYTES=128",
+				`(( ${#TAG} <= MAX_RELEASE_VERSION_BYTES + 1 ))`,
+			},
+		},
+		"offline signing": {
+			path: "../../scripts/offline-sign-release.sh",
+			required: []string{
+				"MAX_RELEASE_VERSION_BYTES=128",
+				`${#TAG} -le $((MAX_RELEASE_VERSION_BYTES + 1))`,
+				`${#VERSION} -le $MAX_RELEASE_VERSION_BYTES`,
+			},
+		},
+		"trusted publication": {
+			path: "../../scripts/publish-release.sh",
+			required: []string{
+				"MAX_RELEASE_VERSION_BYTES=128",
+				`${#TAG} -le $((MAX_RELEASE_VERSION_BYTES + 1))`,
+				`${#VERSION} -le $MAX_RELEASE_VERSION_BYTES`,
+			},
+		},
+		"manual release procedures": {
+			path: "../../docs/releasing.md",
+			required: []string{
+				`[[ ${#TAG} -le 129 ]]`,
+				`[[ ${#LTA_RELEASE_TAG} -le 129`,
+			},
+		},
+	} {
+		content := readReleaseFile(t, check.path)
+		for _, required := range check.required {
+			if !strings.Contains(content, required) {
+				t.Errorf("%s does not enforce the release-version length contract: missing %q", name, required)
+			}
 		}
 	}
 }
@@ -493,6 +575,10 @@ func TestReleaseScriptsBindSignerIdentityAndClientSizeLimit(t *testing.T) {
 		"installed destination differs from the verified candidate",
 		`stat -c %g -- "$DEST"`,
 		"installed destination group is not root",
+		`timeout -k 5 30 sync "$stage"`,
+		`timeout -k 5 30 sync "$DEST"`,
+		`timeout -k 5 30 sync "$dest_dir"`,
+		`sync_destination_directory_chain "$dest_dir"`,
 	} {
 		if !strings.Contains(installer, required) {
 			t.Fatalf("installer does not delegate managed-path lifecycle activation: missing %q", required)
@@ -520,6 +606,148 @@ func TestReleaseScriptsBindSignerIdentityAndClientSizeLimit(t *testing.T) {
 	}
 	if !strings.Contains(release, "cache: false") || !strings.Contains(prepare, "unset GOROOT GOEXPERIMENT") {
 		t.Fatal("release builds do not clear shared caches and caller-controlled Go toolchain settings")
+	}
+}
+
+func TestTransferOutputsAreDurableBeforeSuccess(t *testing.T) {
+	for name, path := range map[string]string{
+		"prepared": "../../scripts/prepare-release.sh",
+		"signed":   "../../scripts/offline-sign-release.sh",
+	} {
+		content := readReleaseFile(t, path)
+		hashCheck := strings.LastIndex(content, "exec sha256sum -c --strict")
+		syncCall := strings.LastIndex(content, "sync_output_directory \"")
+		complete := strings.LastIndex(content, "complete=1")
+		if hashCheck < 0 || syncCall < hashCheck || complete < syncCall {
+			t.Fatalf("%s transfer output is not synced after verification and before success", name)
+		}
+		for _, required := range []string{
+			`local_with_timeout sync -- "$directory/$path"`,
+			`local_with_timeout sync -- "$directory"`,
+			`local_with_timeout sync -- "$parent"`,
+		} {
+			if !strings.Contains(content, required) {
+				t.Fatalf("%s transfer output misses durability operation %q", name, required)
+			}
+		}
+	}
+
+	installer := readReleaseFile(t, "../../scripts/install.sh")
+	directoryCreate := strings.Index(installer, `mkdir -p -- "$dest_dir"`)
+	directoryChainSync := strings.Index(installer, `sync_destination_directory_chain "$dest_dir"`)
+	stageCreate := strings.Index(installer, `stage=$(mktemp "${dest_dir}/.linux-temp-admin.XXXXXX")`)
+	commit := strings.Index(installer, `mv -fT -- "$stage" "$DEST"`)
+	stageSync := strings.Index(installer, `timeout -k 5 30 sync "$stage"`)
+	destinationSync := strings.Index(installer, `timeout -k 5 30 sync "$DEST"`)
+	directorySync := strings.Index(installer, `timeout -k 5 30 sync "$dest_dir"`)
+	success := strings.LastIndex(installer, `echo "installed ${DEST}`)
+	if directoryCreate < 0 || directoryChainSync < directoryCreate ||
+		stageCreate < directoryChainSync || stageSync < 0 || commit < stageSync || destinationSync < commit ||
+		directorySync < destinationSync || success < directorySync {
+		t.Fatal("custom installer destination is not synced around commit and before success")
+	}
+	for _, required := range []string{
+		`timeout -k 5 30 sync "$sync_dir"`,
+		`sync_dir=$(dirname -- "$sync_dir")`,
+		`/ | //) break`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("custom installer directory-chain durability misses %q", required)
+		}
+	}
+}
+
+func TestInstallerSyncsDestinationDirectoryChainAcrossShells(t *testing.T) {
+	installer := readReleaseFile(t, "../../scripts/install.sh")
+	start := strings.Index(installer, "sync_destination_directory_chain() {")
+	if start < 0 {
+		t.Fatal("could not locate installer directory-chain sync function")
+	}
+	endRel := strings.Index(installer[start:], "\n}\n\ncheck_safe_dir_chain")
+	if endRel < 0 {
+		t.Fatal("could not isolate installer directory-chain sync function")
+	}
+	function := installer[start : start+endRel+2]
+
+	type shellCase struct {
+		name string
+		path string
+		args []string
+	}
+	shells := []shellCase{
+		{name: "sh", path: "/bin/sh"},
+		{name: "bash", path: "/bin/bash"},
+		{name: "dash", path: "/bin/dash"},
+	}
+	if busybox, err := exec.LookPath("busybox"); err == nil {
+		shells = append(shells, shellCase{name: "busybox-ash", path: busybox, args: []string{"ash"}})
+	}
+
+	for _, shell := range shells {
+		if _, err := os.Stat(shell.path); err != nil {
+			continue
+		}
+		t.Run(shell.name, func(t *testing.T) {
+			dir := t.TempDir()
+			leaf := filepath.Join(dir, "one", "two")
+			if err := os.MkdirAll(leaf, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			logPath := filepath.Join(dir, "sync.log")
+			source := `set -eu
+fail() { echo "error: $*" >&2; exit 1; }
+timeout() {
+  [ "$1" = -k ] && [ "$2" = 5 ] && [ "$3" = 30 ] && [ "$4" = sync ]
+  printf '%s\n' "$5" >> "$TEST_SYNC_LOG"
+  [ -z "$TEST_FAIL_DIR" ] || [ "$5" != "$TEST_FAIL_DIR" ]
+}
+` + function + `
+sync_destination_directory_chain "$TEST_LEAF"
+`
+			runShellFixture(t, shell.path, shell.args, source,
+				"TEST_LEAF="+leaf,
+				"TEST_SYNC_LOG="+logPath,
+				"TEST_FAIL_DIR=",
+			)
+			logBytes, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want []string
+			for path := leaf; ; path = filepath.Dir(path) {
+				want = append(want, path)
+				if path == "/" {
+					break
+				}
+			}
+			if got := strings.Fields(string(logBytes)); !slices.Equal(got, want) {
+				t.Fatalf("directory sync order = %q, want %q", got, want)
+			}
+
+			failureLog := filepath.Join(dir, "failure.log")
+			failureScript := filepath.Join(dir, "failure.sh")
+			if err := os.WriteFile(failureScript, []byte(source), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			args := append(append([]string(nil), shell.args...), failureScript)
+			cmd := exec.Command(shell.path, args...)
+			cmd.Env = append(os.Environ(),
+				"TEST_LEAF="+leaf,
+				"TEST_SYNC_LOG="+failureLog,
+				"TEST_FAIL_DIR="+filepath.Dir(leaf),
+			)
+			if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "could not be made durable") {
+				t.Fatalf("directory sync failure was not fail-closed: err=%v\n%s", err, out)
+			}
+			failureBytes, err := os.ReadFile(failureLog)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantFailure := []string{leaf, filepath.Dir(leaf)}
+			if got := strings.Fields(string(failureBytes)); !slices.Equal(got, wantFailure) {
+				t.Fatalf("failed directory sync continued: got %q, want %q", got, wantFailure)
+			}
+		})
 	}
 }
 
@@ -860,7 +1088,9 @@ printf '%s' "$FSIZE_BLOCK_BYTES"
 	}
 }
 
-func TestInstallerPinnedReleaseEndToEnd(t *testing.T) {
+// InstallerPinnedReleaseEndToEnd exercises the disposable-host integration
+// entry point declared in release_pipeline_integration_test.go.
+func InstallerPinnedReleaseEndToEnd(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("installer end-to-end test requires root")
 	}
@@ -1004,7 +1234,11 @@ esac
 		return cmd.CombinedOutput()
 	}
 
-	for _, release := range []string{"", "v02.8.0", "v2.8.0?query", "../v2.8.0", "v2.8"} {
+	tooLongRelease := "v2.3.4-" + strings.Repeat("a", validate.MaxReleaseVersionBytes-len("2.3.4-")+1)
+	if len(tooLongRelease) != validate.MaxReleaseVersionBytes+2 {
+		t.Fatalf("overlong installer fixture has length %d", len(tooLongRelease))
+	}
+	for _, release := range []string{"", "v02.8.0", "v2.8.0?query", "../v2.8.0", "v2.8", tooLongRelease} {
 		before := requests.Load()
 		out, err := run(release)
 		if err == nil {
@@ -1079,7 +1313,9 @@ esac
 	}
 }
 
-func TestInstallerOfficialMirrorFallbackBoundary(t *testing.T) {
+// InstallerOfficialMirrorFallbackBoundary exercises the disposable-host
+// integration entry point declared in release_pipeline_integration_test.go.
+func InstallerOfficialMirrorFallbackBoundary(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("installer end-to-end test requires root")
 	}
@@ -4077,6 +4313,7 @@ TAG=v2.8.0
 REPO=mock/repo
 EXPECTED_RELEASE_ID=280
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
+MAX_RELEASE_VERSION_BYTES=128
 work="$TEST_STATE/work"
 mkdir -p "$work"
 printf '%s' "$TEST_STABLE_TAGS" > "$TEST_STATE/stable"
@@ -4300,6 +4537,7 @@ TAG=v2.8.0
 REPO=mock/repo
 EXPECTED_RELEASE_ID=280
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
+MAX_RELEASE_VERSION_BYTES=128
 work="$TEST_STATE/work"
 mkdir -p "$work"
 printf 'v2.7.3\nv2.8.0\n' > "$TEST_STATE/stable"

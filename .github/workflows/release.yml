@@ -44,7 +44,8 @@ jobs:
           set -Eeuo pipefail
           version="${GITHUB_REF_NAME#v}"
           prerelease=false
-          if [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
+          if (( ${#version} <= 128 )) \
+             && [[ "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]] \
              && (( ${#BASH_REMATCH[1]} > 1 || 10#${BASH_REMATCH[1]} >= 2 )); then
             echo "go_release=true" >> "$GITHUB_OUTPUT"
             [[ -z "${BASH_REMATCH[4]}" ]] || prerelease=true
@@ -154,7 +155,7 @@ jobs:
               GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" GOPATH="$GOPATH" GOTMPDIR="$GOTMPDIR" \
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
               go build -mod=readonly -buildvcs=false -trimpath -tags osusergo,netgo \
-              -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION}" \
+              -ldflags "-s -w -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.Version=${VERSION} -X github.com/xxvcc/linux-temp-admin/internal/buildinfo.ReleaseVersionWitness=LTA_RELEASE_VERSION_V1{${VERSION}}" \
               -o "dist/linux-temp-admin-linux-${arch}" ./cmd/linux-temp-admin
           done
           for asset in dist/linux-temp-admin-linux-amd64 dist/linux-temp-admin-linux-arm64; do

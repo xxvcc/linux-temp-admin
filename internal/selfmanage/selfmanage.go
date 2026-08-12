@@ -291,12 +291,14 @@ func (m *Manager) Uninstall(force bool) error {
 	return fsutil.RemoveFile(m.InstallPath)
 }
 
-// UpgradeCandidate is an authenticated, version-probed binary ready for a short
-// locked commit. Its bytes are intentionally private so callers cannot alter the
-// payload between verification and installation.
+// UpgradeCandidate is an authenticated binary ready for a short locked commit.
+// signedVersion comes from bytes covered by the detached signature and is read
+// without executing the candidate. Its bytes are intentionally private so
+// callers cannot alter the payload between verification and installation.
 type UpgradeCandidate struct {
-	bin     []byte
-	version string
+	bin           []byte
+	signedVersion string
+	expected      string
 }
 
 // ReleaseManifest is untrusted routing metadata from the official mirror. Its
@@ -309,12 +311,14 @@ type ReleaseManifest struct {
 	PublishedAt string
 }
 
-// Version reports the authenticated candidate's probed version.
+// Version reports the candidate's authenticated static release-version witness.
+// Historical signed binaries without that witness report an empty version and
+// require an explicit forced upgrade before they may be probed.
 func (c *UpgradeCandidate) Version() string {
 	if c == nil {
 		return ""
 	}
-	return c.version
+	return c.signedVersion
 }
 
 // FetchReleaseManifest downloads and strictly decodes one mirror manifest.
@@ -440,9 +444,9 @@ func decodeReleaseManifest(b []byte) (ReleaseManifest, error) {
 	return manifest, nil
 }
 
-// PrepareUpgrade performs every slow, read-only upgrade step: download, detached
-// signature verification, and the bounded candidate version probe. Callers can
-// do this before taking their lifecycle mutation lock.
+// PrepareUpgrade performs every slow, read-only upgrade step: download and
+// detached signature verification. It does not execute the candidate. Callers
+// can do this before taking their lifecycle mutation lock.
 func (m *Manager) PrepareUpgrade(binaryURL, sigURL string) (*UpgradeCandidate, error) {
 	keys := m.verificationKeys()
 	if len(keys) == 0 {
@@ -581,15 +585,18 @@ func (m *Manager) prepareVerifiedCandidate(bin, sig []byte, expectedVersion stri
 	if !verified {
 		return nil, fmt.Errorf("signature verification failed; refusing to install")
 	}
-	// The bytes are authenticated; safe to execute for its version.
-	newVer, err := m.probeVersion(bin)
+	signedVersion, err := releaseVersionWitness(bin)
 	if err != nil {
-		return nil, fmt.Errorf("read downloaded version: %w", err)
+		return nil, fmt.Errorf("read signed release version: %w", err)
 	}
-	if expectedVersion != "" && newVer != expectedVersion {
-		return nil, fmt.Errorf("signed candidate version %q does not match selected release %q", newVer, expectedVersion)
+	if expectedVersion != "" && signedVersion != "" && signedVersion != expectedVersion {
+		return nil, fmt.Errorf("signed candidate version %q does not match selected release %q", signedVersion, expectedVersion)
 	}
-	return &UpgradeCandidate{bin: append([]byte(nil), bin...), version: newVer}, nil
+	return &UpgradeCandidate{
+		bin:           append([]byte(nil), bin...),
+		signedVersion: signedVersion,
+		expected:      expectedVersion,
+	}, nil
 }
 
 // ApplyUpgrade re-reads the installed command at commit time, applies the
@@ -598,7 +605,9 @@ func (m *Manager) prepareVerifiedCandidate(bin, sig []byte, expectedVersion stri
 // newer. If replacement is visible but not known durable, the version is returned
 // alongside the durability error so the CLI can report the partial outcome.
 func (m *Manager) ApplyUpgrade(candidate *UpgradeCandidate, force bool) (string, error) {
-	if candidate == nil || len(candidate.bin) == 0 || !validate.InstalledVersion(candidate.version) {
+	if candidate == nil || len(candidate.bin) == 0 ||
+		(candidate.signedVersion != "" && !validate.ReleaseVersion(candidate.signedVersion)) ||
+		(candidate.expected != "" && !validate.ReleaseVersion(candidate.expected)) {
 		return "", fmt.Errorf("invalid prepared upgrade candidate")
 	}
 	installedVersion := ""
@@ -607,20 +616,68 @@ func (m *Manager) ApplyUpgrade(candidate *UpgradeCandidate, force bool) (string,
 	} else if !errors.Is(err, ErrNotInstalled) && !force {
 		return "", fmt.Errorf("read installed version: %w", err)
 	}
-	if !force && installedVersion != "" && !version.Greater(candidate.version, installedVersion) {
-		return "", nil // already up to date or newer
+	if !force {
+		if candidate.signedVersion == "" {
+			return "", fmt.Errorf("signed candidate has no static release-version witness; use --force only after independently confirming the historical binary")
+		}
+		if installedVersion != "" && !version.Greater(candidate.signedVersion, installedVersion) {
+			return "", nil // already up to date or newer; candidate was not executed
+		}
+	}
+	probedVersion, err := m.probeVersion(candidate.bin)
+	if err != nil {
+		return "", fmt.Errorf("read downloaded version: %w", err)
+	}
+	if candidate.signedVersion != "" && probedVersion != candidate.signedVersion {
+		return "", fmt.Errorf("candidate version %q does not match signed release-version witness %q", probedVersion, candidate.signedVersion)
+	}
+	if candidate.expected != "" && probedVersion != candidate.expected {
+		return "", fmt.Errorf("signed candidate version %q does not match selected release %q", probedVersion, candidate.expected)
 	}
 	installed, err := m.Install(candidate.bin, true)
 	if err != nil {
 		if installed {
-			return candidate.version, fmt.Errorf("installed command was replaced but durability is unknown: %w", err)
+			return probedVersion, fmt.Errorf("installed command was replaced but durability is unknown: %w", err)
 		}
 		return "", err
 	}
 	if !installed {
 		return "", nil
 	}
-	return candidate.version, nil
+	return probedVersion, nil
+}
+
+var releaseVersionWitnessPrefix = []byte{
+	'L', 'T', 'A', '_', 'R', 'E', 'L', 'E', 'A', 'S', 'E', '_',
+	'V', 'E', 'R', 'S', 'I', 'O', 'N', '_', 'V', '1', '{',
+}
+
+// releaseVersionWitness extracts one canonical framed version from signed
+// candidate bytes. The byte-slice spelling avoids embedding a second complete
+// marker in this binary merely as a parser constant.
+func releaseVersionWitness(bin []byte) (string, error) {
+	versionValue := ""
+	search := bin
+	for {
+		index := bytes.Index(search, releaseVersionWitnessPrefix)
+		if index < 0 {
+			break
+		}
+		valueStart := index + len(releaseVersionWitnessPrefix)
+		remaining := search[valueStart:]
+		valueEnd := bytes.IndexByte(remaining, '}')
+		if valueEnd >= 0 && valueEnd <= validate.MaxReleaseVersionBytes {
+			candidate := string(remaining[:valueEnd])
+			if validate.ReleaseVersion(candidate) {
+				if versionValue != "" {
+					return "", fmt.Errorf("candidate contains multiple release-version witnesses")
+				}
+				versionValue = candidate
+			}
+		}
+		search = search[index+1:]
+	}
+	return versionValue, nil
 }
 
 // Upgrade is the one-shot API retained for callers that already provide their

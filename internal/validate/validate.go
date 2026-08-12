@@ -30,6 +30,10 @@ var (
 	generationRe     = regexp.MustCompile(`^[a-f0-9]{32}$`)
 )
 
+// MaxReleaseVersionBytes bounds the canonical ASCII version carried by release
+// tags, manifests, and the authenticated static binary witness.
+const MaxReleaseVersionBytes = 128
+
 // Username reports whether s is a valid temporary username.
 func Username(s string) bool { return usernameRe.MatchString(s) }
 
@@ -231,4 +235,6 @@ func InstalledVersion(v string) bool { return installedVersionRe.MatchString(v) 
 
 // ReleaseVersion reports whether v is the canonical version portion of a
 // supported vX.Y.Z release tag.
-func ReleaseVersion(v string) bool { return releaseVersionRe.MatchString(v) }
+func ReleaseVersion(v string) bool {
+	return len(v) <= MaxReleaseVersionBytes && releaseVersionRe.MatchString(v)
+}

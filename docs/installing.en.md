@@ -104,7 +104,7 @@ A URL containing credentials, tokens, or signed query values must not appear in 
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin upgrade --url-file /root/lta-upgrade-url
 ```
 
-Explicit `--url` and `--url-file` requests use only the operator-selected source and never silently switch to the official mirror or GitHub.
+Explicit `--url` and `--url-file` requests use only the operator-selected source and never silently switch to the official mirror or GitHub. They download the selected binary and its detached ed25519 signature and verify them against the embedded keyring, but do not fetch `SHA256SUMS`.
 
 ## Install a local binary
 

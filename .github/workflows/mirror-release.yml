@@ -51,6 +51,7 @@ jobs:
           [[ "$TRUSTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_SHA" == "$TRUSTED_WORKFLOW_SHA" ]]
           [[ "$MIRROR_ENVIRONMENT_CONFIGURED" == true ]]
+          (( ${#TAG} <= 129 ))
           [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ ]]
           (( ${#BASH_REMATCH[1]} > 1 || 10#${BASH_REMATCH[1]} >= 2 ))
           [[ "$MIRROR_USER" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]

@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 PROJECT_ROOT = Path("/www/wwwroot/dl.ll.cd/linux-temp-admin")
@@ -31,8 +32,11 @@ LOCK_PATH = INCOMING_ROOT / ".deploy.lock"
 RRSYNC = Path("/usr/bin/rrsync")
 MIRROR_BASE_URL = "https://dl.ll.cd/linux-temp-admin"
 TRANSFER_TIMEOUT_SECONDS = 300
+STAGING_SCAN_INTERVAL_SECONDS = 0.1
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_RELEASE_VERSION_BYTES = 128
+MAX_RELEASE_TAG_BYTES = MAX_RELEASE_VERSION_BYTES + 1
 
 VERSION_PATTERN = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -53,6 +57,23 @@ CHECKSUM_FILES = (
     "linux-temp-admin-linux-arm64.sig",
 )
 STABLE_FILES = ("install.sh", "latest.json")
+# A complete release can contain two maximum-size binaries and four metadata
+# files. Leave a second copy's worth of headroom for rsync --delay-updates
+# temporaries, while bounding a compromised deployment identity before the
+# exact release-tree validation runs.
+MAX_STAGING_BYTES = 2 * (2 * MAX_BINARY_BYTES + 4 * MAX_METADATA_BYTES)
+MAX_STAGING_FILES = 32
+MAX_STAGING_ENTRIES = 64
+# A stolen deployment identity must not be able to fill the public filesystem by
+# serially publishing checksum-consistent but unsigned future version trees.
+# The free-space reserve is the immediate hard stop; the aggregate limits also
+# bound inode and long-term namespace growth even on a very large filesystem.
+MAX_PROJECT_BYTES = 32 * 1024 * 1024 * 1024
+MAX_PROJECT_FILES = 8192
+MAX_PROJECT_ENTRIES = 16384
+MAX_PROJECT_VERSIONS = 1024
+MIN_PROJECT_AVAILABLE_BYTES = 1024 * 1024 * 1024
+MIN_PROJECT_AVAILABLE_PERCENT = 5
 VersionKey = tuple[tuple[int, str], tuple[int, str], tuple[int, str]]
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
@@ -93,6 +114,9 @@ def unmasked_creation() -> Iterator[None]:
 def release_version_tuple(
     tag: str, *, stable: bool
 ) -> VersionKey:
+    if len(tag) > MAX_RELEASE_TAG_BYTES:
+        kind = "stable metadata" if stable else "release destination"
+        fail(f"{kind} exceeds the {MAX_RELEASE_TAG_BYTES}-byte tag limit")
     match = VERSION_PATTERN.fullmatch(tag)
     if match is None or (stable and match.group(4) is not None):
         kind = "stable metadata" if stable else "release destination"
@@ -476,6 +500,24 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
                     f"{destination / name}"
                 )
     else:
+        existing = []
+    missing = [name for name in EXPECTED_VERSION_FILES if name not in existing]
+    additional_bytes = sum(allocated_or_logical_bytes(staged / name) for name in missing)
+    additional_entries = len(missing)
+    additional_versions = 0
+    if not destination.exists():
+        # Reserve generous metadata headroom for the new directory itself.
+        additional_bytes += MAX_METADATA_BYTES
+        additional_entries += 1
+        additional_versions = 1
+    require_project_budget(
+        destination.parent,
+        additional_bytes=additional_bytes,
+        additional_files=len(missing),
+        additional_entries=additional_entries,
+        additional_versions=additional_versions,
+    )
+    if not destination.exists():
         try:
             with unmasked_creation():
                 os.mkdir(destination, 0o755)
@@ -506,6 +548,7 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
         # removed under the deployment lock before that retry validates the directory.
         raise
     fsync_directory(destination)
+    require_project_budget(destination.parent)
 
 
 def matching_stable_installer_versions(
@@ -572,13 +615,174 @@ def publish_stable(staged: Path, name: str, *, project_root: Path, owner: int) -
                 fail("latest.json cannot mutate metadata for the current stable version")
     else:
         fail("unexpected stable file")
+    require_project_budget(
+        project_root,
+        additional_bytes=allocated_or_logical_bytes(staged),
+        additional_files=1,
+        additional_entries=1,
+    )
     atomic_replace(staged, project_root / name, project_root=project_root, owner=owner)
+    require_project_budget(project_root)
 
 
 def limit_receiver() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_BINARY_BYTES, MAX_BINARY_BYTES))
     resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
+
+
+def allocated_or_logical_bytes(path: Path) -> int:
+    info = lstat(path)
+    return max(info.st_size, info.st_blocks * 512)
+
+
+def require_tree_budget(
+    root: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+    maximum_files: int,
+    maximum_entries: int,
+    additional_bytes: int = 0,
+    additional_files: int = 0,
+    additional_entries: int = 0,
+    maximum_versions: int | None = None,
+    additional_versions: int = 0,
+) -> tuple[int, int, int, int]:
+    total_bytes = additional_bytes
+    file_count = additional_files
+    entry_count = additional_entries
+    version_count = additional_versions
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if total_bytes > maximum_bytes:
+        fail(f"{label} exceeds the total-byte limit of {maximum_bytes}")
+    if file_count > maximum_files:
+        fail(f"{label} exceeds the file limit of {maximum_files}")
+    if entry_count > maximum_entries:
+        fail(f"{label} exceeds the directory-entry limit of {maximum_entries}")
+    if maximum_versions is not None and version_count > maximum_versions:
+        fail(f"{label} exceeds the release-version limit of {maximum_versions}")
+    try:
+        root_descriptor = os.open(root, directory_flags)
+    except OSError as exc:
+        fail(f"cannot open {label}: {exc}")
+
+    def walk(descriptor: int, *, root_level: bool) -> None:
+        nonlocal total_bytes, file_count, entry_count, version_count
+        try:
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > maximum_entries:
+                        fail(
+                            f"{label} exceeds the directory-entry limit "
+                            f"of {maximum_entries}"
+                        )
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        # rsync may rename a delay-update temporary while it is
+                        # being scanned. The next scan or final scan sees its
+                        # replacement. Project scans run under the deployment
+                        # lock, so a disappearance there is external drift.
+                        if label == "rsync staging tree":
+                            continue
+                        fail(f"mirror project entry disappeared during inspection: {entry.name}")
+                    total_bytes += max(info.st_size, info.st_blocks * 512)
+                    if total_bytes > maximum_bytes:
+                        fail(f"{label} exceeds the total-byte limit of {maximum_bytes}")
+                    if stat.S_ISDIR(info.st_mode):
+                        if root_level and VERSION_PATTERN.fullmatch(entry.name):
+                            if len(entry.name) > MAX_RELEASE_TAG_BYTES:
+                                fail(f"{label} contains an overlong release-version directory")
+                            version_count += 1
+                            if maximum_versions is not None and version_count > maximum_versions:
+                                fail(
+                                    f"{label} exceeds the release-version limit "
+                                    f"of {maximum_versions}"
+                                )
+                        try:
+                            child = os.open(entry.name, directory_flags, dir_fd=descriptor)
+                        except OSError as exc:
+                            if label == "rsync staging tree" and exc.errno in (
+                                errno.ENOENT,
+                                errno.ENOTDIR,
+                                errno.ELOOP,
+                            ):
+                                continue
+                            fail(f"cannot open {label} directory: {exc}")
+                        try:
+                            walk(child, root_level=False)
+                        finally:
+                            os.close(child)
+                    else:
+                        file_count += 1
+                        if file_count > maximum_files:
+                            fail(f"{label} exceeds the file limit of {maximum_files}")
+        except OSError as exc:
+            fail(f"cannot inspect {label} usage: {exc}")
+
+    try:
+        walk(root_descriptor, root_level=True)
+    finally:
+        os.close(root_descriptor)
+    return total_bytes, file_count, entry_count, version_count
+
+
+def require_staging_budget(staging_root: Path) -> None:
+    require_tree_budget(
+        staging_root,
+        label="rsync staging tree",
+        maximum_bytes=MAX_STAGING_BYTES,
+        maximum_files=MAX_STAGING_FILES,
+        maximum_entries=MAX_STAGING_ENTRIES,
+    )
+
+
+def require_project_budget(
+    project_root: Path,
+    *,
+    additional_bytes: int = 0,
+    additional_files: int = 0,
+    additional_entries: int = 0,
+    additional_versions: int = 0,
+) -> None:
+    require_tree_budget(
+        project_root,
+        label="mirror project tree",
+        maximum_bytes=MAX_PROJECT_BYTES,
+        maximum_files=MAX_PROJECT_FILES,
+        maximum_entries=MAX_PROJECT_ENTRIES,
+        additional_bytes=additional_bytes,
+        additional_files=additional_files,
+        additional_entries=additional_entries,
+        maximum_versions=MAX_PROJECT_VERSIONS,
+        additional_versions=additional_versions,
+    )
+    try:
+        filesystem = os.statvfs(project_root)
+    except OSError as exc:
+        fail(f"cannot inspect mirror project filesystem capacity: {exc}")
+    capacity = filesystem.f_blocks * filesystem.f_frsize
+    proportional_reserve = (
+        capacity * MIN_PROJECT_AVAILABLE_PERCENT + 99
+    ) // 100
+    reserve = max(MIN_PROJECT_AVAILABLE_BYTES, proportional_reserve)
+    available = filesystem.f_bavail * filesystem.f_frsize
+    required = additional_bytes + reserve
+    if available < required:
+        fail(
+            "mirror project filesystem would fall below its available-byte reserve "
+            f"of {reserve}"
+        )
+
+
+def kill_transfer(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def run_rrsync(stage: Path, original_command: str) -> None:
@@ -598,16 +802,67 @@ def run_rrsync(stage: Path, original_command: str) -> None:
         start_new_session=True,
     )
     try:
-        status = process.wait(timeout=TRANSFER_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-        fail("rsync transfer exceeded its time limit")
-    if status != 0:
-        fail(f"rrsync rejected or failed the transfer with status {status}")
+        deadline = time.monotonic() + TRANSFER_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("rsync transfer exceeded its time limit")
+            try:
+                status = process.wait(
+                    timeout=min(STAGING_SCAN_INTERVAL_SECONDS, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                # Count every current and residual transfer tree, not only this
+                # session. The deployment lock is included; its fixed metadata
+                # is negligible and including it avoids a pathname exception.
+                require_staging_budget(stage.parent)
+        if status != 0:
+            fail(f"rrsync rejected or failed the transfer with status {status}")
+        # Close the race between the final periodic scan and process exit before any
+        # release validation or publication begins.
+        require_staging_budget(stage.parent)
+    except BaseException as operation_error:
+        # No catchable receiver exit may leave a writer outside the deployment
+        # lock. The separate session lets one signal terminate rrsync and every
+        # rsync descendant before the lock can be released.
+        if process.returncode is None:
+            try:
+                kill_transfer(process)
+            except BaseException as cleanup_error:
+                raise operation_error from cleanup_error
+        raise
 
 
-def open_lock(path: Path, *, owner: int) -> int:
+def remove_staging_tree(stage: Path) -> None:
+    try:
+        shutil.rmtree(stage)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        fail(f"cannot remove rsync staging tree: {exc}")
+    # A successful session must not hide residue left by another interrupted
+    # session. Keep this under the deployment lock so the aggregate is stable
+    # except for the receiver's own completed cleanup.
+    require_staging_budget(stage.parent)
+
+
+def finish_staging_tree(stage: Path, operation_error: BaseException | None) -> None:
+    try:
+        remove_staging_tree(stage)
+    except ReceiverError as cleanup_error:
+        if operation_error is None:
+            raise
+        if isinstance(operation_error, ReceiverError):
+            operation_error.args = (
+                f"{operation_error}; additionally, {cleanup_error}",
+            )
+        raise operation_error from cleanup_error
+    if operation_error is not None:
+        raise operation_error
+
+
+def open_lock(path: Path, *, owner: int, nonblocking: bool = False) -> int:
     with unmasked_creation():
         descriptor = os.open(
             path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
@@ -617,7 +872,12 @@ def open_lock(path: Path, *, owner: int) -> int:
             or stat.S_IMODE(info.st_mode) != 0o600):
         os.close(descriptor)
         fail("deployment lock has unsafe metadata")
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    try:
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError:
+        os.close(descriptor)
+        fail("another mirror deployment is already active")
     return descriptor
 
 
@@ -631,17 +891,25 @@ def main() -> int:
 
     original_command = os.environ.get("SSH_ORIGINAL_COMMAND", "")
     request_type, destination = parse_request(original_command)
-    with unmasked_creation():
-        stage = Path(tempfile.mkdtemp(prefix="transfer-", dir=INCOMING_ROOT))
-    require_directory(stage, owner=owner, mode=0o700)
+    # Serialize before creating staging state so byte/inode budgets cannot be
+    # multiplied by concurrent sessions using the same deployment key.
+    lock_descriptor = open_lock(LOCK_PATH, owner=owner, nonblocking=True)
+    stage: Path | None = None
     try:
-        run_rrsync(stage, original_command)
-        root_entries = sorted(entry.name for entry in os.scandir(stage))
-        expected_root = [destination]
-        if root_entries != expected_root:
-            fail("transfer created an unexpected staging tree")
-        lock_descriptor = open_lock(LOCK_PATH, owner=owner)
+        # Refuse a new transfer if interrupted sessions already exhausted the
+        # aggregate incoming-root budget.
+        require_staging_budget(INCOMING_ROOT)
+        with unmasked_creation():
+            stage = Path(tempfile.mkdtemp(prefix="transfer-", dir=INCOMING_ROOT))
+        operation_error: BaseException | None = None
         try:
+            require_directory(stage, owner=owner, mode=0o700)
+            require_staging_budget(INCOMING_ROOT)
+            run_rrsync(stage, original_command)
+            root_entries = sorted(entry.name for entry in os.scandir(stage))
+            expected_root = [destination]
+            if root_entries != expected_root:
+                fail("transfer created an unexpected staging tree")
             require_safe_ancestry(PROJECT_ROOT, leaf_owner=owner, leaf_mode=0o755)
             if request_type == "version":
                 publish_version(stage / destination, PROJECT_ROOT / destination, owner=owner)
@@ -652,10 +920,11 @@ def main() -> int:
                     project_root=PROJECT_ROOT,
                     owner=owner,
                 )
-        finally:
-            os.close(lock_descriptor)
+        except BaseException as exc:
+            operation_error = exc
+        finish_staging_tree(stage, operation_error)
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        os.close(lock_descriptor)
     return 0
 
 

@@ -104,7 +104,7 @@ https://dl.ll.cd/linux-temp-admin
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin upgrade --url-file /root/lta-upgrade-url
 ```
 
-显式 `--url` 或 `--url-file` 只使用操作者选择的来源，失败时不会静默切换到官方镜像或 GitHub。
+显式 `--url` 或 `--url-file` 只使用操作者选择的来源，失败时不会静默切换到官方镜像或 GitHub。该路径下载选定的二进制及其 detached ed25519 签名，并使用内置 keyring 验证，但不下载 `SHA256SUMS`。
 
 ## 安装本地二进制
 
