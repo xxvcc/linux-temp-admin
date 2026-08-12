@@ -3,6 +3,7 @@
 package selfmanage
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -213,7 +214,7 @@ func TestInstallReportsVisibleReplacementOnDurabilityFailure(t *testing.T) {
 }
 
 func newBinary(version string) []byte {
-	return []byte("#!/bin/sh\n[ \"$1\" = version ] && echo " + version + "\nexit 0\n")
+	return []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{" + version + "}\n[ \"$1\" = version ] && echo " + version + "\nexit 0\n")
 }
 
 func signedServer(t *testing.T, bin, sig []byte) *httptest.Server {
@@ -355,6 +356,85 @@ func TestPreparedUpgradeRechecksInstalledVersionAtCommit(t *testing.T) {
 	}
 	if current, err := m.InstalledVersion(); err != nil || current != "3.0.0" {
 		t.Fatalf("prepared candidate downgraded newer install: version=%q err=%v", current, err)
+	}
+}
+
+func TestPreparedUpgradeRejectsDowngradeBeforeExecutingCandidate(t *testing.T) {
+	dir := rootDir(t)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	evidence := filepath.Join(dir, "candidate-executed")
+	candidateBytes := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.0.0}\nprintf executed > '" + evidence + "'\nprintf '2.0.0\\n'\n")
+	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+	if wrote, err := m.Install(newBinary("3.0.0"), false); err != nil || !wrote {
+		t.Fatalf("seed newer install: wrote=%v err=%v", wrote, err)
+	}
+
+	candidate, err := m.prepareVerifiedCandidate(candidateBytes, ed25519.Sign(priv, candidateBytes), "")
+	if err != nil || candidate.Version() != "2.0.0" {
+		t.Fatalf("PrepareUpgrade: version=%q err=%v", candidate.Version(), err)
+	}
+	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
+		t.Fatalf("candidate executed during preparation: %v", err)
+	}
+	if got, err := m.ApplyUpgrade(candidate, false); err != nil || got != "" {
+		t.Fatalf("ApplyUpgrade downgrade: version=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
+		t.Fatalf("candidate executed before downgrade refusal: %v", err)
+	}
+}
+
+func TestHistoricalSignedUpgradeRequiresForceBeforeProbe(t *testing.T) {
+	dir := rootDir(t)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	evidence := filepath.Join(dir, "historical-candidate-executed")
+	candidateBytes := []byte("#!/bin/sh\nprintf executed > '" + evidence + "'\nprintf '2.0.0\\n'\n")
+	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+
+	candidate, err := m.prepareVerifiedCandidate(
+		candidateBytes, ed25519.Sign(priv, candidateBytes), "2.0.0")
+	if err != nil || candidate.Version() != "" {
+		t.Fatalf("prepare historical candidate: version=%q err=%v", candidate.Version(), err)
+	}
+	if got, err := m.ApplyUpgrade(candidate, false); got != "" || err == nil ||
+		!strings.Contains(err.Error(), "no static release-version witness") {
+		t.Fatalf("non-forced historical candidate: version=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
+		t.Fatalf("historical candidate executed without --force: %v", err)
+	}
+	if got, err := m.ApplyUpgrade(candidate, true); err != nil || got != "2.0.0" {
+		t.Fatalf("forced historical candidate: version=%q err=%v", got, err)
+	}
+	if content, err := os.ReadFile(evidence); err != nil || string(content) != "executed" {
+		t.Fatalf("forced candidate probe evidence: content=%q err=%v", content, err)
+	}
+	if content, err := os.ReadFile(m.InstallPath); err != nil || !bytes.Equal(content, candidateBytes) {
+		t.Fatalf("forced historical install: bytesMatch=%v err=%v", bytes.Equal(content, candidateBytes), err)
+	}
+}
+
+func TestForcedHistoricalCandidateStillMustMatchSelectedRelease(t *testing.T) {
+	dir := rootDir(t)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	evidence := filepath.Join(dir, "mismatched-candidate-executed")
+	candidateBytes := []byte("#!/bin/sh\nprintf executed > '" + evidence + "'\nprintf '2.0.1\\n'\n")
+	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+	candidate, err := m.prepareVerifiedCandidate(
+		candidateBytes, ed25519.Sign(priv, candidateBytes), "2.0.0")
+	if err != nil {
+		t.Fatalf("prepare historical candidate: %v", err)
+	}
+
+	if got, err := m.ApplyUpgrade(candidate, true); got != "" || err == nil ||
+		!strings.Contains(err.Error(), "does not match selected release") {
+		t.Fatalf("forced mismatched historical candidate: version=%q err=%v", got, err)
+	}
+	if content, err := os.ReadFile(evidence); err != nil || string(content) != "executed" {
+		t.Fatalf("bounded probe evidence: content=%q err=%v", content, err)
+	}
+	if _, err := os.Lstat(m.InstallPath); !os.IsNotExist(err) {
+		t.Fatalf("mismatched historical candidate was installed: %v", err)
 	}
 }
 

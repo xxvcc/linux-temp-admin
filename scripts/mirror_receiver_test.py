@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("mirror-receiver.py")
@@ -86,13 +87,26 @@ class ParseRequestTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(mirror_receiver.ReceiverError):
                 mirror_receiver.parse_request(command)
 
-    def test_orders_unbounded_version_components_without_integer_conversion(self) -> None:
-        smaller = "v2." + "9" * 4999 + ".0"
-        larger = "v2." + "9" * 5000 + ".0"
+    def test_orders_maximum_length_components_without_integer_conversion(self) -> None:
+        smaller = "v2." + "8" * 124 + ".0"
+        larger = "v2." + "9" * 124 + ".0"
+        self.assertEqual(len(smaller), mirror_receiver.MAX_RELEASE_TAG_BYTES)
         self.assertGreater(
             mirror_receiver.release_version_tuple(larger, stable=False),
             mirror_receiver.release_version_tuple(smaller, stable=False),
         )
+
+    def test_rejects_release_tag_above_maximum_length(self) -> None:
+        too_long = "v2." + "9" * 125 + ".0"
+        self.assertEqual(len(too_long), mirror_receiver.MAX_RELEASE_TAG_BYTES + 1)
+        with self.assertRaisesRegex(mirror_receiver.ReceiverError, "tag limit"):
+            mirror_receiver.release_version_tuple(too_long, stable=False)
+        command = (
+            "rsync --server --ignore-existing -logDtprce.iLsfxCIvu "
+            f"--delay-updates . {too_long}/"
+        )
+        with self.assertRaises(mirror_receiver.ReceiverError):
+            mirror_receiver.parse_request(command)
 
 
 class TrustedExecutableTests(unittest.TestCase):
@@ -117,6 +131,364 @@ class TrustedExecutableTests(unittest.TestCase):
             symlink.symlink_to(executable)
             with self.assertRaises(mirror_receiver.ReceiverError):
                 mirror_receiver.require_trusted_executable(symlink, owner=os.getuid())
+
+
+class StagingBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = Path(tempfile.mkdtemp(prefix="mirror-budget-test-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temporary)
+
+    def test_accepts_complete_release_tree(self) -> None:
+        make_version(self.temporary / "stage")
+        mirror_receiver.require_staging_budget(self.temporary / "stage")
+
+    def test_residual_and_current_transfers_share_one_aggregate_budget(self) -> None:
+        residual = self.temporary / "transfer-residual"
+        current = self.temporary / "transfer-current"
+        residual.mkdir()
+        current.mkdir()
+        residual_file = residual / "old"
+        current_file = current / "new"
+        residual_file.write_bytes(b"old")
+        current_file.write_bytes(b"new")
+        total_allocated = sum(
+            max(path.stat().st_size, path.stat().st_blocks * 512)
+            for path in (residual_file, current_file)
+        )
+        original = mirror_receiver.MAX_STAGING_BYTES
+        try:
+            mirror_receiver.MAX_STAGING_BYTES = total_allocated - 1
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "total-byte limit"
+            ):
+                mirror_receiver.require_staging_budget(self.temporary)
+        finally:
+            mirror_receiver.MAX_STAGING_BYTES = original
+
+    def test_rejects_total_bytes_files_and_directory_entries(self) -> None:
+        original = (
+            mirror_receiver.MAX_STAGING_BYTES,
+            mirror_receiver.MAX_STAGING_FILES,
+            mirror_receiver.MAX_STAGING_ENTRIES,
+        )
+        try:
+            byte_stage = self.temporary / "bytes"
+            byte_stage.mkdir()
+            (byte_stage / "large").write_bytes(b"12345")
+            mirror_receiver.MAX_STAGING_BYTES = 4
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "total-byte limit"):
+                mirror_receiver.require_staging_budget(byte_stage)
+
+            file_stage = self.temporary / "files"
+            file_stage.mkdir()
+            (file_stage / "one").touch()
+            (file_stage / "two").touch()
+            mirror_receiver.MAX_STAGING_BYTES = original[0]
+            mirror_receiver.MAX_STAGING_FILES = 1
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "file limit"):
+                mirror_receiver.require_staging_budget(file_stage)
+
+            entry_stage = self.temporary / "entries"
+            entry_stage.mkdir()
+            (entry_stage / "one").mkdir()
+            (entry_stage / "two").mkdir()
+            mirror_receiver.MAX_STAGING_FILES = original[1]
+            mirror_receiver.MAX_STAGING_ENTRIES = 1
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "directory-entry limit"
+            ):
+                mirror_receiver.require_staging_budget(entry_stage)
+        finally:
+            (
+                mirror_receiver.MAX_STAGING_BYTES,
+                mirror_receiver.MAX_STAGING_FILES,
+                mirror_receiver.MAX_STAGING_ENTRIES,
+            ) = original
+
+    def test_running_transfer_is_killed_as_soon_as_it_exceeds_budget(self) -> None:
+        fake_rrsync = self.temporary / "rrsync"
+        fake_rrsync.write_text(
+            "#!/bin/sh\n"
+            "stage=\n"
+            "for argument do stage=$argument; done\n"
+            "mkdir \"$stage/flood\"\n"
+            ": > \"$stage/flood/one\"\n"
+            ": > \"$stage/flood/two\"\n"
+            "sleep 30\n",
+            encoding="ascii",
+        )
+        fake_rrsync.chmod(0o755)
+        stage = self.temporary / "running-stage"
+        stage.mkdir()
+        original = (
+            mirror_receiver.RRSYNC,
+            mirror_receiver.STAGING_SCAN_INTERVAL_SECONDS,
+            mirror_receiver.TRANSFER_TIMEOUT_SECONDS,
+            mirror_receiver.MAX_STAGING_ENTRIES,
+        )
+        try:
+            mirror_receiver.RRSYNC = fake_rrsync
+            mirror_receiver.STAGING_SCAN_INTERVAL_SECONDS = 0.01
+            mirror_receiver.TRANSFER_TIMEOUT_SECONDS = 2
+            mirror_receiver.MAX_STAGING_ENTRIES = 2
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "directory-entry limit"
+            ):
+                mirror_receiver.run_rrsync(stage, "accepted-test-command")
+        finally:
+            (
+                mirror_receiver.RRSYNC,
+                mirror_receiver.STAGING_SCAN_INTERVAL_SECONDS,
+                mirror_receiver.TRANSFER_TIMEOUT_SECONDS,
+                mirror_receiver.MAX_STAGING_ENTRIES,
+            ) = original
+
+    def test_nonreceiver_monitor_failure_kills_transfer_and_preserves_error(self) -> None:
+        process = mock.Mock()
+        process.returncode = None
+        process.pid = 12345
+        process.wait.side_effect = mirror_receiver.subprocess.TimeoutExpired(
+            cmd="rrsync", timeout=0.01
+        )
+        primary = RuntimeError("monitor failed unexpectedly")
+        stage = self.temporary / "monitor-failure-stage"
+        stage.mkdir()
+        with mock.patch.object(
+            mirror_receiver.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            mirror_receiver, "require_staging_budget", side_effect=primary
+        ), mock.patch.object(mirror_receiver, "kill_transfer") as kill:
+            with self.assertRaises(RuntimeError) as caught:
+                mirror_receiver.run_rrsync(stage, "accepted-test-command")
+        self.assertIs(caught.exception, primary)
+        kill.assert_called_once_with(process)
+
+    def test_transfer_kill_failure_preserves_the_monitor_error(self) -> None:
+        process = mock.Mock()
+        process.returncode = None
+        process.wait.side_effect = mirror_receiver.subprocess.TimeoutExpired(
+            cmd="rrsync", timeout=0.01
+        )
+        primary = RuntimeError("monitor failed unexpectedly")
+        cleanup = OSError("could not reap transfer group")
+        stage = self.temporary / "kill-failure-stage"
+        stage.mkdir()
+        with mock.patch.object(
+            mirror_receiver.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            mirror_receiver, "require_staging_budget", side_effect=primary
+        ), mock.patch.object(
+            mirror_receiver, "kill_transfer", side_effect=cleanup
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                mirror_receiver.run_rrsync(stage, "accepted-test-command")
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, cleanup)
+
+    def test_nonblocking_deployment_lock_serializes_staging(self) -> None:
+        lock = self.temporary / ".deploy.lock"
+        first = mirror_receiver.open_lock(lock, owner=os.getuid(), nonblocking=True)
+        try:
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "deployment is already active"
+            ):
+                mirror_receiver.open_lock(lock, owner=os.getuid(), nonblocking=True)
+        finally:
+            os.close(first)
+        second = mirror_receiver.open_lock(lock, owner=os.getuid(), nonblocking=True)
+        os.close(second)
+
+    def test_staging_cleanup_failure_is_not_silently_ignored(self) -> None:
+        stage = self.temporary / "transfer-cleanup-failure"
+        stage.mkdir()
+        with mock.patch.object(
+            mirror_receiver.shutil,
+            "rmtree",
+            side_effect=PermissionError("cleanup denied"),
+        ):
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "cannot remove rsync staging tree"
+            ):
+                mirror_receiver.remove_staging_tree(stage)
+
+    def test_staging_cleanup_rechecks_residual_aggregate(self) -> None:
+        residual = self.temporary / "transfer-residual"
+        residual.mkdir()
+        (residual / "one").touch()
+        (residual / "two").touch()
+        stage = self.temporary / "transfer-current"
+        stage.mkdir()
+        original = mirror_receiver.MAX_STAGING_FILES
+        try:
+            mirror_receiver.MAX_STAGING_FILES = 1
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "file limit"):
+                mirror_receiver.remove_staging_tree(stage)
+        finally:
+            mirror_receiver.MAX_STAGING_FILES = original
+        self.assertFalse(stage.exists())
+
+    def test_cleanup_error_preserves_the_original_receiver_diagnostic(self) -> None:
+        stage = self.temporary / "transfer-combined-error"
+        stage.mkdir()
+        primary = mirror_receiver.ReceiverError("publication failed first")
+        cleanup = mirror_receiver.ReceiverError("cleanup failed second")
+        with mock.patch.object(
+            mirror_receiver,
+            "remove_staging_tree",
+            side_effect=cleanup,
+        ):
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError,
+                "publication failed first; additionally, cleanup failed second",
+            ) as caught:
+                mirror_receiver.finish_staging_tree(stage, primary)
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, cleanup)
+
+    def test_cleanup_error_preserves_a_nonreceiver_primary_exception(self) -> None:
+        stage = self.temporary / "transfer-nonreceiver-error"
+        stage.mkdir()
+        primary = RuntimeError("unexpected publication failure")
+        cleanup = mirror_receiver.ReceiverError("cleanup failed second")
+        with mock.patch.object(
+            mirror_receiver,
+            "remove_staging_tree",
+            side_effect=cleanup,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                mirror_receiver.finish_staging_tree(stage, primary)
+        self.assertIs(caught.exception, primary)
+        self.assertIs(caught.exception.__cause__, cleanup)
+
+
+class ProjectBudgetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = Path(tempfile.mkdtemp(prefix="mirror-project-budget-test-"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temporary)
+
+    def test_rejects_project_bytes_entries_files_and_version_count(self) -> None:
+        project = self.temporary / "project"
+        make_version(project, tag="v2.8.0")
+        originals = (
+            mirror_receiver.MAX_PROJECT_BYTES,
+            mirror_receiver.MAX_PROJECT_FILES,
+            mirror_receiver.MAX_PROJECT_ENTRIES,
+            mirror_receiver.MAX_PROJECT_VERSIONS,
+        )
+        try:
+            mirror_receiver.MAX_PROJECT_BYTES = 1
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "total-byte limit"):
+                mirror_receiver.require_project_budget(project)
+
+            mirror_receiver.MAX_PROJECT_BYTES = originals[0]
+            mirror_receiver.MAX_PROJECT_FILES = 1
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "file limit"):
+                mirror_receiver.require_project_budget(project)
+
+            mirror_receiver.MAX_PROJECT_FILES = originals[1]
+            mirror_receiver.MAX_PROJECT_ENTRIES = 1
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "directory-entry limit"
+            ):
+                mirror_receiver.require_project_budget(project)
+
+            mirror_receiver.MAX_PROJECT_ENTRIES = originals[2]
+            mirror_receiver.MAX_PROJECT_VERSIONS = 0
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "release-version limit"
+            ):
+                mirror_receiver.require_project_budget(project)
+        finally:
+            (
+                mirror_receiver.MAX_PROJECT_BYTES,
+                mirror_receiver.MAX_PROJECT_FILES,
+                mirror_receiver.MAX_PROJECT_ENTRIES,
+                mirror_receiver.MAX_PROJECT_VERSIONS,
+            ) = originals
+
+    def test_rejects_overlong_release_directory_in_project_tree(self) -> None:
+        project = self.temporary / "project"
+        project.mkdir()
+        overlong = "v2." + "9" * 125 + ".0"
+        self.assertEqual(len(overlong), mirror_receiver.MAX_RELEASE_TAG_BYTES + 1)
+        (project / overlong).mkdir()
+        with self.assertRaisesRegex(
+            mirror_receiver.ReceiverError, "overlong release-version directory"
+        ):
+            mirror_receiver.require_project_budget(project)
+
+    def test_rejects_publication_before_available_space_reserve_is_crossed(self) -> None:
+        project = self.temporary / "project"
+        project.mkdir()
+        filesystem = os.statvfs(project)
+        fake = mock.Mock(
+            f_blocks=filesystem.f_blocks,
+            f_bavail=1,
+            f_frsize=filesystem.f_frsize,
+        )
+        with mock.patch.object(mirror_receiver.os, "statvfs", return_value=fake):
+            with self.assertRaisesRegex(
+                mirror_receiver.ReceiverError, "available-byte reserve"
+            ):
+                mirror_receiver.require_project_budget(project, additional_bytes=1)
+
+    def test_available_space_reserve_is_at_least_five_percent(self) -> None:
+        project = self.temporary / "project"
+        project.mkdir()
+        block_size = 1024 * 1024
+        original_minimum = mirror_receiver.MIN_PROJECT_AVAILABLE_BYTES
+        try:
+            mirror_receiver.MIN_PROJECT_AVAILABLE_BYTES = 0
+            below_reserve = mock.Mock(
+                f_blocks=1000,
+                f_bavail=49,
+                f_frsize=block_size,
+            )
+            with mock.patch.object(
+                mirror_receiver.os, "statvfs", return_value=below_reserve
+            ):
+                with self.assertRaisesRegex(
+                    mirror_receiver.ReceiverError,
+                    f"available-byte reserve of {50 * block_size}",
+                ):
+                    mirror_receiver.require_project_budget(project)
+
+            exact_reserve = mock.Mock(
+                f_blocks=1000,
+                f_bavail=50,
+                f_frsize=block_size,
+            )
+            with mock.patch.object(
+                mirror_receiver.os, "statvfs", return_value=exact_reserve
+            ):
+                mirror_receiver.require_project_budget(project)
+                with self.assertRaisesRegex(
+                    mirror_receiver.ReceiverError, "available-byte reserve"
+                ):
+                    mirror_receiver.require_project_budget(
+                        project, additional_bytes=1
+                    )
+        finally:
+            mirror_receiver.MIN_PROJECT_AVAILABLE_BYTES = original_minimum
+
+    def test_new_version_preflight_counts_staged_growth(self) -> None:
+        project = self.temporary / "project"
+        project.mkdir()
+        staged = make_version(self.temporary / "staged", tag="v2.9.5")
+        original = mirror_receiver.MAX_PROJECT_BYTES
+        try:
+            mirror_receiver.MAX_PROJECT_BYTES = 1
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "total-byte limit"):
+                mirror_receiver.publish_version(
+                    staged, project / "v2.9.5", owner=os.getuid()
+                )
+        finally:
+            mirror_receiver.MAX_PROJECT_BYTES = original
+        self.assertFalse((project / "v2.9.5").exists())
 
 
 class ReceiverPolicyTests(unittest.TestCase):

@@ -198,12 +198,14 @@ func TestInstalledVersion(t *testing.T) {
 }
 
 func TestReleaseVersion(t *testing.T) {
-	for _, value := range []string{"0.0.0", "2.8.0", "12.34.56-rc.10"} {
+	maxLength := "2.3.4-" + strings.Repeat("a", MaxReleaseVersionBytes-len("2.3.4-"))
+	tooLong := maxLength + "a"
+	for _, value := range []string{"0.0.0", "2.8.0", "12.34.56-rc.10", maxLength} {
 		if !ReleaseVersion(value) {
 			t.Errorf("ReleaseVersion(%q) = false, want true", value)
 		}
 	}
-	for _, value := range []string{"", "v2.8.0", "02.8.0", "2.08.0", "2.8", "2.8.0+build", "2.8.0-rc_1"} {
+	for _, value := range []string{"", "v2.8.0", "02.8.0", "2.08.0", "2.8", "2.8.0+build", "2.8.0-rc_1", tooLong} {
 		if ReleaseVersion(value) {
 			t.Errorf("ReleaseVersion(%q) = true, want false", value)
 		}

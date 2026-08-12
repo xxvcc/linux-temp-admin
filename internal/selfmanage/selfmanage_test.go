@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
 )
 
@@ -276,6 +277,53 @@ func TestUpgradeRefusedWithoutKey(t *testing.T) {
 	m := &Manager{PublicKey: nil}
 	if _, err := m.Upgrade("https://x/bin", "https://x/sig", false); err == nil {
 		t.Error("Upgrade must refuse when no signing key is configured")
+	}
+}
+
+func TestReleaseVersionWitnessIsCanonicalAndUnique(t *testing.T) {
+	maxVersion := "2.3.4-" + strings.Repeat("a", validate.MaxReleaseVersionBytes-len("2.3.4-"))
+	for _, tc := range []struct {
+		name    string
+		bin     string
+		want    string
+		wantErr bool
+	}{
+		{name: "historical binary has no witness", bin: "historical"},
+		{name: "canonical", bin: "prefix LTA_RELEASE_VERSION_V1{2.9.5} suffix", want: "2.9.5"},
+		{name: "prerelease", bin: "LTA_RELEASE_VERSION_V1{2.10.0-rc.1}", want: "2.10.0-rc.1"},
+		{name: "maximum length", bin: "LTA_RELEASE_VERSION_V1{" + maxVersion + "}", want: maxVersion},
+		{name: "over maximum length", bin: "LTA_RELEASE_VERSION_V1{" + maxVersion + "a}"},
+		{name: "duplicate", bin: "LTA_RELEASE_VERSION_V1{2.9.5} LTA_RELEASE_VERSION_V1{2.9.5}", wantErr: true},
+		{name: "different duplicate", bin: "LTA_RELEASE_VERSION_V1{2.9.5} LTA_RELEASE_VERSION_V1{2.9.6}", wantErr: true},
+		{name: "noncanonical version is not a witness", bin: "LTA_RELEASE_VERSION_V1{02.9.5}"},
+		{name: "unterminated marker is not a witness", bin: "LTA_RELEASE_VERSION_V1{2.9.5"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := releaseVersionWitness([]byte(tc.bin))
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("releaseVersionWitness = %q,%v, want %q, error=%v", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPrepareVerifiedCandidateDoesNotExecuteSignedBytes(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := filepath.Join(t.TempDir(), "candidate-executed")
+	bin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.9.5}\nprintf executed > '" + evidence + "'\nprintf '2.9.5\\n'\n")
+	m := &Manager{PublicKey: pub}
+	candidate, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), "2.9.5")
+	if err != nil || candidate.Version() != "2.9.5" {
+		t.Fatalf("prepareVerifiedCandidate = version %q, err=%v", candidate.Version(), err)
+	}
+	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
+		t.Fatalf("candidate executed during signed preparation: %v", err)
+	}
+	if _, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), "2.9.6"); err == nil {
+		t.Fatal("candidate witness mismatch was accepted")
 	}
 }
 

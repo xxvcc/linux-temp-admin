@@ -37,6 +37,7 @@ hash -r
 
 MAX_BINARY_BYTES=67108864
 MAX_METADATA_BYTES=1048576
+MAX_RELEASE_VERSION_BYTES=128
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 SIGNER_TIMEOUT_SECONDS=300
 
@@ -270,7 +271,10 @@ done
 TAG="$(<"$BUNDLE_DIR/TAG")"
 VERSION="$(<"$BUNDLE_DIR/VERSION")"
 COMMIT="$(<"$BUNDLE_DIR/COMMIT")"
-[[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ && "$VERSION" == "${TAG#v}" ]] \
+[[ ${#TAG} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+   && ${#VERSION} -le $MAX_RELEASE_VERSION_BYTES \
+   && "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ \
+   && "$VERSION" == "${TAG#v}" ]] \
   || { echo "invalid or inconsistent bundle tag/version" >&2; exit 1; }
 major="${BASH_REMATCH[1]}"
 (( ${#major} > 1 || 10#$major >= 2 )) || { echo "release tags below v2 are not supported" >&2; exit 1; }
@@ -351,9 +355,11 @@ decimal_gt() {
 
 stable_tag_gt() {
   local newer=$1 older=$2 nmajor nminor npatch omajor ominor opatch pair left right
-  [[ "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ ${#newer} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+     && "$newer" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
   nmajor=${BASH_REMATCH[1]}; nminor=${BASH_REMATCH[2]}; npatch=${BASH_REMATCH[3]}
-  [[ "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+  [[ ${#older} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+     && "$older" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
   omajor=${BASH_REMATCH[1]}; ominor=${BASH_REMATCH[2]}; opatch=${BASH_REMATCH[3]}
   for pair in "$nmajor:$omajor" "$nminor:$ominor" "$npatch:$opatch"; do
     left=${pair%%:*}; right=${pair#*:}
@@ -369,7 +375,8 @@ highest_stable_release_excluding() {
     --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')" || return 1
   while IFS= read -r tag; do
     [[ -n "$tag" ]] || continue
-    [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    [[ ${#tag} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+       && "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
       || { echo "published stable release has a non-canonical tag: $tag" >&2; return 1; }
     [[ -z "$excluded" || "$tag" != "$excluded" ]] || continue
     if [[ -z "$highest" ]] || stable_tag_gt "$tag" "$highest"; then
@@ -383,7 +390,8 @@ current_latest_tag() {
   local latest response_file api_status status_count not_found_count
   response_file="$work/latest-api-response"
   if latest="$(gh_with_timeout release view --repo "$REPO" --json tagName --jq '.tagName' 2>"$work/latest-view-error")"; then
-    [[ "$latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    [[ ${#latest} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+       && "$latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
       || { echo "Latest has a non-canonical stable tag: $latest" >&2; return 1; }
     printf '%s\n' "$latest"
     return 0
@@ -430,6 +438,7 @@ current_latest_release() {
   read -r actual_tag actual_draft actual_prerelease actual_immutable actual_id extra <<<"$state"
   [[ -z "$extra" && "$state" == "$actual_tag $actual_draft $actual_prerelease $actual_immutable $actual_id" \
     && "$actual_tag" == "$latest" \
+    && ${#actual_tag} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
     && "$actual_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
     && "$actual_draft" == false && "$actual_prerelease" == false \
     && "$actual_immutable" == true && "$actual_id" =~ ^[1-9][0-9]*$ ]] \
@@ -440,7 +449,8 @@ current_latest_release() {
 require_latest_release_exact() {
   local expected_tag=$1 expected_id=$2 context=$3 state actual_tag="" actual_id="" extra
   if [[ -n "$expected_tag" ]]; then
-    [[ "$expected_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+    [[ ${#expected_tag} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+      && "$expected_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
       && "$expected_id" =~ ^[1-9][0-9]*$ ]] \
       || { echo "$context: invalid expected Latest identity" >&2; return 1; }
   else
@@ -619,7 +629,8 @@ secure_failed_publication_state() {
 
 resolve_published_stable_release_id() {
   local tag=$1 state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
-  [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+  [[ ${#tag} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+     && "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
     || { echo "cannot resolve non-canonical stable tag: $tag" >&2; return 1; }
   state="$(gh_with_timeout api "repos/${REPO}/releases/tags/${tag}" \
     --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
@@ -635,7 +646,9 @@ resolve_published_stable_release_id() {
 
 set_latest_by_release_id() {
   local release_id=$1 tag=$2 make_latest=$3 state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
-  [[ "$release_id" =~ ^[1-9][0-9]*$ && "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+  [[ "$release_id" =~ ^[1-9][0-9]*$ \
+    && ${#tag} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+    && "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
     && ( "$make_latest" == true || "$make_latest" == false ) ]] \
     || { echo "invalid bound Release identity for Latest update" >&2; return 1; }
   state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${release_id}" \

@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented here.
 
+## v2.9.5 - 2026-08-12
+
+- Embed one canonical version witness inside each signed release binary. Routine
+  upgrades now read that authenticated witness and reject an equal or older
+  candidate before executing it; an allowed candidate's bounded `version` probe
+  must still match both the witness and selected release. Historical signed
+  binaries without the witness require an explicit `--force` recovery.
+- Reconcile a registry durability error after the quarantine row's rename is
+  already visible. A fully matching row now retains its systemd finalizer and
+  reports the uncertain directory sync, while unproved state preserves both
+  timer and registry evidence for fail-closed operator recovery.
+- Bound all current and residual mirror deployment staging trees together by
+  aggregate allocated/logical bytes, file count, directory-entry count, time,
+  and one serialized receiver session at a time. The receiver checks before
+  creating a new stage, scans while rsync is running, kills an over-budget
+  process group, rechecks the completed tree before publication, terminates the
+  process group on every catchable monitor failure, and reports cleanup failures
+  explicitly.
+  Published version storage is also bounded by aggregate bytes, files, entries,
+  version count, and a required free-space reserve.
+- Sync prepared and offline-signed release transfer files plus their output and
+  parent directories before reporting success. Custom installer destinations
+  likewise sync every destination-directory ancestor, the verified staging
+  inode, and the committed file/directory before success; the managed install
+  continues to use the Go atomic durability path.
+- Move root installer end-to-end tests that write below `/usr/local/lib` behind
+  the disposable-host `integration` tag, and document that ordinary tests must
+  not mutate fixed system paths.
+- Clarify the distinct trust checks for the official complete release set,
+  custom binary/signature upgrade URLs, and local already-running binary
+  installation in the security and installation documentation.
+- Bound canonical release versions to 128 ASCII bytes across binary witnesses,
+  manifests, installers, workflows, trusted release scripts, and the mirror.
+
 ## v2.9.4 - 2026-08-06
 
 - Prevent ordinary `chfn`/`chsh` changes from postponing revoke indefinitely by

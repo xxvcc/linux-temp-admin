@@ -196,7 +196,7 @@ func TestUpgradeDownloadDoesNotHoldLifecycleLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bin := []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 9.9.9\n")
+	bin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{9.9.9}\n[ \"$1\" = version ] && echo 9.9.9\n")
 	sig := ed25519.Sign(priv, bin)
 	started := make(chan struct{})
 	unblock := make(chan struct{})
@@ -280,13 +280,13 @@ func TestUpgradeDownloadDoesNotHoldLifecycleLock(t *testing.T) {
 
 func TestOfficialUpgradeMirrorFallbackBoundary(t *testing.T) {
 	asset := config.BinaryAssetPrefix + "amd64"
-	goodBin := []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 2.8.0\n")
+	goodBin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.8.0}\n[ \"$1\" = version ] && echo 2.8.0\n")
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	goodSig := ed25519.Sign(priv, goodBin)
-	otherBin := []byte("#!/bin/sh\n[ \"$1\" = version ] && echo 2.8.1\n")
+	otherBin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.8.1}\n[ \"$1\" = version ] && echo 2.8.1\n")
 	otherSig := ed25519.Sign(priv, otherBin)
 	_, wrongPriv, _ := ed25519.GenerateKey(rand.Reader)
 	wrongSig := ed25519.Sign(wrongPriv, goodBin)

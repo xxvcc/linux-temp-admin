@@ -13,10 +13,11 @@ hash -r
 
 MAX_BINARY_BYTES=67108864
 MAX_METADATA_BYTES=1048576
+MAX_RELEASE_VERSION_BYTES=128
 LOCAL_COMMAND_TIMEOUT_SECONDS=120
 SIGNER_TIMEOUT_SECONDS=300
 
-for command_name in awk chmod cp dirname grep mkdir mktemp readlink rm sha256sum stat timeout wc; do
+for command_name in awk chmod cp dirname grep mkdir mktemp readlink rm sha256sum stat sync timeout wc; do
   command -v "$command_name" >/dev/null 2>&1 \
     || { echo "required command not found: $command_name" >&2; exit 1; }
 done
@@ -188,6 +189,20 @@ bounded_copy() {
   (( size <= max )) || { echo "input exceeds its snapshot limit: $source" >&2; return 1; }
 }
 
+sync_output_directory() {
+  local directory=$1 label=$2 path parent
+  shift 2
+  for path in "$@"; do
+    local_with_timeout sync -- "$directory/$path" \
+      || { echo "cannot sync $label file: $path" >&2; return 1; }
+  done
+  local_with_timeout sync -- "$directory" \
+    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
+  parent="$(dirname -- "$directory")"
+  local_with_timeout sync -- "$parent" \
+    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
+}
+
 # Pin the audited executable by an open descriptor. Hashing and every later
 # execution address this same inode even if its pathname is replaced.
 exec {trusted_signer_fd}<"$LTA_TRUSTED_SIGNER"
@@ -227,7 +242,9 @@ for arch in amd64 arm64; do
 done
 TAG="$(<"$snapshot/TAG")"
 VERSION="$(<"$snapshot/VERSION")"
-[[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ \
+[[ ${#TAG} -le $((MAX_RELEASE_VERSION_BYTES + 1)) \
+   && ${#VERSION} -le $MAX_RELEASE_VERSION_BYTES \
+   && "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z]+([.-][0-9A-Za-z]+)*))?$ \
    && "$VERSION" == "${TAG#v}" ]] \
   || { echo "invalid or inconsistent prepared tag/version" >&2; exit 1; }
 major="${BASH_REMATCH[1]}"
@@ -273,9 +290,10 @@ require_safe_new_output_path "$SIGNED_DIR" "signed output"
 timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" mkdir -m 0700 -- "$SIGNED_DIR"
 out_created=1
 require_safe_directory_path "$SIGNED_DIR" "signed output"
-for name in COMMIT PREPARED_SHA256SUMS RELEASE_SIGNER_PUBKEY SHA256SUMS SIGNER_SHA256 TAG VERSION release_pubkey.hex \
+signed_output_files=(COMMIT PREPARED_SHA256SUMS RELEASE_SIGNER_PUBKEY SHA256SUMS SIGNER_SHA256 TAG VERSION release_pubkey.hex \
   linux-temp-admin-linux-amd64 linux-temp-admin-linux-amd64.sig \
-  linux-temp-admin-linux-arm64 linux-temp-admin-linux-arm64.sig SIGNED_BUNDLE_SHA256SUMS; do
+  linux-temp-admin-linux-arm64 linux-temp-admin-linux-arm64.sig SIGNED_BUNDLE_SHA256SUMS)
+for name in "${signed_output_files[@]}"; do
   limit=$MAX_METADATA_BYTES
   [[ "$name" != linux-temp-admin-linux-amd64 && "$name" != linux-temp-admin-linux-arm64 ]] \
     || limit=$MAX_BINARY_BYTES
@@ -290,6 +308,7 @@ done
   || { echo "signed output manifest changed during transfer" >&2; exit 1; }
 timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" /bin/sh -c \
   'cd -- "$1" && exec sha256sum -c --strict SIGNED_BUNDLE_SHA256SUMS' sh "$SIGNED_DIR"
+sync_output_directory "$SIGNED_DIR" "signed output" "${signed_output_files[@]}"
 complete=1
 echo "signed release data: $SIGNED_DIR"
 echo "signed bundle manifest SHA-256: $signed_manifest_sha256"

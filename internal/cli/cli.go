@@ -112,6 +112,9 @@ type App struct {
 	// before a revoke hands final deletion to systemd. Production leaves it nil and
 	// installs or verifies the running binary through ensureStableInstalled.
 	EnsureScheduledCommand func() error
+	// BeginQuarantine is a test hook for the registry half of the finalizer
+	// handoff. Production leaves it nil and calls Registry.BeginQuarantine.
+	BeginQuarantine func(user string, uid int, generation string, deadline time.Time, unit string) error
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -459,6 +462,10 @@ func (a *App) Dispatch(args []string) int {
 	}
 	switch cmd {
 	case "version", "--version":
+		if !buildinfo.VersionMetadataConsistent() {
+			a.errorf("%s", a.P.M("构建版本元数据不一致", "inconsistent build version metadata"))
+			return 1
+		}
 		fmt.Fprintln(a.Out, buildinfo.Version)
 		return 0
 	case "help", "-h", "--help":

@@ -48,7 +48,8 @@ Out of scope:
 - Revoke access immediately after use; do not rely only on expiry.
 - Grant `--sudo` only to users you trust with full root access.
 - Treat revoke or rollback cleanup errors as unresolved incidents. The command returns nonzero and retains the account/registry when a name-scoped sudoers or sshd grant cannot be safely removed.
-- The official installer is `https://dl.ll.cd/linux-temp-admin/install.sh`. Binary installation and upgrades verify the complete release set and detached ed25519 signature against the embedded keyring, with no unsigned or checksum-only fallback.
+- The official installer is `https://dl.ll.cd/linux-temp-admin/install.sh`. That installer and default official upgrades verify canonical `SHA256SUMS`, the current-architecture binary, and its detached ed25519 signature as one release set against the embedded keyring, with no unsigned or checksum-only fallback.
+- A custom `upgrade --url` or `--url-file` verifies the selected binary against its detached ed25519 signature and the embedded keyring, but does not fetch `SHA256SUMS`. The local `install` command copies the already-running inode without network access or an additional signature check; independently trust that binary first.
 - The README convenience command streams the mirror's installer into a root shell and therefore trusts that first HTTPS/script path before binary verification begins. Use the [installation guide](docs/installing.en.md#high-assurance-first-install) when the script must be authenticated before execution.
 
 The complete runtime guarantees, failure behavior, and residual risks are documented in the [security model](docs/security-model.en.md). Installation source selection and verification are documented in the [installation guide](docs/installing.en.md).
