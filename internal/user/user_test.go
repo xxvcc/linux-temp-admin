@@ -239,6 +239,27 @@ func TestLifecycleMarkerAccountsFindsOnlyExactMarkers(t *testing.T) {
 	}
 }
 
+func TestLifecycleMarkerAccountsSkipsNamesThisToolCannotHaveCreated(t *testing.T) {
+	// invite runs validateMutationName before useradd, so every account this tool
+	// has ever made carries a validate.Username name. A marker on any other name is
+	// not evidence about this tool — and treating it as an inventory error let any
+	// local user with a non-conforming name refuse every uninstall, permanently and
+	// with no operator override, just by running chfn on their own account.
+	setPasswd(t, strings.Join([]string{
+		"Uppercase:x:1000:1000:" + config.ManagedGECOS + ":/home/Uppercase:/bin/sh",
+		"way-too-long-a-name-for-a-temporary-account:x:1001:1001:" + config.ManagedGECOS + ":/home/x:/bin/sh",
+		"managed:x:1002:1002:" + config.ManagedGenerationGECOSPrefix + testGeneration + ":/home/managed:/bin/sh",
+	}, "\n")+"\n")
+
+	got, err := LifecycleMarkerAccounts()
+	if err != nil {
+		t.Fatalf("marker scan failed on names this tool could never have created: %v", err)
+	}
+	if want := []string{"managed"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("LifecycleMarkerAccounts = %v, want %v", got, want)
+	}
+}
+
 func TestLifecycleMarkerAccountsFailsClosedOnMalformedPasswd(t *testing.T) {
 	setPasswd(t, "broken:x:not-a-uid\nmanaged:x:1001:1001:"+config.ManagedGenerationGECOSPrefix+testGeneration+":/home/managed:/bin/sh\n")
 	if _, err := LifecycleMarkerAccounts(); err == nil || !strings.Contains(err.Error(), "passwd line 1") {
@@ -376,7 +397,7 @@ func TestNSSCommandsAreBoundedAndUseCLocale(t *testing.T) {
 
 	t.Run("groups locale", func(t *testing.T) {
 		dir := t.TempDir()
-		writeUserCommand(t, dir, "id", `[ "$LC_ALL:$LANG:$1:$2" = "C:C:-Gn:alice" ] || exit 9
+		writeUserCommand(t, dir, "id", `[ "$LC_ALL:$LANG:$1:$2:$3" = "C:C:-Gn:--:alice" ] || exit 9
 printf 'primary extra\n'`)
 		t.Setenv("PATH", dir)
 		groups, err := Groups(Passwd{Name: "alice"})
@@ -523,6 +544,44 @@ func TestIsProtectedRevokeEntryUsesSuppliedSnapshot(t *testing.T) {
 	snapshot := Passwd{Name: "same", UID: 1234, GID: 1234, GECOS: "Real Person", Home: "/srv/same", Shell: "/bin/sh"}
 	if !IsProtectedRevokeEntry("same", snapshot, true, true, 1234, testGeneration, false) {
 		t.Fatal("supplied untrusted snapshot was ignored in favor of a second passwd lookup")
+	}
+}
+
+// TestUnregisteredDeletionRequiresAuthoritativeMarker pins the split between the
+// two questions a GECOS marker answers. HasLifecycleMarker only ever BLOCKS work,
+// so it stays permissive about which field the marker sits in. IsProtectedRevoke*
+// turns a marker into permission to DELETE an unregistered account, so once the
+// root-only trailing field carries a value it decides — a user-changeable
+// full-name copy must not be able to re-establish evidence it contradicts.
+func TestUnregisteredDeletionRequiresAuthoritativeMarker(t *testing.T) {
+	firstField := config.ManagedGenerationGECOSPrefix + testGeneration
+	witness := config.ManagedGenerationGECOSWitnessPrefix + testGeneration
+	for _, tc := range []struct {
+		name          string
+		gecos         string
+		wantProtected bool
+	}{
+		{name: "trailing witness", gecos: ",,,," + witness, wantProtected: false},
+		{name: "v2.9.3 first field only", gecos: firstField, wantProtected: false},
+		{name: "first field with four empty office fields", gecos: firstField + ",,,", wantProtected: false},
+		{name: "contradicted by a non-witness trailing field", gecos: firstField + ",,,,other info", wantProtected: true},
+		{name: "contradicted by an empty-looking trailing field", gecos: firstField + ",room,work,home,x", wantProtected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := Passwd{
+				Name: "xxvcc-a1", UID: 1500, GID: 1500, GECOS: tc.gecos,
+				Home: "/home/xxvcc-a1", Shell: "/bin/sh",
+			}
+			got := IsProtectedRevokeEntry("xxvcc-a1", pw, true, false, 0, "", false)
+			if got != tc.wantProtected {
+				t.Fatalf("IsProtectedRevokeEntry = %v, want %v", got, tc.wantProtected)
+			}
+			// The blocking predicate must stay permissive in every one of these cases,
+			// including the ones deletion now refuses.
+			if !HasLifecycleMarker(pw) {
+				t.Fatal("block-only marker recognition regressed to the deletion-authority rule")
+			}
+		})
 	}
 }
 
@@ -796,6 +855,61 @@ func TestIdentityAllocationRangeFailsClosedOnInvalidPolicyOrDatabase(t *testing.
 				t.Fatalf("IdentityAllocationRange error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestIdentityAllocationRangeFallsBackWhenLoginDefsIsAbsent(t *testing.T) {
+	// shadow's own useradd uses its compiled-in range when /etc/login.defs is
+	// missing, and minimal images ship it that way. Failing closed here made every
+	// invite fail on a host whose account tooling works perfectly.
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1500::/home/alice:/bin/sh\n",
+		"root:x:0:\nalice:x:1500:\n",
+		"UID_MIN 1000\n")
+	if err := os.Remove(loginDefsPath); err != nil {
+		t.Fatal(err)
+	}
+	minimum, maximum, err := IdentityAllocationRange()
+	if err != nil || minimum != 1501 || maximum != 60000 {
+		t.Fatalf("IdentityAllocationRange = %d..%d err=%v, want the built-in 1501..60000", minimum, maximum, err)
+	}
+}
+
+func TestIdentityAllocationRangeStillFailsClosedOnUnreadableLoginDefs(t *testing.T) {
+	// Only a confirmed absence uses the built-in range. Anything that could be
+	// hiding a narrower configured range must still stop account creation.
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\n", "root:x:0:\n", "UID_MIN 1000\n")
+	if err := os.Remove(loginDefsPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(loginDefsPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := IdentityAllocationRange(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("IdentityAllocationRange error = %v, want a fail-closed non-regular login.defs refusal", err)
+	}
+}
+
+func TestCreateReturnsTheIdentityItReadOnFieldMismatch(t *testing.T) {
+	// The snapshot is the last complete identity this call proved. Returning a
+	// zero Passwd instead left invite's rollback with nothing to verify, so one
+	// unexpected field turned into an account only a human could ever clean up.
+	pendingMarker := testPendingGenerationGECOS(t)
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
+	setProcRoot(t, map[int]string{})
+	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	m := managerWithStubbedHomeChecks(f)
+	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
+	if err == nil || !strings.Contains(err.Error(), "rollback or manual recovery") {
+		t.Fatalf("shell mismatch error = %v, want a retained-account report", err)
+	}
+	want := Passwd{
+		Name: "xxvcc-a1", UID: 2345, GID: 2345, GECOS: pendingMarker,
+		Home: "/home/xxvcc-a1", Shell: "/bin/sh",
+	}
+	if pw != want {
+		t.Fatalf("returned identity = %+v, want the snapshot that was read %+v", pw, want)
 	}
 }
 

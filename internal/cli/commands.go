@@ -742,7 +742,11 @@ func (a *App) compactLocked() int {
 		return rc
 	}
 	removed, err := a.Registry.Compact(func(rec registry.Record) (bool, error) {
-		return user.Exists(rec.User)
+		// Use the injected snapshot source, like every other identity read in this
+		// package. Compact holds the registry lock while this runs, so it must not
+		// re-enter Store; lookupUser only reads the account database.
+		_, exists, err := a.lookupUser(rec.User)
+		return exists, err
 	})
 	if err != nil {
 		a.warnf("%v", err)

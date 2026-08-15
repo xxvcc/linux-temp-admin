@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.0 - 2026-08-15
+
+- Stop an unprivileged local account from permanently blocking `uninstall`. The
+  legacy fixed GECOS marker contains no `=`, `,` or `:`, so any user can write it
+  into their own full-name field with `chfn` and appear in the teardown
+  inventory. A marker on a name this tool could never have created (one that
+  fails `validate.Username`) is now ignored instead of reported as an inventory
+  read failure, and the new `uninstall --ignore-foreign-markers` explicitly
+  excuses a live account named ONLY by a passwd marker — no registry row, no sudo
+  grant, no sshd exception, no auto-delete task. Skipped accounts are printed by
+  name and are never deleted; anything carrying a second witness still blocks.
+  The refusal without the flag now names the account, the witness doing the
+  blocking, and both remedies.
+- Split the two opposite questions a GECOS marker answers. The blocking
+  predicate stays permissive about which field the marker sits in, while
+  deletion authority for an unregistered `--force` target now requires the
+  authoritative position: once the root-only fifth field carries a value it
+  decides, so a user-writable full-name copy cannot re-establish generation
+  evidence that field contradicts.
+- Use shadow's own built-in 1000..60000 range when `/etc/login.defs` is
+  confirmed absent, instead of failing every invite on a minimal image whose
+  `useradd` works from its compiled-in defaults. A file that exists but is
+  unreadable, oversized, or not a regular file still fails closed.
+- Return the passwd snapshot that was actually read when a newly created account
+  mismatches the requested name, home, shell, or marker. Discarding it left
+  invite's rollback with nothing to verify, so one unexpected field turned into
+  an account only manual recovery could ever clean up.
+- Pin PATH to the trusted system directories for non-root runs too. `doctor` and
+  `status` have no root gate yet exec sshd, systemctl, atq, at, id, and the
+  installed command, so their verdict must not be steerable through the caller's
+  environment.
+- Use the injected account-snapshot source in `cleanup-expired --compact`, and
+  pass `--` to the `id -Gn` group probe, matching every other identity read.
+- Document the two fixed cloud-metadata addresses invite probes before the
+  create confirmation, including that `100.100.100.200` is shared address space
+  that is not guaranteed to stop at the local link.
+
 ## v2.9.5 - 2026-08-12
 
 - Embed one canonical version witness inside each signed release binary. Routine

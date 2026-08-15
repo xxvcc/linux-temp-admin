@@ -41,7 +41,7 @@ Before creating anything, the tool checks whether the planned credential is comp
 
 ### Host detection
 
-Without `--host`, interactive mode first queries fixed-address cloud metadata endpoints and inspects local interfaces. Interface inspection sends no traffic; metadata uses plaintext HTTP and avoids DNS, redirects, and environment proxies, but it may traverse the local or cloud-provider network and its response is unauthenticated. The detected value is only a default that the operator must confirm or replace. Especially for password login, verify the Host first through the cloud console, DNS, or another independent channel so the invitee is not directed to submit the password to the wrong SSH server. Only when no public address is found does the tool ask permission to query a public IP service, which exposes the server's egress address to that third party; that result also requires confirmation.
+Without `--host`, interactive mode first queries fixed-address cloud metadata endpoints and inspects local interfaces. Those endpoints are `http://169.254.169.254/latest/meta-data/public-ipv4` and `http://100.100.100.200/latest/meta-data/eipv4`, and both are requested before the create confirmation. The first is link-local; the second is in the `100.64.0.0/10` shared address space and is **not guaranteed to stop at the local link**, so on a non-cloud host these are two requests that may leave the machine. Interface inspection sends no traffic; metadata uses plaintext HTTP and avoids DNS, redirects, and environment proxies, but it may traverse the local or cloud-provider network and its response is unauthenticated. The detected value is only a default that the operator must confirm or replace. Especially for password login, verify the Host first through the cloud console, DNS, or another independent channel so the invitee is not directed to submit the password to the wrong SSH server. Only when no public address is found does the tool ask permission to query a public IP service, which exposes the server's egress address to that third party; that result also requires confirmation.
 
 `--yes` mode never queries a public IP service and requires an explicit `--host`. The host accepts a plain domain, IPv4, or IPv6 value; pass the port separately with `--port`.
 
@@ -179,6 +179,14 @@ A default random-name invite computes its lifetime once after immediate job clea
 ```
 
 Uninstall first applies the same identity checks and cleanup as a normal `revoke` to each account in the inventory. It deletes state and the program only after confirming that every account, grant, exception, and task is gone. Any item that cannot be confirmed during account cleanup aborts the uninstall and keeps the management command and state. Running uninstall from the temporary account's own session is refused.
+
+A live account whose NAMED BY column reads `passwd-marker-block-only` is named only by the lifecycle marker in its passwd GECOS field: no registry row, and none of this tool's sudo grants, sshd exceptions, or auto-delete tasks. Such an account is never deleted automatically, and by default it also aborts the uninstall — it may be a permanent account whose registry row was lost, but it may equally be **any local user** who wrote the same text onto their own account with `chfn`. Once you have confirmed it is not an account this tool created, clear the marker (`usermod -c '' <name>`) or skip it explicitly:
+
+```bash
+/usr/bin/sudo /usr/local/sbin/linux-temp-admin uninstall --yes --ignore-foreign-markers
+```
+
+The switch applies only to that one shape, and every skipped account is printed by name. As soon as the username also carries any grant, exception, task, or registry row of this tool's, it blocks the uninstall as before. Skipping never deletes an account; it only stops it from blocking.
 
 The audit log remains at `/var/log/linux-temp-admin/audit.log` by default. The lifecycle lock and uninstall marker also remain; current binaries check the marker after taking the lock and refuse to recreate state. A previously loaded binary from before this protocol may not check it, so the marker does not guarantee control over every historically queued process. An explicit reinstall handles the marker.
 

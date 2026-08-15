@@ -77,8 +77,9 @@ func Lookup(name string) (Passwd, bool, error) {
 	}
 	var found *Passwd
 	for _, line := range strings.Split(string(data), "\n") {
-		parts := strings.Split(line, ":")
-		if len(parts) == 0 || parts[0] != name {
+		// strings.Split always yields at least one element, so indexing [0] is safe
+		// even for the empty trailing line produced by a final newline.
+		if strings.Split(line, ":")[0] != name {
 			continue
 		}
 		if found != nil {
@@ -207,6 +208,15 @@ func IdentityAllocationRange() (minimum, maximum int, err error) {
 func loginIdentityBounds() (uidMin, uidMax, gidMin, gidMax int, err error) {
 	uidMin, uidMax, gidMin, gidMax = 1000, 60000, 1000, 60000
 	b, err := readPasswdDatabase(loginDefsPath, maxLoginDefsBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		// shadow's own useradd falls back to its compiled-in range when
+		// /etc/login.defs is absent, and minimal images ship shadow without it. A
+		// missing file must therefore not make every invite fail on a host whose
+		// account tooling works. Every other error stays fail-closed: an unreadable,
+		// oversized, or non-regular file could be hiding a narrower configured range,
+		// and allocating outside it would collide with the administrator's policy.
+		return uidMin, uidMax, gidMin, gidMax, nil
+	}
 	if err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("read login.defs: %w", err)
 	}
@@ -273,8 +283,16 @@ func LifecycleMarkerAccounts() ([]string, error) {
 		if !HasLifecycleMarker(pw) {
 			continue
 		}
+		// A marker on a name this tool could never have created is not evidence
+		// about this tool: invite runs validateMutationName before useradd, so every
+		// account it has ever made carries a validate.Username name. Skipping such an
+		// entry is deliberate rather than fail-closed, because the marker lives in the
+		// GECOS full-name field that any local user can set with chfn. Reporting it as
+		// an inventory error instead let an unprivileged account with a non-conforming
+		// name (uppercase, over 32 bytes) permanently refuse every uninstall, with no
+		// operator override.
 		if !validate.Username(pw.Name) {
-			return nil, fmt.Errorf("account marker names invalid temporary username %q", pw.Name)
+			continue
 		}
 		names = append(names, pw.Name)
 	}
@@ -327,7 +345,9 @@ func idReportsUnknownUser(name string, out []byte) bool {
 func Groups(pw Passwd) ([]string, error) {
 	// Use the system identity resolver rather than parsing /etc/group: sshd also
 	// consults NSS, so LDAP/SSSD memberships must participate in DenyGroups.
-	out, err := executil.Output("id", []string{"-Gn", pw.Name}, nssCommandOptions)
+	// "--" matches NameInUse's invocation: the name is already constrained to
+	// [a-z_]-led characters, so this is consistency rather than a live defence.
+	out, err := executil.Output("id", []string{"-Gn", "--", pw.Name}, nssCommandOptions)
 	if err != nil {
 		return nil, fmt.Errorf("resolve groups for %s: %w", pw.Name, err)
 	}
@@ -476,6 +496,33 @@ func hasGenerationMarker(gecos, deployedPrefix, witnessPrefix string) bool {
 		(witnessed && validate.Generation(witnessGeneration))
 }
 
+// hasAuthoritativeGenerationMarker is the deletion-authority form of
+// hasGenerationMarker. The two differ deliberately, because the same question
+// has opposite safe answers in the two places it is asked:
+//
+//   - HasLifecycleMarker only ever BLOCKS work, so recognizing a marker in either
+//     GECOS position is the conservative reading there.
+//   - IsProtectedRevokeEntry turns a marker into permission to delete an
+//     unregistered account, so the root-only trailing field must win once it
+//     carries any value at all. Otherwise a user-writable full-name copy could
+//     re-establish deletion evidence that the trailing witness contradicts.
+//
+// This mirrors matchesGenerationMarker's precedence without pinning the result
+// to one specific recorded generation.
+func hasAuthoritativeGenerationMarker(gecos, deployedPrefix, witnessPrefix string) bool {
+	if trailing := gecosTrailingInfo(gecos); trailing != "" {
+		generation, witnessed := strings.CutPrefix(trailing, witnessPrefix)
+		return witnessed && validate.Generation(generation)
+	}
+	generation, deployed := strings.CutPrefix(gecosFullName(gecos), deployedPrefix)
+	return deployed && validate.Generation(generation)
+}
+
+func hasAuthoritativeManagedGenerationMarker(pw Passwd) bool {
+	return hasAuthoritativeGenerationMarker(pw.GECOS,
+		config.ManagedGenerationGECOSPrefix, config.ManagedGenerationGECOSWitnessPrefix)
+}
+
 func trailingLifecycleWitness(gecos string) (string, bool) {
 	marker := gecosTrailingInfo(gecos)
 	for _, prefix := range []string{config.ManagedGenerationGECOSWitnessPrefix, config.PendingGenerationGECOSWitnessPrefix} {
@@ -580,9 +627,12 @@ func IsProtectedRevokeEntry(name string, pw Passwd, exists, registered bool, rec
 	// A fixed legacy marker can be reproduced and is therefore only recovery
 	// evidence. It becomes deletion authority solely when the caller obtained the
 	// explicit legacy confirmation, including when the registry row was lost. A
-	// random generation marker may still support explicit unregistered recovery;
-	// registered accounts must match their exact recorded generation below.
-	managed := hasManagedGenerationMarker(pw) || (allowLegacy && IsLegacyManagedEntry(pw))
+	// random generation marker may still support explicit unregistered recovery,
+	// but only in its authoritative form: once the root-only trailing GECOS field
+	// holds a value it decides, so a user-changeable full-name copy can never
+	// re-establish a marker that field contradicts. Registered accounts must match
+	// their exact recorded generation below.
+	managed := hasAuthoritativeManagedGenerationMarker(pw) || (allowLegacy && IsLegacyManagedEntry(pw))
 	if registered {
 		managed = MatchesManagedGeneration(pw, recordedGeneration) || (allowLegacy && IsLegacyManagedEntry(pw))
 	}
@@ -827,7 +877,13 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool, reser
 			pw.UID, pw.GID, reservedID, reservedID)
 	}
 	if pw.Name != name || pw.Home != home || pw.Shell != shell || pw.GECOS != gecos {
-		return Passwd{}, fmt.Errorf("newly created account identity does not match the requested name, home, shell, and marker; account retained for manual recovery")
+		// Return the snapshot that was actually read, exactly as the reserved-identity
+		// mismatch above does. It is the last complete identity this call proved, and
+		// discarding it left the caller with a zero Passwd whose first rollback check
+		// fails, so a benign distro quirk in one field turned into an account that
+		// could only ever be recovered by hand. The rollback path re-verifies the
+		// generation marker and every name-scoped grant before it may delete anything.
+		return pw, fmt.Errorf("newly created account identity does not match the requested name, home, shell, and marker; account retained for rollback or manual recovery")
 	}
 	pids, scanErr := processesForUID(pw.UID)
 	if scanErr != nil {

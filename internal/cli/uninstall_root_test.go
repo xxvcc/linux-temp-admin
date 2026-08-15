@@ -131,7 +131,7 @@ func TestTeardownRemovesLegacyPersistentTimerStamps(t *testing.T) {
 	}
 
 	plan := a.teardownPlan(false, false)
-	if rc := a.teardown(plan, false, false); rc != 0 {
+	if rc := a.teardown(plan, uninstallOptions{}); rc != 0 {
 		t.Fatal("teardown failed while removing legacy timer timestamps")
 	}
 	for _, path := range []string{managed, legacy} {
@@ -153,7 +153,7 @@ func TestTeardownKeepsCommandAndStateWhenTimerStampCleanupFails(t *testing.T) {
 	}
 
 	plan := a.teardownPlan(false, false)
-	if rc := a.teardown(plan, false, false); rc != 1 {
+	if rc := a.teardown(plan, uninstallOptions{}); rc != 1 {
 		t.Fatalf("teardown rc=%d, want timer timestamp cleanup failure", rc)
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
@@ -169,7 +169,7 @@ func TestTeardownStopsWhenRevokeFailsWithoutDiskResidue(t *testing.T) {
 	a.Scheduler.Sys = failingCancelSystem{}
 	plan := a.teardownPlan(false, false)
 
-	if rc := a.teardown(plan, false, false); rc != 1 {
+	if rc := a.teardown(plan, uninstallOptions{}); rc != 1 {
 		t.Fatalf("teardown rc=%d, want failure after revoke failed", rc)
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
@@ -693,7 +693,7 @@ func TestUninstallReInventoriesBeforeRemovingTheBinary(t *testing.T) {
 	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
 
 	// An empty plan — as if the account was created after the plan was built.
-	if rc := a.teardown(teardownPlan{stateDir: a.StateDir, binaryPath: a.InstallPath}, false, false); rc != 1 {
+	if rc := a.teardown(teardownPlan{stateDir: a.StateDir, binaryPath: a.InstallPath}, uninstallOptions{}); rc != 1 {
 		t.Errorf("rc=%d, want 1: a re-inventory must catch an account the plan missed", rc)
 	}
 	if _, err := os.Stat(a.InstallPath); err != nil {
