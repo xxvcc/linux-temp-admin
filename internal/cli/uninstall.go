@@ -58,6 +58,55 @@ func hasRegistryWitness(acc teardownAccount) bool {
 	return false
 }
 
+// markerOnlyForeignAccount reports whether acc is named ONLY by a passwd GECOS
+// lifecycle marker — no registry row, no v1 row, and no privilege-carrying
+// artifact.
+//
+// This is the one witness an unprivileged account can forge. The legacy fixed
+// marker contains no '=', ',' or ':', so both shadow's and util-linux's chfn
+// accept it in the user-writable full-name field, and any local user can make
+// their own account name itself as this tool's. That block is correct by default
+// — the marker may also be the last trace of a permanent no-sudo/no-timer
+// account whose registry row was lost — but without an override it let any
+// unprivileged user refuse every uninstall forever.
+//
+// The override is safe to offer precisely for this shape and no other: an
+// account with anything left to clean up (a sudo grant, an sshd exception, an
+// auto-delete unit, a registry row) carries a second witness and still blocks.
+// Ignoring one of these never deletes it; it only stops it from blocking.
+func markerOnlyForeignAccount(acc teardownAccount) bool {
+	return !acc.registryFound && len(acc.witnesses) == 1 && acc.witnesses[0] == witnessMarker
+}
+
+// uninstallOptions is the operator's intent for one teardown. It is a struct so
+// the authorization and execution steps cannot be handed the flags in the wrong
+// order as the list grows.
+type uninstallOptions struct {
+	force                bool
+	yes                  bool
+	removeUsers          bool
+	purgeAudit           bool
+	ignoreForeignMarkers bool
+}
+
+// ignoredForeignMarkers lists the accounts opts excuses from blocking.
+func (p teardownPlan) ignoredForeignMarkers(opts uninstallOptions) []string {
+	if !opts.ignoreForeignMarkers {
+		return nil
+	}
+	var out []string
+	for _, acc := range p.accounts {
+		if markerOnlyForeignAccount(acc) {
+			out = append(out, acc.name)
+		}
+	}
+	return out
+}
+
+func (p teardownPlan) ignores(opts uninstallOptions, acc teardownAccount) bool {
+	return opts.ignoreForeignMarkers && markerOnlyForeignAccount(acc)
+}
+
 // hasArtifactWitness reports whether the account is named by a filesystem
 // artifact that carries privilege — a sudo grant, an sshd exception, or an
 // auto-delete unit — as opposed to only a registry row. A row is a record; an
@@ -412,17 +461,19 @@ func (a *App) uninstallResult(args []string) commandResult {
 	}
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	fs.SetOutput(a.Err)
-	var force, yes, removeUsers, purgeAudit bool
-	fs.BoolVar(&force, "force", false, "")
-	fs.BoolVar(&yes, "yes", false, "")
-	fs.BoolVar(&yes, "y", false, "")
-	fs.BoolVar(&removeUsers, "remove-users", false, "")
-	fs.BoolVar(&purgeAudit, "purge-audit", false, "")
+	var opts uninstallOptions
+	fs.BoolVar(&opts.force, "force", false, "")
+	fs.BoolVar(&opts.yes, "yes", false, "")
+	fs.BoolVar(&opts.yes, "y", false, "")
+	fs.BoolVar(&opts.removeUsers, "remove-users", false, "")
+	fs.BoolVar(&opts.purgeAudit, "purge-audit", false, "")
+	fs.BoolVar(&opts.ignoreForeignMarkers, "ignore-foreign-markers", false, "")
 	if !a.parseFlags(fs, args) {
 		return statusResult(1)
 	}
+	purgeAudit, force, yes := opts.purgeAudit, opts.force, opts.yes
 	plan := a.teardownPlan(purgeAudit, force)
-	if !a.authorizeUninstall(plan, yes, removeUsers) {
+	if !a.authorizeUninstall(plan, opts) {
 		return statusResult(1)
 	}
 	if !yes {
@@ -445,14 +496,14 @@ func (a *App) uninstallResult(args []string) commandResult {
 			a.audit("uninstall", "", "fail", "inventory changed after confirmation", nil)
 			return 1
 		}
-		status := a.teardown(current, force, purgeAudit)
+		status := a.teardown(current, opts)
 		result = commandResult{status: status, applied: status == 0}
 		return status
 	})
 	return result
 }
 
-func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool {
+func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool {
 	// A witness that could not be read is fatal, not advisory. Every way of failing
 	// to read one makes accounts vanish from the inventory rather than announce
 	// themselves, and an inventory that under-reports is how a teardown deletes the
@@ -470,6 +521,13 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 	}
 
 	a.printTeardownPlan(plan)
+
+	if ignored := plan.ignoredForeignMarkers(opts); len(ignored) > 0 {
+		a.warnf("%s %s", a.P.M(
+			"--ignore-foreign-markers：以下账号只由 passwd GECOS 标记指认，没有登记行，也没有本工具的 sudo 授权、sshd 例外或自动删除任务。卸载不会删除它们，也不会再因它们中止；如果其中有你的临时账号，请先取消卸载并人工处理：",
+			"--ignore-foreign-markers: these accounts are named only by a passwd GECOS marker, with no registry row and none of this tool's sudo grants, sshd exceptions, or auto-delete tasks. The uninstall will neither delete them nor stop for them; if any of them is really yours, cancel and deal with it by hand first:"),
+			strings.Join(ignored, " "))
+	}
 
 	// If the binary itself cannot be removed, refuse NOW — before a single account
 	// or grant is torn down. binaryBlocker is force-aware (empty under --force), so
@@ -510,18 +568,28 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 	// rebuilt and compared under the lock before teardown, and revoke still repeats
 	// its identity checks immediately before each mutation.
 	for _, acc := range plan.accounts {
-		if !acc.exists || liveTeardownAccountAuthorized(acc) {
+		if !acc.exists || liveTeardownAccountAuthorized(acc) || plan.ignores(opts, acc) {
 			continue
 		}
 		a.errorf("%s %s", a.P.M("拒绝卸载：无法在缺少当前世代绑定身份登记时自动删除活账号；在删除任何账号前已停止：",
 			"refusing to uninstall: cannot auto-delete a live account without a current generation-bound identity record; stopped before deleting any account:"), acc.name)
+		if markerOnlyForeignAccount(acc) {
+			// Say which witness is doing the blocking and how to clear it. This shape
+			// is reachable by any local user running chfn on their own account, so an
+			// operator who cannot see the cause has no way to finish an uninstall.
+			a.warnf("%s", a.P.M(
+				"该账号只由 passwd GECOS 生命周期标记指认（没有登记行，也没有本工具的授权或任务）。任何本机用户都能用 chfn 给自己写上这个标记。确认它不是本工具创建的账号后，可用 `usermod -c '' "+acc.name+"` 清除标记，或用 --ignore-foreign-markers 明确跳过。",
+				"this account is named only by a passwd GECOS lifecycle marker (no registry row, and none of this tool's grants or tasks). Any local user can write that marker onto their own account with chfn. Once you have confirmed it is not an account this tool created, clear it with `usermod -c '' "+acc.name+"`, or skip it explicitly with --ignore-foreign-markers."))
+		}
 		return false
 	}
 
-	// Refuse before anything is touched, not partway through.
+	// Refuse before anything is touched, not partway through. An explicitly
+	// ignored foreign marker is exempt: the teardown will not delete that account,
+	// so warning that it would is simply untrue.
 	if who := callerAccount(); who != "" {
 		for _, acc := range plan.accounts {
-			if acc.name == who && acc.exists {
+			if acc.name == who && acc.exists && !plan.ignores(opts, acc) {
 				a.errorf("%s", a.P.M(
 					"你正以临时账号 "+who+" 的身份运行卸载，而卸载会删除这个账号。请改用 root 或其他管理员登录后重试。",
 					"you are running this as the temporary account "+who+", which the uninstall would delete. Log in as root or another administrator and retry."))
@@ -530,17 +598,26 @@ func (a *App) authorizeUninstall(plan teardownPlan, yes, removeUsers bool) bool 
 		}
 	}
 
-	if len(plan.accounts) > 0 && !removeUsers {
+	// Count only the accounts this teardown would actually act on. An explicitly
+	// ignored foreign marker is left alone, so demanding --remove-users for it
+	// would name a deletion that is not going to happen.
+	pending := 0
+	for _, acc := range plan.accounts {
+		if !plan.ignores(opts, acc) {
+			pending++
+		}
+	}
+	if pending > 0 && !opts.removeUsers {
 		// Mirrors --fix-sshd: a non-interactive run never does the irreversible thing
 		// implicitly, and the flag is what says it out loud. The analogy is not exact
 		// and the difference is worth admitting: this tool's other --yes gates
 		// (--confirm-sudo, --confirm-force) make you retype the USERNAME, which a
 		// bare bool cannot do because there is no single username here. The printed
 		// count is the compensation, not an equal.
-		if yes || !a.StdinIsTTY() {
+		if opts.yes || !a.StdinIsTTY() {
 			a.errorf("%s", a.P.M(
-				fmt.Sprintf("非交互模式不会删除账号。这台机器上有 %d 个由本工具管理的账号，卸载必须先删除它们；确认请加 --remove-users。", len(plan.accounts)),
-				fmt.Sprintf("a non-interactive run will not delete accounts. This host has %d managed by this tool, and the uninstall must remove them first; pass --remove-users to say so.", len(plan.accounts))))
+				fmt.Sprintf("非交互模式不会删除账号。这台机器上有 %d 个由本工具管理的账号，卸载必须先删除它们；确认请加 --remove-users。", pending),
+				fmt.Sprintf("a non-interactive run will not delete accounts. This host has %d managed by this tool, and the uninstall must remove them first; pass --remove-users to say so.", pending)))
 			a.warnf("%s", a.P.M("（不能只卸载命令、留下受管账号：这会让工具失去撤销这些账号、清理授权和执行已有自动删除任务的能力。）",
 				"(uninstalling the command while keeping managed accounts is not an option: it removes the ability to revoke those accounts, clean their grants, and run any auto-delete tasks already scheduled.)"))
 			return false
@@ -581,7 +658,8 @@ func sameTeardownPlan(a, b teardownPlan) bool {
 // teardown executes the plan. Order is the whole design: every step leaves the
 // host no worse than it found it, and the binary goes last because everything
 // that could still need a manager needs the manager to exist.
-func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
+func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
+	force, purgeAudit := opts.force, opts.purgeAudit
 	// Each account goes through the ordinary revoke — the same path, the same
 	// protections, the same audit trail. Nothing here reimplements deletion.
 	//
@@ -603,6 +681,12 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// survivor check below is for.
 	var failedRevokes []string
 	for _, acc := range plan.accounts {
+		if plan.ignores(opts, acc) {
+			// Explicitly excused by --ignore-foreign-markers, and authorizeUninstall
+			// already named it. Nothing is deleted for it and nothing is cleaned up:
+			// this shape has no registry row and no artifact of ours to remove.
+			continue
+		}
 		// A passwd marker, v1 row, or name-scoped artifact can make a live account
 		// block uninstall, but none can authorize its deletion. Require the current
 		// registry witness before even entering the destructive revoke path; the
@@ -668,6 +752,13 @@ func (a *App) teardown(plan teardownPlan, force, purgeAudit bool) int {
 	// user.Exists-only check this re-inventory replaced.
 	var blocking []teardownAccount
 	for _, acc := range residual.accounts {
+		// An explicitly ignored foreign marker is still expected to be here — that is
+		// what ignoring it meant. It is only excused while it still carries nothing
+		// but that marker: if a grant, exception, unit, or registry row has appeared
+		// for the name since the plan was approved, it blocks like anything else.
+		if residual.ignores(opts, acc) {
+			continue
+		}
 		if acc.exists || hasArtifactWitness(acc) {
 			blocking = append(blocking, acc)
 		}

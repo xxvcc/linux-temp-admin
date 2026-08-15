@@ -258,7 +258,7 @@ const EnvLang = "LINUX_TEMP_ADMIN_LANG"
 // Run is the process entry point: it resolves the language, then dispatches.
 func Run(args []string) int {
 	syscall.Umask(0o077)
-	if err := setTrustedRootPath(os.Geteuid, os.Setenv); err != nil {
+	if err := setTrustedPath(os.Setenv); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot set trusted PATH: %v\n", err)
 		return 1
 	}
@@ -278,17 +278,22 @@ func Run(args []string) int {
 	return app.Dispatch(rest)
 }
 
-const trustedRootPath = "/usr/sbin:/usr/bin:/sbin:/bin"
+const trustedPath = "/usr/sbin:/usr/bin:/sbin:/bin"
 
-// setTrustedRootPath prevents a root invocation from resolving privileged
-// helper commands through a caller-controlled directory. Non-root invocations
-// keep their environment unchanged; their mutating commands are rejected by
-// requireRoot before any helper is run.
-func setTrustedRootPath(geteuid func() int, setenv func(string, string) error) error {
-	if geteuid() != 0 {
-		return nil
-	}
-	return setenv("PATH", trustedRootPath)
+// setTrustedPath prevents any invocation from resolving privileged helper
+// commands through a caller-controlled directory.
+//
+// It deliberately applies to non-root runs too. The original rule — pin only for
+// root, because requireRoot rejects a non-root mutation before any helper runs —
+// covers the mutating commands but not the two read-only ones: doctor and status
+// have no root gate, and doctor execs sshd, systemctl, atq, at, id and the
+// installed command to produce the verdict an operator reads when deciding
+// whether this host can safely issue an invite. Leaving that verdict at the mercy
+// of the caller's own PATH makes it worth less than the pinned-PATH root run it
+// exists to predict, and pinning unconditionally also stops the two runs from
+// silently disagreeing about which sshd they inspected.
+func setTrustedPath(setenv func(string, string) error) error {
+	return setenv("PATH", trustedPath)
 }
 
 // resolveLang picks the UI language: an explicit --lang, then the env override,

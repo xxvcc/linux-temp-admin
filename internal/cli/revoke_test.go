@@ -1363,6 +1363,35 @@ func TestCompactPreservesDeletionStartedRecoveryRow(t *testing.T) {
 	}
 }
 
+// TestCompactUsesTheInjectedAccountSnapshotSource pins compact's liveness probe
+// to the same passwd source every other identity read in this package uses.
+// Reading the host's real /etc/passwd instead made the sweep's verdict depend on
+// the machine running it rather than on the snapshot the test supplied.
+func TestCompactUsesTheInjectedAccountSnapshotSource(t *testing.T) {
+	rec := registry.Record{User: "xxvcc-compact2", UID: 1001, Port: 22}
+	a, _, _ := newTestApp(t, "")
+	setTestRegistryRecord(t, a, rec)
+	// The name is absent from the host's real account database, so a sweep that
+	// consults it directly prunes the row. The injected source says it is live.
+	queried := false
+	a.LookupUser = func(name string) (user.Passwd, bool, error) {
+		queried = true
+		return user.Passwd{
+			Name: name, UID: rec.UID, GID: rec.UID,
+			Home: "/home/" + name, Shell: "/bin/sh",
+		}, true, nil
+	}
+	if rc := a.compactLocked(); rc != 0 {
+		t.Fatalf("compact rc = %d, want success", rc)
+	}
+	if !queried {
+		t.Fatal("compact never consulted the injected account snapshot source")
+	}
+	if _, found, err := a.Registry.Lookup(rec.User); err != nil || !found {
+		t.Fatalf("compact pruned a row the injected source reported live: found=%v err=%v", found, err)
+	}
+}
+
 func TestAutoRevokeRetentionSeparatesRetryableAndManualRecovery(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
 	boundPW := user.Passwd{

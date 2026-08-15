@@ -8,6 +8,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
+	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
 
@@ -155,12 +156,128 @@ func TestAuthorizeUninstallRejectsLaterUnverifiedAccountBeforeTeardown(t *testin
 	}}
 
 	a, _, errb := newTestApp(t, "")
-	if a.authorizeUninstall(plan, true, true) {
+	if a.authorizeUninstall(plan, uninstallOptions{yes: true, removeUsers: true}) {
 		t.Fatal("mixed uninstall was authorized even though a later live account lacks deletion authority")
 	}
 	if got := errb.String(); !strings.Contains(got, blockedName) ||
 		!strings.Contains(got, "before deleting any account") {
 		t.Fatalf("whole-plan refusal did not identify the later blocker: %q", got)
+	}
+}
+
+// foreignMarkerPlan builds the one shape --ignore-foreign-markers excuses: a
+// live account named ONLY by a passwd GECOS marker. Any local user can produce it
+// with `chfn -f 'linux-temp-admin temporary admin'` on their own account.
+func foreignMarkerPlan(name string, extra ...witness) teardownPlan {
+	return teardownPlan{accounts: []teardownAccount{{
+		name:      name,
+		exists:    true,
+		witnesses: append([]witness{witnessMarker}, extra...),
+		passwd: user.Passwd{
+			Name: name, UID: 4242, GID: 4242, GECOS: config.ManagedGECOS,
+			Home: "/home/" + name, Shell: "/bin/sh",
+		},
+	}}}
+}
+
+func TestAuthorizeUninstallRefusesForeignMarkerAndNamesTheRemedy(t *testing.T) {
+	const name = "someone-else"
+	a, _, errb := newTestApp(t, "")
+	if a.authorizeUninstall(foreignMarkerPlan(name), uninstallOptions{yes: true, removeUsers: true}) {
+		t.Fatal("a marker-only account was silently ignored without the explicit opt-in")
+	}
+	got := errb.String()
+	for _, want := range []string{name, "usermod -c ''", "--ignore-foreign-markers", "chfn"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("refusal did not mention %q: %q", want, got)
+		}
+	}
+}
+
+func TestAuthorizeUninstallIgnoresForeignMarkerOnExplicitOptIn(t *testing.T) {
+	const name = "someone-else"
+	a, _, errb := newTestApp(t, "")
+	// removeUsers is deliberately absent: nothing is going to be deleted, so
+	// demanding the flag that authorizes deletion would name a lie.
+	if !a.authorizeUninstall(foreignMarkerPlan(name), uninstallOptions{yes: true, ignoreForeignMarkers: true}) {
+		t.Fatalf("explicit opt-in did not clear a marker-only block: %q", errb.String())
+	}
+	if got := errb.String(); !strings.Contains(got, name) || !strings.Contains(got, "--ignore-foreign-markers") {
+		t.Fatalf("ignored accounts were not named back to the operator: %q", got)
+	}
+}
+
+func TestAuthorizeUninstallStillBlocksMarkerAccountCarryingAnArtifact(t *testing.T) {
+	const name = "someone-else"
+	for _, extra := range []witness{witnessSudoers, witnessSSHD, witnessUnit} {
+		t.Run(string(extra), func(t *testing.T) {
+			a, _, errb := newTestApp(t, "")
+			plan := foreignMarkerPlan(name, extra)
+			if a.authorizeUninstall(plan, uninstallOptions{yes: true, removeUsers: true, ignoreForeignMarkers: true}) {
+				t.Fatalf("the opt-in excused an account that still carries %s", extra)
+			}
+			if got := errb.String(); !strings.Contains(got, name) {
+				t.Fatalf("refusal did not identify the account: %q", got)
+			}
+		})
+	}
+}
+
+func TestAuthorizeUninstallStillBlocksRegisteredMarkerAccount(t *testing.T) {
+	const name = "lta-registered"
+	a, _, _ := newTestApp(t, "")
+	plan := foreignMarkerPlan(name)
+	// A registry row is exactly the evidence that says this account may be ours.
+	plan.accounts[0].registryFound = true
+	plan.accounts[0].registryRecord = registry.Record{User: name, UID: 4242, Port: 22}
+	if a.authorizeUninstall(plan, uninstallOptions{yes: true, removeUsers: true, ignoreForeignMarkers: true}) {
+		t.Fatal("the opt-in excused an account that has a registry row")
+	}
+}
+
+func TestUninstallIgnoreForeignMarkersCompletesTeardown(t *testing.T) {
+	const name = "someone-else"
+	a, _, errb := newTestApp(t, "")
+	root := t.TempDir()
+	a.StateDir = filepath.Join(root, "state")
+	a.AuditLogDir = filepath.Join(root, "audit")
+	registryDir := filepath.Join(a.StateDir, "v2")
+	if err := os.MkdirAll(registryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.Registry = &registry.Store{
+		Dir:  registryDir,
+		File: filepath.Join(registryDir, "registry.tsv"),
+		Lock: filepath.Join(registryDir, "registry.lock"),
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.InstallPath = filepath.Join(binDir, "linux-temp-admin")
+	if err := os.WriteFile(a.InstallPath, []byte("installed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Selfmanage = selfmanage.New(a.InstallPath, 0)
+
+	pw := user.Passwd{
+		Name: name, UID: 4242, GID: 4242, GECOS: config.ManagedGECOS,
+		Home: "/home/" + name, Shell: "/bin/sh",
+	}
+	a.ListMarkerAccounts = func() ([]string, error) { return []string{name}, nil }
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	// Users is nil on purpose: reaching any account mutation would panic, which is
+	// the assertion that the ignored account is never revoked or deleted.
+
+	result := a.uninstallResult([]string{"--yes", "--force", "--ignore-foreign-markers"})
+	if result.status != 0 || !result.applied {
+		t.Fatalf("uninstall result = %+v, want a completed teardown; stderr=%q", result, errb.String())
+	}
+	if _, err := os.Lstat(a.InstallPath); !os.IsNotExist(err) {
+		t.Fatalf("installed command survived the teardown: %v", err)
+	}
+	if _, err := os.Lstat(a.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("state directory survived the teardown: %v", err)
 	}
 }
 
@@ -174,7 +291,7 @@ func TestUninstallRefusesWhenMarkerInventoryCannotBeRead(t *testing.T) {
 	if plan.inventoryErr == nil {
 		t.Fatal("marker scan failure was not included in the fail-closed inventory error")
 	}
-	if a.authorizeUninstall(plan, true, true) {
+	if a.authorizeUninstall(plan, uninstallOptions{yes: true, removeUsers: true}) {
 		t.Fatal("uninstall was authorized with an unreadable marker inventory")
 	}
 	if got := errb.String(); !strings.Contains(got, "scanning account lifecycle markers failed") {

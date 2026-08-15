@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,29 +200,50 @@ func TestExtractLang(t *testing.T) {
 	}
 }
 
-func TestSetTrustedRootPath(t *testing.T) {
+func TestSetTrustedPath(t *testing.T) {
+	// The pin is unconditional: doctor and status run without a root gate but
+	// still exec sshd, systemctl, atq, at, id, and the installed command, so their
+	// verdict must not be steerable through the caller's own PATH.
+	calls := 0
 	var key, value string
-	if err := setTrustedRootPath(func() int { return 0 }, func(k, v string) error {
-		key, value = k, v
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if err := setTrustedPath(func(k, v string) error {
+			calls++
+			key, value = k, v
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if key != "PATH" || value != trustedRootPath {
-		t.Fatalf("root environment set (%q, %q), want PATH=%q", key, value, trustedRootPath)
+	if calls != 2 {
+		t.Fatalf("setTrustedPath called setenv %d times, want 2 (root and non-root alike)", calls)
 	}
-
-	called := false
-	if err := setTrustedRootPath(func() int { return 1000 }, func(string, string) error {
-		called = true
-		return nil
-	}); err != nil || called {
-		t.Fatalf("non-root path changed: called=%v err=%v", called, err)
+	if key != "PATH" || value != trustedPath {
+		t.Fatalf("environment set (%q, %q), want PATH=%q", key, value, trustedPath)
 	}
 
 	wantErr := errors.New("setenv failed")
-	if err := setTrustedRootPath(func() int { return 0 }, func(string, string) error { return wantErr }); !errors.Is(err, wantErr) {
+	if err := setTrustedPath(func(string, string) error { return wantErr }); !errors.Is(err, wantErr) {
 		t.Fatalf("setenv error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestRunPinsPathBeforeDispatch is the end-to-end half: the pin must land on the
+// real process environment before any subcommand can resolve a helper, so an
+// inherited hostile PATH cannot decide which sshd, systemctl, or id this run
+// inspects. Whether the pin is also uid-independent is enforced by the signature
+// of setTrustedPath, which is given no uid to branch on.
+func TestRunPinsPathBeforeDispatch(t *testing.T) {
+	oldMask := syscall.Umask(0o022)
+	syscall.Umask(oldMask)
+	t.Cleanup(func() { syscall.Umask(oldMask) })
+	t.Setenv("PATH", "/attacker/bin")
+
+	if rc := Run([]string{"version"}); rc != 0 {
+		t.Fatalf("version exit = %d, want 0", rc)
+	}
+	if got := os.Getenv("PATH"); got != trustedPath {
+		t.Fatalf("PATH after Run = %q, want the pinned %q", got, trustedPath)
 	}
 }
 
