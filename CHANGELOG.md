@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.1 - 2026-08-16
+
+- Rebuild the v2.10.0 changes with Go 1.26.6. The release gate now rejects the
+  four reachable Go 1.26.5 standard-library vulnerabilities reported as
+  GO-2026-6218, GO-2026-6090, GO-2026-5972, and GO-2026-5026.
+
 ## v2.10.0 - 2026-08-15
 
 - Stop an unprivileged local account from permanently blocking `uninstall`. The

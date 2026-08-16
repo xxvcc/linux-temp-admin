@@ -1,6 +1,6 @@
 module github.com/xxvcc/linux-temp-admin
 
-go 1.26.5
+go 1.26.6
 
 require (
 	golang.org/x/crypto v0.54.0
