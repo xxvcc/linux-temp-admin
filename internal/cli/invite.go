@@ -911,6 +911,8 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 	// registry fails fast instead of leaving a stray account behind.
 	if err := a.Registry.Init(); err != nil {
 		a.errorf("%s: %v", a.P.M("初始化注册表失败", "registry init failed"), err)
+		a.warnf("%s", a.P.M("请运行 linux-temp-admin doctor 查看安全恢复指引。",
+			"run linux-temp-admin doctor for safe recovery guidance."))
 		return 1
 	}
 
@@ -1053,8 +1055,8 @@ func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int
 	}
 	if staleRegistered && staleRec.DeletionStarted {
 		return failf("%s", a.P.M(
-			"同名账号存在未完成的删除恢复见证；拒绝复用用户名或覆盖登记。请先运行 revoke --user "+username+" 完成恢复。",
-			"an unfinished deletion-recovery witness exists for this username; refusing to reuse the name or overwrite the registry. Run revoke --user "+username+" first to complete recovery."))
+			"同名账号存在未完成的删除恢复见证；拒绝复用用户名或覆盖登记。请先运行 linux-temp-admin revoke --user "+username+" 完成恢复。",
+			"an unfinished deletion-recovery witness exists for this username; refusing to reuse the name or overwrite the registry. Run linux-temp-admin revoke --user "+username+" first to complete recovery."))
 	}
 	if err := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username)); err != nil {
 		return failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)

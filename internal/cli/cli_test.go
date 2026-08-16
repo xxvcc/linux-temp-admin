@@ -118,6 +118,7 @@ func setTestRegistryRecord(t *testing.T, a *App, rec registry.Record) {
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveTestIdentity(t, a, rec.UID)
 	if rec.Port == 0 {
 		rec.Port = 22
 	}
@@ -147,6 +148,20 @@ func setTestRegistryRecord(t *testing.T, a *App, rec registry.Record) {
 		if err := a.Registry.BeginDeletion(rec.User, rec.UID, generation); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func reserveTestIdentity(t *testing.T, a *App, uid int) {
+	t.Helper()
+	if uid <= 0 {
+		return
+	}
+	reserved, _, err := a.Registry.ReserveIdentity(uid, uid)
+	if err != nil {
+		t.Fatalf("reserve test identity %d: %v", uid, err)
+	}
+	if reserved != uid {
+		t.Fatalf("reserved test identity %d, want %d", reserved, uid)
 	}
 }
 
@@ -485,7 +500,7 @@ func TestLegacyUnboundRevokeSkipsSameNameInviteBarrier(t *testing.T) {
 		t.Fatalf("legacy revoke queued behind the lifecycle lock for %s", elapsed)
 	}
 	if got := errb.String(); !strings.Contains(got, "no account was revoked") ||
-		!strings.Contains(got, "invoke revoke again") {
+		!strings.Contains(got, "invoke linux-temp-admin revoke again") {
 		t.Fatalf("legacy revoke did not explain the non-destructive retry requirement: %q", got)
 	}
 }

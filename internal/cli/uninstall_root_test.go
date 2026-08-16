@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -493,6 +494,7 @@ func TestUninstallKeepsTheBinaryWhenAnAccountSurvives(t *testing.T) {
 
 	// Rewrite the row so the recorded UID no longer matches: revoke will refuse.
 	pw, _ := mustUserLookup(t, name)
+	reserveTestIdentity(t, a, pw.UID+4242)
 	if err := a.Registry.Record(registry.Record{
 		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
 		Host: "203.0.113.5", Port: 22, UID: pw.UID + 4242,
@@ -853,6 +855,7 @@ func TestCompactPreservesArtifactsForLiveLegacyIdentity(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy account was not found")
 	}
+	reserveTestIdentity(t, a, pw.UID)
 	if err := a.Registry.Record(registry.Record{User: name, Host: "203.0.113.5", Port: 22, UID: pw.UID}); err != nil {
 		t.Fatal(err)
 	}
@@ -876,6 +879,65 @@ func TestCompactPreservesArtifactsForLiveLegacyIdentity(t *testing.T) {
 	}
 	if found, err := a.Registry.Contains(name); err != nil || !found {
 		t.Fatalf("compact removed a live legacy registry row: found=%v err=%v", found, err)
+	}
+}
+
+func TestCompactSweepsUnverifiedLegacyGrantsWithoutDeletingAccounts(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields int
+	}{
+		{name: "ltalegacyuidmismatch", fields: 11},
+		{name: "ltalegacyuidunknown", fields: 9},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, _ := uninstallApp(t, "")
+			a.Users = user.New()
+			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
+			rm()
+			t.Cleanup(rm)
+			if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, tc.name).CombinedOutput(); err != nil {
+				t.Fatalf("useradd: %v: %s", err, out)
+			}
+			pw, ok := mustUserLookup(t, tc.name)
+			if !ok {
+				t.Fatal("legacy account was not found")
+			}
+
+			row := []string{
+				tc.name, "2026-08-16 12:00:00 UTC", "never", "yes",
+				"203.0.113.5", "22", "SHA256:legacy", "no", "",
+			}
+			if tc.fields == 11 {
+				row = append(row, strconv.Itoa(pw.UID+4242), "0123456789abcdef0123456789abcdef")
+			}
+			if len(row) != tc.fields {
+				t.Fatalf("legacy fixture has %d fields, want %d", len(row), tc.fields)
+			}
+			sequence := filepath.Join(a.Registry.Dir, "identity-sequence")
+			if err := os.Remove(sequence); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(a.Registry.File, []byte("# linux-temp-admin registry v2\n"+strings.Join(row, "\t")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			grant := a.Sudoers.FilePath(tc.name)
+			mustWrite(t, grant, tc.name+" ALL=(ALL) NOPASSWD:ALL\n")
+
+			if rc := a.compact(); rc != 0 {
+				t.Fatalf("compact rc=%d", rc)
+			}
+			if _, err := os.Stat(grant); !os.IsNotExist(err) {
+				t.Fatalf("compact retained an unverified legacy sudo grant: %v", err)
+			}
+			if !mustUserExists(t, tc.name) {
+				t.Fatal("compact deleted the live legacy account")
+			}
+			if found, err := a.Registry.Contains(tc.name); err != nil || !found {
+				t.Fatalf("compact removed the legacy registry witness: found=%v err=%v", found, err)
+			}
+		})
 	}
 }
 
@@ -1092,6 +1154,7 @@ func TestUninstallDoesNotBulkDeleteLegacyV2Identity(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy account was not found")
 	}
+	reserveTestIdentity(t, a, pw.UID)
 	if err := a.Registry.Record(registry.Record{
 		User: name, Host: "203.0.113.5", Port: 22, UID: pw.UID, Generation: generation,
 	}); err != nil {
@@ -1187,6 +1250,7 @@ func TestUninstallRequiresCompletedMatchingV2IdentityForLiveAccounts(t *testing.
 			if !exists {
 				t.Fatal("fixture account was not found")
 			}
+			reserveTestIdentity(t, a, tc.uid(pw.UID))
 			if err := a.Registry.Record(registry.Record{
 				User: tc.name, Port: 22, UID: tc.uid(pw.UID), Pending: tc.pending,
 			}); err != nil {

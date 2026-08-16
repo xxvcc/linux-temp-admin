@@ -821,6 +821,9 @@ func newManageApp(t *testing.T, in string, users ...string) (*App, *bytes.Buffer
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	if len(users) > 0 {
+		reserveTestIdentity(t, a, 4242)
+	}
 	for _, u := range users {
 		rec := registry.Record{
 			User: u, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
@@ -1030,6 +1033,7 @@ func newRealAccount(t *testing.T, a *App, name string) int {
 	if !ok {
 		t.Fatalf("%s was not created", name)
 	}
+	reserveTestIdentity(t, a, pw.UID)
 	if err := a.Registry.Record(registry.Record{
 		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
 		Host: "203.0.113.5", Port: 22, UID: pw.UID, Generation: generation, IdentityBound: true,
@@ -1081,6 +1085,84 @@ func TestManageUsersRevokeDeletesOnceTheFullNameIsTyped(t *testing.T) {
 	}
 	if got := regUsers(t, a); len(got) != 0 {
 		t.Errorf("the registry row should be gone; rows now %v", got)
+	}
+}
+
+func TestManageUsersAddsForceForPendingAndLegacyRecovery(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name  string
+		user  string
+		gecos string
+		seed  func(*testing.T, *App, string)
+	}{
+		{
+			name: "pending", user: "ltamenupending", gecos: config.PendingGenerationGECOSPrefix + generation,
+			seed: func(t *testing.T, a *App, name string) {
+				setTestRegistryRecord(t, a, registry.Record{
+					User: name, UID: 1001, Generation: generation,
+					IdentityBound: true, Pending: true, Port: 22,
+				})
+			},
+		},
+		{
+			name: "unbound legacy", user: "ltamenulegacy", gecos: config.ManagedGECOS,
+			seed: func(t *testing.T, a *App, name string) {
+				setLegacyV2RevokeRegistry(t, a, name, 10, 1001, "")
+			},
+		},
+		{
+			name: "UID-only recovery", user: "ltamenuuidonly",
+			gecos: config.ManagedGenerationGECOSPrefix + generation,
+			seed: func(t *testing.T, a *App, name string) {
+				setTestRegistryRecord(t, a, registry.Record{
+					User: name, UID: 1001, DeletionStarted: true, Port: 22,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, errb := newTestApp(t, "1\n"+tc.user+"\n")
+			a.StdinIsTTY = func() bool { return true }
+			tc.seed(t, a, tc.user)
+			pw := user.Passwd{
+				Name: tc.user, UID: 1001, GID: 1001, GECOS: tc.gecos,
+				Home: "/home/" + tc.user, Shell: "/bin/sh",
+			}
+			present := true
+			events := []string{}
+			lookup := func(string) (user.Passwd, bool, error) {
+				if !present {
+					return user.Passwd{}, false, nil
+				}
+				return pw, true, nil
+			}
+			a.Users = &user.Manager{
+				Runner:            &orderedTeardownRunner{events: &events, present: &present},
+				LookupUser:        lookup,
+				NameInUse:         func(string) (bool, error) { return false, nil },
+				RemoveManagedMail: func(user.Passwd) error { return nil },
+				RemoveManagedHome: func(user.Passwd) error { return nil },
+			}
+			a.LookupUser = lookup
+			a.TerminateProcesses = func(int) error { return nil }
+			a.ClearScheduledJobs = func(string, int) error { return nil }
+			a.DrainScheduledJobs = func() error { return nil }
+			a.Scheduler = &schedule.Scheduler{
+				SystemdDir: t.TempDir(), InstallPath: a.InstallPath,
+				UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now, Sys: fakeSys{},
+			}
+
+			if rc := a.manageUsers(); rc != 0 {
+				t.Fatalf("menu recovery rc = %d; force was not applied or recovery failed: %q", rc, errb.String())
+			}
+			if present {
+				t.Fatalf("menu recovery left %s account present; force was not applied", tc.name)
+			}
+			if found, err := a.Registry.Contains(tc.user); err != nil || found {
+				t.Fatalf("menu recovery registry result: found=%v err=%v", found, err)
+			}
+		})
 	}
 }
 
@@ -1138,6 +1220,7 @@ func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	// The row pins a UID this account does not have: the shape of an account that
 	// rewrote its own passwd entry, and of a name whose account was recreated.
 	// The GECOS marker is intact, which is exactly the case that used to pass.
+	reserveTestIdentity(t, a, pw.UID+4242)
 	if err := a.Registry.Record(registry.Record{
 		User: name, Created: "2026-07-07 12:00:00 UTC", Expires: "2026-07-08 12:00:00 UTC",
 		Host: "203.0.113.5", Port: 22, UID: pw.UID + 4242,

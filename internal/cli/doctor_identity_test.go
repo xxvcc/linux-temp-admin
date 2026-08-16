@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ func TestDoctorReportsUnsafeLiveAccountGID(t *testing.T) {
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveTestIdentity(t, a, 1001)
 	if err := a.Registry.Record(registry.Record{
 		User: name, UID: 1001, Generation: generation, IdentityBound: true, Port: 22,
 	}); err != nil {
@@ -57,6 +59,7 @@ func TestCompletedAccountIdentityRejectsUnsafeLiveAccountGID(t *testing.T) {
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveTestIdentity(t, a, 1001)
 	if err := a.Registry.Record(registry.Record{
 		User: name, UID: 1001, Generation: generation, IdentityBound: true, Port: 22,
 	}); err != nil {
@@ -76,6 +79,139 @@ func TestCompletedAccountIdentityRejectsUnsafeLiveAccountGID(t *testing.T) {
 	}
 	if ours || !live {
 		t.Fatalf("completedAccountIdentity = ours %v, live %v; want false, true", ours, live)
+	}
+}
+
+func TestDoctorDistinguishesIdentitySequenceIntegrityFailures(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		name       = "xxvcc-sequence-doctor"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	for _, tc := range []struct {
+		name       string
+		mutate     func(*testing.T, string) []byte
+		want       []string
+		doNotWant  []string
+		wantAbsent bool
+	}{
+		{
+			name: "missing",
+			mutate: func(t *testing.T, path string) []byte {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				return nil
+			},
+			want: []string{
+				"v5 registry is missing identity-sequence",
+				"linux-temp-admin recover-identity-sequence --highest <N>",
+			},
+			doNotWant:  []string{"identity sequence is corrupt or unsafe", "will not overwrite an existing object"},
+			wantAbsent: true,
+		},
+		{
+			name: "corrupt",
+			mutate: func(t *testing.T, path string) []byte {
+				t.Helper()
+				content := []byte("not an identity sequence\n")
+				if err := os.WriteFile(path, content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return content
+			},
+			want: []string{
+				"identity sequence is corrupt or unsafe",
+				"will not overwrite an existing object",
+			},
+			doNotWant: []string{"recover-identity-sequence --highest"},
+		},
+		{
+			name: "too low",
+			mutate: func(t *testing.T, path string) []byte {
+				t.Helper()
+				content := []byte("# linux-temp-admin identity sequence v1\nhighest\t1000\nsafe-after\tnone\n")
+				if err := os.WriteFile(path, content, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return content
+			},
+			want: []string{
+				"identity sequence is corrupt or unsafe",
+				"will not overwrite an existing object",
+				"high-water mark 1000 is below recorded UID 1001",
+			},
+			doNotWant: []string{"recover-identity-sequence --highest"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, errb := newTestApp(t, "")
+			setTestRegistryRecord(t, a, registry.Record{
+				User: name, UID: 1001, Generation: generation, IdentityBound: true, Port: 22,
+			})
+			sequencePath := filepath.Join(a.Registry.Dir, "identity-sequence")
+			wantSequence := tc.mutate(t, sequencePath)
+			a.LookupUser = func(string) (user.Passwd, bool, error) {
+				return user.Passwd{
+					Name: name, UID: 1001, GID: 1001,
+					GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
+					Home:  "/home/" + name, Shell: "/bin/sh",
+				}, true, nil
+			}
+			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+				return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+			}
+
+			if rc := a.doctor(nil); rc != 1 {
+				t.Fatalf("doctor rc = %d, want integrity failure", rc)
+			}
+			got := errb.String()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("doctor output missing %q: %q", want, got)
+				}
+			}
+			for _, unwanted := range tc.doNotWant {
+				if strings.Contains(got, unwanted) {
+					t.Fatalf("doctor output unexpectedly contains %q: %q", unwanted, got)
+				}
+			}
+			if tc.wantAbsent {
+				if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+					t.Fatalf("read-only doctor recreated missing sequence: %v", err)
+				}
+			} else if current, err := os.ReadFile(sequencePath); err != nil || string(current) != string(wantSequence) {
+				t.Fatalf("read-only doctor changed sequence: bytes=%q err=%v", current, err)
+			}
+		})
+	}
+}
+
+func TestNineFieldLegacyStatusAndDoctorNameTheManualRecoveryCommand(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const name = "xxvcc-ninelegacy"
+	a, _, errb := newTestApp(t, "")
+	rec := setLegacyV2RevokeRegistry(t, a, name, 9, 1001, "")
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		return user.Passwd{
+			Name: name, UID: 1001, GID: 1001, GECOS: config.ManagedGECOS,
+			Home: "/home/" + name, Shell: "/bin/sh",
+		}, true, nil
+	}
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+
+	if got := a.userCells(rec)[1]; got != "legacy identity unverified" {
+		t.Fatalf("nine-field legacy state = %q, want legacy identity warning", got)
+	}
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc = %d, want legacy identity warning", rc)
+	}
+	wantCommand := "linux-temp-admin revoke --user " + name + " --force"
+	if got := errb.String(); !strings.Contains(got, "legacy fixed identity marker") || !strings.Contains(got, wantCommand) {
+		t.Fatalf("doctor did not name nine-field recovery command %q: %q", wantCommand, got)
 	}
 }
 
@@ -179,7 +315,7 @@ func TestStatusAndDoctorReportDeployedFirstFieldGenerationWitness(t *testing.T) 
 		t.Fatalf("doctor rc=%d, want compatibility warning", rc)
 	}
 	if got := errb.String(); !strings.Contains(got, "v2.9.3-and-earlier generation witness") ||
-		!strings.Contains(got, name) {
+		!strings.Contains(got, "linux-temp-admin revoke --user "+name) {
 		t.Fatalf("doctor hid first-field migration risk: %q", got)
 	}
 }
@@ -254,6 +390,7 @@ func TestDoctorReportsLifecycleMarkerWithoutRegistryRow(t *testing.T) {
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveTestIdentity(t, a, 1001)
 	if err := a.Registry.Record(registry.Record{
 		User: registered, UID: 1001, Generation: generation, IdentityBound: true, Port: 22,
 	}); err != nil {

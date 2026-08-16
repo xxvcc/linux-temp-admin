@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
+	"github.com/xxvcc/linux-temp-admin/internal/sshdconf"
 	"github.com/xxvcc/linux-temp-admin/internal/sudoers"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
@@ -25,6 +27,7 @@ type orderedTeardownRunner struct {
 
 type revokeTestScheduleSystem struct {
 	removeAtCalls *int
+	removeAtErr   error
 	hasSystemctl  bool
 }
 
@@ -36,7 +39,7 @@ func (s revokeTestScheduleSystem) RemoveAtJobsFor(string) error {
 	if s.removeAtCalls != nil {
 		*s.removeAtCalls++
 	}
-	return nil
+	return s.removeAtErr
 }
 func (revokeTestScheduleSystem) AtrmJob(string) error              { return nil }
 func (revokeTestScheduleSystem) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
@@ -121,6 +124,46 @@ func requireTeardownEvents(t *testing.T, got []string, want ...string) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("teardown events = %v, want %v", got, want)
 	}
+}
+
+func setLegacyV2RevokeRegistry(t *testing.T, a *App, username string, fields, uid int, generation string) registry.Record {
+	t.Helper()
+	requireRootRegistryFixture(t)
+	if fields < 9 || fields > 11 {
+		t.Fatalf("legacy field count = %d, want 9..11", fields)
+	}
+	if err := os.Chmod(a.Registry.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	row := []string{username, "2026-01-01", "permanent", "yes", "example.test", "22", "", "no", ""}
+	if fields >= 10 {
+		row = append(row, strconv.Itoa(uid))
+	}
+	if fields >= 11 {
+		row = append(row, generation)
+	}
+	data := "# linux-temp-admin registry v2\n" + strings.Join(row, "\t") + "\n"
+	if err := os.WriteFile(a.Registry.File, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.Registry.Lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec, found, err := a.Registry.Lookup(username)
+	if err != nil || !found {
+		t.Fatalf("load %d-field legacy row: found=%v rec=%+v err=%v", fields, found, rec, err)
+	}
+	wantUID, wantGeneration := 0, ""
+	if fields >= 10 {
+		wantUID = uid
+	}
+	if fields >= 11 {
+		wantGeneration = generation
+	}
+	if rec.IdentityBound || rec.UID != wantUID || rec.Generation != wantGeneration {
+		t.Fatalf("%d-field legacy identity parsed incorrectly: %+v", fields, rec)
+	}
+	return rec
 }
 
 func TestLegacyRecoveryAuthorizationRequiresInteractiveConfirmation(t *testing.T) {
@@ -245,6 +288,19 @@ func TestPendingCreationRecordRequiresExactBoundShape(t *testing.T) {
 	}
 }
 
+func TestUIDOnlyDeletionCandidateRejectsSystemRangeIdentity(t *testing.T) {
+	pw := user.Passwd{
+		Name: "xxvcc-lowrecovery", UID: 994, GID: 994, GECOS: config.ManagedGECOS,
+		Home: "/home/xxvcc-lowrecovery", Shell: "/bin/sh",
+	}
+	for _, recordedUID := range []int{0, pw.UID} {
+		rec := registry.Record{User: pw.Name, UID: recordedUID}
+		if uidOnlyDeletionCandidateMatches(rec, pw) {
+			t.Fatalf("UID-only recovery accepted system UID %d with recorded UID %d", pw.UID, recordedUID)
+		}
+	}
+}
+
 func TestInteractiveRevokeBindsConfirmationToAccountGeneration(t *testing.T) {
 	const (
 		username      = "xxvcc-confirm1"
@@ -283,6 +339,7 @@ func TestInteractiveRevokeBindsConfirmationToAccountGeneration(t *testing.T) {
 		if lookupCalls == 1 {
 			// Model a complete same-name replacement while the operator is at the
 			// confirmation boundary and before revoke acquires its account lock.
+			reserveTestIdentity(t, a, newRecord.UID)
 			if err := a.Registry.Record(newRecord); err != nil {
 				t.Fatal(err)
 			}
@@ -363,11 +420,14 @@ func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(
 	requireRootRegistryFixture(t)
 	const generation = "0123456789abcdef0123456789abcdef"
 	for _, tc := range []struct {
-		name       string
-		registered bool
-		marker     string
+		name         string
+		registered   bool
+		legacyFields int
+		marker       string
 	}{
-		{name: "registered legacy", registered: true, marker: config.ManagedGECOS},
+		{name: "registered nine-field legacy", registered: true, legacyFields: 9, marker: config.ManagedGECOS},
+		{name: "registered ten-field legacy", registered: true, legacyFields: 10, marker: config.ManagedGECOS},
+		{name: "registered eleven-field legacy", registered: true, legacyFields: 11, marker: config.ManagedGECOS},
 		{name: "unregistered generation marker", marker: config.ManagedGenerationGECOSPrefix + generation},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -378,13 +438,10 @@ func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(
 			}
 			a, _, _ := newTestApp(t, "")
 			a.StdinIsTTY = func() bool { return true }
-			if err := a.Registry.Init(); err != nil {
-				t.Fatal(err)
-			}
 			if tc.registered {
-				if err := a.Registry.Record(registry.Record{
-					User: username, Port: 22, UID: pw.UID, Generation: generation,
-				}); err != nil {
+				setLegacyV2RevokeRegistry(t, a, username, tc.legacyFields, pw.UID, generation)
+			} else {
+				if err := a.Registry.Init(); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -433,6 +490,255 @@ func TestInteractiveLegacyAndUnregisteredDeletionPersistUIDWitnessBeforeUserdel(
 	}
 }
 
+func TestInteractiveLegacyRecoveryRefusesLowUIDWithAndWithoutRecordedUID(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const username = "xxvcc-lowlegacy"
+	for _, fields := range []int{9, 10} {
+		t.Run(strconv.Itoa(fields)+" fields", func(t *testing.T) {
+			pw := user.Passwd{
+				Name: username, UID: 994, GID: 994, GECOS: config.ManagedGECOS,
+				Home: "/home/" + username, Shell: "/bin/sh",
+			}
+			a, _, _ := newTestApp(t, "")
+			a.StdinIsTTY = func() bool { return true }
+			setLegacyV2RevokeRegistry(t, a, username, fields, pw.UID, "")
+			a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+			a.TerminateProcesses = func(int) error {
+				t.Fatal("low-UID legacy identity reached process termination")
+				return nil
+			}
+
+			if rc := a.revokeOptionsLocked(revokeOptions{
+				username: username, force: true, manualInvocation: true, liveConfirmed: true,
+			}); rc != 1 {
+				t.Fatalf("low-UID legacy recovery rc = %d, want refusal", rc)
+			}
+			if rec, found, err := a.Registry.Lookup(username); err != nil || !found || rec.IdentityBound {
+				t.Fatalf("low-UID refusal changed registry identity: found=%v rec=%+v err=%v", found, rec, err)
+			}
+		})
+	}
+}
+
+func TestLegacyRecoveryRejectsNonInteractiveAndInternalAuthorities(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-legacydeny"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	for _, tc := range []struct {
+		name     string
+		stdinTTY bool
+		run      func(*App) int
+	}{
+		{
+			name: "yes", stdinTTY: true,
+			run: func(a *App) int {
+				return a.revokeOptionsLocked(revokeOptions{
+					username: username, yes: true, force: true, confirmForce: username,
+				})
+			},
+		},
+		{
+			name: "uninstall internal", stdinTTY: true,
+			run: func(a *App) int {
+				return a.revokeLocked([]string{"--user", username, "--yes", "--force", "--confirm-force", username})
+			},
+		},
+		{
+			name: "non TTY direct",
+			run: func(a *App) int {
+				return a.revokeOptionsLocked(revokeOptions{
+					username: username, force: true, manualInvocation: true, liveConfirmed: true,
+				})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := user.Passwd{
+				Name: username, UID: 1001, GID: 1001,
+				GECOS: config.ManagedGenerationGECOSPrefix + generation,
+				Home:  "/home/" + username, Shell: "/bin/sh",
+			}
+			a, _, _ := newTestApp(t, "")
+			a.StdinIsTTY = func() bool { return tc.stdinTTY }
+			setLegacyV2RevokeRegistry(t, a, username, 11, pw.UID, generation)
+			a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+			a.TerminateProcesses = func(int) error {
+				t.Fatal("unattended legacy identity reached process termination")
+				return nil
+			}
+
+			if rc := tc.run(a); rc != 1 {
+				t.Fatalf("legacy recovery rc = %d, want refusal", rc)
+			}
+			if rec, found, err := a.Registry.Lookup(username); err != nil || !found || rec.IdentityBound {
+				t.Fatalf("legacy refusal changed registry identity: found=%v rec=%+v err=%v", found, rec, err)
+			}
+		})
+	}
+}
+
+func installLegacyScheduledArtifacts(t *testing.T, a *App, username string, sudoRemove, sshdRemove func(string) error) (string, string) {
+	t.Helper()
+	sudoDir := t.TempDir()
+	sshdDir := t.TempDir()
+	a.Sudoers = &sudoers.Manager{Dir: sudoDir, RemoveFile: sudoRemove}
+	a.SSHD = &sshdconf.Manager{
+		Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
+		RemoveFile: sshdRemove,
+	}
+	sudoPath := a.Sudoers.FilePath(username)
+	sshdPath := a.SSHD.FilePath(username)
+	if err := os.WriteFile(sudoPath, []byte(username+" ALL=(ALL) NOPASSWD:ALL\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sshdPath, []byte("Match User "+username+"\n    PasswordAuthentication yes\nMatch all\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return sudoPath, sshdPath
+}
+
+func installLegacyScheduledCancellation(t *testing.T, a *App, sys schedule.System) {
+	t.Helper()
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), SystemdTimerStateDir: t.TempDir(),
+		InstallPath: a.InstallPath, UnitPrefix: config.AutoRevokeUnitPrefix, Sys: sys,
+	}
+}
+
+func TestLegacyElevenFieldScheduledRevokeStripsGrantsWithoutDeletingAccount(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-legacyscheduled"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, _, _ := newTestApp(t, "")
+	rec := setLegacyV2RevokeRegistry(t, a, username, 11, 1001, generation)
+	if err := a.Registry.Init(); err != nil {
+		t.Fatalf("migrate legacy registry: %v", err)
+	}
+	sudoPath, sshdPath := installLegacyScheduledArtifacts(t, a, username, nil, nil)
+	cancelCalls := 0
+	installLegacyScheduledCancellation(t, a, revokeTestScheduleSystem{removeAtCalls: &cancelCalls})
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		t.Fatal("unbound scheduled identity reached passwd deletion policy")
+		return user.Passwd{}, false, nil
+	}
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, yes: true, force: true, confirmForce: username,
+		expectedUID: rec.UID, generation: rec.Generation,
+	}); rc != 0 {
+		t.Fatalf("unbound scheduled access revoke rc = %d, want success", rc)
+	}
+	if current, found, err := a.Registry.Lookup(username); err != nil || !found || current != rec {
+		t.Fatalf("scheduled access revoke changed legacy row: found=%v rec=%+v err=%v", found, current, err)
+	}
+	if _, err := os.Lstat(sudoPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy scheduled revoke retained sudo grant: %v", err)
+	}
+	if _, err := os.Lstat(sshdPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy scheduled revoke retained sshd exception: %v", err)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("legacy scheduled cancellation calls = %d, want 1", cancelCalls)
+	}
+	registryBytes, err := os.ReadFile(a.Registry.File)
+	if err != nil || !strings.HasPrefix(string(registryBytes), registry.Header+"\n") {
+		t.Fatalf("legacy registry was not migrated before scheduled recovery: bytes=%q err=%v", registryBytes, err)
+	}
+}
+
+func TestLegacyElevenFieldScheduledRevokeRetainsTaskWhenGrantCleanupFails(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-legacygrantfail"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	for _, failedGrant := range []string{"sudo", "sshd"} {
+		t.Run(failedGrant, func(t *testing.T) {
+			a, _, _ := newTestApp(t, "")
+			rec := setLegacyV2RevokeRegistry(t, a, username, 11, 1001, generation)
+			if err := a.Registry.Init(); err != nil {
+				t.Fatal(err)
+			}
+			wantErr := errors.New("injected " + failedGrant + " removal failure")
+			var sudoRemove, sshdRemove func(string) error
+			if failedGrant == "sudo" {
+				sudoRemove = func(string) error { return wantErr }
+			} else {
+				sshdRemove = func(string) error { return wantErr }
+			}
+			sudoPath, sshdPath := installLegacyScheduledArtifacts(t, a, username, sudoRemove, sshdRemove)
+			cancelCalls := 0
+			installLegacyScheduledCancellation(t, a, revokeTestScheduleSystem{removeAtCalls: &cancelCalls})
+			a.LookupUser = func(string) (user.Passwd, bool, error) {
+				t.Fatal("unbound scheduled identity reached passwd deletion policy")
+				return user.Passwd{}, false, nil
+			}
+
+			if rc := a.revokeOptionsLocked(revokeOptions{
+				username: username, yes: true, force: true, confirmForce: username,
+				expectedUID: rec.UID, generation: rec.Generation,
+			}); rc != 1 {
+				t.Fatalf("grant-cleanup failure rc = %d, want retryable failure", rc)
+			}
+			if cancelCalls != 0 {
+				t.Fatalf("automatic task was cancelled after incomplete grant cleanup: calls=%d", cancelCalls)
+			}
+			if current, found, err := a.Registry.Lookup(username); err != nil || !found || current != rec {
+				t.Fatalf("grant-cleanup failure changed legacy row: found=%v rec=%+v err=%v", found, current, err)
+			}
+			if _, err := os.Lstat(sudoPath); (failedGrant == "sudo") != (err == nil) {
+				t.Fatalf("sudo artifact state after %s failure: %v", failedGrant, err)
+			}
+			if _, err := os.Lstat(sshdPath); (failedGrant == "sshd") != (err == nil) {
+				t.Fatalf("sshd artifact state after %s failure: %v", failedGrant, err)
+			}
+		})
+	}
+}
+
+func TestLegacyElevenFieldScheduledRevokeReportsCancellationFailure(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-legacycancelfail"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, _, _ := newTestApp(t, "")
+	rec := setLegacyV2RevokeRegistry(t, a, username, 11, 1001, generation)
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	sudoPath, sshdPath := installLegacyScheduledArtifacts(t, a, username, nil, nil)
+	cancelCalls := 0
+	installLegacyScheduledCancellation(t, a, revokeTestScheduleSystem{
+		removeAtCalls: &cancelCalls, removeAtErr: errors.New("injected cancellation failure"),
+	})
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		t.Fatal("unbound scheduled identity reached passwd deletion policy")
+		return user.Passwd{}, false, nil
+	}
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, yes: true, force: true, confirmForce: username,
+		expectedUID: rec.UID, generation: rec.Generation,
+	}); rc != 1 {
+		t.Fatalf("cancellation failure rc = %d, want retryable failure", rc)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("cancellation attempts = %d, want 1", cancelCalls)
+	}
+	for _, path := range []string{sudoPath, sshdPath} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("grant remained after successful cleanup before cancellation failure: %s: %v", path, err)
+		}
+	}
+	if current, found, err := a.Registry.Lookup(username); err != nil || !found || current != rec {
+		t.Fatalf("cancellation failure changed legacy row: found=%v rec=%+v err=%v", found, current, err)
+	}
+}
+
 func TestInteractivePendingCreationRecoveryPersistsUIDWitnessBeforeUserdel(t *testing.T) {
 	requireRootRegistryFixture(t)
 	const (
@@ -450,6 +756,9 @@ func TestInteractivePendingCreationRecoveryPersistsUIDWitnessBeforeUserdel(t *te
 	a, _, _ := newTestApp(t, "")
 	a.StdinIsTTY = func() bool { return true }
 	setTestRegistryRecord(t, a, rec)
+	// The pending row predates useradd, while this fixture models the account
+	// already having been created with its reserved identity.
+	reserveTestIdentity(t, a, pw.UID)
 
 	present := true
 	events := []string{}
@@ -512,6 +821,8 @@ func TestInteractivePendingRecoveryReturnsAfterDurableIdentityQuarantine(t *test
 	a, _, _ := newTestApp(t, "")
 	a.StdinIsTTY = func() bool { return true }
 	setTestRegistryRecord(t, a, rec)
+	// This path starts after useradd consumed the pending intent's UID/GID.
+	reserveTestIdentity(t, a, pw.UID)
 
 	present := true
 	events := []string{}
@@ -805,6 +1116,7 @@ func TestRevokeUnsafeHomeAndGrantFailureStillDisableAndRetainAccount(t *testing.
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveTestIdentity(t, a, pw.UID)
 	rec := registry.Record{
 		User: name, UID: pw.UID, Generation: generation, IdentityBound: true,
 		Port: 22,

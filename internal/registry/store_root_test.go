@@ -3,9 +3,11 @@
 package registry_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,6 +39,59 @@ func newStore(t *testing.T) *registry.Store {
 		t.Fatalf("Init: %v", err)
 	}
 	return s
+}
+
+func reserveThrough(t *testing.T, s *registry.Store, highest int) {
+	t.Helper()
+	got, _, err := s.ReserveIdentity(highest, highest)
+	if err != nil || got != highest {
+		t.Fatalf("reserve identity through %d: got=%d err=%v", highest, got, err)
+	}
+}
+
+func newRawRegistryStore(t *testing.T, header string, rows ...string) *registry.Store {
+	t.Helper()
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := &registry.Store{
+		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),
+		Now: func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	}
+	body := header + "\n"
+	if len(rows) > 0 {
+		body += strings.Join(rows, "\n") + "\n"
+	}
+	if err := os.WriteFile(s.File, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Lock, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func legacyMutationRow(version int, user string, uid int, generation string, pending, bound, deletion bool) string {
+	fields := []string{
+		user, "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
+		"yes", "203.0.113.5", "22", "SHA256:legacy", "yes", "legacy.timer",
+		strconv.Itoa(uid), generation,
+	}
+	if version >= 3 {
+		fields = append(fields, map[bool]string{true: "yes", false: "no"}[pending])
+		fields = append(fields, map[bool]string{true: "yes", false: "no"}[bound])
+	}
+	if version >= 4 {
+		fields = append(fields, map[bool]string{true: "yes", false: "no"}[deletion])
+	}
+	return strings.Join(fields, "\t")
 }
 
 func TestInitRepairsExistingRegistryFileAndLockMetadata(t *testing.T) {
@@ -122,7 +177,7 @@ func TestInitMigratesV2RegistryToV5UnderLock(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 500_000_000, time.UTC)
 	s := &registry.Store{Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"), Now: func() time.Time { return now }}
 	v2row := strings.Join([]string{
 		"xxvcc-v2", "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
@@ -151,7 +206,7 @@ func TestInitMigratesV2RegistryToV5UnderLock(t *testing.T) {
 	}
 	sequence, err := os.ReadFile(filepath.Join(dir, "identity-sequence"))
 	if err != nil || !strings.Contains(string(sequence), "highest\t1001\n") ||
-		!strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:05Z\n") {
+		!strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:06Z\n") {
 		t.Fatalf("migrated identity sequence = %q err=%v", sequence, err)
 	}
 }
@@ -285,6 +340,79 @@ func TestReserveIdentityIsMonotonicAndFailsClosedAtLimit(t *testing.T) {
 	}
 }
 
+func TestReserveIdentityRevalidatesV5RegistryAndSequenceUnderLock(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	rec := registry.Record{
+		User: "xxvcc-reserve-guard", Port: 22, UID: 1777,
+		Generation: generation, IdentityBound: true,
+	}
+	validSequence := []byte("# linux-temp-admin identity sequence v1\nhighest\t1777\nsafe-after\tnone\n")
+	lowSequence := []byte("# linux-temp-admin identity sequence v1\nhighest\t1000\nsafe-after\tnone\n")
+	corruptSequence := []byte("not an identity sequence\n")
+
+	tests := []struct {
+		name           string
+		header         string
+		rows           []string
+		sequence       []byte
+		removeRegistry bool
+		wantMissing    bool
+		wantError      string
+	}{
+		{name: "missing sequence", header: registry.Header, rows: []string{rec.TSV()}, wantMissing: true},
+		{name: "corrupt sequence", header: registry.Header, rows: []string{rec.TSV()}, sequence: corruptSequence},
+		{name: "sequence below recorded UID", header: registry.Header, rows: []string{rec.TSV()}, sequence: lowSequence, wantError: "below recorded UID"},
+		{name: "legacy registry", header: "# linux-temp-admin registry v4", rows: []string{
+			legacyMutationRow(4, rec.User, rec.UID, generation, false, true, false),
+		}, sequence: validSequence, wantError: "requires an existing valid v5 registry"},
+		{name: "unsupported registry header", header: "# linux-temp-admin registry v99", sequence: validSequence, wantError: "header is missing or unsupported"},
+		{name: "missing registry", header: registry.Header, sequence: validSequence, removeRegistry: true, wantError: "requires an existing valid v5 registry"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newRawRegistryStore(t, tc.header, tc.rows...)
+			sequencePath := filepath.Join(s.Dir, "identity-sequence")
+			if tc.sequence != nil {
+				if err := os.WriteFile(sequencePath, tc.sequence, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.removeRegistry {
+				if err := os.Remove(s.File); err != nil {
+					t.Fatal(err)
+				}
+			}
+			registryBefore, registryBeforeErr := os.ReadFile(s.File)
+			sequenceBefore, sequenceBeforeErr := os.ReadFile(sequencePath)
+
+			_, _, err := s.ReserveIdentity(1000, 3000)
+			if err == nil {
+				t.Fatal("ReserveIdentity accepted inconsistent registry/sequence state")
+			}
+			if errors.Is(err, registry.ErrIdentitySequenceMissing) != tc.wantMissing {
+				t.Fatalf("ReserveIdentity error = %v, missing sentinel=%v", err, errors.Is(err, registry.ErrIdentitySequenceMissing))
+			}
+			if tc.wantError != "" && !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("ReserveIdentity error = %v, want %q", err, tc.wantError)
+			}
+
+			registryAfter, registryAfterErr := os.ReadFile(s.File)
+			registryErrorChanged := (registryBeforeErr == nil) != (registryAfterErr == nil) ||
+				(registryBeforeErr != nil && (!os.IsNotExist(registryBeforeErr) || !os.IsNotExist(registryAfterErr)))
+			if registryErrorChanged || string(registryAfter) != string(registryBefore) {
+				t.Fatalf("refused reservation changed registry: before=%q/%v after=%q/%v", registryBefore, registryBeforeErr, registryAfter, registryAfterErr)
+			}
+			sequenceAfter, sequenceAfterErr := os.ReadFile(sequencePath)
+			sequenceErrorChanged := (sequenceBeforeErr == nil) != (sequenceAfterErr == nil) ||
+				(sequenceBeforeErr != nil && (!os.IsNotExist(sequenceBeforeErr) || !os.IsNotExist(sequenceAfterErr)))
+			if sequenceErrorChanged || string(sequenceAfter) != string(sequenceBefore) {
+				t.Fatalf("refused reservation changed sequence: before=%q/%v after=%q/%v", sequenceBefore, sequenceBeforeErr, sequenceAfter, sequenceAfterErr)
+			}
+		})
+	}
+}
+
 func TestMigratedIdentitySequenceRequiresOneIsolationWindow(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
@@ -296,7 +424,7 @@ func TestMigratedIdentitySequenceRequiresOneIsolationWindow(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 500_000_000, time.UTC)
 	s := &registry.Store{
 		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),
 		Now: func() time.Time { return now },
@@ -313,12 +441,12 @@ func TestMigratedIdentitySequenceRequiresOneIsolationWindow(t *testing.T) {
 	if got, isolated, err := s.ReserveIdentity(1000, 1002); err != nil || got != 1000 || isolated {
 		t.Fatalf("first migrated reserve = %d isolated=%v err=%v", got, isolated, err)
 	}
-	now = now.Add(65 * time.Second)
+	now = time.Date(2026, 8, 1, 12, 1, 6, 0, time.UTC)
 	if got, isolated, err := s.ReserveIdentity(1000, 1002); err != nil || got != 1001 || !isolated {
 		t.Fatalf("post-isolation reserve = %d isolated=%v err=%v", got, isolated, err)
 	}
 	sequence, err := os.ReadFile(filepath.Join(dir, "identity-sequence"))
-	if err != nil || !strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:05Z\n") {
+	if err != nil || !strings.Contains(string(sequence), "safe-after\t2026-08-01T12:01:06Z\n") {
 		t.Fatalf("isolation deadline was not preserved: %q err=%v", sequence, err)
 	}
 }
@@ -336,6 +464,7 @@ func TestBeginQuarantineBindsCompletedAndPendingGenerations(t *testing.T) {
 				name = "xxvcc-pending"
 				recordedUID = 0
 			}
+			reserveThrough(t, s, uid)
 			rec := registry.Record{
 				User: name, Port: 22, UID: recordedUID, Generation: generation,
 				IdentityBound: true, Pending: pending,
@@ -501,6 +630,7 @@ func TestStoreCompact(t *testing.T) {
 
 func TestDeletionRecoveryStateIsProtected(t *testing.T) {
 	s := newStore(t)
+	reserveThrough(t, s, 1001)
 	const generation = "0123456789abcdef0123456789abcdef"
 	recovery := registry.Record{
 		User: "xxvcc-recovery", Port: 22, UID: 1001, Generation: generation, IdentityBound: true,
@@ -549,6 +679,7 @@ func TestDeletionRecoveryStateIsProtected(t *testing.T) {
 
 func TestUIDOnlyDeletionRecoveryStateIsProtected(t *testing.T) {
 	s := newStore(t)
+	reserveThrough(t, s, 1001)
 	const (
 		user  = "xxvcc-uid-only"
 		stale = "xxvcc-stale"
@@ -588,6 +719,7 @@ func TestUIDOnlyDeletionRecoveryStateIsProtected(t *testing.T) {
 
 func TestBeginDeletionConvertsPendingRollbackToUIDOnlyRecovery(t *testing.T) {
 	s := newStore(t)
+	reserveThrough(t, s, 1001)
 	const generation = "0123456789abcdef0123456789abcdef"
 	rec := registry.Record{
 		User: "xxvcc-pending", Port: 22, Generation: generation, IdentityBound: true, Pending: true,
@@ -610,6 +742,7 @@ func TestBeginDeletionConvertsPendingRollbackToUIDOnlyRecovery(t *testing.T) {
 
 func TestStorePersistsLegacyAndUnregisteredUIDOnlyRecovery(t *testing.T) {
 	s := newStore(t)
+	reserveThrough(t, s, 1002)
 	legacy := registry.Record{
 		User: "xxvcc-legacy", Port: 22, UID: 1001,
 		Generation: "0123456789abcdef0123456789abcdef", AutoUnit: "legacy.timer",
@@ -715,5 +848,509 @@ func TestStoreRejectsInvalidRecordBeforeWriting(t *testing.T) {
 	}
 	if len(recs) != 0 {
 		t.Errorf("invalid Record poisoned the registry: %v", recs)
+	}
+}
+
+func TestLegacyMutationsCommitSequenceBeforePublishingV5(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	type mutationCase struct {
+		version int
+		kind    string
+		user    string
+	}
+	var tests []mutationCase
+	for _, version := range []int{2, 3, 4} {
+		tests = append(tests,
+			mutationCase{version: version, kind: "remove", user: fmt.Sprintf("xxvcc-v%d-rm", version)},
+			mutationCase{version: version, kind: "compact", user: fmt.Sprintf("xxvcc-v%d-cp", version)},
+			mutationCase{version: version, kind: "begin-deletion", user: fmt.Sprintf("xxvcc-v%d-bd", version)},
+		)
+	}
+	for _, version := range []int{3, 4} {
+		tests = append(tests, mutationCase{version: version, kind: "begin-quarantine", user: fmt.Sprintf("xxvcc-v%d-bq", version)})
+	}
+	tests = append(tests, mutationCase{version: 4, kind: "finish-recovery", user: "xxvcc-v4-fr"})
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("v%d/%s", tc.version, tc.kind), func(t *testing.T) {
+			header := fmt.Sprintf("# linux-temp-admin registry v%d", tc.version)
+			bound := tc.version >= 3
+			deletionStarted := tc.kind == "finish-recovery"
+			row := legacyMutationRow(tc.version, tc.user, 1777, generation, false, bound, deletionStarted)
+			s := newRawRegistryStore(t, header, row)
+
+			var err error
+			switch tc.kind {
+			case "remove":
+				err = s.Remove(tc.user)
+			case "compact":
+				var removed int
+				removed, err = s.Compact(func(registry.Record) (bool, error) { return false, nil })
+				if err == nil && removed != 1 {
+					err = fmt.Errorf("removed %d records, want 1", removed)
+				}
+			case "begin-deletion":
+				boundGeneration := ""
+				if bound {
+					boundGeneration = generation
+				}
+				err = s.BeginDeletion(tc.user, 1777, boundGeneration)
+			case "begin-quarantine":
+				deadline := time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC)
+				err = s.BeginQuarantine(tc.user, 1777, generation, deadline, "linux-temp-admin-v2-quarantine-"+tc.user)
+			case "finish-recovery":
+				err = s.FinishDeletionRecovery(tc.user, 1777, generation)
+			default:
+				t.Fatalf("unknown mutation kind %q", tc.kind)
+			}
+			if err != nil {
+				t.Fatalf("legacy mutation: %v", err)
+			}
+
+			registryBytes, err := os.ReadFile(s.File)
+			if err != nil || !strings.HasPrefix(string(registryBytes), registry.Header+"\n") {
+				t.Fatalf("registry was not published as v5: bytes=%q err=%v", registryBytes, err)
+			}
+			sequencePath := filepath.Join(s.Dir, "identity-sequence")
+			sequenceBytes, err := os.ReadFile(sequencePath)
+			if err != nil || !strings.Contains(string(sequenceBytes), "highest\t1777\n") ||
+				!strings.Contains(string(sequenceBytes), "safe-after\t2026-08-01T12:01:05Z\n") {
+				t.Fatalf("legacy mutation sequence = %q err=%v", sequenceBytes, err)
+			}
+			if err := s.CheckIntegrity(); err != nil {
+				t.Fatalf("migrated registry integrity: %v", err)
+			}
+			recs, err := s.List()
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch tc.kind {
+			case "remove", "compact", "finish-recovery":
+				if len(recs) != 0 {
+					t.Fatalf("completed mutation retained records: %+v", recs)
+				}
+			case "begin-deletion":
+				if len(recs) != 1 || !recs[0].DeletionStarted || recs[0].UID != 1777 {
+					t.Fatalf("deletion transition = %+v", recs)
+				}
+				if bound != recs[0].IdentityBound {
+					t.Fatalf("deletion identity binding changed: %+v", recs[0])
+				}
+			case "begin-quarantine":
+				if len(recs) != 1 || !recs[0].DeletionStarted ||
+					recs[0].QuarantineUntil != "2026-08-01T12:02:00Z" ||
+					recs[0].QuarantineUnit != "linux-temp-admin-v2-quarantine-"+tc.user {
+					t.Fatalf("quarantine transition = %+v", recs)
+				}
+			}
+		})
+	}
+}
+
+func TestV5MutationsFailClosedWhenSequenceIsMissingOrCorrupt(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	rec := registry.Record{
+		User: "xxvcc-v5-bound", Port: 22, UID: 1777, Generation: generation, IdentityBound: true,
+	}
+	deadline := time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC)
+	mutations := []struct {
+		name string
+		run  func(*registry.Store) error
+	}{
+		{name: "record", run: func(s *registry.Store) error { return s.Record(rec) }},
+		{name: "begin deletion", run: func(s *registry.Store) error {
+			return s.BeginDeletion(rec.User, rec.UID, generation)
+		}},
+		{name: "begin quarantine", run: func(s *registry.Store) error {
+			return s.BeginQuarantine(rec.User, rec.UID, generation, deadline, "linux-temp-admin-v2-quarantine-"+rec.User)
+		}},
+		{name: "finish absent recovery", run: func(s *registry.Store) error {
+			return s.FinishDeletionRecovery("xxvcc-v5-absent", rec.UID, generation)
+		}},
+		{name: "remove absent", run: func(s *registry.Store) error { return s.Remove("xxvcc-v5-absent") }},
+		{name: "compact no-op", run: func(s *registry.Store) error {
+			_, err := s.Compact(func(registry.Record) (bool, error) { return true, nil })
+			return err
+		}},
+	}
+	for _, state := range []string{"missing", "corrupt", "low"} {
+		for _, mutation := range mutations {
+			t.Run(state+"/"+mutation.name, func(t *testing.T) {
+				s := newRawRegistryStore(t, registry.Header, rec.TSV())
+				sequencePath := filepath.Join(s.Dir, "identity-sequence")
+				badSequence := []byte("corrupt sequence\n")
+				if state == "low" {
+					badSequence = []byte("# linux-temp-admin identity sequence v1\nhighest\t1000\nsafe-after\tnone\n")
+				}
+				if state == "corrupt" {
+					if err := os.WriteFile(sequencePath, badSequence, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				} else if state == "low" {
+					if err := os.WriteFile(sequencePath, badSequence, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, err := os.ReadFile(s.File)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = mutation.run(s)
+				if err == nil {
+					t.Fatal("mutation accepted invalid v5 sequence state")
+				}
+				if (state == "missing") != errors.Is(err, registry.ErrIdentitySequenceMissing) {
+					t.Fatalf("mutation error = %v, missing sentinel match=%v", err, errors.Is(err, registry.ErrIdentitySequenceMissing))
+				}
+				after, readErr := os.ReadFile(s.File)
+				if readErr != nil || string(after) != string(before) {
+					t.Fatalf("refused mutation changed registry: bytes=%q err=%v", after, readErr)
+				}
+				if state == "missing" {
+					if _, statErr := os.Lstat(sequencePath); !os.IsNotExist(statErr) {
+						t.Fatalf("refused mutation created sequence: %v", statErr)
+					}
+				} else if got, readErr := os.ReadFile(sequencePath); readErr != nil || string(got) != string(badSequence) {
+					t.Fatalf("refused mutation changed invalid sequence: bytes=%q err=%v", got, readErr)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckIntegrityAndExplicitMissingSequenceRepair(t *testing.T) {
+	s := newStore(t)
+	reserveThrough(t, s, 1777)
+	if err := s.Record(registry.Record{User: "xxvcc-repair", Port: 22, UID: 1777}); err != nil {
+		t.Fatal(err)
+	}
+	sequencePath := filepath.Join(s.Dir, "identity-sequence")
+	if err := os.Remove(sequencePath); err != nil {
+		t.Fatal(err)
+	}
+	registryBefore, err := os.ReadFile(s.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckIntegrity(); !errors.Is(err, registry.ErrIdentitySequenceMissing) {
+		t.Fatalf("CheckIntegrity missing error = %v", err)
+	}
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("CheckIntegrity mutated missing sequence: %v", err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(1776); err == nil || !strings.Contains(err.Error(), "below recorded UID") {
+		t.Fatalf("too-low repair error = %v", err)
+	}
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("too-low repair created sequence: %v", err)
+	}
+	info, err := s.RepairMissingIdentitySequence(2000)
+	if err != nil {
+		t.Fatalf("repair missing sequence: %v", err)
+	}
+	if info.Highest != 2000 || !info.SafeAfter.Equal(time.Date(2026, 8, 1, 12, 1, 5, 0, time.UTC)) {
+		t.Fatalf("repair info = %+v", info)
+	}
+	wantSequence := "# linux-temp-admin identity sequence v1\nhighest\t2000\nsafe-after\t2026-08-01T12:01:05Z\n"
+	sequenceBytes, err := os.ReadFile(sequencePath)
+	if err != nil || string(sequenceBytes) != wantSequence {
+		t.Fatalf("repaired sequence = %q err=%v", sequenceBytes, err)
+	}
+	fi, err := os.Stat(sequencePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := fi.Sys().(*syscall.Stat_t)
+	if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o600 || stat.Uid != 0 || stat.Gid != 0 || stat.Nlink != 1 {
+		t.Fatalf("repaired sequence type=%v owner=%d:%d mode=%o links=%d", fi.Mode(), stat.Uid, stat.Gid, fi.Mode().Perm(), stat.Nlink)
+	}
+	entries, err := os.ReadDir(s.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".identity-sequence.repair-") {
+			t.Fatalf("repair left temporary link %q", entry.Name())
+		}
+	}
+	if err := s.CheckIntegrity(); err != nil {
+		t.Fatalf("repaired integrity: %v", err)
+	}
+	registryAfter, err := os.ReadFile(s.File)
+	if err != nil || string(registryAfter) != string(registryBefore) {
+		t.Fatalf("repair changed registry: bytes=%q err=%v", registryAfter, err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(3000); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("existing sequence repair error = %v", err)
+	}
+	if got, err := os.ReadFile(sequencePath); err != nil || string(got) != wantSequence {
+		t.Fatalf("existing sequence was overwritten: bytes=%q err=%v", got, err)
+	}
+
+	if err := os.Remove(sequencePath); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte("not a sequence\n")
+	if err := os.WriteFile(sequencePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckIntegrity(); err == nil || errors.Is(err, registry.ErrIdentitySequenceMissing) {
+		t.Fatalf("corrupt integrity error = %v", err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(3000); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("corrupt sequence repair error = %v", err)
+	}
+	if got, err := os.ReadFile(sequencePath); err != nil || string(got) != string(corrupt) {
+		t.Fatalf("corrupt sequence was overwritten: bytes=%q err=%v", got, err)
+	}
+
+	if err := os.Remove(sequencePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", sequencePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(3000); err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("symlink sequence repair error = %v", err)
+	}
+	fi, err = os.Lstat(sequencePath)
+	if err != nil {
+		t.Fatalf("stat sequence symlink after refused repair: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("sequence symlink was replaced: mode=%v", fi.Mode())
+	}
+}
+
+func TestIntegrityCheckLeavesLegacyStateReadOnlyAndRepairRefusesIt(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	s := newRawRegistryStore(t, "# linux-temp-admin registry v4",
+		legacyMutationRow(4, "xxvcc-v4-read", 1777, generation, false, true, false))
+	before, err := os.ReadFile(s.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckIntegrity(); err != nil {
+		t.Fatalf("legacy integrity check: %v", err)
+	}
+	sequencePath := filepath.Join(s.Dir, "identity-sequence")
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("legacy integrity check created sequence: %v", err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(1777); err == nil || !strings.Contains(err.Error(), "requires an existing valid v5") {
+		t.Fatalf("legacy repair error = %v", err)
+	}
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("legacy repair created sequence: %v", err)
+	}
+	after, err := os.ReadFile(s.File)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("read-only legacy checks changed registry: bytes=%q err=%v", after, err)
+	}
+}
+
+func TestConcurrentMissingSequenceRepairPublishesExactlyOnce(t *testing.T) {
+	s := newStore(t)
+	sequencePath := filepath.Join(s.Dir, "identity-sequence")
+	if err := os.Remove(sequencePath); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		info registry.IdentitySequenceInfo
+		err  error
+	}
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan result, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(highWater int) {
+			defer wg.Done()
+			<-start
+			info, err := s.RepairMissingIdentitySequence(highWater)
+			results <- result{info: info, err: err}
+		}(1000 + i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	var committed registry.IdentitySequenceInfo
+	for result := range results {
+		if result.err == nil {
+			successes++
+			committed = result.info
+			continue
+		}
+		if !strings.Contains(result.err.Error(), "refusing to overwrite") {
+			t.Fatalf("concurrent repair error = %v", result.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent repairs succeeded %d times, want exactly one", successes)
+	}
+	sequenceBytes, err := os.ReadFile(sequencePath)
+	if err != nil || !strings.Contains(string(sequenceBytes), fmt.Sprintf("highest\t%d\n", committed.Highest)) ||
+		!strings.Contains(string(sequenceBytes), "safe-after\t2026-08-01T12:01:05Z\n") {
+		t.Fatalf("concurrently repaired sequence = %q committed=%+v err=%v", sequenceBytes, committed, err)
+	}
+	if err := s.CheckIntegrity(); err != nil {
+		t.Fatalf("concurrently repaired integrity: %v", err)
+	}
+}
+
+func TestMissingSequenceRepairRequiresAValidRegistryAndHighWater(t *testing.T) {
+	s := newRawRegistryStore(t, registry.Header, "invalid\trow")
+	sequencePath := filepath.Join(s.Dir, "identity-sequence")
+	if _, err := s.RepairMissingIdentitySequence(2000); err == nil || !strings.Contains(err.Error(), "registry line") {
+		t.Fatalf("malformed-registry repair error = %v", err)
+	}
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("malformed-registry repair created sequence: %v", err)
+	}
+	if _, err := s.RepairMissingIdentitySequence(-1); err == nil || !strings.Contains(err.Error(), "invalid identity sequence high-water") {
+		t.Fatalf("invalid-high-water repair error = %v", err)
+	}
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("invalid-high-water repair created sequence: %v", err)
+	}
+}
+
+func TestBeginDeletionAdvancesSequenceForFirstUIDOnlyWitness(t *testing.T) {
+	const (
+		targetUID  = 1777
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	for _, pending := range []bool{false, true} {
+		name := "unregistered"
+		if pending {
+			name = "pending-uid-zero"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			reserveThrough(t, s, 1000)
+			userName := "xxvcc-first-uid"
+			if pending {
+				userName = "xxvcc-pending-zero"
+				if err := s.Record(registry.Record{
+					User: userName, Port: 22, Generation: generation,
+					Pending: true, IdentityBound: true,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := s.BeginDeletion(userName, targetUID, ""); err != nil {
+				t.Fatalf("BeginDeletion UID-only witness: %v", err)
+			}
+			sequenceBytes, err := os.ReadFile(filepath.Join(s.Dir, "identity-sequence"))
+			if err != nil || !strings.Contains(string(sequenceBytes), "highest\t1777\n") ||
+				!strings.Contains(string(sequenceBytes), "safe-after\tnone\n") {
+				t.Fatalf("advanced sequence = %q err=%v", sequenceBytes, err)
+			}
+			rec, found, err := s.Lookup(userName)
+			if err != nil || !found || rec.UID != targetUID || !rec.DeletionStarted ||
+				rec.Pending || rec.IdentityBound || rec.SequentialID || rec.Generation != "" {
+				t.Fatalf("UID-only recovery = found=%v rec=%+v err=%v", found, rec, err)
+			}
+			next, isolated, err := s.ReserveIdentity(1000, targetUID+1)
+			if err != nil || next != targetUID+1 || !isolated {
+				t.Fatalf("post-recovery reservation = %d isolated=%v err=%v", next, isolated, err)
+			}
+		})
+	}
+}
+
+func TestBeginDeletionMigratesNineFieldRowAndBurnsRecoveredUID(t *testing.T) {
+	const (
+		userName = "xxvcc-nine-field"
+		uid      = 1777
+	)
+	nineFieldRow := strings.Join([]string{
+		userName, "2026-07-07 12:00:00 UTC", "2026-07-08 12:00:00 UTC",
+		"yes", "203.0.113.5", "22", "SHA256:legacy", "yes", "legacy.timer",
+	}, "\t")
+	s := newRawRegistryStore(t, "# linux-temp-admin registry v2", nineFieldRow)
+	sequencePath := filepath.Join(s.Dir, "identity-sequence")
+	if _, err := os.Lstat(sequencePath); !os.IsNotExist(err) {
+		t.Fatalf("nine-field fixture unexpectedly has a sequence: %v", err)
+	}
+
+	if err := s.BeginDeletion(userName, uid, ""); err != nil {
+		t.Fatalf("BeginDeletion nine-field row: %v", err)
+	}
+	registryBytes, err := os.ReadFile(s.File)
+	if err != nil || !strings.HasPrefix(string(registryBytes), registry.Header+"\n") {
+		t.Fatalf("nine-field registry was not migrated: bytes=%q err=%v", registryBytes, err)
+	}
+	sequenceBytes, err := os.ReadFile(sequencePath)
+	if err != nil || !strings.Contains(string(sequenceBytes), "highest\t1777\n") ||
+		!strings.Contains(string(sequenceBytes), "safe-after\t2026-08-01T12:01:05Z\n") {
+		t.Fatalf("nine-field migration sequence = %q err=%v", sequenceBytes, err)
+	}
+	rec, found, err := s.Lookup(userName)
+	if err != nil || !found || rec.UID != uid || !rec.DeletionStarted ||
+		rec.IdentityBound || rec.Generation != "" || rec.AutoUnit != "legacy.timer" {
+		t.Fatalf("migrated nine-field recovery = found=%v rec=%+v err=%v", found, rec, err)
+	}
+	next, isolated, err := s.ReserveIdentity(1000, uid+1)
+	if err != nil || next != uid+1 || isolated {
+		t.Fatalf("post-migration reservation = %d isolated=%v err=%v", next, isolated, err)
+	}
+}
+
+func TestBeginDeletionUIDOnlyAdvanceRejectsInvalidSequenceState(t *testing.T) {
+	const uid = 1777
+	for _, state := range []string{"missing", "corrupt", "below-recorded-uid"} {
+		t.Run(state, func(t *testing.T) {
+			userName := "xxvcc-invalid-seq"
+			var rows []string
+			if state == "below-recorded-uid" {
+				rows = append(rows, registry.Record{User: userName, Port: 22, UID: uid}.TSV())
+			}
+			s := newRawRegistryStore(t, registry.Header, rows...)
+			sequencePath := filepath.Join(s.Dir, "identity-sequence")
+			var sequenceBefore []byte
+			switch state {
+			case "corrupt":
+				sequenceBefore = []byte("not an identity sequence\n")
+			case "below-recorded-uid":
+				sequenceBefore = []byte("# linux-temp-admin identity sequence v1\nhighest\t1000\nsafe-after\tnone\n")
+			}
+			if sequenceBefore != nil {
+				if err := os.WriteFile(sequencePath, sequenceBefore, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			registryBefore, err := os.ReadFile(s.File)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = s.BeginDeletion(userName, uid, "")
+			if err == nil {
+				t.Fatal("BeginDeletion accepted invalid sequence state")
+			}
+			if (state == "missing") != errors.Is(err, registry.ErrIdentitySequenceMissing) {
+				t.Fatalf("BeginDeletion error = %v, missing sentinel match=%v", err, errors.Is(err, registry.ErrIdentitySequenceMissing))
+			}
+			if state == "below-recorded-uid" && !strings.Contains(err.Error(), "below recorded UID") {
+				t.Fatalf("low-sequence error = %v", err)
+			}
+			registryAfter, readErr := os.ReadFile(s.File)
+			if readErr != nil || string(registryAfter) != string(registryBefore) {
+				t.Fatalf("refused BeginDeletion changed registry: bytes=%q err=%v", registryAfter, readErr)
+			}
+			if state == "missing" {
+				if _, statErr := os.Lstat(sequencePath); !os.IsNotExist(statErr) {
+					t.Fatalf("refused BeginDeletion created sequence: %v", statErr)
+				}
+			} else if sequenceAfter, readErr := os.ReadFile(sequencePath); readErr != nil ||
+				string(sequenceAfter) != string(sequenceBefore) {
+				t.Fatalf("refused BeginDeletion changed sequence: bytes=%q err=%v", sequenceAfter, readErr)
+			}
+		})
 	}
 }

@@ -446,7 +446,9 @@ func TestLookupErrorsAreNotAbsence(t *testing.T) {
 	if _, err := Exists("someone"); err == nil {
 		t.Fatal("Exists must preserve the passwd read error")
 	}
-	if _, err := IsProtectedRevokeTarget("someone", true, 1001, testGeneration, false); err == nil {
+	if _, err := IsProtectedRevokeTarget("someone", RevokeIdentity{
+		Registered: true, RecordedUID: 1001, RecordedGeneration: testGeneration, IdentityBound: true,
+	}, false); err == nil {
 		t.Fatal("revoke protection must fail closed on a passwd read error")
 	}
 }
@@ -470,7 +472,7 @@ func TestIsReservedName(t *testing.T) {
 	// Every reserved name must also be refused by the revoke path (defense in
 	// depth: the two sides share this predicate and must never diverge).
 	for _, n := range reserved {
-		if protected, err := IsProtectedRevokeTarget(n, true, 0, testGeneration, false); err != nil || !protected {
+		if protected, err := IsProtectedRevokeTarget(n, RevokeIdentity{Registered: true}, false); err != nil || !protected {
 			t.Errorf("reserved %q is not a protected revoke target", n)
 		}
 	}
@@ -479,41 +481,44 @@ func TestIsReservedName(t *testing.T) {
 func TestIsProtectedRevokeTarget(t *testing.T) {
 	setPasswd(t, samplePasswd)
 	cases := []struct {
-		name        string
-		registered  bool
-		recordedUID int // 0 = an older registry row that recorded no UID
-		generation  string
-		allowLegacy bool
-		want        bool
+		name          string
+		registered    bool
+		recordedUID   int // 0 = an older registry row that recorded no UID
+		generation    string
+		identityBound bool
+		allowLegacy   bool
+		want          bool
 	}{
-		{"root", false, 0, "", false, true},                 // uid 0 / blocklist
-		{"daemon", false, 0, "", false, true},               // blocklist (not in passwd)
-		{"systemd-network", false, 0, "", false, true},      // systemd- prefix
-		{"svc", false, 0, "", false, true},                  // system uid, unregistered
-		{"svc", true, 0, testGeneration, false, true},       // system uid, registered but not managed
-		{"tmp500", false, 0, "", false, true},               // managed system uid but unregistered
-		{"tmp500", true, 500, testGeneration, false, false}, // generation-bound + registered system uid -> deletable
-		{"human", false, 0, "", false, true},                // real uid, unregistered human
-		{"human", true, 0, testGeneration, false, true},     // real uid, registered but NOT managed -> protected
-		{"tmp1000", false, 0, "", false, false},             // managed real uid -> explicit unregistered recovery may delete
-		{"legacy", false, 0, "", false, true},               // a fixed marker alone is not unattended deletion authority
-		{"legacy", false, 0, "", true, false},               // live explicit recovery may accept a marker-only legacy account
-		{"legacy", true, 0, "", false, true},                // a nine-field row has no unattended deletion authority
-		{"legacy", true, 0, "", true, false},                // direct recovery may supply its missing UID authority
-		{"legacy", true, 1004, "", false, true},             // fixed legacy marker is not identity proof
-		{"legacy", true, 1004, "", true, false},             // direct force recovery may accept it
+		{"root", false, 0, "", false, false, true},                 // uid 0 / blocklist
+		{"daemon", false, 0, "", false, false, true},               // blocklist (not in passwd)
+		{"systemd-network", false, 0, "", false, false, true},      // systemd- prefix
+		{"svc", false, 0, "", false, false, true},                  // system uid, unregistered
+		{"svc", true, 0, testGeneration, false, false, true},       // system uid, registered but not managed
+		{"tmp500", false, 0, "", false, false, true},               // managed system uid but unregistered
+		{"tmp500", true, 500, testGeneration, true, false, false},  // generation-bound + registered system uid -> deletable
+		{"tmp500", true, 500, testGeneration, false, true, true},   // unbound system uid is protected even with recovery authority
+		{"human", false, 0, "", false, false, true},                // real uid, unregistered human
+		{"human", true, 0, testGeneration, true, false, true},      // real uid, registered but NOT managed -> protected
+		{"tmp1000", false, 0, "", false, false, false},             // managed real uid -> explicit unregistered recovery may delete
+		{"tmp1000", true, 1001, testGeneration, false, true, true}, // an unbound generation column is never identity proof
+		{"legacy", false, 0, "", false, false, true},               // a fixed marker alone is not unattended deletion authority
+		{"legacy", false, 0, "", false, true, false},               // live explicit recovery may accept a marker-only legacy account
+		{"legacy", true, 0, "", false, false, true},                // a nine-field row has no unattended deletion authority
+		{"legacy", true, 0, "", false, true, false},                // direct recovery may supply its missing UID authority
+		{"legacy", true, 1004, "", false, false, true},             // fixed legacy marker is not identity proof
+		{"legacy", true, 1004, "", false, true, false},             // direct force recovery may accept it
 
 		// A recorded UID detects contradictions but cannot prove identity on its own:
 		// Linux can reuse the same UID after an account is deleted and recreated.
-		{"wiped", true, 1002, testGeneration, false, true}, // marker erased
-		{"wiped", true, 0, testGeneration, false, true},    // no recorded uid
-		{"wiped", false, 1002, "", false, true},            // unregistered
-		{"wiped", true, 9999, testGeneration, false, true}, // recorded uid mismatch
+		{"wiped", true, 1002, testGeneration, true, false, true}, // marker erased
+		{"wiped", true, 0, testGeneration, true, false, true},    // no recorded uid
+		{"wiped", false, 1002, "", false, false, true},           // unregistered
+		{"wiped", true, 9999, testGeneration, true, false, true}, // recorded uid mismatch
 
 		// A recorded UID must never make a real account deletable, even when it
 		// matches exactly: the username and UID can both be reused.
-		{"human", true, 1000, testGeneration, false, true}, // matching UID can belong to a recreated real account
-		{"human", true, 1234, testGeneration, false, true}, // recorded uid disagrees
+		{"human", true, 1000, testGeneration, true, false, true}, // matching UID can belong to a recreated real account
+		{"human", true, 1234, testGeneration, true, false, true}, // recorded uid disagrees
 
 		// A recorded UID that disagrees is not a MISSING witness but a CONTRADICTING
 		// one, and the marker must not overrule it. The two rows above only ever
@@ -521,22 +526,27 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		// that decides it — marker intact, recorded UID contradicting — went untested
 		// and returned "deletable". revoke then aimed its SIGKILL sweep at the UID in
 		// passwd, i.e. at whatever UID the account had been given.
-		{"tmp1000", true, 9999, testGeneration, false, true},                     // marker intact BUT recorded uid contradicts
-		{"tmp1000", true, 1001, "fedcba9876543210fedcba9876543210", false, true}, // wrong generation
+		{"tmp1000", true, 9999, testGeneration, true, false, true},                     // marker intact BUT recorded uid contradicts
+		{"tmp1000", true, 1001, "fedcba9876543210fedcba9876543210", true, false, true}, // wrong generation
 
 		// Escalating to uid 0 stays protected — never auto-delete a root account —
 		// even though it is registered, managed, and its name is ours.
-		{"escalated", true, 1003, testGeneration, false, true},
-		{"escalated", true, 0, testGeneration, false, true},
+		{"escalated", true, 1003, testGeneration, true, false, true},
+		{"escalated", true, 0, testGeneration, true, false, true},
 	}
 	for _, c := range cases {
-		got, err := IsProtectedRevokeTarget(c.name, c.registered, c.recordedUID, c.generation, c.allowLegacy)
+		got, err := IsProtectedRevokeTarget(c.name, RevokeIdentity{
+			Registered:         c.registered,
+			RecordedUID:        c.recordedUID,
+			RecordedGeneration: c.generation,
+			IdentityBound:      c.identityBound,
+		}, c.allowLegacy)
 		if err != nil {
 			t.Fatalf("IsProtectedRevokeTarget(%q): %v", c.name, err)
 		}
 		if got != c.want {
-			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d, generation=%q, allowLegacy=%v) = %v, want %v",
-				c.name, c.registered, c.recordedUID, c.generation, c.allowLegacy, got, c.want)
+			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d, generation=%q, identityBound=%v, allowLegacy=%v) = %v, want %v",
+				c.name, c.registered, c.recordedUID, c.generation, c.identityBound, c.allowLegacy, got, c.want)
 		}
 	}
 }
@@ -563,8 +573,48 @@ func TestRegisteredLegacyMissingUIDRecoveryRequiresHighUIDAndExactMarker(t *test
 			if tc.mutate != nil {
 				tc.mutate(&pw)
 			}
-			if got := IsProtectedRevokeEntry(pw.Name, pw, true, true, 0, "", tc.allowLegacy); got != tc.wantProtected {
+			if got := IsProtectedRevokeEntry(pw.Name, pw, true, RevokeIdentity{Registered: true}, tc.allowLegacy); got != tc.wantProtected {
 				t.Fatalf("IsProtectedRevokeEntry = %v, want %v", got, tc.wantProtected)
+			}
+		})
+	}
+}
+
+func TestLegacyRevokePolicyKeepsNineTenAndElevenColumnRowsUnbound(t *testing.T) {
+	const otherGeneration = "fedcba9876543210fedcba9876543210"
+	for _, tc := range []struct {
+		name          string
+		uid           int
+		recordedUID   int
+		generation    string
+		gecos         string
+		wantProtected bool
+	}{
+		{name: "nine fields high UID", uid: 1001, gecos: config.ManagedGECOS},
+		{name: "ten fields high UID", uid: 1001, recordedUID: 1001, gecos: config.ManagedGECOS},
+		{name: "eleven fields high UID", uid: 1001, recordedUID: 1001, generation: otherGeneration, gecos: config.ManagedGECOS},
+		{name: "nine fields low UID", uid: 999, gecos: config.ManagedGECOS, wantProtected: true},
+		{name: "ten fields low UID", uid: 999, recordedUID: 999, gecos: config.ManagedGECOS, wantProtected: true},
+		{
+			name: "eleven fields cannot impersonate a bound generation", uid: 1001,
+			recordedUID: 1001, generation: testGeneration,
+			gecos: config.ManagedGenerationGECOSPrefix + testGeneration, wantProtected: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := Passwd{
+				Name: "xxvcc-legacy1", UID: tc.uid, GID: tc.uid, GECOS: tc.gecos,
+				Home: "/home/xxvcc-legacy1", Shell: "/bin/sh",
+			}
+			identity := RevokeIdentity{
+				Registered: true, RecordedUID: tc.recordedUID,
+				RecordedGeneration: tc.generation, IdentityBound: false,
+			}
+			if got := IsProtectedRevokeEntry(pw.Name, pw, true, identity, true); got != tc.wantProtected {
+				t.Fatalf("interactive legacy protection = %v, want %v", got, tc.wantProtected)
+			}
+			if !IsProtectedRevokeEntry(pw.Name, pw, true, identity, false) {
+				t.Fatal("unattended invocation gained legacy deletion authority")
 			}
 		})
 	}
@@ -573,7 +623,9 @@ func TestRegisteredLegacyMissingUIDRecoveryRequiresHighUIDAndExactMarker(t *test
 func TestIsProtectedRevokeEntryUsesSuppliedSnapshot(t *testing.T) {
 	setPasswd(t, "same:x:4321:4321:"+config.ManagedGECOS+":/home/same:/bin/bash\n")
 	snapshot := Passwd{Name: "same", UID: 1234, GID: 1234, GECOS: "Real Person", Home: "/srv/same", Shell: "/bin/sh"}
-	if !IsProtectedRevokeEntry("same", snapshot, true, true, 1234, testGeneration, false) {
+	if !IsProtectedRevokeEntry("same", snapshot, true, RevokeIdentity{
+		Registered: true, RecordedUID: 1234, RecordedGeneration: testGeneration, IdentityBound: true,
+	}, false) {
 		t.Fatal("supplied untrusted snapshot was ignored in favor of a second passwd lookup")
 	}
 }
@@ -603,7 +655,7 @@ func TestUnregisteredDeletionRequiresAuthoritativeMarker(t *testing.T) {
 				Name: "xxvcc-a1", UID: 1500, GID: 1500, GECOS: tc.gecos,
 				Home: "/home/xxvcc-a1", Shell: "/bin/sh",
 			}
-			got := IsProtectedRevokeEntry("xxvcc-a1", pw, true, false, 0, "", false)
+			got := IsProtectedRevokeEntry("xxvcc-a1", pw, true, RevokeIdentity{}, false)
 			if got != tc.wantProtected {
 				t.Fatalf("IsProtectedRevokeEntry = %v, want %v", got, tc.wantProtected)
 			}
@@ -863,12 +915,45 @@ func TestCreatePendingIdentityRejectsReservedIDMismatch(t *testing.T) {
 
 func TestIdentityAllocationRangeScansLocalUIDsAndGIDs(t *testing.T) {
 	setIdentityDatabases(t,
-		"root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1500::/home/alice:/bin/sh\n",
-		"root:x:0:\nalice:x:1500:\nservice:x:1600:\n",
+		"root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1700::/home/alice:/bin/sh\noutside:x:2100:2100::/home/outside:/bin/sh\n",
+		"root:x:0:\nalice:x:1500:\nservice:x:1600:\noutside:x:2100:\n",
 		"UID_MIN 1000\nUID_MAX 2000\nGID_MIN 1200\nGID_MAX 1900\n")
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil || snapshot != (IdentityAllocationSnapshot{Lower: 1200, Upper: 1900, CurrentHighest: 1700}) {
+		t.Fatalf("InspectIdentityAllocation = %+v err=%v, want lower=1200 upper=1900 currentHighest=1700", snapshot, err)
+	}
 	minimum, maximum, err := IdentityAllocationRange()
-	if err != nil || minimum != 1601 || maximum != 1900 {
-		t.Fatalf("IdentityAllocationRange = %d..%d err=%v, want 1601..1900", minimum, maximum, err)
+	if err != nil || minimum != 1701 || maximum != 1900 {
+		t.Fatalf("IdentityAllocationRange = %d..%d err=%v, want 1701..1900", minimum, maximum, err)
+	}
+}
+
+func TestInspectIdentityAllocationReturnsExhaustedSnapshot(t *testing.T) {
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nlast:x:1900:1500::/home/last:/bin/sh\n",
+		"root:x:0:\nlast:x:1900:\n",
+		"UID_MIN 1000\nUID_MAX 2000\nGID_MIN 1200\nGID_MAX 1900\n")
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil || snapshot != (IdentityAllocationSnapshot{Lower: 1200, Upper: 1900, CurrentHighest: 1900}) {
+		t.Fatalf("InspectIdentityAllocation = %+v err=%v, want an exhausted 1200..1900 snapshot", snapshot, err)
+	}
+	if _, _, err := IdentityAllocationRange(); err == nil || err.Error() != "UID/GID allocation range 1200..1900 is exhausted" {
+		t.Fatalf("IdentityAllocationRange exhaustion error = %v", err)
+	}
+}
+
+func TestInspectIdentityAllocationReportsNoObservedIDAsZero(t *testing.T) {
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nservice:x:999:999::/nonexistent:/usr/sbin/nologin\n",
+		"root:x:0:\nservice:x:999:\n",
+		"UID_MIN 1000\nUID_MAX 2000\nGID_MIN 1200\nGID_MAX 1900\n")
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil || snapshot != (IdentityAllocationSnapshot{Lower: 1200, Upper: 1900}) {
+		t.Fatalf("InspectIdentityAllocation = %+v err=%v, want no ID observed in 1200..1900", snapshot, err)
+	}
+	minimum, maximum, err := IdentityAllocationRange()
+	if err != nil || minimum != 1200 || maximum != 1900 {
+		t.Fatalf("IdentityAllocationRange = %d..%d err=%v, want 1200..1900", minimum, maximum, err)
 	}
 }
 

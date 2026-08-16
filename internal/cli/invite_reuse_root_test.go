@@ -104,6 +104,17 @@ func unusedHighIntegrationUID(t *testing.T) int {
 	return 0
 }
 
+func reserveIntegrationIdentity(t *testing.T, store *registry.Store, uid int) {
+	t.Helper()
+	reserved, _, err := store.ReserveIdentity(uid, uid)
+	if err != nil {
+		t.Fatalf("reserve integration identity %d: %v", uid, err)
+	}
+	if reserved != uid {
+		t.Fatalf("reserved integration identity %d, want %d", reserved, uid)
+	}
+}
+
 // TestInviteNoSudoDoesNotInheritAStaleGrant is the CRITICAL. invite unconditionally
 // clears a reused name's stale auto-revoke UNIT but not its stale sudo grant or
 // sshd exception, so a --no-sudo invite that reuses a name still carrying an
@@ -405,6 +416,7 @@ func TestAutoRevokeProtectsSameUIDMarkerReplacement(t *testing.T) {
 			if err := a.Registry.Init(); err != nil {
 				t.Fatal(err)
 			}
+			reserveIntegrationIdentity(t, a.Registry, original.UID)
 			if err := a.Registry.Record(registry.Record{
 				User: tc.name, Port: 22, UID: original.UID, Generation: generation,
 				IdentityBound: true, AutoRevoke: true,
@@ -471,11 +483,14 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 		t.Fatal(err)
 	}
 	scheduled := strings.Fields((&schedule.Scheduler{InstallPath: installPath}).RevokeCommand(name, pw.UID, generation))[1:]
-	if rc := a.Dispatch(scheduled); rc == 0 {
-		t.Fatal("scheduled revoke accepted a legacy fixed identity")
+	if rc := a.Dispatch(scheduled); rc != 0 {
+		t.Fatalf("legacy scheduled access revoke rc=%d, want safe grant cleanup", rc)
 	}
 	if !mustExternalUserExists(t, name) {
 		t.Fatal("scheduled revoke deleted a legacy account")
+	}
+	if !strings.Contains(a.Err.(*bytes.Buffer).String(), "no account-deletion authority") {
+		t.Fatalf("scheduled revoke did not report grant-only legacy handling: %q", a.Err.(*bytes.Buffer).String())
 	}
 	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force"}); rc == 0 {
 		t.Fatal("unconfirmed legacy revoke succeeded")
@@ -590,6 +605,7 @@ func TestAutoRevokeSkipsStaleGeneration(t *testing.T) {
 	if err := a.Registry.Init(); err != nil {
 		t.Fatal(err)
 	}
+	reserveIntegrationIdentity(t, a.Registry, pw.UID)
 	if err := a.Registry.Record(registry.Record{User: name, Port: 22, UID: pw.UID, Generation: currentGeneration, AutoRevoke: true}); err != nil {
 		t.Fatal(err)
 	}
