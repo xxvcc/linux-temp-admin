@@ -132,8 +132,8 @@ unset TAR_OPTIONS GZIP BZIP2 BZIP XZ_OPT
        GOTELEMETRY=off GOAUTH=off timeout -k 5 30 go version); then
     fail "cannot execute the trusted Go toolchain"
   fi
-  [[ "$(awk '{print $3}' <<<"$trusted_go_version")" == go1.26.5 ]] \
-    || fail "trusted Go toolchain is not exactly go1.26.5"
+  [[ "$(awk '{print $3}' <<<"$trusted_go_version")" == go1.26.6 ]] \
+    || fail "trusted Go toolchain is not exactly go1.26.6"
   signer_arch=$(env -i PATH="$PATH" LC_ALL=C HOME=/root GOROOT= GOENV=off \
     GOTOOLCHAIN=local GOFLAGS= GOWORK=off GOEXPERIMENT= GOFIPS140=off \
     GOTELEMETRY=off GOAUTH=off timeout -k 5 30 go env GOARCH) \
@@ -254,7 +254,7 @@ unset TAR_OPTIONS GZIP BZIP2 BZIP XZ_OPT
 LTA_TRUSTED_SIGNER
 ```
 
-The preparation workstation must likewise have Go 1.26.5 installed as its
+The preparation workstation must likewise have Go 1.26.6 installed as its
 local toolchain. An automatically downloaded toolchain is not sufficient: the
 version gate and every reproducible build use `GOENV=off GOTOOLCHAIN=local
 GOFLAGS= GOWORK=off` so they cannot inspect one compiler and build with another
@@ -443,7 +443,7 @@ API and require `verification.verified=true`, `verification.reason=valid`, and
 an armored OpenPGP signature before continuing. Use that same fingerprint as
 `LTA_EXPECTED_TAG_SIGNER_FINGERPRINT` during preparation and publication.
 
-The `Release` workflow uses exactly Go 1.26.5. Its read-only `gate-build` job
+The `Release` workflow uses exactly Go 1.26.6. Its read-only `gate-build` job
 runs vet, uncached race tests, package-serialized root integration tests,
 formatting, shell checks,
 the mirror receiver policy tests, a clean-worktree check, and
@@ -472,7 +472,7 @@ objects, checks the commit's ancestry against GitHub's `main` rather than a
 caller-configured `origin`, rejects symlinks and submodules, and exports the
 self-contained tree with `git archive`. Ignored/untracked files and candidate
 scripts therefore cannot affect the build. It checks the successful Release
-workflow and draft, rebuilds with exactly Go 1.26.5, `GOWORK=off`, and the CI
+workflow and draft, rebuilds with exactly Go 1.26.6, `GOWORK=off`, and the CI
 flags, then `cmp`s every CI binary byte-for-byte. Draft assets are fetched one
 at a time through the authenticated Release Asset API after an advertised-size
 preflight and under a kernel file-size limit. The source archive has its own size

@@ -14,7 +14,7 @@ The tool lives in `cmd/` and `internal/`, and ships as a signed static Go binary
 
 ## Local Checks
 
-**Go** — requires Go 1.26.5+:
+**Go** — requires Go 1.26.6+:
 
 ```bash
 go build ./...

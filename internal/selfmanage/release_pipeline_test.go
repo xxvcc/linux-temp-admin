@@ -3142,14 +3142,14 @@ func TestPrepareRejectsFailingGoVersionCommandWithValidLookingOutput(t *testing.
 		t.Fatal(err)
 	}
 	mockGo := filepath.Join(binDir, "go")
-	if err := os.WriteFile(mockGo, []byte("#!/bin/sh\necho 'go version go1.26.5 linux/amd64'\nexit 23\n"), 0o700); err != nil {
+	if err := os.WriteFile(mockGo, []byte("#!/bin/sh\necho 'go version go1.26.6 linux/amd64'\nexit 23\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dir, "gate-passed")
 	script := filepath.Join(dir, "version-gate.sh")
 	body := `#!/bin/bash
 set -Eeuo pipefail
-GO_VERSION=go1.26.5
+GO_VERSION=go1.26.6
 ` + versionGate + `
 : > "$TEST_MARKER"
 `
