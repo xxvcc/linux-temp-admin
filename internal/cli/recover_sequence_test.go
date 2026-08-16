@@ -42,17 +42,21 @@ func assertPathAbsent(t *testing.T, path string) {
 }
 
 func TestIdentitySequenceHighWaterFlagRequiresCanonicalLinuxID(t *testing.T) {
-	for _, value := range []string{"0", "1", "1000", "4294967294"} {
+	valid := []string{"0", "1", "1000", "2147483647"}
+	if strconv.IntSize >= 64 {
+		valid = append(valid, "4294967294")
+	}
+	for _, value := range valid {
 		t.Run("valid "+value, func(t *testing.T) {
 			var flag identitySequenceHighWaterFlag
 			if err := flag.Set(value); err != nil {
 				t.Fatalf("Set(%q): %v", value, err)
 			}
-			want, err := strconv.ParseUint(value, 10, 32)
+			want, err := strconv.Atoi(value)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !flag.set || flag.text != value || flag.value != int(want) || flag.String() != value {
+			if !flag.set || flag.text != value || flag.value != want || flag.String() != value {
 				t.Fatalf("Set(%q) produced %+v", value, flag)
 			}
 			if err := flag.Set(value); err == nil || !strings.Contains(err.Error(), "only once") {
@@ -60,7 +64,11 @@ func TestIdentitySequenceHighWaterFlagRequiresCanonicalLinuxID(t *testing.T) {
 			}
 		})
 	}
-	for _, value := range []string{"", "+1", "-1", "01", "1 ", "1_0", "4294967295", "4294967296"} {
+	invalid := []string{"", "+1", "-1", "01", "1 ", "1_0", "4294967295", "4294967296"}
+	if strconv.IntSize < 64 {
+		invalid = append(invalid, "2147483648", "4294967294")
+	}
+	for _, value := range invalid {
 		t.Run("invalid "+strconv.Quote(value), func(t *testing.T) {
 			var flag identitySequenceHighWaterFlag
 			if err := flag.Set(value); err == nil {

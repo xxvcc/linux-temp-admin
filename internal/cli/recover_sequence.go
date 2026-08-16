@@ -35,12 +35,12 @@ func (f *identitySequenceHighWaterFlag) Set(value string) error {
 			return fmt.Errorf("--highest must be a canonical decimal Linux ID")
 		}
 	}
-	parsed, err := strconv.ParseUint(value, 10, 32)
-	if err != nil || parsed == uint64(^uint32(0)) || !validate.KernelID(int(parsed)) {
+	parsed, err := strconv.Atoi(value)
+	if err != nil || !validate.KernelID(parsed) {
 		return fmt.Errorf("--highest is outside the usable Linux ID range")
 	}
 	f.text = value
-	f.value = int(parsed)
+	f.value = parsed
 	return nil
 }
 
