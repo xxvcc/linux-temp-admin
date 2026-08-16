@@ -61,7 +61,7 @@
 
 v2.9.3 及更早版本创建的世代绑定账号只有首字段标记。升级不会由 `status` 或 `doctor` 隐式改写 `/etc/passwd`：标记尚精确时仍按旧规则正常撤销，并显示 `generation-bound-first-field-compat`/诊断警告；应尽快撤销后用当前版本重新邀请。若旧账号此前已修改 full-name 并丢失这个唯一见证，程序无法在不冒同名/同 UID 替代账号误删风险的前提下自动认回，仍会保持 protected 并要求人工核查。
 
-从旧登记格式迁移的固定标记账号显示为 `legacy-unverified`，不会被定时、批量清理或卸载自动删除。旧版 timer 使用的 `--yes --force --confirm-force` 不能获得这类账号的删除授权；遗留任务会被报告为孤儿任务，并可由 `cleanup-expired --compact` 取消而不删除活账号或登记。人工核对后，必须在交互终端运行 `revoke --force` 并输入完整用户名确认。非交互调用始终拒绝删除这类账号。
+从旧登记格式迁移的固定标记账号显示为 `legacy-unverified`，不会被定时、批量清理或卸载自动删除。旧版 timer 使用的 `--yes --force --confirm-force` 不能获得这类账号的删除授权；遗留任务会被报告为孤儿任务，并可由 `cleanup-expired --compact` 取消而不删除活账号或登记。人工核对后，必须在交互终端运行 `revoke --force` 并输入完整用户名确认。对于仍缺少 UID 列的 9 列 v2 登记，只有当前 UID 不低于 1000 且精确固定标记仍存在时，人工确认才补足恢复授权；清权前必须先通过正式 `Init` 迁移为 v5、创建 `identity-sequence`，并复核登记语义和完整 passwd 快照。迁移或复核失败时不清权、不禁用也不删除账号。非交互调用、低 UID、UID 0、保留名称及标记不匹配始终拒绝删除。
 
 v2.9.2 之前的版本可能在 `useradd` 已成功、后续准备失败时留下仍活着的 pending 创建登记。这种登记本身不提供普通或无人值守删除权限；只有管理员人工核查后，在菜单选择该行或直接交互运行 `revoke --user <名> --force` 并输入完整用户名，才会进入恢复候选。程序还要求登记中的随机世代精确匹配 pending GECOS、登记 UID 为尚未写入的 0 或与当前 UID 一致、Home 为确定的受管路径、UID/GID 均为非 root 且 shell 非空。systemd 可用时会保留精确 pending 世代进入持久隔离；同步回退才在清理前把它降为不带世代的 UID-only `DeletionStarted` 见证。`--yes`、自动任务、卸载批量、非 TTY 及任何不匹配状态始终失败关闭并保留账号和登记。
 

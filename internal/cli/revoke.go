@@ -256,6 +256,58 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	}
 
 	stdinTTY := a.StdinIsTTY != nil && a.StdinIsTTY()
+	// Released v2 rows used one fixed GECOS marker, so username+UID+marker still
+	// cannot distinguish the original account from a same-name/same-UID replacement.
+	// Only a direct interactive operator invocation with --force and an explicit
+	// full-name confirmation may recover such an account. Historical unattended
+	// timers used the same --yes --force --confirm-force argv that an operator could
+	// type, so no non-interactive invocation receives this exception. Scheduled and
+	// uninstall-internal invocations remain blocked even though they carry --force.
+	allowLegacy := legacyRecoveryAuthorized(rec.IdentityBound, opts, stdinTTY)
+
+	// A real v2 row may still have only nine fields and no recorded UID; later v2
+	// rows can carry the UID while retaining the same unbound fixed marker. Before
+	// any narrowly authorized legacy recovery mutates grants or account state, run
+	// the formal migration so BeginDeletion cannot rewrite the row as v5 without
+	// first creating the monotonic identity sequence. Re-read both sources afterward:
+	// migration may change the representation, never the semantic record or the
+	// exact legacy passwd snapshot the operator confirmed.
+	legacyRegistryMigration := registered && !rec.IdentityBound && allowLegacy &&
+		(rec.UID == 0 || rec.UID == pw.UID) && pw.UID >= 1000 &&
+		!user.IsReservedName(username) && user.IsLegacyManagedEntry(pw)
+	if legacyRegistryMigration {
+		if err := a.Registry.Init(); err != nil {
+			a.errorf("%s: %v", a.P.M(
+				"旧版登记迁移失败；未清理授权、禁用或删除账号",
+				"legacy registry migration failed; no grant was cleaned and no account was disabled or deleted"), err)
+			a.audit("account.delete", username, "fail", "legacy registry migration failed: "+err.Error(), nil)
+			return 1
+		}
+		migrated, stillRegistered, err := a.Registry.Lookup(username)
+		if err != nil || !stillRegistered || migrated != rec {
+			if err == nil {
+				err = fmt.Errorf("registry identity changed during migration")
+			}
+			a.errorf("%s: %v", a.P.M(
+				"旧版登记迁移期间账号登记身份发生变化；未清理授权、禁用或删除账号",
+				"the registry identity changed during legacy migration; no grant was cleaned and no account was disabled or deleted"), err)
+			a.audit("account.delete", username, "fail", err.Error(), nil)
+			return 1
+		}
+		current, stillExists, err := a.lookupUser(username)
+		if err != nil || !stillExists || !user.SameAccountIdentity(pw, current) {
+			if err == nil {
+				err = fmt.Errorf("account identity changed during registry migration")
+			}
+			a.errorf("%s: %v", a.P.M(
+				"旧版登记迁移期间账号身份发生变化；未清理授权、禁用或删除账号",
+				"the account identity changed during legacy registry migration; no grant was cleaned and no account was disabled or deleted"), err)
+			a.audit("account.delete", username, "fail", err.Error(), nil)
+			return 1
+		}
+		rec, registered, pw = migrated, stillRegistered, current
+	}
+
 	// A pending row was written before useradd and is not ordinary deletion
 	// authority; it may still carry the initial UID 0 or a later captured UID.
 	// Releases before v2.9.2 could nevertheless retain that row
@@ -288,14 +340,6 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	// NOPASSWD sudo and an sshd exception.
 	grantErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 
-	// Released v2 rows used one fixed GECOS marker, so username+UID+marker still
-	// cannot distinguish the original account from a same-name/same-UID replacement.
-	// Only a direct interactive operator invocation with --force and an explicit
-	// full-name confirmation may recover such an account. Historical unattended
-	// timers used the same --yes --force --confirm-force argv that an operator could
-	// type, so no non-interactive invocation receives this exception. Scheduled and
-	// uninstall-internal invocations remain blocked even though they carry --force.
-	allowLegacy := legacyRecoveryAuthorized(rec.IdentityBound, opts, stdinTTY)
 	protected := user.IsProtectedRevokeEntry(username, pw, true, registered, rec.UID, rec.Generation, allowLegacy)
 	if pendingRecovery {
 		protected = false

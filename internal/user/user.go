@@ -620,7 +620,15 @@ func IsProtectedRevokeEntry(name string, pw Passwd, exists, registered bool, rec
 		return true
 	}
 	if registered {
-		if recordedUID < 1 || pw.UID != recordedUID {
+		if recordedUID > 0 && pw.UID != recordedUID {
+			return true
+		}
+		// A v2 registry row has no UID column. It can never authorize automatic
+		// deletion, but the direct interactive legacy-recovery gate may supply the
+		// missing authority for an ordinary-range account that still carries the
+		// exact fixed marker. Low-UID legacy identities remain protected even after
+		// operator confirmation.
+		if recordedUID < 1 && !(allowLegacy && pw.UID >= 1000 && IsLegacyManagedEntry(pw)) {
 			return true
 		}
 	}

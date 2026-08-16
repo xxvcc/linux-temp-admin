@@ -498,6 +498,8 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"tmp1000", false, 0, "", false, false},             // managed real uid -> explicit unregistered recovery may delete
 		{"legacy", false, 0, "", false, true},               // a fixed marker alone is not unattended deletion authority
 		{"legacy", false, 0, "", true, false},               // live explicit recovery may accept a marker-only legacy account
+		{"legacy", true, 0, "", false, true},                // a nine-field row has no unattended deletion authority
+		{"legacy", true, 0, "", true, false},                // direct recovery may supply its missing UID authority
 		{"legacy", true, 1004, "", false, true},             // fixed legacy marker is not identity proof
 		{"legacy", true, 1004, "", true, false},             // direct force recovery may accept it
 
@@ -536,6 +538,35 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d, generation=%q, allowLegacy=%v) = %v, want %v",
 				c.name, c.registered, c.recordedUID, c.generation, c.allowLegacy, got, c.want)
 		}
+	}
+}
+
+func TestRegisteredLegacyMissingUIDRecoveryRequiresHighUIDAndExactMarker(t *testing.T) {
+	base := Passwd{
+		Name: "xxvcc-legacy1", UID: 1000, GID: 1000, GECOS: config.ManagedGECOS,
+		Home: "/home/xxvcc-legacy1", Shell: "/bin/bash",
+	}
+	for _, tc := range []struct {
+		name          string
+		mutate        func(*Passwd)
+		allowLegacy   bool
+		wantProtected bool
+	}{
+		{name: "interactive recovery", allowLegacy: true},
+		{name: "no recovery authority", wantProtected: true},
+		{name: "low UID", allowLegacy: true, mutate: func(p *Passwd) { p.UID, p.GID = 999, 999 }, wantProtected: true},
+		{name: "UID zero", allowLegacy: true, mutate: func(p *Passwd) { p.UID, p.GID = 0, 0 }, wantProtected: true},
+		{name: "marker mismatch", allowLegacy: true, mutate: func(p *Passwd) { p.GECOS = "ordinary account" }, wantProtected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := base
+			if tc.mutate != nil {
+				tc.mutate(&pw)
+			}
+			if got := IsProtectedRevokeEntry(pw.Name, pw, true, true, 0, "", tc.allowLegacy); got != tc.wantProtected {
+				t.Fatalf("IsProtectedRevokeEntry = %v, want %v", got, tc.wantProtected)
+			}
+		})
 	}
 }
 
