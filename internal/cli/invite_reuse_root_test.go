@@ -462,12 +462,12 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy account was not found")
 	}
-	if err := a.Registry.Init(); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Registry.Record(registry.Record{
-		User: name, Port: 22, UID: pw.UID, Generation: generation, AutoRevoke: true,
-	}); err != nil {
+	legacyRow := strings.Join([]string{
+		name, "2026-08-16 12:00:00 UTC", "2026-08-17 20:00 CST",
+		"no", "203.0.113.5", "22", "SHA256:legacy", "yes", "",
+		strconv.Itoa(pw.UID), generation,
+	}, "\t")
+	if err := os.WriteFile(a.Registry.File, []byte("# linux-temp-admin registry v2\n"+legacyRow+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	scheduled := strings.Fields((&schedule.Scheduler{InstallPath: installPath}).RevokeCommand(name, pw.UID, generation))[1:]
@@ -508,6 +508,68 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 	}
 	if mustExternalUserExists(t, name) {
 		t.Fatal("interactive confirmed legacy revoke did not delete the account")
+	}
+}
+
+func TestLegacyNineFieldRegistryInteractiveRevokeMigratesBeforeDeletion(t *testing.T) {
+	a, _, _, _ := inviteApp(t)
+	const name = "ltalegacyacct2"
+	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
+	rm()
+	t.Cleanup(rm)
+	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
+		t.Fatalf("useradd: %v: %s", err, out)
+	}
+	pw, ok := mustExternalUserLookup(t, name)
+	if !ok || pw.UID < 1000 {
+		t.Fatalf("legacy account identity = %+v, found=%v", pw, ok)
+	}
+
+	legacyRow := strings.Join([]string{
+		name, "2026-08-16 12:00:00 UTC", "2026-08-17 20:00 CST",
+		"no", "203.0.113.5", "22", "SHA256:legacy", "no", "",
+	}, "\t")
+	if fields := strings.Split(legacyRow, "\t"); len(fields) != 9 {
+		t.Fatalf("legacy fixture has %d fields, want 9", len(fields))
+	}
+	if err := os.WriteFile(a.Registry.File, []byte("# linux-temp-admin registry v2\n"+legacyRow+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sequence := filepath.Join(a.Registry.Dir, "identity-sequence")
+	if _, err := os.Lstat(sequence); !os.IsNotExist(err) {
+		t.Fatalf("legacy fixture unexpectedly has an identity sequence: %v", err)
+	}
+
+	// The historical unattended argv must neither delete the account nor migrate
+	// state; only the later TTY confirmation is allowed to cross that boundary.
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--yes", "--force", "--confirm-force", name}); rc == 0 {
+		t.Fatal("historical non-interactive revoke accepted a nine-field legacy row")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatal("historical non-interactive revoke deleted the legacy account")
+	}
+	if _, err := os.Lstat(sequence); !os.IsNotExist(err) {
+		t.Fatalf("rejected non-interactive revoke migrated the registry: %v", err)
+	}
+
+	a.In = strings.NewReader(name + "\n")
+	a.StdinIsTTY = func() bool { return true }
+	if rc := a.Dispatch([]string{"revoke", "--user", name, "--force"}); rc != 0 {
+		t.Fatalf("interactive nine-field legacy revoke rc=%d\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if mustExternalUserExists(t, name) {
+		t.Fatal("interactive nine-field legacy revoke did not delete the account")
+	}
+	registryData, err := os.ReadFile(a.Registry.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(registryData) != registry.Header+"\n" {
+		t.Fatalf("completed registry was not migrated to an empty v5 file: %q", registryData)
+	}
+	sequenceData, err := os.ReadFile(sequence)
+	if err != nil || len(strings.TrimSpace(string(sequenceData))) == 0 {
+		t.Fatalf("identity sequence missing after legacy migration: bytes=%q err=%v", sequenceData, err)
 	}
 }
 

@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.2 - 2026-08-16
+
+- Restore the documented manual recovery path for a deployed nine-field v2
+  registry row whose account still carries the legacy fixed GECOS marker but
+  has no recorded UID. Deletion remains limited to a direct interactive
+  `revoke --user <name> --force` with the complete username confirmation and a
+  current UID of at least 1000; timers, `--yes`, uninstall, low/root UIDs,
+  reserved names, and marker mismatches still fail closed. Before removing any
+  grant or account state, the command formally migrates the registry to v5,
+  creates the monotonic `identity-sequence`, and rechecks both the semantic
+  registry record and exact passwd snapshot.
+
 ## v2.10.1 - 2026-08-16
 
 - Rebuild the v2.10.0 changes with Go 1.26.6. The release gate now rejects the

@@ -121,7 +121,7 @@ ssh -i ./USER.key -p PORT USER@HOST
 
 兼容旧版自动任务时，不带 UID/世代参数的 `revoke --yes` 若恰好与同名 `invite` 并发，无法证明旧删除意图在创建结束后仍指向同一账号。此时命令会明确警告、本次不删除任何账号并以成功状态跳过，避免 systemd 把旧任务重试到新世代；人工执行的同形非交互命令也遵循这一规则。并发操作完成后必须运行 `doctor`，并针对当前账号重新执行 `revoke`。
 
-`doctor` 报告为 `legacy-unverified` 的账号来自旧版固定身份标记，无法排除同名/同 UID 重用。人工核查后，只能在交互终端运行 `revoke --user <名> --force` 并输入完整用户名确认。旧版 timer 使用的 `--yes --force --confirm-force` 以及其他非交互调用都不会获得这类账号的删除授权；`doctor` 会把仍存在的旧任务报告为孤儿任务，`cleanup-expired --compact` 会取消任务但保留活账号及登记供人工处理。
+`doctor` 报告为 `legacy-unverified` 的账号来自旧版固定身份标记，无法排除同名/同 UID 重用。人工核查后，只能在交互终端运行 `revoke --user <名> --force` 并输入完整用户名确认。若旧 v2 登记仍只有 9 列、没有记录 UID，这条人工恢复路径仅在当前账号保留精确固定标记且 UID 不低于 1000 时可用；程序会在清权前正式迁移登记到 v5、创建 `identity-sequence`，并重新核对登记语义与完整 passwd 快照。迁移或复核失败不会清理授权、禁用或删除账号。旧版 timer 使用的 `--yes --force --confirm-force` 以及其他非交互调用都不会获得这类账号的删除授权；低 UID、UID 0、保留名称和标记不匹配仍受保护。`doctor` 会把仍存在的旧任务报告为孤儿任务，`cleanup-expired --compact` 会取消任务但保留活账号及登记供人工处理。
 
 v2.9.3 及更早版本创建的世代账号只有 GECOS 首字段中的旧完整标记。它尚未被改写时，`status` 显示 `generation-bound-first-field-compat`，普通及自动撤销仍可按登记 UID/世代和完整旧快照执行；撤销期间每次 passwd 复读都必须与开始时的完整快照逐字节一致，`doctor` 会提示尽快撤销并用当前版本重新邀请。`status`/`doctor` 都不会隐式改写旧账号；旧首字段见证若已经丢失且没有第五字段见证，账号会保持 protected，必须人工核查处理，不能用同名/同 UID 猜测恢复，也不能从登记内容自动重建见证。
 
