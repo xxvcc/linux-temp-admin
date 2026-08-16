@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -52,6 +53,12 @@ func TestMissingStoreRemovalAndCompactAreNoOps(t *testing.T) {
 	if err != nil || removed != 0 || called {
 		t.Fatalf("Compact on absent store: removed=%d called=%v err=%v", removed, called, err)
 	}
+	if err := s.FinishDeletionRecovery("xxvcc-a1", 1001, ""); err != nil {
+		t.Fatalf("FinishDeletionRecovery on a fully absent store: %v", err)
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("idempotent absent-store operations created state: %v", err)
+	}
 }
 
 func TestExistingRegistryWithoutLockStillFailsClosed(t *testing.T) {
@@ -77,6 +84,62 @@ func TestWriteAllRejectsOutputAboveRegistryLimit(t *testing.T) {
 	}
 	if _, err := os.Lstat(s.File); !os.IsNotExist(err) {
 		t.Fatalf("oversized registry write created output: %v", err)
+	}
+}
+
+func TestWriteAllFailsClosedWithoutAValidIdentitySequence(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root-owned sequence validation requires root")
+	}
+	dir := t.TempDir()
+	s := &Store{
+		Dir: dir, File: filepath.Join(dir, "registry.tsv"), Lock: filepath.Join(dir, "registry.lock"),
+	}
+	original := []byte(Header + "\n")
+	if err := os.WriteFile(s.File, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recs := []Record{{User: "xxvcc-defensive", Port: 22, UID: 1777}}
+
+	err := s.writeAll(recs)
+	if !errors.Is(err, ErrIdentitySequenceMissing) {
+		t.Fatalf("writeAll without sequence error = %v, want ErrIdentitySequenceMissing", err)
+	}
+	if got, readErr := os.ReadFile(s.File); readErr != nil || string(got) != string(original) {
+		t.Fatalf("missing-sequence refusal changed registry: bytes=%q err=%v", got, readErr)
+	}
+
+	sequencePath := s.sequencePath()
+	corrupt := []byte("not an identity sequence\n")
+	if err := os.WriteFile(sequencePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = s.writeAll(recs)
+	if err == nil || errors.Is(err, ErrIdentitySequenceMissing) {
+		t.Fatalf("writeAll with corrupt sequence error = %v", err)
+	}
+	if got, readErr := os.ReadFile(s.File); readErr != nil || string(got) != string(original) {
+		t.Fatalf("corrupt-sequence refusal changed registry: bytes=%q err=%v", got, readErr)
+	}
+	if got, readErr := os.ReadFile(sequencePath); readErr != nil || string(got) != string(corrupt) {
+		t.Fatalf("corrupt sequence was overwritten: bytes=%q err=%v", got, readErr)
+	}
+
+	if err := os.WriteFile(sequencePath, identitySequenceBytes(identitySequence{}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeAll(recs); err == nil || !strings.Contains(err.Error(), "below recorded UID") {
+		t.Fatalf("writeAll with too-low valid sequence error = %v", err)
+	}
+	sequence, err := readIdentitySequence(sequencePath)
+	if err != nil || sequence.highest != 0 {
+		t.Fatalf("defensive refusal changed sequence = %+v err=%v", sequence, err)
+	}
+	if err := os.WriteFile(sequencePath, identitySequenceBytes(identitySequence{highest: 1777}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeAll(recs); err != nil {
+		t.Fatalf("writeAll with covering sequence: %v", err)
 	}
 }
 

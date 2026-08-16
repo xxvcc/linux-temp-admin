@@ -63,7 +63,7 @@
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin invite --sudo --no-auto-revoke
 ```
 
-关闭自动删除后，账号只能通过 `revoke` 手动删除，`--hours` 会被忽略。
+关闭自动删除后，账号只能通过 `linux-temp-admin revoke` 手动删除，`--hours` 会被忽略。
 
 账号数据库项自 `useradd` 起就使用过去日期过期并锁定密码，不会复制 `/etc/skel`。程序先在 root-only 高水位文件中永久烧掉一个 UID/GID，再用 `useradd` 把账号和私有组固定到同一号码；默认随机用户名具有长随机后缀，因此正常菜单创建不会复用本工具曾释放的数值身份。以 `<32hex>` 表示 32 位小写十六进制世代，当前版本让 GECOS 前四个子字段初始为空，并在第五个 trailing/other 字段写入紧凑世代见证：完成态为 `,,,,lta-m=<32hex>`，pending 创建态为 `,,,,lta-p=<32hex>`。旧版二进制在首字段看不到旧格式标记，因而对这种新账号失败关闭。Home 保持不存在时会执行两轮进程终止与同名 crontab、目标 UID `at`/`batch` 任务清理，不再前台等待 65 秒。显式 `--user` 仍可能复用历史名称和 daemon 已缓存的同名任务，所以该特殊路径会说明原因并同步等待一个轮询周期。邀请创建期间始终复核 `useradd` 后捕获的完整 passwd 快照；只有清场、完整快照和无残留进程复查通过后才创建权限 `0700` 的空 Home。密码/公钥、授权、登记和自动撤销任务全部完成后账号才被激活。有效期从清场完成后开始，因此显式用户名的安全等待不会缩短 `--hours` 请求的访问时长。
 
@@ -119,15 +119,15 @@ ssh -i ./USER.key -p PORT USER@HOST
 
 删除 `at` 作业前会重新读取作业正文并再次核对 UID 或精确撤销命令，避免已复用的作业 ID 指向无关任务；`at` 没有原子的比较删除接口，因此重新读取到 `atrm` 之间仍存在本机 root 信任边界内的极短窗口。
 
-兼容旧版自动任务时，不带 UID/世代参数的 `revoke --yes` 若恰好与同名 `invite` 并发，无法证明旧删除意图在创建结束后仍指向同一账号。此时命令会明确警告、本次不删除任何账号并以成功状态跳过，避免 systemd 把旧任务重试到新世代；人工执行的同形非交互命令也遵循这一规则。并发操作完成后必须运行 `doctor`，并针对当前账号重新执行 `revoke`。
+兼容旧版自动任务时，不带 UID/世代参数的 `linux-temp-admin revoke --yes` 若恰好与同名 `invite` 并发，无法证明旧删除意图在创建结束后仍指向同一账号。此时命令会明确警告、本次不删除任何账号并以成功状态跳过，避免 systemd 把旧任务重试到新世代；人工执行的同形非交互命令也遵循这一规则。并发操作完成后必须运行 `linux-temp-admin doctor`，并针对当前账号重新执行 `linux-temp-admin revoke`。
 
-`doctor` 报告为 `legacy-unverified` 的账号来自旧版固定身份标记，无法排除同名/同 UID 重用。人工核查后，只能在交互终端运行 `revoke --user <名> --force` 并输入完整用户名确认。若旧 v2 登记仍只有 9 列、没有记录 UID，这条人工恢复路径仅在当前账号保留精确固定标记且 UID 不低于 1000 时可用；程序会在清权前正式迁移登记到 v5、创建 `identity-sequence`，并重新核对登记语义与完整 passwd 快照。迁移或复核失败不会清理授权、禁用或删除账号。旧版 timer 使用的 `--yes --force --confirm-force` 以及其他非交互调用都不会获得这类账号的删除授权；低 UID、UID 0、保留名称和标记不匹配仍受保护。`doctor` 会把仍存在的旧任务报告为孤儿任务，`cleanup-expired --compact` 会取消任务但保留活账号及登记供人工处理。
+`linux-temp-admin doctor` 报告为 `legacy-unverified` 的账号来自旧版固定身份标记，无法排除同名/同 UID 重用。人工核查后，只能在交互终端运行 `linux-temp-admin revoke --user <名> --force` 并输入完整用户名确认。若旧 v2 登记仍只有 9 列、没有记录 UID，这条人工恢复路径仅在当前账号保留精确固定标记且 UID 不低于 1000 时可用；程序会在清权前正式迁移登记到 v5、创建 `identity-sequence`，并重新核对登记语义与完整 passwd 快照。迁移或复核失败不会清理授权、禁用或删除账号。旧版 timer 使用的 `--yes --force --confirm-force` 以及其他非交互调用都不会获得这类账号的删除授权；若旧 timer 的 UID/世代与未绑定登记精确匹配，它只会先移除本工具的 sudoers/sshd 授权，再取消旧到期任务，全程不读取 passwd 删除策略、不禁用或删除账号，也不改登记。任一授权移除失败都不会主动取消任务，systemd 会按策略重试，已触发的 `at` 和旧一次性任务仍需人工处理；取消任务失败也返回非零，账号和登记始终保留供人工恢复。低 UID、UID 0、保留名称和标记不匹配仍受保护。`linux-temp-admin doctor` 会把仍存在的旧任务报告为孤儿任务，`linux-temp-admin cleanup-expired --compact` 也可取消任务而保留活账号及登记供人工处理。
 
 v2.9.3 及更早版本创建的世代账号只有 GECOS 首字段中的旧完整标记。它尚未被改写时，`status` 显示 `generation-bound-first-field-compat`，普通及自动撤销仍可按登记 UID/世代和完整旧快照执行；撤销期间每次 passwd 复读都必须与开始时的完整快照逐字节一致，`doctor` 会提示尽快撤销并用当前版本重新邀请。`status`/`doctor` 都不会隐式改写旧账号；旧首字段见证若已经丢失且没有第五字段见证，账号会保持 protected，必须人工核查处理，不能用同名/同 UID 猜测恢复，也不能从登记内容自动重建见证。
 
-从 v2.9.1 等旧版升级后，若 `status`/`doctor` 显示仍活着的 pending 创建登记，应先人工确认它确实来自失败的邀请。菜单选择该行会自动进入与直接运行 `revoke --user <名> --force` 相同的恢复门，并仍要求交互终端输入完整用户名；程序还会核对随机 pending 世代、GECOS、登记 UID（0 或当前 UID）、受管 Home、非 root UID/GID 和非空 shell。systemd 可用时，验证通过的 pending 身份也会立即撤权并保留精确世代进入后台隔离；同步回退才会把它转换为 UID-only 删除恢复见证。`--yes`、自动撤销、卸载批量、管道输入或任何身份不匹配都拒绝首次授权这类恢复。
+从 v2.9.1 等旧版升级后，若 `status`/`doctor` 显示仍活着的 pending 创建登记，应先人工确认它确实来自失败的邀请。菜单选择该行会自动进入与直接运行 `linux-temp-admin revoke --user <名> --force` 相同的恢复门，并仍要求交互终端输入完整用户名；程序还会核对随机 pending 世代、GECOS、登记 UID（0 或当前 UID）、受管 Home、非 root UID/GID 和非空 shell。systemd 可用时，验证通过的 pending 身份也会立即撤权并保留精确世代进入后台隔离；同步回退才会把它转换为 UID-only 删除恢复见证。`--yes`、自动撤销、卸载批量、管道输入或任何身份不匹配都拒绝首次授权这类恢复。
 
-删除授权、身份及删除前的任务/进程静默检查通过后，程序会在受控的 mail/Home 清理和 `userdel` 前持久化删除恢复见证；Home 清理后、`userdel` 前仍会再次复核任务、进程和稳定身份（用户名、UID/GID、Home、第五字段世代见证；旧单标记账号则复核完整快照）。若账号删除、删除后的 mail spool 复扫或任务清理中断，`status` 和 `doctor` 会显示删除恢复状态，同名 `invite` 会拒绝覆盖该见证，`cleanup-expired --compact` 也不会删除见证。账号已经不存在或仍精确匹配登记世代时，运行 `revoke --user <名>` 可继续恢复；账号缺失时，每轮窄范围邮件清扫前后都会复核本地 passwd 与 NSS 均无同名身份。上述两种状态下仍保留可识别的自动任务，但只有 systemd 任务会按重启策略自动重试，`at` 和旧的一次性任务需要人工重试。旧版、未登记或 pending 回滚只保留 UID 见证，若账号仍存在，必须人工核查后在交互终端运行 `revoke --user <名> --force` 并输入完整用户名，任何非交互调用都会被拒绝；这类活账号的旧自动任务会被当作孤儿任务取消，登记见证则保留供人工恢复。
+删除授权、身份及删除前的任务/进程静默检查通过后，程序会在受控的 mail/Home 清理和 `userdel` 前持久化删除恢复见证；Home 清理后、`userdel` 前仍会再次复核任务、进程和稳定身份（用户名、UID/GID、Home、第五字段世代见证；旧单标记账号则复核完整快照）。若账号删除、删除后的 mail spool 复扫或任务清理中断，`status` 和 `doctor` 会显示删除恢复状态，同名 `invite` 会拒绝覆盖该见证，`cleanup-expired --compact` 也不会删除见证。账号已经不存在或仍精确匹配登记世代时，运行 `linux-temp-admin revoke --user <名>` 可继续恢复；账号缺失时，每轮窄范围邮件清扫前后都会复核本地 passwd 与 NSS 均无同名身份。上述两种状态下仍保留可识别的自动任务，但只有 systemd 任务会按重启策略自动重试，`at` 和旧的一次性任务需要人工重试。旧版、未登记或 pending 回滚只保留 UID 见证，若账号仍存在，必须人工核查后在交互终端运行 `linux-temp-admin revoke --user <名> --force` 并输入完整用户名，任何非交互调用都会被拒绝；这类活账号的旧自动任务会被当作孤儿任务取消，登记见证则保留供人工恢复。
 
 删除未登记账号需要显式 `--force`，并有额外用户名确认；它不会绕过保留名称、UID 0 或未登记/旧身份低 UID 账号的保护。若某些系统把本工具新建的账号分配到低 UID，只有登记用户名、当前 UID/GID、确定的 Home、随机世代和兼容格式的精确 GECOS 见证完整绑定时才能正常撤销。没有本工具精确见证的真实账号始终不会被当作受管账号删除。
 
@@ -137,7 +137,19 @@ v2.9.3 及更早版本创建的世代账号只有 GECOS 首字段中的旧完整
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin cleanup-expired --compact
 ```
 
-`cleanup-expired` 只清理失效登记及孤儿 sudoers、sshd 例外和撤销任务，**不会删除账号**。删除账号使用 `revoke`，查看列表使用 `status`。
+`linux-temp-admin cleanup-expired` 只清理失效登记及孤儿 sudoers、sshd 例外和撤销任务，**不会删除账号**。删除账号使用 `linux-temp-admin revoke`，查看列表使用 `linux-temp-admin status`。
+
+### 恢复缺失的身份序列
+
+若 `linux-temp-admin doctor` 明确报告“有效 v5 登记表缺少 `identity-sequence`”，邀请和登记变更会失败关闭。只有这一种“对象确实不存在”的状态允许使用专用恢复命令；文件已存在但内容损坏、权限或属主不安全、是符号链接，或高水位低于登记 UID 时，命令绝不会覆盖它。此时应从可信备份恢复，或保留现场后人工调查，不能删除或手工改写文件来绕过检查。
+
+恢复值 `N` 必须从可信历史独立确定为本工具**曾经预留过的最高 UID/GID**，包括后来已经删除的账号及在创建失败时已经烧掉的号码。当前 passwd/group 和仍存登记只能给出下限，不能证明历史最高值；不要猜测，也不要只把当前表中的最大 UID 当作完整历史。确认依据后，在真实交互终端运行：
+
+```bash
+/usr/bin/sudo /usr/local/sbin/linux-temp-admin recover-identity-sequence --highest N
+```
+
+命令会显示登记最高值、本机当前分配范围与观测下限，并拒绝低于这些观测值的输入；达到或超过当前分配上限时会警告后续邀请将耗尽。继续时必须逐字输入命令给出的 `RECOVER IDENTITY-SEQUENCE HIGHEST=N`。确认后程序才取得全局生命周期锁，重新读取登记和本机 UID/GID 状态，拒绝确认期间发生的变化，并以 no-replace 方式创建 root:root、`0600` 的序列文件。成功输出的 `safe-after` 是一次至少 65 秒的身份隔离窗口；在它过去前，下一次自动用户名邀请不会跳过同步任务清场。成功和锁内失败都会以 `registry.identity-sequence.recover` 写入审计日志。恢复后再次运行 `linux-temp-admin doctor`，确认完整性错误已经消失。
 
 ## 公钥登录被禁用
 

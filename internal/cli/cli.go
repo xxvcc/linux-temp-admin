@@ -108,6 +108,9 @@ type App struct {
 	// Production scans passwd, group, and login.defs; tests inject a deterministic
 	// range so their account helper and registry sequence agree.
 	IdentityAllocationRange func() (minimum, maximum int, err error)
+	// InspectIdentityAllocation returns the allocation bounds and observed local
+	// high-water without treating an exhausted range as an inspection failure.
+	InspectIdentityAllocation func() (user.IdentityAllocationSnapshot, error)
 	// EnsureScheduledCommand is a test hook for the stable-command preflight used
 	// before a revoke hands final deletion to systemd. Production leaves it nil and
 	// installs or verifies the running binary through ensureStableInstalled.
@@ -162,7 +165,8 @@ func NewApp(lang i18n.Lang) *App {
 		RunningLegacyRevoke: func(installPath, username string) (bool, error) {
 			return runningLegacyRevokeProcess("/proc", installPath, username)
 		},
-		IdentityAllocationRange: user.IdentityAllocationRange,
+		IdentityAllocationRange:   user.IdentityAllocationRange,
+		InspectIdentityAllocation: user.InspectIdentityAllocation,
 	}
 }
 
@@ -192,6 +196,13 @@ func (a *App) identityAllocationRange() (int, int, error) {
 		return a.IdentityAllocationRange()
 	}
 	return user.IdentityAllocationRange()
+}
+
+func (a *App) inspectIdentityAllocation() (user.IdentityAllocationSnapshot, error) {
+	if a.InspectIdentityAllocation != nil {
+		return a.InspectIdentityAllocation()
+	}
+	return user.InspectIdentityAllocation()
 }
 
 func (a *App) terminateProcesses(uid int) error {
@@ -486,6 +497,8 @@ func (a *App) Dispatch(args []string) int {
 		return a.cleanupExpired(args)
 	case "doctor", "check":
 		return a.doctor(args)
+	case "recover-identity-sequence":
+		return a.recoverIdentitySequence(args)
 	case "install":
 		return a.install(args)
 	case "upgrade", "update":
@@ -725,6 +738,6 @@ func (a *App) prompt(msg string) string {
 
 func (a *App) usage() {
 	fmt.Fprintf(a.Out, "%s v%s\n\n%s\n", config.ManagedTag, buildinfo.Version,
-		a.P.M("用法： invite | revoke | status | cleanup-expired | doctor | install | upgrade | uninstall | version | help  （无参数进入菜单；--lang zh|en）",
-			"Usage: invite | revoke | status | cleanup-expired | doctor | install | upgrade | uninstall | version | help  (no args = menu; --lang zh|en)"))
+		a.P.M("用法： invite | revoke | status | cleanup-expired | doctor | recover-identity-sequence | install | upgrade | uninstall | version | help  （无参数进入菜单；--lang zh|en）",
+			"Usage: invite | revoke | status | cleanup-expired | doctor | recover-identity-sequence | install | upgrade | uninstall | version | help  (no args = menu; --lang zh|en)"))
 }

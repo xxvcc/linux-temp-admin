@@ -17,6 +17,11 @@ import (
 
 const maxRegistryBytes = int64(16 << 20)
 
+type mutationSnapshot struct {
+	records []Record
+	header  string
+}
+
 // Store is the flock-guarded, root-owned registry of managed accounts. Dir must
 // be absolute; File and Lock must be distinct direct children. Paths are fields
 // so tests can point the complete layout at a temporary directory.
@@ -122,7 +127,8 @@ func (s *Store) Init() error {
 		}
 		return s.writeAll(recs)
 	}
-	return s.ensureIdentitySequence(0, false, time.Time{})
+	_, err = s.requireIdentitySequenceCovering(recs)
+	return err
 }
 
 func (s *Store) now() time.Time {
@@ -292,6 +298,52 @@ func (s *Store) readAllWithHeader() ([]Record, string, error) {
 	return recs, header, nil
 }
 
+// readMutationSnapshot preserves the schema that supplied records to a
+// mutation. Current-schema state validates its sequence even if the requested
+// transition later proves idempotent. Legacy state is left untouched until a
+// real write is needed; commitMutation then creates/advances the sequence from
+// the complete pre-mutation record set before publishing a v5 registry.
+func (s *Store) readMutationSnapshot() (mutationSnapshot, error) {
+	recs, header, err := s.readAllWithHeader()
+	if err != nil {
+		return mutationSnapshot{}, err
+	}
+	if header == Header || header == "" {
+		if _, err := s.requireIdentitySequenceCovering(recs); err != nil {
+			return mutationSnapshot{}, err
+		}
+	}
+	return mutationSnapshot{records: recs, header: header}, nil
+}
+
+func (s *Store) commitMutation(snapshot mutationSnapshot, recs []Record) error {
+	if isLegacyHeader(snapshot.header) {
+		safeAfter := s.now().Add(time.Duration(config.IdentityQuarantineSeconds) * time.Second).UTC()
+		highest := highestRecordedUID(snapshot.records)
+		if outputHighest := highestRecordedUID(recs); outputHighest > highest {
+			highest = outputHighest
+		}
+		if err := s.ensureIdentitySequence(highest, true, safeAfter); err != nil {
+			return err
+		}
+	}
+	return s.writeAll(recs)
+}
+
+func isLegacyHeader(header string) bool {
+	return header == legacyHeaderV2 || header == legacyHeaderV3 || header == legacyHeaderV4
+}
+
+func highestRecordedUID(recs []Record) int {
+	highest := 0
+	for _, rec := range recs {
+		if rec.UID > highest {
+			highest = rec.UID
+		}
+	}
+	return highest
+}
+
 func requireRegularFD(path string, f *os.File) error {
 	fi, err := f.Stat()
 	if err != nil {
@@ -355,6 +407,13 @@ func (s *Store) writeAll(recs []Record) error {
 		b.WriteString(row)
 		b.WriteByte('\n')
 	}
+	// A v5 registry is never published without its durable allocation history.
+	// A syntactically valid but too-low sequence is also corruption: inferring a
+	// replacement value from surviving rows could hide already-retired IDs.
+	_, err := s.requireIdentitySequenceCovering(recs)
+	if err != nil {
+		return err
+	}
 	return fsutil.WriteRootFile(s.File, []byte(b.String()), 0o600)
 }
 
@@ -373,10 +432,11 @@ func (s *Store) Record(rec Record) error {
 		return fmt.Errorf("deletion-started state requires BeginDeletion")
 	}
 	return s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
+		recs := snapshot.records
 		out := recs[:0:0]
 		for _, r := range recs {
 			if r.User == rec.User {
@@ -388,7 +448,7 @@ func (s *Store) Record(rec Record) error {
 			out = append(out, r)
 		}
 		out = append(out, rec)
-		return s.writeAll(out)
+		return s.commitMutation(snapshot, out)
 	})
 }
 
@@ -404,15 +464,27 @@ func (s *Store) BeginDeletion(user string, uid int, generation string) error {
 		return err
 	}
 	return s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
-		out, changed, err := beginDeletionRecords(recs, user, uid, generation)
+		out, changed, err := beginDeletionRecords(snapshot.records, user, uid, generation)
 		if err != nil || !changed {
 			return err
 		}
-		return s.writeAll(out)
+		if generation == "" && !isLegacyHeader(snapshot.header) {
+			// UID-only recovery is the first durable retirement witness for an
+			// unregistered account, a UID-zero pending row, or a nine-field legacy
+			// row. Advance before publishing that witness so this tool cannot later
+			// allocate the identity being released. A later registry-write failure
+			// can only burn the number, which is the safe side of the transaction.
+			// Legacy registries have no sequence yet; commitMutation creates it from
+			// both the pre-mutation rows and this output witness before publishing v5.
+			if err := s.ensureIdentitySequence(uid, false, time.Time{}); err != nil {
+				return err
+			}
+		}
+		return s.commitMutation(snapshot, out)
 	})
 }
 
@@ -433,11 +505,11 @@ func (s *Store) BeginQuarantine(user string, uid int, generation string, deadlin
 		return fmt.Errorf("invalid quarantine unit %q", unit)
 	}
 	return s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
-		out := append([]Record(nil), recs...)
+		out := append([]Record(nil), snapshot.records...)
 		for i := range out {
 			current := out[i]
 			if current.User != user {
@@ -465,7 +537,7 @@ func (s *Store) BeginQuarantine(user string, uid int, generation string, deadlin
 				return fmt.Errorf("invalid quarantine transition: %w", err)
 			}
 			out[i] = current
-			return s.writeAll(out)
+			return s.commitMutation(snapshot, out)
 		}
 		return fmt.Errorf("registry identity disappeared before quarantine")
 	})
@@ -564,15 +636,15 @@ func (s *Store) FinishDeletionRecovery(user string, uid int, generation string) 
 		return nil
 	}
 	return s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
-		out, changed, err := finishDeletionRecoveryRecords(recs, user, uid, generation)
+		out, changed, err := finishDeletionRecoveryRecords(snapshot.records, user, uid, generation)
 		if err != nil || !changed {
 			return err
 		}
-		return s.writeAll(out)
+		return s.commitMutation(snapshot, out)
 	})
 }
 
@@ -607,10 +679,11 @@ func (s *Store) Remove(user string) error {
 		return nil
 	}
 	return s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
+		recs := snapshot.records
 		out := recs[:0:0]
 		removed := false
 		for _, r := range recs {
@@ -626,7 +699,7 @@ func (s *Store) Remove(user string) error {
 		if !removed {
 			return nil
 		}
-		return s.writeAll(out)
+		return s.commitMutation(snapshot, out)
 	})
 }
 
@@ -694,10 +767,11 @@ func (s *Store) Compact(keep func(Record) (bool, error)) (int, error) {
 	}
 	removed := 0
 	err = s.withLock(func() error {
-		recs, err := s.readAll()
+		snapshot, err := s.readMutationSnapshot()
 		if err != nil {
 			return err
 		}
+		recs := snapshot.records
 		out := recs[:0:0]
 		for _, r := range recs {
 			if r.DeletionStarted {
@@ -717,7 +791,7 @@ func (s *Store) Compact(keep func(Record) (bool, error)) (int, error) {
 		if removed == 0 {
 			return nil
 		}
-		return s.writeAll(out)
+		return s.commitMutation(snapshot, out)
 	})
 	if err != nil {
 		return 0, err

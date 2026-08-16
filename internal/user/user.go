@@ -140,14 +140,26 @@ func readPasswdDatabase(path string, maxBytes int64) ([]byte, error) {
 	return b, nil
 }
 
-// IdentityAllocationRange returns the first numeric identity above every local
-// UID and GID in the ordinary login.defs account range, plus that range's upper
-// bound. The registry's durable high-water mark is applied separately, under its
-// own lock, immediately before useradd.
-func IdentityAllocationRange() (minimum, maximum int, err error) {
+// IdentityAllocationSnapshot is one bounded read of the local UID/GID allocation
+// policy and account databases. Lower and Upper are the overlap of login.defs'
+// ordinary UID and GID ranges. CurrentHighest is the greatest passwd UID/GID or
+// group GID currently present inside that overlap; zero means none was observed.
+//
+// The snapshot deliberately remains valid when CurrentHighest == Upper. Callers
+// diagnosing or repairing allocation state still need the observed bounds when
+// no further identity can currently be allocated.
+type IdentityAllocationSnapshot struct {
+	Lower          int
+	Upper          int
+	CurrentHighest int
+}
+
+// InspectIdentityAllocation validates the local allocation policy and returns a
+// complete bounded snapshot without deciding whether the range is exhausted.
+func InspectIdentityAllocation() (IdentityAllocationSnapshot, error) {
 	uidMin, uidMax, gidMin, gidMax, err := loginIdentityBounds()
 	if err != nil {
-		return 0, 0, err
+		return IdentityAllocationSnapshot{}, err
 	}
 	lower := uidMin
 	if gidMin > lower {
@@ -158,12 +170,12 @@ func IdentityAllocationRange() (minimum, maximum int, err error) {
 		upper = gidMax
 	}
 	if !validate.AccountID(lower) || !validate.AccountID(upper) || lower > upper {
-		return 0, 0, fmt.Errorf("UID/GID allocation ranges do not overlap safely")
+		return IdentityAllocationSnapshot{}, fmt.Errorf("UID/GID allocation ranges do not overlap safely")
 	}
-	highest := lower - 1
+	snapshot := IdentityAllocationSnapshot{Lower: lower, Upper: upper}
 	passwd, err := readPasswdDatabase(passwdPath, maxLocalPasswdBytes)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read passwd database for identity allocation: %w", err)
+		return IdentityAllocationSnapshot{}, fmt.Errorf("read passwd database for identity allocation: %w", err)
 	}
 	for i, line := range strings.Split(string(passwd), "\n") {
 		if line == "" {
@@ -171,17 +183,17 @@ func IdentityAllocationRange() (minimum, maximum int, err error) {
 		}
 		pw, err := parsePasswdEntry(line)
 		if err != nil {
-			return 0, 0, fmt.Errorf("scan passwd identity at line %d: %w", i+1, err)
+			return IdentityAllocationSnapshot{}, fmt.Errorf("scan passwd identity at line %d: %w", i+1, err)
 		}
 		for _, id := range []int{pw.UID, pw.GID} {
-			if id >= lower && id <= upper && id > highest {
-				highest = id
+			if id >= lower && id <= upper && id > snapshot.CurrentHighest {
+				snapshot.CurrentHighest = id
 			}
 		}
 	}
 	groups, err := readPasswdDatabase(groupPath, maxLocalGroupBytes)
 	if err != nil {
-		return 0, 0, fmt.Errorf("read group database for identity allocation: %w", err)
+		return IdentityAllocationSnapshot{}, fmt.Errorf("read group database for identity allocation: %w", err)
 	}
 	for i, line := range strings.Split(string(groups), "\n") {
 		if line == "" {
@@ -189,20 +201,36 @@ func IdentityAllocationRange() (minimum, maximum int, err error) {
 		}
 		parts := strings.Split(line, ":")
 		if len(parts) != 4 || parts[0] == "" {
-			return 0, 0, fmt.Errorf("malformed group entry at line %d", i+1)
+			return IdentityAllocationSnapshot{}, fmt.Errorf("malformed group entry at line %d", i+1)
 		}
 		gid, parseErr := strconv.Atoi(parts[2])
 		if parseErr != nil || !validate.KernelID(gid) {
-			return 0, 0, fmt.Errorf("malformed group GID at line %d", i+1)
+			return IdentityAllocationSnapshot{}, fmt.Errorf("malformed group GID at line %d", i+1)
 		}
-		if gid >= lower && gid <= upper && gid > highest {
-			highest = gid
+		if gid >= lower && gid <= upper && gid > snapshot.CurrentHighest {
+			snapshot.CurrentHighest = gid
 		}
 	}
-	if highest >= upper {
-		return 0, 0, fmt.Errorf("UID/GID allocation range %d..%d is exhausted", lower, upper)
+	return snapshot, nil
+}
+
+// IdentityAllocationRange returns the first numeric identity above every local
+// UID and GID in the ordinary login.defs account range, plus that range's upper
+// bound. The registry's durable high-water mark is applied separately, under its
+// own lock, immediately before useradd.
+func IdentityAllocationRange() (minimum, maximum int, err error) {
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil {
+		return 0, 0, err
 	}
-	return highest + 1, upper, nil
+	if snapshot.CurrentHighest >= snapshot.Upper {
+		return 0, 0, fmt.Errorf("UID/GID allocation range %d..%d is exhausted", snapshot.Lower, snapshot.Upper)
+	}
+	minimum = snapshot.Lower
+	if snapshot.CurrentHighest >= minimum {
+		minimum = snapshot.CurrentHighest + 1
+	}
+	return minimum, snapshot.Upper, nil
 }
 
 func loginIdentityBounds() (uidMin, uidMax, gidMin, gidMax int, err error) {
@@ -577,10 +605,20 @@ func validateMutationName(name string) error {
 	return nil
 }
 
+// RevokeIdentity is the registry evidence a revoke decision may use. IdentityBound
+// is deliberately separate from RecordedGeneration: released legacy rows can
+// carry a generation-shaped value without proving that it was embedded in the
+// account's passwd marker.
+type RevokeIdentity struct {
+	Registered         bool
+	RecordedUID        int
+	RecordedGeneration string
+	IdentityBound      bool
+}
+
 // IsProtectedRevokeTarget reports whether deleting name must be refused.
-// registered says whether the tool's registry lists it, and recordedUID is the
-// UID the registry recorded when it created the account (0 = not recorded, i.e.
-// a row from a build before that field existed).
+// RecordedUID is the UID the registry recorded when it created the account
+// (0 = not recorded, i.e. a row from a build before that field existed).
 //
 // A reserved (system/systemd-) name or a UID-0 account is always protected; a
 // system-range UID (<1000) is protected unless it is a registered, managed temp
@@ -598,37 +636,39 @@ func validateMutationName(name string) error {
 // An account that escalates itself to UID 0 stays protected: never auto-delete a
 // root account. The caller is expected to report that tamper rather than retry —
 // see UIDTampered.
-func IsProtectedRevokeTarget(name string, registered bool, recordedUID int, recordedGeneration string, allowLegacy bool) (bool, error) {
+func IsProtectedRevokeTarget(name string, identity RevokeIdentity, allowLegacy bool) (bool, error) {
 	pw, ok, err := Lookup(name)
 	if err != nil {
 		return true, err
 	}
-	return IsProtectedRevokeEntry(name, pw, ok, registered, recordedUID, recordedGeneration, allowLegacy), nil
+	return IsProtectedRevokeEntry(name, pw, ok, identity, allowLegacy), nil
 }
 
 // IsProtectedRevokeEntry applies the revoke policy to one already-read passwd
 // snapshot. Destructive callers must not splice the UID from one lookup together
 // with the marker or name from another lookup while an account is being replaced.
-func IsProtectedRevokeEntry(name string, pw Passwd, exists, registered bool, recordedUID int, recordedGeneration string, allowLegacy bool) bool {
+func IsProtectedRevokeEntry(name string, pw Passwd, exists bool, identity RevokeIdentity, allowLegacy bool) bool {
 	if IsReservedName(name) {
 		return true
 	}
 	if !exists {
-		return !registered
+		return !identity.Registered
 	}
 	if pw.UID == 0 {
 		return true
 	}
-	if registered {
-		if recordedUID > 0 && pw.UID != recordedUID {
+	if identity.Registered {
+		if identity.RecordedUID > 0 && pw.UID != identity.RecordedUID {
 			return true
 		}
-		// A v2 registry row has no UID column. It can never authorize automatic
-		// deletion, but the direct interactive legacy-recovery gate may supply the
-		// missing authority for an ordinary-range account that still carries the
-		// exact fixed marker. Low-UID legacy identities remain protected even after
-		// operator confirmation.
-		if recordedUID < 1 && !(allowLegacy && pw.UID >= 1000 && IsLegacyManagedEntry(pw)) {
+		// A legacy row is explicitly unbound even when it carries both a UID and a
+		// generation-shaped column. Never turn that value into deletion authority by
+		// comparing it with passwd. Only the direct interactive recovery gate may
+		// authorize the exact fixed legacy marker, and never for a system-range UID.
+		if !identity.IdentityBound {
+			return pw.UID < 1000 || !allowLegacy || !IsLegacyManagedEntry(pw)
+		}
+		if identity.RecordedUID < 1 {
 			return true
 		}
 	}
@@ -641,11 +681,11 @@ func IsProtectedRevokeEntry(name string, pw Passwd, exists, registered bool, rec
 	// re-establish a marker that field contradicts. Registered accounts must match
 	// their exact recorded generation below.
 	managed := hasAuthoritativeManagedGenerationMarker(pw) || (allowLegacy && IsLegacyManagedEntry(pw))
-	if registered {
-		managed = MatchesManagedGeneration(pw, recordedGeneration) || (allowLegacy && IsLegacyManagedEntry(pw))
+	if identity.Registered {
+		managed = identity.IdentityBound && MatchesManagedGeneration(pw, identity.RecordedGeneration)
 	}
 	if pw.UID < 1000 {
-		return !(registered && managed)
+		return !(identity.Registered && identity.IdentityBound && managed)
 	}
 	// UIDs are reusable. Even a matching recorded UID cannot prove that this is the
 	// same account generation after an out-of-band deletion and recreation. Require

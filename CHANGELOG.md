@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.3 - 2026-08-17
+
+- Fix the v2.10.2 registry migration regression that could publish a v5 row
+  without first creating `identity-sequence`, leaving later invites fail-closed
+  with a missing-sequence error. Every v2/v3/v4 mutation now commits or advances
+  the sequence before publishing v5; every v5 mutation rejects a missing,
+  corrupt, unsafe, or too-low sequence. A UID-only deletion transition also
+  advances the sequence before it records the identity being retired, and each
+  UID/GID reservation revalidates the v5 registry and its covering sequence
+  while holding the registry lock.
+- Add the root-only, real-TTY `recover-identity-sequence --highest <N>` recovery
+  command for the one repairable state: an otherwise valid v5 registry whose
+  sequence object is genuinely absent. It requires an independently established
+  historical high-water mark, checks it against surviving registry and local
+  UID/GID state, demands an exact confirmation, replans under the lifecycle lock,
+  publishes root-owned mode `0600` state without replacement, starts an identity-
+  isolation window of at least 65 seconds, and records the result in the audit log.
+  Existing corrupt, unsafe, too-low, legacy, or concurrently changed state is never
+  overwritten; `doctor` distinguishes these cases and prints the eligible command.
+- Keep released legacy rows unbound even when they contain UID or
+  generation-shaped columns: current automatic deletion now requires the explicit
+  v5 identity-bound bit. Interactive legacy and UID-only recovery rejects UIDs
+  below 1000, while the account-management menu supplies the required `--force`
+  only for protected recovery rows and all operator guidance names the complete
+  `linux-temp-admin` command.
+- Fix a matching legacy UID/generation timer so it cannot leave a live fixed-marker
+  account holding this tool's NOPASSWD sudo or sshd exception. The task now strips
+  both name-scoped grants before cancelling only its old expiry schedule; it never
+  reads passwd deletion policy, disables or deletes the account, or changes the
+  registry row. Incomplete grant cleanup does not actively cancel the task so
+  systemd can retry; `at` and legacy one-shot jobs still require manual handling.
+  Every cleanup or cancellation failure returns nonzero.
+
 ## v2.10.2 - 2026-08-16
 
 - Restore the documented manual recovery path for a deployed nine-field v2

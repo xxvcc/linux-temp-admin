@@ -555,8 +555,8 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 			continue
 		}
 		a.errorf("%s %s", a.P.M(
-			"拒绝卸载：活账号的删除恢复见证未绑定当前世代；已保留账号、命令和状态。请先人工核查并交互执行 revoke --force：",
-			"refusing to uninstall: a live account has a deletion-recovery witness that is not bound to its current generation; the account, command, and state were kept. Inspect it and complete an interactive revoke --force first:"), acc.name)
+			"拒绝卸载：活账号的删除恢复见证未绑定当前世代；已保留账号、命令和状态。请先人工核查并交互执行 linux-temp-admin revoke --force：",
+			"refusing to uninstall: a live account has a deletion-recovery witness that is not bound to its current generation; the account, command, and state were kept. Inspect it and complete an interactive linux-temp-admin revoke --force first:"), acc.name)
 		return false
 	}
 

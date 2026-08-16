@@ -325,14 +325,13 @@ func classifyRegisteredAccount(rec registry.Record, pw user.Passwd, exists bool,
 		return registeredIdentityUnverified
 	case rec.Pending:
 		return registeredPending
+	case !rec.IdentityBound && user.IsLegacyManagedEntry(pw):
+		return registeredLegacyIdentity
 	case !validate.AccountID(rec.UID):
 		return registeredIdentityUnverified
 	case pw.UID != rec.UID:
 		return registeredUIDMismatch
 	case !rec.IdentityBound:
-		if user.IsLegacyManagedEntry(pw) {
-			return registeredLegacyIdentity
-		}
 		return registeredMarkerMismatch
 	case !user.MatchesManagedGeneration(pw, rec.Generation):
 		return registeredMarkerMismatch
@@ -444,11 +443,11 @@ func (a *App) manageUsers() int {
 		name = recs[n-1].User
 	}
 	args := []string{"--user", name}
-	if rec, found, err := a.Registry.Lookup(name); err == nil && found && rec.Pending {
-		// Pending recovery is still protected by the direct TTY, full-name prompt,
-		// generation/GECOS/UID/Home checks, and manual-invocation gate. Supplying
-		// --force here makes the menu's advertised revoke action usable without
-		// weakening any of those checks.
+	if rec, found, err := a.Registry.Lookup(name); err == nil && found && (rec.Pending || !rec.IdentityBound) {
+		// Pending, legacy, and UID-only recovery are still protected by the direct
+		// TTY, full-name prompt, identity/Home checks, and manual-invocation gate.
+		// Supplying --force here makes the menu's advertised revoke action usable
+		// without weakening any of those checks.
 		args = append(args, "--force")
 	}
 	return a.revoke(args)
@@ -465,8 +464,8 @@ func (a *App) cleanupExpired(args []string) int {
 	if !a.parseFlags(fs, args) {
 		return 1
 	}
-	a.warnf("%s", a.P.M("此命令不删除用户；账号请用 revoke，状态请用 status。",
-		"This never deletes a user: revoke deletes accounts, status shows them."))
+	a.warnf("%s", a.P.M("此命令不删除用户；账号请用 linux-temp-admin revoke，状态请用 linux-temp-admin status。",
+		"This never deletes a user: linux-temp-admin revoke deletes accounts; linux-temp-admin status shows them."))
 	// The account list is status's job — this used to print its own poorer copy of
 	// it. Show it here too, but through the one renderer, so the two can never
 	// drift apart.
@@ -486,9 +485,11 @@ func (a *App) cleanupExpired(args []string) int {
 
 // accountIsOursAndLive reports whether name is still associated with a live
 // registry row for orphan-scanning purposes. Generation-bound identities must
-// match exactly. A migrated v2 row with its fixed legacy marker is also treated
-// as live here so cleanup does not silently cancel a genuine legacy account's
-// grants and timer; destructive paths still refuse that weaker identity.
+// match exactly. A migrated v2 row with its fixed legacy marker is treated as
+// live only when its recorded UID still matches, so cleanup preserves a genuine
+// legacy account's grants without letting a nine-field or UID-mismatched row
+// transfer name-scoped privilege; destructive paths still refuse that weaker
+// identity.
 //
 // It is the predicate the orphan sweeps use instead of a bare user.Exists,
 // because a grant/exception/unit outlives its account in TWO ways, not one: the
@@ -516,7 +517,10 @@ func (a *App) accountIsOursAndLive(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
-	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredLegacyIdentity, nil
+	if state == registeredLegacyIdentity {
+		return validate.AccountID(rec.UID) && rec.UID == pw.UID, nil
+	}
+	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine, nil
 }
 
 // accountNeedsAutoRevoke reports whether a managed auto-revoke task must be
@@ -870,6 +874,18 @@ func (a *App) doctor(args []string) int {
 			rc = 1
 		} else {
 			registryReadable = true
+			if integrityErr := a.Registry.CheckIntegrity(); integrityErr != nil {
+				if errors.Is(integrityErr, registry.ErrIdentitySequenceMissing) {
+					a.warnf("%s", a.P.M(
+						"v5 登记表缺少 identity-sequence；邀请和登记变更已失败关闭。不要手工创建该文件。请先从可信历史独立确定本工具曾预留的最高 UID/GID，再运行 `linux-temp-admin recover-identity-sequence --highest <N>`。",
+						"the v5 registry is missing identity-sequence; invites and registry mutations are fail-closed. Do not create the file by hand. First establish the highest UID/GID ever reserved by this tool from trusted history, then run `linux-temp-admin recover-identity-sequence --highest <N>`."))
+				} else {
+					a.warnf("%s: %v", a.P.M(
+						"登记表身份序列损坏或不安全；recover-identity-sequence 不会覆盖已有对象，请从可信备份恢复或人工调查",
+						"the registry identity sequence is corrupt or unsafe; recover-identity-sequence will not overwrite an existing object, so restore trusted state or investigate manually"), integrityErr)
+				}
+				rc = 1
+			}
 			for _, rec := range registryRecords {
 				pw, exists, lookupErr := a.lookupUser(rec.User)
 				if lookupErr != nil {
@@ -880,13 +896,13 @@ func (a *App) doctor(args []string) int {
 				switch classifyRegisteredAccount(rec, pw, exists, nil) {
 				case registeredRecoveryAbsent:
 					a.warnf("%s%s", a.P.M(
-						"删除事务已持久化且账号已不存在；见证只允许重试按 UID 校验所属者的邮件清扫，请运行 revoke 完成恢复：",
-						"deletion was durably started and the account is absent; the witness authorizes only an owner-checked UID-bound mail cleanup retry. Run revoke to finish recovery: "), rec.User)
+						"删除事务已持久化且账号已不存在；见证只允许重试按 UID 校验所属者的邮件清扫，请运行 linux-temp-admin revoke 完成恢复：",
+						"deletion was durably started and the account is absent; the witness authorizes only an owner-checked UID-bound mail cleanup retry. Run linux-temp-admin revoke to finish recovery: "), rec.User)
 					rc = 1
 				case registeredRecoveryBound:
 					a.warnf("%s%s", a.P.M(
-						"活账号与已持久化的删除世代精确匹配；这是可重试的中断删除，请运行 revoke 完成：",
-						"the live account exactly matches a durably started deletion generation; this interrupted deletion can be retried with revoke: "), rec.User)
+						"活账号与已持久化的删除世代精确匹配；这是可重试的中断删除，请运行 linux-temp-admin revoke 完成：",
+						"the live account exactly matches a durably started deletion generation; this interrupted deletion can be retried with linux-temp-admin revoke: "), rec.User)
 					rc = 1
 				case registeredQuarantine:
 					a.info(a.P.M(
@@ -894,16 +910,16 @@ func (a *App) doctor(args []string) int {
 						"account access is revoked; its name and UID are quarantined until "+rec.QuarantineUntil+" and a persistent task will then finish deletion: ") + rec.User)
 				case registeredRecoveryManual:
 					a.warnf("%s%s", a.P.M(
-						"活账号的删除恢复见证未绑定当前世代或已不匹配；自动删除、--yes 和卸载批量删除均被拒绝。人工核查后，请直接运行 revoke --force 并输入完整用户名：",
-						"the live account's deletion-recovery witness is unbound to the current generation or no longer matches; automatic deletion, --yes, and uninstall bulk deletion are refused. Inspect it, then invoke revoke --force directly and type the full username: "), rec.User)
+						"活账号的删除恢复见证未绑定当前世代或已不匹配；自动删除、--yes 和卸载批量删除均被拒绝。人工核查后，请直接运行 linux-temp-admin revoke --force 并输入完整用户名：",
+						"the live account's deletion-recovery witness is unbound to the current generation or no longer matches; automatic deletion, --yes, and uninstall bulk deletion are refused. Inspect it, then invoke linux-temp-admin revoke --force directly and type the full username: "), rec.User)
 					rc = 1
 				case registeredPending:
 					a.warnf("%s%s", a.P.M("登记仍是未完成的 pending 创建意图，不能证明当前账号身份：",
 						"registry row is still an incomplete pending creation intent and cannot prove the current account identity: "), rec.User)
 					rc = 1
 				case registeredMissing:
-					a.warnf("%s%s", a.P.M("登记指向已不存在的账号（可用 cleanup-expired --compact 清理）：",
-						"registry row points to an absent account (remove it with cleanup-expired --compact): "), rec.User)
+					a.warnf("%s%s", a.P.M("登记指向已不存在的账号（可用 linux-temp-admin cleanup-expired --compact 清理）：",
+						"registry row points to an absent account (remove it with linux-temp-admin cleanup-expired --compact): "), rec.User)
 					rc = 1
 				case registeredIdentityUnverified:
 					a.warnf("%s%s", a.P.M("活账号或登记没有安全的非 root UID/GID，不能证明身份：",
@@ -914,8 +930,9 @@ func (a *App) doctor(args []string) int {
 						"registered account %s has a UID mismatch: recorded %d, current %d; automatic deletion is refused."), rec.User, rec.UID, pw.UID))
 					rc = 1
 				case registeredLegacyIdentity:
-					a.warnf("%s%s", a.P.M("登记账号来自旧版固定身份标记，无法排除同名/同 UID 重用；自动和批量删除已禁用，请人工核查后用 revoke --force 处理：",
-						"registered account uses a legacy fixed identity marker, so same-name/same-UID reuse cannot be excluded; automatic and bulk deletion are disabled; inspect it and use revoke --force: "), rec.User)
+					a.warnf("%s", a.P.M(
+						"登记账号来自旧版固定身份标记，无法排除同名/同 UID 重用；自动和批量删除已禁用。人工核查后，请运行 linux-temp-admin revoke --user "+rec.User+" --force，并输入完整用户名确认。",
+						"the registered account uses a legacy fixed identity marker, so same-name/same-UID reuse cannot be excluded; automatic and bulk deletion are disabled. After inspection, run linux-temp-admin revoke --user "+rec.User+" --force and type the full username to confirm."))
 					rc = 1
 				case registeredMarkerMismatch:
 					a.warnf("%s%s", a.P.M("登记账号缺少与登记世代精确匹配的受管身份标记，可能已被替换或篡改：",
@@ -926,9 +943,9 @@ func (a *App) doctor(args []string) int {
 						"registered account home is not the deterministic path used by this tool; automatic deletion is disabled: "), rec.User)
 					rc = 1
 				case registeredFirstFieldWitness:
-					a.warnf("%s%s", a.P.M(
-						"登记账号仍使用 v2.9.3 及更早版本的 GECOS 首字段世代见证；当前精确标记仍可安全撤销，但允许普通用户修改 full-name 的主机可在撤销前丢失该见证。请尽快撤销并按当前版本重新邀请：",
-						"registered account still uses the v2.9.3-and-earlier generation witness in the GECOS full-name field. Its currently exact marker remains revocable, but a host that lets regular users change full-name can lose this witness before revoke. Revoke it promptly and issue a new invite with the current version: "), rec.User)
+					a.warnf("%s", a.P.M(
+						"登记账号仍使用 v2.9.3 及更早版本的 GECOS 首字段世代见证；当前精确标记仍可安全撤销，但允许普通用户修改 full-name 的主机可在撤销前丢失该见证。请尽快运行 linux-temp-admin revoke --user "+rec.User+"，随后按当前版本重新邀请。",
+						"the registered account still uses the v2.9.3-and-earlier generation witness in the GECOS full-name field. Its currently exact marker remains revocable, but a host that lets regular users change full-name can lose this witness before revoke. Run linux-temp-admin revoke --user "+rec.User+" promptly, then issue a new invite with the current version."))
 					rc = 1
 				}
 			}
@@ -972,8 +989,8 @@ func (a *App) doctor(args []string) int {
 				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号不存在或身份无法验证）：",
 					"orphaned sshd exception (the account is absent or its identity is unverified): "), a.SSHD.FilePath(u))
 			}
-			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
-				"remove them with `cleanup-expired --compact`."))
+			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
+				"remove them with `linux-temp-admin cleanup-expired --compact`."))
 			rc = 1
 		}
 	}
@@ -996,8 +1013,8 @@ func (a *App) doctor(args []string) int {
 				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号不存在或身份无法验证，NOPASSWD:ALL 仍在）：",
 					"orphaned sudo grant (the account is absent or its identity is unverified; NOPASSWD:ALL is still on disk): "), a.Sudoers.FilePath(u))
 			}
-			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
-				"remove them with `cleanup-expired --compact`."))
+			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
+				"remove them with `linux-temp-admin cleanup-expired --compact`."))
 			rc = 1
 		}
 	}
@@ -1014,8 +1031,8 @@ func (a *App) doctor(args []string) int {
 				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号不存在或身份无法验证）：",
 					"orphaned auto-delete task (the account is absent or its identity is unverified): "), u)
 			}
-			a.warnf("%s", a.P.M("请用 `cleanup-expired --compact` 清理。",
-				"remove them with `cleanup-expired --compact`."))
+			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
+				"remove them with `linux-temp-admin cleanup-expired --compact`."))
 			rc = 1
 		}
 	}
@@ -1068,8 +1085,8 @@ func (a *App) doctor(args []string) int {
 				a.warnf("%s%s", a.P.M("账号设置了自动删除但已无可验证的对应任务（任务必须匹配 UID、世代、记录的 unit 和正文；chage 仅提供按天粒度的较晚兜底锁定）：",
 					"account set to auto-delete but has no valid task left to do it (the UID, generation, recorded unit, and body must all match; chage only provides a later, day-granularity lockout backstop): "), u)
 			}
-			a.warnf("%s", a.P.M("到期后请用 `revoke --user <名>` 手动删除。",
-				"remove them with `revoke --user <name>` once expired."))
+			a.warnf("%s", a.P.M("到期后请用 `linux-temp-admin revoke --user <名>` 手动删除。",
+				"remove them with `linux-temp-admin revoke --user <name>` once expired."))
 			rc = 1
 		}
 		if len(strandedQuarantine) > 0 {
@@ -1079,8 +1096,8 @@ func (a *App) doctor(args []string) int {
 					"account access is revoked and its identity remains quarantined, but no valid background finalizer remains (the UID, generation, quarantine deadline, recorded unit, and body must all match): "), u)
 			}
 			a.warnf("%s", a.P.M(
-				"请运行 `revoke --user <名>`；隔离截止时间已到时会立即续删，尚未到时会确认账号仍保持禁用。",
-				"run `revoke --user <name>`; after the quarantine deadline it resumes deletion immediately, and before the deadline it reconfirms that access remains disabled."))
+				"请运行 `linux-temp-admin revoke --user <名>`；隔离截止时间已到时会立即续删，尚未到时会确认账号仍保持禁用。",
+				"run `linux-temp-admin revoke --user <name>`; after the quarantine deadline it resumes deletion immediately, and before the deadline it reconfirms that access remains disabled."))
 			rc = 1
 		}
 	}

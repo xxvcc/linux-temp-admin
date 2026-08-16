@@ -76,8 +76,8 @@ func (a *App) revoke(args []string) int {
 		rc, busy := a.withAccountTrySharedLock(opts.username, run)
 		if busy {
 			a.warnf("%s", a.P.M(
-				"旧版无世代绑定的撤销命令与同名账号创建冲突，无法证明原删除意图仍指向当前账号；本次未撤销账号并以成功状态跳过，以免旧任务重试误删新世代。请在当前操作完成后运行 doctor，并按当前身份重新执行 revoke。",
-				"a legacy revoke command without a generation binding collided with creation of the same account name, so its original deletion intent can no longer be proved to target the current account; no account was revoked and this run was skipped successfully to keep an old job from retrying against a new generation. Run doctor and invoke revoke again against the current identity after the in-flight operation finishes."))
+				"旧版无世代绑定的撤销命令与同名账号创建冲突，无法证明原删除意图仍指向当前账号；本次未撤销账号并以成功状态跳过，以免旧任务重试误删新世代。请在当前操作完成后运行 linux-temp-admin doctor，并按当前身份重新执行 linux-temp-admin revoke。",
+				"a legacy revoke command without a generation binding collided with creation of the same account name, so its original deletion intent can no longer be proved to target the current account; no account was revoked and this run was skipped successfully to keep an old job from retrying against a new generation. Run linux-temp-admin doctor and invoke linux-temp-admin revoke again against the current identity after the in-flight operation finishes."))
 			a.audit("account.delete", opts.username, "skip", "legacy unbound revoke collided with same-name invite", nil)
 			return 0
 		}
@@ -182,6 +182,11 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 
 	// New scheduled jobs are bound to one account generation. A stale job exits
 	// successfully so systemd does not retry it against a replacement account.
+	// Released v2 rows may carry the same UID/generation tuple without binding it
+	// to the passwd marker. An exactly matching old task has no deletion authority,
+	// but it still owns a useful cleanup intent: strip only this tool's name-scoped
+	// grants, then cancel that expiry task. This branch must stay before passwd
+	// lookup so an unbound tuple can never reach account deletion policy.
 	if opts.generation != "" || opts.expectedUID != 0 {
 		if !validate.Generation(opts.generation) || !validate.AccountID(opts.expectedUID) {
 			a.errorf("%s", a.P.M("自动撤销身份参数不完整或不合法", "invalid or incomplete auto-revoke identity"))
@@ -191,6 +196,9 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 			a.warnf("%s", a.P.M("陈旧的自动撤销任务已忽略：账号世代不再匹配", "ignored stale auto-revoke task: account generation no longer matches"))
 			a.audit("account.delete", username, "skip", "stale scheduled generation", nil)
 			return 0
+		}
+		if !rec.IdentityBound {
+			return a.revokeLegacyScheduledAccess(username, rec)
 		}
 	}
 
@@ -321,8 +329,8 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 		grantCleanupErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 		cleanupErr := errors.Join(grantCleanupErr, a.Scheduler.Cancel(username, rec.AutoUnit))
 		a.errorf("%s", a.P.M(
-			"该登记仍处于创建中的 pending 状态，不能直接证明当前同名账号的身份；已保留账号和登记。人工核查后，只能在交互终端运行 revoke --user "+username+" --force，并输入完整用户名；程序还会严格核对 pending 世代与账号形状。",
-			"the registry row is still a pending creation intent and does not directly prove the current same-name identity; the account and registry record were retained. After manual inspection, recovery requires revoke --user "+username+" --force in an interactive terminal, the full username confirmation, and an exact pending-generation account-shape match."))
+			"该登记仍处于创建中的 pending 状态，不能直接证明当前同名账号的身份；已保留账号和登记。人工核查后，只能在交互终端运行 linux-temp-admin revoke --user "+username+" --force，并输入完整用户名；程序还会严格核对 pending 世代与账号形状。",
+			"the registry row is still a pending creation intent and does not directly prove the current same-name identity; the account and registry record were retained. After manual inspection, recovery requires linux-temp-admin revoke --user "+username+" --force in an interactive terminal, the full username confirmation, and an exact pending-generation account-shape match."))
 		if cleanupErr != nil {
 			a.errorf("%s: %v", a.P.M("清理 pending 账号的遗留授权或任务未完整完成", "cleanup of grants or schedules for the pending account did not complete"), cleanupErr)
 		}
@@ -340,7 +348,12 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	// NOPASSWD sudo and an sshd exception.
 	grantErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
 
-	protected := user.IsProtectedRevokeEntry(username, pw, true, registered, rec.UID, rec.Generation, allowLegacy)
+	protected := user.IsProtectedRevokeEntry(username, pw, true, user.RevokeIdentity{
+		Registered:         registered,
+		RecordedUID:        rec.UID,
+		RecordedGeneration: rec.Generation,
+		IdentityBound:      rec.IdentityBound,
+	}, allowLegacy)
 	if pendingRecovery {
 		protected = false
 	}
@@ -360,13 +373,13 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 			"refusing to delete a protected or system user: "+username))
 		if !rec.IdentityBound && user.IsLegacyManagedEntry(pw) {
 			a.errorf("%s", a.P.M(
-				"该账号使用旧版固定身份标记，无法证明它仍是原账号。请人工核查后在交互终端直接运行 revoke --user "+username+" --force，并输入完整用户名确认；为避免旧版自动任务获得删除授权，非交互调用始终拒绝删除此类账号。",
-				"this account uses a legacy fixed identity marker and cannot be proved to be the original account. After manual inspection, invoke revoke --user "+username+" --force directly in an interactive terminal and type the full username; non-interactive deletion is always refused so a historical automatic task cannot gain this authority."))
+				"该账号使用旧版固定身份标记，无法证明它仍是原账号。请人工核查后在交互终端直接运行 linux-temp-admin revoke --user "+username+" --force，并输入完整用户名确认；为避免旧版自动任务获得删除授权，非交互调用始终拒绝删除此类账号。",
+				"this account uses a legacy fixed identity marker and cannot be proved to be the original account. After manual inspection, invoke linux-temp-admin revoke --user "+username+" --force directly in an interactive terminal and type the full username; non-interactive deletion is always refused so a historical automatic task cannot gain this authority."))
 		}
 		if rec.DeletionStarted && !rec.IdentityBound {
 			a.errorf("%s", a.P.M(
-				"该账号只有 UID 删除恢复见证，不能证明当前同名账号就是原删除目标。自动任务、--yes 和卸载批量删除始终拒绝；请人工核查后在交互终端直接运行 revoke --user "+username+" --force，并输入完整用户名。",
-				"this account has only a UID-bound deletion-recovery witness, which cannot prove that the current same-name account is the original deletion target. Automatic jobs, --yes, and uninstall bulk deletion always refuse it; after manual inspection, invoke revoke --user "+username+" --force directly in an interactive terminal and type the full username."))
+				"该账号只有 UID 删除恢复见证，不能证明当前同名账号就是原删除目标。自动任务、--yes 和卸载批量删除始终拒绝；请人工核查后在交互终端直接运行 linux-temp-admin revoke --user "+username+" --force，并输入完整用户名。",
+				"this account has only a UID-bound deletion-recovery witness, which cannot prove that the current same-name account is the original deletion target. Automatic jobs, --yes, and uninstall bulk deletion always refuse it; after manual inspection, invoke linux-temp-admin revoke --user "+username+" --force directly in an interactive terminal and type the full username."))
 		}
 		// Name the tamper if that is why: an account that rewrote its own UID (most
 		// dangerously to 0) is now protected by the very check meant to shield real
@@ -551,6 +564,41 @@ func (a *App) revokeOptionsLocked(opts revokeOptions) int {
 	}
 	a.audit("account.delete", username, "ok", "", map[string]string{"force": ynStr(opts.force), "registered": ynStr(registered)})
 	a.success(a.P.M("已撤销并删除用户："+username, "user revoked and deleted: "+username))
+	return 0
+}
+
+// revokeLegacyScheduledAccess handles an old UID/generation-shaped timer whose
+// registry row was never identity-bound. The tuple can identify the old task and
+// its name-scoped grants, but not the current passwd account. It therefore never
+// reads or mutates passwd state and never changes the registry record.
+func (a *App) revokeLegacyScheduledAccess(username string, rec registry.Record) int {
+	grantErr := errors.Join(a.removeSudoGrant(username), a.removeSSHDException(username))
+	if grantErr != nil {
+		a.errorf("%s: %v", a.P.M(
+			"旧版自动撤销任务不能证明账号身份，且授权未能完整移除；已保留账号和登记，未主动取消任务。systemd 会按策略重试，at 和旧的一次性任务需人工处理",
+			"the legacy automatic revoke cannot prove the account identity, and its grants were not fully removed; the account and registry record were retained and the task was not actively cancelled. systemd retries by policy, while at and legacy one-shot jobs require manual handling"), grantErr)
+		a.audit("account.delete", username, "fail", "legacy unbound scheduled grant cleanup failed", nil)
+		return 1
+	}
+	if a.Scheduler == nil {
+		err := fmt.Errorf("scheduler is not configured")
+		a.errorf("%s: %v", a.P.M(
+			"旧版账号授权已移除，但无法取消自动删除任务；账号和登记已保留",
+			"legacy account grants were removed, but the automatic deletion task could not be cancelled; the account and registry record were retained"), err)
+		a.audit("account.delete", username, "fail", "legacy unbound scheduled task cancellation failed: "+err.Error(), nil)
+		return 1
+	}
+	if err := a.Scheduler.CancelAuto(username, rec.AutoUnit); err != nil {
+		a.errorf("%s: %v", a.P.M(
+			"旧版账号授权已移除，但无法取消自动删除任务；账号和登记已保留",
+			"legacy account grants were removed, but the automatic deletion task could not be cancelled; the account and registry record were retained"), err)
+		a.audit("account.delete", username, "fail", "legacy unbound scheduled task cancellation failed: "+err.Error(), nil)
+		return 1
+	}
+	a.warnf("%s", a.P.M(
+		"旧版自动任务没有账号删除权限；已移除本工具的 sudo/sshd 授权并取消该任务，账号和登记保留供人工恢复。",
+		"the legacy automatic task has no account-deletion authority; this tool's sudo/sshd grants were removed and the task was cancelled, while the account and registry record were retained for manual recovery."))
+	a.audit("account.delete", username, "skip", "legacy unbound scheduled identity; grants stripped and auto-delete task cancelled", nil)
 	return 0
 }
 
@@ -746,9 +794,10 @@ func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, 
 // witness. It is intentionally not identity proof: UID and lifecycle markers can
 // be reproduced. The interactive --force/full-name gate supplies the authority
 // for a live recovery; this predicate only prevents that authority from reaching
-// a reserved/root identity, an unsafe Home, or an account with no tool marker.
+// a reserved/root or system-range identity, an unsafe Home, or an account with no
+// tool marker.
 func uidOnlyDeletionCandidateMatches(rec registry.Record, pw user.Passwd) bool {
-	if rec.User != pw.Name || user.IsReservedName(pw.Name) || !validate.AccountID(pw.UID) ||
+	if rec.User != pw.Name || user.IsReservedName(pw.Name) || pw.UID < 1000 || !validate.AccountID(pw.UID) ||
 		!validate.AccountID(pw.GID) || (rec.UID != 0 && rec.UID != pw.UID) ||
 		!validate.ManagedHome(pw.Name, pw.Home) || pw.Shell == "" {
 		return false
