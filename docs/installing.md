@@ -13,7 +13,7 @@
 - 安装需要 root 权限、curl、OpenSSL 3、sha256sum 和 timeout；
 - GitHub CDN 回退还需要 `getent` 或 `nslookup`，用于验证并固定每个重定向目标的公网地址。
 
-二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`、`userdel`、`usermod` 和 `chage`；密码登录还需要 `chpasswd`，授予 sudo 时还需要 `sudo` 和用于写入前策略校验的 `visudo`。程序不回退到发行版 `adduser`/`deluser` 或任意 BusyBox 账号 applet：这些实现的参数、配置及编译期 shadow/group 语义不能仅凭命令名证明与 shadow 工具链等价。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装。
+二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`、`userdel`、`groupdel`、`usermod` 和 `chage`；密码登录还需要 `chpasswd`，授予 sudo 时还需要 `sudo` 和用于写入前策略校验的 `visudo`。`groupdel` 用于清理 `userdel` 可能留下、且已由登记中的 `SequentialID` 证明 GID 的受管同名私有组；它因此属于基础依赖，即使目标发行版上的 `userdel` 通常会自行删除该组。程序不回退到发行版 `adduser`/`deluser` 或任意 BusyBox 账号 applet：这些实现的参数、配置及编译期 shadow/group 语义不能仅凭命令名证明与 shadow 工具链等价。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装；账号 helper 分别由 Debian 系的 `passwd`、RPM 系的 `shadow-utils` 或 Alpine/Arch 的 `shadow` 包提供。使用 apt 时，程序会依次尝试更新索引和安装软件包；即使旧缓存让安装完成，索引更新失败仍会作为错误返回并保留诊断。
 
 ### 传统系统邮箱目录兼容边界
 

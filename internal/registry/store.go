@@ -457,8 +457,8 @@ func (s *Store) Record(rec Record) error {
 // identity-bound row with the same user, UID, and generation. An empty generation
 // requests a UID-only recovery witness: an existing legacy row is converted, an
 // unregistered name is inserted, and a rollback-pending row is deliberately
-// stripped of pending and generation authority. Repeating the exact same
-// transition is harmless.
+// stripped of pending and generation authority while retaining any proven
+// sequential UID/GID allocation. Repeating the exact same transition is harmless.
 func (s *Store) BeginDeletion(user string, uid int, generation string) error {
 	if err := validateDeletionIdentity(user, uid, generation); err != nil {
 		return err
@@ -592,7 +592,6 @@ func beginDeletionRecords(recs []Record, user string, uid int, generation string
 			current.UID = uid
 			current.Generation = ""
 			current.IdentityBound = false
-			current.SequentialID = false
 			current.Pending = false
 			current.DeletionStarted = true
 		}

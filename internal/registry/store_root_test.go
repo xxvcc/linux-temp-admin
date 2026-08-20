@@ -722,7 +722,8 @@ func TestBeginDeletionConvertsPendingRollbackToUIDOnlyRecovery(t *testing.T) {
 	reserveThrough(t, s, 1001)
 	const generation = "0123456789abcdef0123456789abcdef"
 	rec := registry.Record{
-		User: "xxvcc-pending", Port: 22, Generation: generation, IdentityBound: true, Pending: true,
+		User: "xxvcc-pending", Port: 22, UID: 1001, Generation: generation,
+		IdentityBound: true, SequentialID: true, Pending: true,
 	}
 	if err := s.Record(rec); err != nil {
 		t.Fatal(err)
@@ -732,7 +733,7 @@ func TestBeginDeletionConvertsPendingRollbackToUIDOnlyRecovery(t *testing.T) {
 	}
 	got, found, err := s.Lookup(rec.User)
 	if err != nil || !found || got.UID != 1001 || got.Pending || got.IdentityBound ||
-		got.Generation != "" || !got.DeletionStarted {
+		got.Generation != "" || !got.DeletionStarted || !got.SequentialID {
 		t.Fatalf("pending deletion state: found=%v rec=%+v err=%v", found, got, err)
 	}
 	if err := s.BeginDeletion(rec.User, 1001, ""); err != nil {

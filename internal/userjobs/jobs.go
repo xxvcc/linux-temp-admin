@@ -5,7 +5,6 @@
 package userjobs
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
@@ -27,8 +27,8 @@ const (
 	atInventoryTimeout = 30 * time.Second
 	queueOutputLimit   = int64(4 << 20)
 	atOwnerProbeLimit  = int64(64 << 10)
-	maxAtJobs          = 4096
 	spoolReadBatch     = 256
+	procStatusLimit    = int64(64 << 10)
 )
 
 var (
@@ -56,9 +56,16 @@ func commandOptions(maxOutput int64) executil.Options {
 }
 
 var (
-	drainSleep    = time.Sleep
-	drainProcRoot = "/proc"
+	drainSleep          = time.Sleep
+	drainProcRoot       = "/proc"
+	drainExecutableInfo = processExecutableInfo
 )
+
+type executableInfo struct {
+	target   string
+	mode     os.FileMode
+	uid, gid uint32
+}
 
 // WaitForDrain leaves the disabled account and UID allocated for longer than one
 // cron/at polling cycle. A daemon may already have read a due job before Clear
@@ -96,31 +103,43 @@ func cronAtDaemonPresent(procRoot string) (bool, error) {
 				continue
 			}
 			commPath := filepath.Join(procRoot, entry, "comm")
-			comm, openErr := os.OpenFile(commPath, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-			if openErr != nil {
-				if errors.Is(openErr, os.ErrNotExist) {
+			nameBody, nameErr := readProcEntry(commPath, 64)
+			if nameErr != nil {
+				if errors.Is(nameErr, os.ErrNotExist) {
 					continue
 				}
-				return false, fmt.Errorf("open process name %s: %w", commPath, openErr)
+				return false, fmt.Errorf("read process name %s: %w", commPath, nameErr)
 			}
-			name, bodyErr := io.ReadAll(io.LimitReader(comm, 65))
-			closeErr := comm.Close()
-			if bodyErr != nil {
-				if errors.Is(bodyErr, os.ErrNotExist) {
-					continue
-				}
-				return false, fmt.Errorf("read process name %s: %w", commPath, bodyErr)
-			}
-			if closeErr != nil {
-				return false, fmt.Errorf("close process name %s: %w", commPath, closeErr)
-			}
-			if len(name) > 64 {
-				return false, fmt.Errorf("process name %s exceeds the expected kernel limit", commPath)
-			}
-			switch strings.TrimSpace(string(name)) {
+			name := strings.TrimSpace(string(nameBody))
+			switch name {
 			case "cron", "crond", "atd":
-				return true, nil
+			default:
+				continue
 			}
+
+			statusPath := filepath.Join(procRoot, entry, "status")
+			rootProcess, statusErr := processRunsAsRoot(statusPath)
+			if statusErr != nil {
+				if errors.Is(statusErr, os.ErrNotExist) {
+					continue
+				}
+				return false, fmt.Errorf("verify process credentials %s: %w", statusPath, statusErr)
+			}
+			if !rootProcess {
+				continue
+			}
+
+			executable, executableErr := drainExecutableInfo(procRoot, entry)
+			if executableErr != nil {
+				if errors.Is(executableErr, os.ErrNotExist) {
+					continue
+				}
+				return false, fmt.Errorf("verify process executable %s: %w", filepath.Join(procRoot, entry, "exe"), executableErr)
+			}
+			if !trustedDaemonExecutable(name, executable) {
+				return false, fmt.Errorf("root-owned %s candidate has untrusted executable %q", name, executable.target)
+			}
+			return true, nil
 		}
 		if errors.Is(readErr, io.EOF) {
 			return false, nil
@@ -129,6 +148,95 @@ func cronAtDaemonPresent(procRoot string) (bool, error) {
 			return false, fmt.Errorf("read process inventory: %w", readErr)
 		}
 	}
+}
+
+func readProcEntry(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	closeErr := f.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("content exceeds %d-byte limit", maxBytes)
+	}
+	return body, nil
+}
+
+func processRunsAsRoot(statusPath string) (bool, error) {
+	body, err := readProcEntry(statusPath, procStatusLimit)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "Uid:" {
+			continue
+		}
+		if len(fields) != 5 {
+			return false, fmt.Errorf("malformed Uid line")
+		}
+		hasRoot, hasNonRoot := false, false
+		for _, raw := range fields[1:] {
+			uid, parseErr := strconv.ParseUint(raw, 10, 32)
+			if parseErr != nil {
+				return false, fmt.Errorf("malformed Uid value %q", raw)
+			}
+			if uid == 0 {
+				hasRoot = true
+			} else {
+				hasNonRoot = true
+			}
+		}
+		if hasRoot && hasNonRoot {
+			return false, fmt.Errorf("mixed root and non-root process credentials")
+		}
+		return hasRoot, nil
+	}
+	return false, fmt.Errorf("status has no Uid line")
+}
+
+func processExecutableInfo(procRoot, pid string) (executableInfo, error) {
+	exePath := filepath.Join(procRoot, pid, "exe")
+	target, err := os.Readlink(exePath)
+	if err != nil {
+		return executableInfo{}, err
+	}
+	f, err := os.Open(exePath)
+	if err != nil {
+		return executableInfo{}, err
+	}
+	fi, statErr := f.Stat()
+	closeErr := f.Close()
+	if statErr != nil {
+		return executableInfo{}, statErr
+	}
+	if closeErr != nil {
+		return executableInfo{}, closeErr
+	}
+	stat, ok := fi.Sys().(*unix.Stat_t)
+	if !ok {
+		return executableInfo{}, fmt.Errorf("executable metadata is unavailable")
+	}
+	return executableInfo{target: target, mode: fi.Mode(), uid: stat.Uid, gid: stat.Gid}, nil
+}
+
+func trustedDaemonExecutable(name string, executable executableInfo) bool {
+	if !filepath.IsAbs(executable.target) || !executable.mode.IsRegular() || executable.mode.Perm()&0o111 == 0 ||
+		executable.mode.Perm()&0o022 != 0 || executable.uid != 0 || executable.gid != 0 {
+		return false
+	}
+	base := filepath.Base(executable.target)
+	if base == name {
+		return true
+	}
+	return base == "busybox" && (name == "cron" || name == "crond")
 }
 
 // Clear removes and verifies the absence of a personal crontab and every
@@ -267,78 +375,11 @@ func queuedAtJobIDs(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("atq: %w", err)
 	}
-	var ids []string
-	seen := make(map[string]bool)
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	scanner.Buffer(make([]byte, 1024), int(queueOutputLimit))
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 || !numericJobID(fields[0]) {
-			return nil, fmt.Errorf("parse atq line %d: invalid job id in %q", lineNo, line)
-		}
-		id := fields[0]
-		if seen[id] {
-			return nil, fmt.Errorf("parse atq line %d: duplicate job id %s", lineNo, id)
-		}
-		seen[id] = true
-		ids = append(ids, id)
-		if len(ids) > maxAtJobs {
-			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs", maxAtJobs)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("parse atq: %w", err)
-	}
-	return ids, nil
-}
-
-func parseAtOwner(body []byte) (uint32, error) {
-	scanner := bufio.NewScanner(strings.NewReader(string(body)))
-	scanner.Buffer(make([]byte, 1024), int(atOwnerProbeLimit))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 || fields[0] != "#" || fields[1] != "atrun" {
-			continue
-		}
-		// at writes this owner header in its root-controlled prologue before the
-		// submitted command body. Return on the first atrun header: a user may put
-		// an identical-looking comment in that body, but it must not make an
-		// unrelated queue entry poison the complete root inventory.
-		if len(fields) != 4 || !strings.HasPrefix(fields[2], "uid=") ||
-			!strings.HasPrefix(fields[3], "gid=") {
-			return 0, fmt.Errorf("invalid atrun owner header")
-		}
-		uid, err := parseKernelID(strings.TrimPrefix(fields[2], "uid="))
-		if err != nil {
-			return 0, fmt.Errorf("invalid atrun UID %q", fields[2])
-		}
-		if _, err := parseKernelID(strings.TrimPrefix(fields[3], "gid=")); err != nil {
-			return 0, fmt.Errorf("invalid atrun GID %q", fields[3])
-		}
-		return uid, nil
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("scan at job: %w", err)
-	}
-	return 0, fmt.Errorf("job has no atrun owner header")
-}
-
-func parseKernelID(value string) (uint32, error) {
-	id, err := strconv.ParseUint(value, 10, 32)
-	if err != nil || id == uint64(^uint32(0)) {
-		return 0, fmt.Errorf("invalid kernel ID %q", value)
-	}
-	return uint32(id), nil
+	return atqueue.ParseInventory(out, int(queueOutputLimit))
 }
 
 func removeAtJob(ctx context.Context, id string, expectedUID uint32) error {
-	if !numericJobID(id) {
+	if !atqueue.ValidJobID(id) {
 		return fmt.Errorf("invalid at job id %q", id)
 	}
 	if expectedUID == ^uint32(0) {
@@ -383,14 +424,14 @@ func removeAtJob(ctx context.Context, id string, expectedUID uint32) error {
 // local user may submit an arbitrarily large command body, but the first atrun
 // owner header appears near the start and is all UID-based cleanup needs.
 func readAtJobOwner(ctx context.Context, id string) (uint32, bool, error) {
-	if !numericJobID(id) {
+	if !atqueue.ValidJobID(id) {
 		return 0, false, fmt.Errorf("invalid at job id %q", id)
 	}
 	opts := commandOptions(atOwnerProbeLimit)
 	opts.Context = ctx
 	prefix, err := output("at", []string{"-c", id}, opts)
 	if err == nil || errors.Is(err, executil.ErrOutputLimit) {
-		owner, ownerErr := parseAtOwner(prefix)
+		owner, ownerErr := atqueue.ParseOwner(prefix, int(atOwnerProbeLimit))
 		if ownerErr == nil {
 			return owner, true, nil
 		}
@@ -426,21 +467,6 @@ func atJobQueued(ctx context.Context, id string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-func numericJobID(id string) bool {
-	// at/atq emit canonical positive decimal identifiers. Bound the textual
-	// form before it can become a helper argument, and reject aliases such as
-	// leading-zero spellings of the same queue entry.
-	if id == "" || len(id) > 20 || id[0] == '0' {
-		return false
-	}
-	for _, r := range id {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func namedSpoolArtifacts(directories []string, name string) ([]string, error) {
@@ -492,9 +518,9 @@ func ownedSpoolArtifacts(directories []string, uid uint32) ([]string, error) {
 			entries, readErr := dir.ReadDir(spoolReadBatch)
 			for _, entry := range entries {
 				count++
-				if count > maxAtJobs+1 {
+				if count > atqueue.MaxJobs+1 {
 					_ = dir.Close()
-					return nil, fmt.Errorf("spool %s contains more than %d inspectable entries", directory, maxAtJobs+1)
+					return nil, fmt.Errorf("spool %s contains more than %d inspectable entries", directory, atqueue.MaxJobs+1)
 				}
 				name := entry.Name()
 				if name == "" || filepath.Base(name) != name {

@@ -36,9 +36,11 @@ func TestRemoveStateDirRefusesLiveBindMount(t *testing.T) {
 	removeCalled := false
 	a := &App{
 		StateDir: target,
-		RemoveAll: func(string) error {
-			removeCalled = true
-			return nil
+		HostOperations: HostOperations{
+			RemoveAll: func(string) error {
+				removeCalled = true
+				return nil
+			},
 		},
 	}
 	err := a.removeStateDir(true)

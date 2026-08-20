@@ -5,6 +5,7 @@ package sysinfo
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -86,6 +87,7 @@ func RequiredDeps(needSudo, needPassword bool) []Dep {
 		{Label: "usermod", Names: []string{"usermod"}, Present: has("usermod")},
 		{Label: "chage", Names: []string{"chage"}, Present: has("chage")},
 		{Label: "userdel", Names: []string{"userdel"}, Present: has("userdel")},
+		{Label: "groupdel", Names: []string{"groupdel"}, Present: has("groupdel")},
 	}
 	if needPassword {
 		deps = append(deps, Dep{Label: "chpasswd", Names: []string{"chpasswd"}, Present: has("chpasswd")})
@@ -114,7 +116,7 @@ func MissingDeps(needSudo, needPassword bool) []string {
 // manager, or "" if unknown.
 func PackageCandidate(label, pm string) string {
 	switch label {
-	case "useradd", "usermod", "userdel", "chage", "chpasswd":
+	case "useradd", "usermod", "userdel", "groupdel", "chage", "chpasswd":
 		switch pm {
 		case "apt":
 			return "passwd"
@@ -131,13 +133,20 @@ func PackageCandidate(label, pm string) string {
 	return ""
 }
 
-// InstallPackages installs pkgs using the given package manager.
+// InstallPackages installs pkgs using the given package manager. APT refresh
+// and installation are both attempted so the operator gets every actionable
+// diagnostic, but success requires both phases to succeed: packages may have
+// been installed from an old cache even when a non-nil update error is returned.
 func InstallPackages(pm string, pkgs []string) error {
 	var name string
 	var args []string
+	var updateErr error
 	switch pm {
 	case "apt":
-		_ = executil.Run("apt-get", []string{"update"}, packageCommandOptions)
+		out, err := executil.CombinedOutput("apt-get", []string{"update"}, packageCommandOptions)
+		if err != nil {
+			updateErr = packageCommandError("apt-get update", out, err)
+		}
 		name, args = "apt-get", append([]string{"install", "-y"}, pkgs...)
 	case "dnf":
 		name, args = "dnf", append([]string{"install", "-y"}, pkgs...)
@@ -154,33 +163,72 @@ func InstallPackages(pm string, pkgs []string) error {
 	default:
 		return fmt.Errorf("unsupported package manager: %q", pm)
 	}
-	if out, err := executil.CombinedOutput(name, args, packageCommandOptions); err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	out, installErr := executil.CombinedOutput(name, args, packageCommandOptions)
+	if installErr != nil {
+		return errors.Join(updateErr, packageCommandError(name+" "+args[0], out, installErr))
 	}
-	return nil
+	return updateErr
 }
 
-// SSHPort returns the configured SSH port, preferring `sshd -T`, then
-// sshd_config, defaulting to 22.
-func SSHPort() int {
-	if p, ok := sshPortFromSshdT(); ok {
-		return p
+func packageCommandError(action string, out []byte, err error) error {
+	diagnostic := strings.TrimSpace(string(out))
+	if diagnostic == "" {
+		return fmt.Errorf("%s: %w", action, err)
 	}
-	if p, ok, _ := sshPortFromConfig(sshdConfigPath); ok {
-		return p
-	}
-	return 22
+	return fmt.Errorf("%s: %w: %s", action, err, diagnostic)
 }
 
-func sshPortFromSshdT() (int, bool) {
+// DetectSSHPort returns the configured SSH port, preferring `sshd -T`, then
+// sshd_config, and finally 22 when neither source is available. The returned
+// port remains a bounded best-effort hint when err is non-nil; callers must
+// surface that diagnostic instead of presenting the fallback as authoritative.
+func DetectSSHPort() (int, error) {
+	var effectiveErr error
+	if has(sshdCommand) {
+		if p, err := sshPortFromSshdT(); err == nil {
+			return p, nil
+		} else {
+			effectiveErr = err
+		}
+	}
+
+	p, ok, configErr := sshPortFromConfig(sshdConfigPath)
+	if configErr == nil {
+		if ok {
+			if effectiveErr != nil {
+				return p, fmt.Errorf("effective SSH port probe failed; static sshd_config suggests port %d: %w", p, effectiveErr)
+			}
+			return p, nil
+		}
+		if effectiveErr != nil {
+			return 22, fmt.Errorf("effective SSH port probe failed; defaulting to port 22: %w", effectiveErr)
+		}
+		return 22, nil
+	}
+
+	// An absent config is the documented default case when sshd is not installed.
+	// Any other read or parse failure must remain visible to the caller.
+	if errors.Is(configErr, os.ErrNotExist) && effectiveErr == nil {
+		return 22, nil
+	}
+	configErr = fmt.Errorf("read SSH port from %s: %w", sshdConfigPath, configErr)
+	if effectiveErr != nil {
+		return 22, errors.Join(effectiveErr, configErr)
+	}
+	return 22, configErr
+}
+
+func sshPortFromSshdT() (int, error) {
 	cfg, err := SSHDEffective("")
 	if err != nil {
-		return 0, false
+		return 0, err
 	}
-	if p, err := strconv.Atoi(cfg.First("port")); err == nil && p >= 1 && p <= 65535 {
-		return p, true
+	raw := cfg.First("port")
+	p, err := strconv.Atoi(raw)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, fmt.Errorf("sshd -T returned invalid port %q", raw)
 	}
-	return 0, false
+	return p, nil
 }
 
 func sshPortFromConfig(path string) (int, bool, error) {
@@ -203,20 +251,37 @@ func sshPortFromConfig(path string) (int, bool, error) {
 	sc := bufio.NewScanner(limited)
 	sc.Buffer(make([]byte, 64<<10), maxSSHDConfigLine)
 	var port int
-	found := false
+	found, hasInclude := false, false
 	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		keyword, args, complete := parseSSHDDirective(sc.Text())
+		if !complete {
+			return 0, false, fmt.Errorf("sshd config %s contains a directive the static port fallback cannot parse", path)
+		}
+		if keyword == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if !found && len(fields) >= 2 && strings.EqualFold(fields[0], "port") {
-			if p, err := strconv.Atoi(fields[1]); err == nil && p >= 1 && p <= 65535 {
-				// First Port wins: sshd listens on every Port directive, and
-				// sshPortFromSshdT returns the first, so the config fallback matches it
-				// for a consistent hint (rather than the bash awk's last-wins).
-				port, found = p, true
+		if strings.EqualFold(keyword, "include") {
+			if len(args) == 0 {
+				return 0, false, fmt.Errorf("sshd config %s contains Include without a value", path)
 			}
+			hasInclude = true
+			continue
+		}
+		if !strings.EqualFold(keyword, "port") {
+			continue
+		}
+		if len(args) != 1 {
+			return 0, false, fmt.Errorf("sshd config %s contains Port without exactly one value", path)
+		}
+		p, err := strconv.Atoi(args[0])
+		if err != nil || p < 1 || p > 65535 {
+			return 0, false, fmt.Errorf("sshd config %s contains invalid Port value %q", path, args[0])
+		}
+		if !found {
+			// First Port wins: sshd listens on every Port directive, and
+			// sshPortFromSshdT returns the first, so the config fallback matches it
+			// for a consistent hint (rather than the bash awk's last-wins).
+			port, found = p, true
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -224,6 +289,9 @@ func sshPortFromConfig(path string) (int, bool, error) {
 	}
 	if limited.N == 0 {
 		return 0, false, fmt.Errorf("sshd config %s exceeds %d-byte limit", path, maxSSHDConfigBytes)
+	}
+	if !found && hasInclude {
+		return 0, false, fmt.Errorf("sshd config %s has active Include directives but no direct Port; static port detection is incomplete", path)
 	}
 	return port, found, nil
 }

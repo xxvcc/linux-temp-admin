@@ -228,7 +228,7 @@ func TestBeginDeletionRecordsSupportsBoundAndUIDOnlyRecovery(t *testing.T) {
 			user: "xxvcc-pending",
 			check: func(t *testing.T, got []Record) {
 				if len(got) != 1 || !got[0].DeletionStarted || got[0].Pending ||
-					got[0].IdentityBound || got[0].SequentialID || got[0].Generation != "" || got[0].UID != 1001 {
+					got[0].IdentityBound || !got[0].SequentialID || got[0].Generation != "" || got[0].UID != 1001 {
 					t.Fatalf("pending rollback transition = %+v", got)
 				}
 			},

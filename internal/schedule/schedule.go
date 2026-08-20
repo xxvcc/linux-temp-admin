@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -404,7 +405,7 @@ func (s *Scheduler) scheduleAt(user string, uid int, generation string, deadline
 	if err != nil {
 		return "", err
 	}
-	if !numericJobID(id) {
+	if !atqueue.ValidJobID(id) {
 		cause := fmt.Errorf("at scheduler returned invalid job id %q", id)
 		if cleanupErr := s.Sys.RemoveAtJobsFor(s.revokeAtNeedle(user)); cleanupErr != nil {
 			return "", errors.Join(cause, fmt.Errorf("sweep jobs after invalid at id: %w", cleanupErr))
@@ -447,7 +448,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 	// registry evidence and fail closed instead of guessing from the id.
 	if strings.HasPrefix(recordedUnit, "at:") {
 		id := strings.TrimPrefix(recordedUnit, "at:")
-		if !numericJobID(id) {
+		if !atqueue.ValidJobID(id) {
 			errs = append(errs, fmt.Errorf("unsupported recorded auto-revoke identifier %q", recordedUnit))
 		} else if !s.Sys.HasAt() {
 			errs = append(errs, fmt.Errorf("at backend is unavailable; cannot verify recorded auto-revoke job %s before preserving its registry evidence", id))

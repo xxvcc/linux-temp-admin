@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/cli"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/integrationtest"
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -162,9 +162,8 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const username = "ltae2euser"
-	forceDelete := func() { _ = exec.Command("userdel", "-r", "--", username).Run() }
-	forceDelete()
-	t.Cleanup(forceDelete)
+	integrationtest.RequireUserAbsent(t, username, false)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, username, false) })
 
 	regDir := rootDir(t, 0o700)
 	sudoDir := rootDir(t, 0o750)
@@ -196,28 +195,35 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Reload: func() error { return nil },
 			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		},
-		SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		SSHDHasUnverifiableMatch: func(bool) bool { return false },
-		Detector:                 netdetect.New(),
-		Selfmanage:               &selfmanage.Manager{InstallPath: installPath},
+		SystemProbes: cli.SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
+			SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+			SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		},
+		Detector:   netdetect.New(),
+		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
 		Audit: &audit.Logger{
 			Dir: filepath.Dir(auditFile), File: auditFile, Now: now,
 			Actor: func() (string, int) { return "e2e", 0 },
 		},
 		InstallPath: installPath,
-		Executable:  func() (string, error) { return installPath, nil },
-		Now:         now,
-		RandHex: func(n int) (string, error) {
-			if n == 16 {
-				return "0123456789abcdef0123456789abcdef", nil
-			}
-			return "abcdef0123", nil
+		RuntimeHooks: cli.RuntimeHooks{
+			Executable: func() (string, error) { return installPath, nil },
+			Now:        now,
+			RandHex: func(n int) (string, error) {
+				if n == 16 {
+					return "0123456789abcdef0123456789abcdef", nil
+				}
+				return "abcdef0123", nil
+			},
+			StdoutIsTTY: func() bool { return true },
+			StdinIsTTY:  func() bool { return false },
+			Geteuid:     func() int { return 0 },
 		},
-		StdoutIsTTY:        func() bool { return true },
-		StdinIsTTY:         func() bool { return false },
-		Geteuid:            func() int { return 0 },
-		ClearScheduledJobs: noDeferredJobs,
-		DrainScheduledJobs: noDeferredJobDrain,
+		HostOperations: cli.HostOperations{
+			ClearScheduledJobs: noDeferredJobs,
+			DrainScheduledJobs: noDeferredJobDrain,
+		},
 	}
 
 	// --- invite ---
@@ -308,9 +314,8 @@ func TestInviteRollsBackWhenAutoDeleteCannotBeScheduled(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const name = "lta-nosched1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	a, _, _, _ := inviteApp(t)
 	a.Scheduler.Sys = unavailableSched{}
@@ -338,9 +343,8 @@ func TestInvitePersistsIdentityIntentBeforeScheduling(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const name = "lta-intent1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	a, _, _, _ := inviteApp(t)
 	tracker := newTrackingSched()
@@ -380,9 +384,8 @@ func TestInvitePersistsAccountIntentBeforeCredentialMutation(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const name = "lta-accountintent1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	a, _, _, _ := inviteApp(t)
 	probes := 0
@@ -434,9 +437,8 @@ func TestInviteRollsBackWhenExplicitSudoGrantFails(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const name = "lta-sudofail2"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	a, sudoMgr, _, _ := inviteApp(t)
 	sudoMgr.Validate = func([]byte) error { return errors.New("injected sudo validation failure") }
@@ -471,9 +473,8 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 		t.Skip("requires root")
 	}
 	const username = "ltae2efix"
-	forceDelete := func() { _ = exec.Command("userdel", "-r", "--", username).Run() }
-	forceDelete()
-	t.Cleanup(forceDelete)
+	integrationtest.RequireUserAbsent(t, username, false)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, username, false) })
 
 	regDir := rootDir(t, 0o700)
 	sudoDir := rootDir(t, 0o750)
@@ -505,8 +506,11 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 			Dir: sshdDir, Validate: func() error { return nil }, Effective: effective,
 			Reload: func() error { reloads++; return nil },
 		},
-		SSHDConfig:               effective,
-		SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		SystemProbes: cli.SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
+			SSHDConfig:               effective,
+			SSHDHasUnverifiableMatch: func(bool) bool { return false },
+		},
 		Scheduler: &schedule.Scheduler{
 			SystemdDir: rootDir(t, 0o755), InstallPath: installPath,
 			UnitPrefix: config.AutoRevokeUnitPrefix, Now: now, Sys: fakeSched{},
@@ -517,19 +521,23 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 		Detector:    netdetect.New(),
 		Selfmanage:  &selfmanage.Manager{InstallPath: installPath},
 		InstallPath: installPath,
-		Executable:  func() (string, error) { return installPath, nil },
-		Now:         now,
-		RandHex: func(n int) (string, error) {
-			if n == 16 {
-				return "0123456789abcdef0123456789abcdef", nil
-			}
-			return "abcdef0123", nil
+		RuntimeHooks: cli.RuntimeHooks{
+			Executable: func() (string, error) { return installPath, nil },
+			Now:        now,
+			RandHex: func(n int) (string, error) {
+				if n == 16 {
+					return "0123456789abcdef0123456789abcdef", nil
+				}
+				return "abcdef0123", nil
+			},
+			StdoutIsTTY: func() bool { return true },
+			StdinIsTTY:  func() bool { return false },
+			Geteuid:     func() int { return 0 },
 		},
-		StdoutIsTTY:        func() bool { return true },
-		StdinIsTTY:         func() bool { return false },
-		Geteuid:            func() int { return 0 },
-		ClearScheduledJobs: noDeferredJobs,
-		DrainScheduledJobs: noDeferredJobDrain,
+		HostOperations: cli.HostOperations{
+			ClearScheduledJobs: noDeferredJobs,
+			DrainScheduledJobs: noDeferredJobDrain,
+		},
 	}
 
 	// Without --fix-sshd, a non-interactive invite must refuse and change nothing:
