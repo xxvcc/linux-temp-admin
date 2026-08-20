@@ -233,7 +233,7 @@ func (a *App) invite(args []string) int {
 	port := *portFlag
 	if !portSet {
 		var err error
-		port, err = sysinfo.DetectSSHPort()
+		port, err = a.detectSSHPort()
 		if err != nil {
 			a.errorf("%s: %v", a.P.M("无法可靠探测 SSH 端口；请用 --port 明确指定",
 				"could not reliably detect the SSH port; specify it with --port"), err)

@@ -38,6 +38,10 @@ import (
 // Tests replace these probes to avoid consulting the host's account and sshd
 // state.
 type SystemProbes struct {
+	// DetectSSHPort resolves the listening port shown in invite connection
+	// details and doctor diagnostics. Tests inject a deterministic result instead
+	// of consulting the runner's sshd configuration.
+	DetectSSHPort func() (int, error)
 	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
 	// test's verdict comes from a fixture, not from the test host's own sshd.
 	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
@@ -158,6 +162,7 @@ func NewApp(lang i18n.Lang) *App {
 		Audit:      audit.Default(),
 		Lifecycle:  lifecycle.New(config.LifecycleLockFile),
 		SystemProbes: SystemProbes{
+			DetectSSHPort:            sysinfo.DetectSSHPort,
 			SSHDConfig:               sysinfo.SSHDEffective,
 			SSHDHasUnverifiableMatch: sysinfo.HasUnverifiableMatch,
 			LookupUser:               user.Lookup,
@@ -193,6 +198,13 @@ func NewApp(lang i18n.Lang) *App {
 		StateDir:    config.StateDir,
 		AuditLogDir: config.AuditLogDir,
 	}
+}
+
+func (a *App) detectSSHPort() (int, error) {
+	if a.DetectSSHPort == nil {
+		return 0, errors.New("no SSH port probe is wired")
+	}
+	return a.DetectSSHPort()
 }
 
 func (a *App) lookupUser(name string) (user.Passwd, bool, error) {

@@ -196,6 +196,7 @@ func TestInviteThenRevokeEndToEnd(t *testing.T) {
 			Effective: func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 		},
 		SystemProbes: cli.SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
 			SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 			SSHDHasUnverifiableMatch: func(bool) bool { return false },
 		},
@@ -506,6 +507,7 @@ func TestInviteFixSSHDThenRevokeEndToEnd(t *testing.T) {
 			Reload: func() error { reloads++; return nil },
 		},
 		SystemProbes: cli.SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
 			SSHDConfig:               effective,
 			SSHDHasUnverifiableMatch: func(bool) bool { return false },
 		},

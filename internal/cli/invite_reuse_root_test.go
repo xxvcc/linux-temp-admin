@@ -68,6 +68,7 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
 		Audit:      &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
 		SystemProbes: cli.SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
 			SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
 			SSHDHasUnverifiableMatch: func(bool) bool { return false },
 		},

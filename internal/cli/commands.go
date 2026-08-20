@@ -899,7 +899,7 @@ func (a *App) doctorBaseEnvironment() doctorResult {
 	}
 	a.info(a.P.M("包管理器：", "package manager: ") + orNone(sysinfo.PackageManager()))
 	a.info(a.P.M("init 系统：", "init system: ") + sysinfo.InitSystem())
-	sshPort, sshPortErr := sysinfo.DetectSSHPort()
+	sshPort, sshPortErr := a.detectSSHPort()
 	if sshPortErr != nil {
 		a.warnf(a.P.M("SSH 端口探测不完整（暂用 %d）：%v", "SSH port detection was incomplete (best effort %d): %v"), sshPort, sshPortErr)
 		result.fail()

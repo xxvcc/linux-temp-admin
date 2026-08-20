@@ -89,6 +89,7 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 		Registry:    &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
 		InstallPath: filepath.Join(dir, "lta"),
 		SystemProbes: SystemProbes{
+			DetectSSHPort:            func() (int, error) { return 22, nil },
 			SSHDHasUnverifiableMatch: func(bool) bool { return false },
 			ListMarkerAccounts:       func() ([]string, error) { return nil, nil },
 			RunningLegacyRevoke:      func(string, string) (bool, error) { return false, nil },
@@ -106,6 +107,29 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 		},
 	}
 	return a, &out, &errb
+}
+
+func TestDoctorBaseEnvironmentUsesInjectedSSHPortProbe(t *testing.T) {
+	a, out, _ := newTestApp(t, "")
+	calls := 0
+	a.DetectSSHPort = func() (int, error) {
+		calls++
+		return 2222, nil
+	}
+
+	_ = a.doctorBaseEnvironment()
+	if calls != 1 {
+		t.Fatalf("SSH port probe calls = %d, want 1", calls)
+	}
+	if got := out.String(); !strings.Contains(got, "detected SSH port: 2222") {
+		t.Fatalf("doctor did not report the injected SSH port: %q", got)
+	}
+}
+
+func TestDetectSSHPortFailsClosedWhenProbeIsUnwired(t *testing.T) {
+	if port, err := (&App{}).detectSSHPort(); err == nil || port != 0 {
+		t.Fatalf("unwired SSH port probe = (%d, %v), want (0, error)", port, err)
+	}
 }
 
 func waitForOpenFileDescriptors(t *testing.T, path string, want int) {
