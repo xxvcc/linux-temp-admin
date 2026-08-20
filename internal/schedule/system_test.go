@@ -279,16 +279,7 @@ func TestAtJobsSkipsOversizedNonRootBodyAfterOwnerProbe(t *testing.T) {
 	}
 }
 
-func TestAtQueueParsingFailsClosedOnMalformedOrDuplicateLines(t *testing.T) {
-	for _, output := range []string{
-		"warning: partial queue output\n42 x\n",
-		"42 x\n42 duplicate\n",
-	} {
-		if _, err := parseAtQueueIDs(output); err == nil {
-			t.Fatalf("parseAtQueueIDs(%q) succeeded, want incomplete-inventory refusal", output)
-		}
-	}
-
+func TestAtJobQueuedFailsClosedOnMalformedInventory(t *testing.T) {
 	dir := t.TempDir()
 	writeCommand(t, dir, "atq", "printf '%s\\n' 'corrupt queue line'")
 	t.Setenv("PATH", dir)

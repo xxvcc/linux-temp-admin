@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
@@ -24,12 +25,34 @@ const legacyHeaderV2 = "# linux-temp-admin registry v2"
 const legacyHeaderV3 = "# linux-temp-admin registry v3"
 const legacyHeaderV4 = "# linux-temp-admin registry v4"
 
+// Field indexes are append-only: deployed v2/v3/v4 rows are migrated by width,
+// so inserting or reordering a column would reinterpret durable state.
 const (
-	legacyFieldCount    = 9
-	legacyMaxFieldCount = 11
-	legacyV3FieldCount  = 13
-	legacyV4FieldCount  = 14
-	currentFieldCount   = 17
+	userField = iota
+	createdField
+	expiresField
+	sudoField
+	hostField
+	portField
+	fingerprintField
+	autoRevokeField
+	autoUnitField
+	uidField
+	generationField
+	pendingField
+	identityBoundField
+	deletionStartedField
+	sequentialIDField
+	quarantineUntilField
+	quarantineUnitField
+	currentFieldCount
+)
+
+const (
+	legacyFieldCount    = uidField
+	legacyMaxFieldCount = generationField + 1
+	legacyV3FieldCount  = identityBoundField + 1
+	legacyV4FieldCount  = deletionStartedField + 1
 )
 
 // Record is one managed temporary account.
@@ -77,6 +100,9 @@ type Record struct {
 	// SequentialID proves that this account received an explicitly reserved,
 	// monotonically increasing UID/GID pair. Generated-name invites with this bit
 	// can skip the daemon polling delay because neither numeric identity is reused.
+	// A UID-only DeletionStarted recovery row may retain this historical proof for
+	// cleaning up the matching private group after the account is gone; it does not
+	// authorize unattended deletion of a live account.
 	SequentialID bool
 	// QuarantineUntil is the UTC RFC3339 deadline after which a disabled live
 	// account may be removed without another cron/at polling delay. The account
@@ -100,37 +126,27 @@ func boolYN(b bool) string {
 	return "no"
 }
 
-// Column indexes are retained while migrating deployed v2/v3/v4 rows to v5.
-const uidField = 9
-const generationField = 10
-const pendingField = 11
-const identityBoundField = 12
-const deletionStartedField = 13
-const sequentialIDField = 14
-const quarantineUntilField = 15
-const quarantineUnitField = 16
-
 // TSV renders the record as one tab-separated line (no trailing newline).
 func (r Record) TSV() string {
-	return strings.Join([]string{
-		sanitize(r.User),
-		sanitize(r.Created),
-		sanitize(r.Expires),
-		boolYN(r.Sudo),
-		sanitize(r.Host),
-		strconv.Itoa(r.Port),
-		sanitize(r.Fingerprint),
-		boolYN(r.AutoRevoke),
-		sanitize(r.AutoUnit),
-		strconv.Itoa(r.UID), // mandatory since v3; legacy v2 rows are migrated on load
-		sanitize(r.Generation),
-		boolYN(r.Pending),
-		boolYN(r.IdentityBound),
-		boolYN(r.DeletionStarted),
-		boolYN(r.SequentialID),
-		sanitize(r.QuarantineUntil),
-		sanitize(r.QuarantineUnit),
-	}, "\t")
+	fields := make([]string, currentFieldCount)
+	fields[userField] = sanitize(r.User)
+	fields[createdField] = sanitize(r.Created)
+	fields[expiresField] = sanitize(r.Expires)
+	fields[sudoField] = boolYN(r.Sudo)
+	fields[hostField] = sanitize(r.Host)
+	fields[portField] = strconv.Itoa(r.Port)
+	fields[fingerprintField] = sanitize(r.Fingerprint)
+	fields[autoRevokeField] = boolYN(r.AutoRevoke)
+	fields[autoUnitField] = sanitize(r.AutoUnit)
+	fields[uidField] = strconv.Itoa(r.UID) // mandatory since v3; legacy v2 rows are migrated on load
+	fields[generationField] = sanitize(r.Generation)
+	fields[pendingField] = boolYN(r.Pending)
+	fields[identityBoundField] = boolYN(r.IdentityBound)
+	fields[deletionStartedField] = boolYN(r.DeletionStarted)
+	fields[sequentialIDField] = boolYN(r.SequentialID)
+	fields[quarantineUntilField] = sanitize(r.QuarantineUntil)
+	fields[quarantineUnitField] = sanitize(r.QuarantineUnit)
+	return strings.Join(fields, "\t")
 }
 
 // ParseLine parses a current-schema registry line. It returns ok=false only for
@@ -165,6 +181,9 @@ func parseLegacyV4Line(line string) (Record, bool, error) {
 }
 
 func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
+	if !utf8.ValidString(line) {
+		return Record{}, false, fmt.Errorf("record is not valid UTF-8")
+	}
 	f := strings.Split(line, "\t")
 	if len(f) < minFields || len(f) > maxFields {
 		if minFields == maxFields {
@@ -172,26 +191,27 @@ func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
 		}
 		return Record{}, false, fmt.Errorf("record has %d fields, want %d..%d", len(f), minFields, maxFields)
 	}
-	if !validate.Username(f[0]) {
-		return Record{}, false, fmt.Errorf("invalid username %q", f[0])
+	if !validate.Username(f[userField]) {
+		return Record{}, false, fmt.Errorf("invalid username %q", f[userField])
 	}
-	port, err := strconv.Atoi(f[5])
+	port, err := strconv.Atoi(f[portField])
 	if err != nil {
-		return Record{}, false, fmt.Errorf("invalid port %q", f[5])
+		return Record{}, false, fmt.Errorf("invalid port %q", f[portField])
 	}
-	if (f[3] != "yes" && f[3] != "no") || (f[7] != "yes" && f[7] != "no") {
+	if (f[sudoField] != "yes" && f[sudoField] != "no") ||
+		(f[autoRevokeField] != "yes" && f[autoRevokeField] != "no") {
 		return Record{}, false, fmt.Errorf("invalid boolean field")
 	}
 	rec := Record{
-		User:        f[0],
-		Created:     f[1],
-		Expires:     f[2],
-		Sudo:        f[3] == "yes",
-		Host:        f[4],
+		User:        f[userField],
+		Created:     f[createdField],
+		Expires:     f[expiresField],
+		Sudo:        f[sudoField] == "yes",
+		Host:        f[hostField],
 		Port:        port,
-		Fingerprint: f[6],
-		AutoRevoke:  f[7] == "yes",
-		AutoUnit:    f[8],
+		Fingerprint: f[fingerprintField],
+		AutoRevoke:  f[autoRevokeField] == "yes",
+		AutoUnit:    f[autoUnitField],
 	}
 	if len(f) > uidField {
 		rec.UID, err = strconv.Atoi(f[uidField])
@@ -238,42 +258,86 @@ func parseFields(line string, minFields, maxFields int) (Record, bool, error) {
 	// UID-only recovery rows created for an unregistered account have no honest
 	// endpoint metadata to preserve. Port 0 is reserved for exactly that state;
 	// every ordinary and migrated account row still requires a real SSH port.
-	if !validate.Port(rec.Port) && !(rec.DeletionStarted && !rec.IdentityBound && rec.Port == 0) {
-		return Record{}, false, fmt.Errorf("invalid port %q", f[5])
-	}
-	if rec.IdentityBound && !validate.Generation(rec.Generation) {
-		return Record{}, false, fmt.Errorf("identity-bound record has no valid generation")
-	}
-	if rec.IdentityBound && !rec.Pending && !validate.AccountID(rec.UID) {
-		return Record{}, false, fmt.Errorf("completed identity-bound record has no valid uid")
-	}
-	if rec.DeletionStarted && !validate.AccountID(rec.UID) {
-		return Record{}, false, fmt.Errorf("deletion-started record has no valid uid")
-	}
-	if rec.DeletionStarted && !rec.IdentityBound && rec.Generation != "" {
-		return Record{}, false, fmt.Errorf("uid-only deletion-started record carries a generation")
-	}
-	if rec.SequentialID && (!rec.IdentityBound || !validate.AccountID(rec.UID)) {
-		return Record{}, false, fmt.Errorf("sequential identity record is not safely identity-bound")
-	}
-	if rec.QuarantineUntil != "" {
-		deadline, err := time.Parse(time.RFC3339, rec.QuarantineUntil)
-		if err != nil || deadline.Location() != time.UTC {
-			return Record{}, false, fmt.Errorf("invalid quarantine deadline %q", rec.QuarantineUntil)
+	if _, err := rec.lifecycleState(); err != nil {
+		if err == errInvalidRecordPort {
+			return Record{}, false, fmt.Errorf("invalid port %q", f[portField])
 		}
-		if !rec.DeletionStarted || !rec.IdentityBound {
-			return Record{}, false, fmt.Errorf("quarantine requires an identity-bound deletion row")
-		}
-		if rec.QuarantineUnit == "" {
-			return Record{}, false, fmt.Errorf("quarantine has no scheduled finalizer")
-		}
-		if rec.QuarantineUnit != config.QuarantineUnitPrefix+rec.User {
-			return Record{}, false, fmt.Errorf("invalid quarantine unit %q", rec.QuarantineUnit)
-		}
-	} else if rec.QuarantineUnit != "" {
-		return Record{}, false, fmt.Errorf("quarantine unit has no deadline")
-	} else if rec.DeletionStarted && rec.Pending {
-		return Record{}, false, fmt.Errorf("pending deletion recovery requires a durable quarantine")
+		return Record{}, false, err
 	}
 	return rec, true, nil
+}
+
+type recordLifecycleState uint8
+
+const (
+	recordLegacyActive recordLifecycleState = iota + 1
+	recordPending
+	recordActive
+	recordDeletingUIDOnly
+	recordDeletingBound
+	recordQuarantined
+)
+
+var errInvalidRecordPort = fmt.Errorf("invalid record port")
+
+// lifecycleState is the single cross-field model for v5 state. The booleans
+// remain on Record for on-disk compatibility, but no parser or writer should
+// independently invent another set of allowed combinations.
+func (r Record) lifecycleState() (recordLifecycleState, error) {
+	// UID-only recovery rows created for an unregistered account have no honest
+	// endpoint metadata to preserve. Port 0 is reserved for exactly that state;
+	// every ordinary and migrated account row still requires a real SSH port.
+	if !validate.Port(r.Port) && !(r.DeletionStarted && !r.IdentityBound && r.Port == 0) {
+		return 0, errInvalidRecordPort
+	}
+	if r.IdentityBound && !validate.Generation(r.Generation) {
+		return 0, fmt.Errorf("identity-bound record has no valid generation")
+	}
+	if r.IdentityBound && !r.Pending && !validate.AccountID(r.UID) {
+		return 0, fmt.Errorf("completed identity-bound record has no valid uid")
+	}
+	if r.DeletionStarted && !validate.AccountID(r.UID) {
+		return 0, fmt.Errorf("deletion-started record has no valid uid")
+	}
+	if r.DeletionStarted && !r.IdentityBound && r.Generation != "" {
+		return 0, fmt.Errorf("uid-only deletion-started record carries a generation")
+	}
+	if r.SequentialID && (!validate.AccountID(r.UID) || (!r.IdentityBound && !r.DeletionStarted)) {
+		return 0, fmt.Errorf("sequential identity record is neither safely identity-bound nor in deletion recovery")
+	}
+	if r.QuarantineUntil != "" {
+		deadline, err := time.Parse(time.RFC3339, r.QuarantineUntil)
+		if err != nil || deadline.Location() != time.UTC {
+			return 0, fmt.Errorf("invalid quarantine deadline %q", r.QuarantineUntil)
+		}
+		if !r.DeletionStarted || !r.IdentityBound {
+			return 0, fmt.Errorf("quarantine requires an identity-bound deletion row")
+		}
+		if r.QuarantineUnit == "" {
+			return 0, fmt.Errorf("quarantine has no scheduled finalizer")
+		}
+		if r.QuarantineUnit != config.QuarantineUnitPrefix+r.User {
+			return 0, fmt.Errorf("invalid quarantine unit %q", r.QuarantineUnit)
+		}
+		return recordQuarantined, nil
+	}
+	if r.QuarantineUnit != "" {
+		return 0, fmt.Errorf("quarantine unit has no deadline")
+	}
+	if r.DeletionStarted && r.Pending {
+		return 0, fmt.Errorf("pending deletion recovery requires a durable quarantine")
+	}
+	if r.DeletionStarted {
+		if r.IdentityBound {
+			return recordDeletingBound, nil
+		}
+		return recordDeletingUIDOnly, nil
+	}
+	if r.Pending {
+		return recordPending, nil
+	}
+	if r.IdentityBound {
+		return recordActive, nil
+	}
+	return recordLegacyActive, nil
 }

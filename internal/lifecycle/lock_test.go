@@ -9,6 +9,35 @@ import (
 	"time"
 )
 
+func waitForOpenFileDescriptors(t *testing.T, path string, want int) {
+	t.Helper()
+	target, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		open := 0
+		for _, entry := range entries {
+			fi, err := os.Stat(filepath.Join("/proc/self/fd", entry.Name()))
+			if err == nil && os.SameFile(target, fi) {
+				open++
+			}
+		}
+		if open >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s has %d open descriptors, want at least %d", path, open, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestTryAcquireReportsBusyWithoutWaiting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lifecycle.lock")
 	first, err := New(path).Acquire()
@@ -83,6 +112,7 @@ func TestLockSerializesIndependentCallers(t *testing.T) {
 		}
 		acquired <- release
 	}()
+	waitForOpenFileDescriptors(t, path, 2)
 
 	select {
 	case <-acquired:

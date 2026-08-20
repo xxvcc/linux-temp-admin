@@ -21,9 +21,11 @@ func isolateJobHelpers(t *testing.T) {
 	t.Helper()
 	oldLook, oldCombinedOutput, oldOutput := lookPath, combinedOutput, output
 	oldCron, oldAt, oldSleep, oldProcRoot := cronSpoolDirectories, atSpoolDirectories, drainSleep, drainProcRoot
+	oldExecutableInfo := drainExecutableInfo
 	t.Cleanup(func() {
 		lookPath, combinedOutput, output = oldLook, oldCombinedOutput, oldOutput
 		cronSpoolDirectories, atSpoolDirectories, drainSleep, drainProcRoot = oldCron, oldAt, oldSleep, oldProcRoot
+		drainExecutableInfo = oldExecutableInfo
 	})
 	root := t.TempDir()
 	cronDir := filepath.Join(root, "cron")
@@ -433,86 +435,6 @@ func TestClearRefusesAStaleNamedCronSpoolWithoutCrontabTool(t *testing.T) {
 	}
 }
 
-func TestAtJobIDMustBeCanonicalAndBounded(t *testing.T) {
-	tests := []struct {
-		id   string
-		want bool
-	}{
-		{id: "1", want: true},
-		{id: "18446744073709551615", want: true},
-		{id: ""},
-		{id: "0"},
-		{id: "01"},
-		{id: "+1"},
-		{id: "1a"},
-		{id: "184467440737095516150"},
-	}
-	for _, test := range tests {
-		if got := numericJobID(test.id); got != test.want {
-			t.Errorf("numericJobID(%q) = %t, want %t", test.id, got, test.want)
-		}
-	}
-}
-
-func TestParseAtOwnerFailsClosedOnAmbiguousOrInvalidHeaders(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want uint32
-		err  string
-	}{
-		{
-			name: "valid",
-			body: "#!/bin/sh\n# atrun uid=1001 gid=2002\n/bin/true\n",
-			want: 1001,
-		},
-		{
-			name: "valid high kernel IDs",
-			body: "# atrun uid=4294967294 gid=4294967294\n",
-			want: 4294967294,
-		},
-		{
-			name: "missing",
-			body: "#!/bin/sh\n/bin/true\n",
-			err:  "no atrun owner header",
-		},
-		{
-			name: "user body may repeat owner-shaped comment",
-			body: "# atrun uid=1001 gid=1001\n# atrun uid=2002 gid=2002\n",
-			want: 1001,
-		},
-		{
-			name: "malformed first owner header",
-			body: "# atrun owner is unknown\n# atrun uid=1001 gid=1001\n",
-			err:  "invalid atrun owner header",
-		},
-		{
-			name: "negative UID",
-			body: "# atrun uid=-1 gid=1001\n",
-			err:  "invalid atrun UID",
-		},
-		{
-			name: "reserved GID",
-			body: "# atrun uid=1001 gid=4294967295\n",
-			err:  "invalid atrun GID",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, err := parseAtOwner([]byte(test.body))
-			if test.err == "" {
-				if err != nil || got != test.want {
-					t.Fatalf("parseAtOwner() = (%d, %v), want (%d, nil)", got, err, test.want)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), test.err) {
-				t.Fatalf("parseAtOwner() error = %v, want %q", err, test.err)
-			}
-		})
-	}
-}
-
 func TestSpoolInspectionRefusesSymlinkedDirectory(t *testing.T) {
 	root := t.TempDir()
 	realDirectory := filepath.Join(root, "real")
@@ -642,6 +564,15 @@ func TestWaitForDrainRecognizesRunningDaemonWithoutInstalledTools(t *testing.T) 
 			if err := os.WriteFile(filepath.Join(pidDir, "comm"), []byte(daemon+"\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			if err := os.WriteFile(filepath.Join(pidDir, "status"), []byte("Uid:\t0\t0\t0\t0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			drainExecutableInfo = func(procRoot, pid string) (executableInfo, error) {
+				if procRoot != drainProcRoot || pid != "123" {
+					t.Fatalf("executable probe = (%q, %q), want (%q, 123)", procRoot, pid, drainProcRoot)
+				}
+				return executableInfo{target: "/usr/sbin/" + daemon, mode: 0o755, uid: 0, gid: 0}, nil
+			}
 			var slept time.Duration
 			drainSleep = func(delay time.Duration) { slept = delay }
 			if err := WaitForDrain(); err != nil {
@@ -649,6 +580,96 @@ func TestWaitForDrainRecognizesRunningDaemonWithoutInstalledTools(t *testing.T) 
 			}
 			if slept != 65*time.Second {
 				t.Fatalf("drain wait = %s, want 65s for running %s", slept, daemon)
+			}
+		})
+	}
+}
+
+func TestWaitForDrainRejectsUnprivilegedDaemonNameSpoof(t *testing.T) {
+	isolateJobHelpers(t)
+	lookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	pidDir := filepath.Join(drainProcRoot, "123")
+	if err := os.Mkdir(pidDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "comm"), []byte("cron\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "status"), []byte("Uid:\t1000\t1000\t1000\t1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	drainExecutableInfo = func(string, string) (executableInfo, error) {
+		t.Fatal("non-root name spoof reached executable trust check")
+		return executableInfo{}, nil
+	}
+	drainSleep = func(time.Duration) { t.Fatal("non-root daemon name spoof caused a drain delay") }
+	if err := WaitForDrain(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitForDrainConservativelyWaitsOnUntrustedRootDaemonExecutable(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		executable executableInfo
+	}{
+		{name: "user-owned writable executable", executable: executableInfo{target: "/tmp/cron", mode: 0o777, uid: 1000, gid: 1000}},
+		{name: "deleted executable", executable: executableInfo{target: "/usr/sbin/cron (deleted)", mode: 0o755, uid: 0, gid: 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateJobHelpers(t)
+			lookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+			pidDir := filepath.Join(drainProcRoot, "123")
+			if err := os.Mkdir(pidDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pidDir, "comm"), []byte("cron\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pidDir, "status"), []byte("Uid:\t0\t0\t0\t0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			drainExecutableInfo = func(string, string) (executableInfo, error) { return tc.executable, nil }
+			var slept time.Duration
+			drainSleep = func(delay time.Duration) { slept = delay }
+			if err := WaitForDrain(); err != nil {
+				t.Fatal(err)
+			}
+			if slept != 65*time.Second {
+				t.Fatalf("drain wait = %s, want conservative 65s for untrusted root daemon candidate", slept)
+			}
+		})
+	}
+}
+
+func TestWaitForDrainConservativelyWaitsOnCandidateCredentialFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{name: "malformed", status: "Uid:\tbroken\n"},
+		{name: "mixed root and non-root", status: "Uid:\t1000\t0\t0\t1000\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateJobHelpers(t)
+			lookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+			pidDir := filepath.Join(drainProcRoot, "123")
+			if err := os.Mkdir(pidDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pidDir, "comm"), []byte("cron\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(pidDir, "status"), []byte(tc.status), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var slept time.Duration
+			drainSleep = func(delay time.Duration) { slept = delay }
+			if err := WaitForDrain(); err != nil {
+				t.Fatal(err)
+			}
+			if slept != 65*time.Second {
+				t.Fatalf("drain wait = %s, want conservative 65s after credential scan failure", slept)
 			}
 		})
 	}

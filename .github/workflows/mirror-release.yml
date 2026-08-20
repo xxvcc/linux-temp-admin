@@ -174,6 +174,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          MAX_BINARY_BYTES=67108864
+          MAX_METADATA_BYTES=1048576
+          SIGNATURE_BYTES=64
           expected=$'SHA256SUMS\nlinux-temp-admin-linux-amd64\nlinux-temp-admin-linux-amd64.sig\nlinux-temp-admin-linux-arm64\nlinux-temp-admin-linux-arm64.sig'
           release_json="$(timeout -k 5 60 gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
           [[ "$(jq -r '.id' <<<"$release_json")" == "$RELEASE_ID" ]]
@@ -184,18 +187,82 @@ jobs:
             echo "unexpected release asset set" >&2
             exit 1
           }
+
+          asset_records="$(jq -r '
+            .assets[] |
+            [.name, (.id | tostring), (.digest // ""), (.size | tostring), (.url // "")] |
+            @tsv
+          ' <<<"$release_json" | LC_ALL=C sort)"
+          declare -A seen_asset_ids=() seen_asset_urls=()
+          while IFS=$'\t' read -r name asset_id digest size api_url extra; do
+            [[ -z "$extra" && "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            [[ "$size" =~ ^(0|[1-9][0-9]*)$ ]]
+            [[ "$api_url" == "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" ]]
+            [[ -z "${seen_asset_ids[$asset_id]+present}" && -z "${seen_asset_urls[$api_url]+present}" ]]
+            seen_asset_ids[$asset_id]=1
+            seen_asset_urls[$api_url]=1
+            case "$name" in
+              SHA256SUMS)
+                limit=$MAX_METADATA_BYTES
+                (( size > 0 && size <= limit ))
+                ;;
+              linux-temp-admin-linux-amd64|linux-temp-admin-linux-arm64)
+                limit=$MAX_BINARY_BYTES
+                (( size > 0 && size <= limit ))
+                ;;
+              linux-temp-admin-linux-amd64.sig|linux-temp-admin-linux-arm64.sig)
+                limit=$SIGNATURE_BYTES
+                (( size == limit ))
+                ;;
+              *)
+                echo "unexpected release asset: $name" >&2
+                exit 1
+                ;;
+            esac
+          done <<<"$asset_records"
+
           mkdir -m 0700 rel
-          timeout -k 10 300 gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel
+          download_deadline=$((SECONDS + 300))
+          while IFS=$'\t' read -r name asset_id digest size api_url extra; do
+            case "$name" in
+              SHA256SUMS) limit=$MAX_METADATA_BYTES ;;
+              linux-temp-admin-linux-amd64|linux-temp-admin-linux-arm64) limit=$MAX_BINARY_BYTES ;;
+              linux-temp-admin-linux-amd64.sig|linux-temp-admin-linux-arm64.sig) limit=$SIGNATURE_BYTES ;;
+              *) exit 1 ;;
+            esac
+            blocks=$(( (limit + 1023) / 1024 ))
+            remaining=$((download_deadline - SECONDS))
+            (( remaining > 0 )) || {
+              echo "aggregate release download deadline exceeded" >&2
+              exit 1
+            }
+            if ! (
+              ulimit -c 0 || exit 1
+              ulimit -f "$blocks" || exit 1
+              exec timeout -k 10 "$remaining" gh api -H 'Accept: application/octet-stream' "$api_url"
+            ) >"rel/$name"; then
+              rm -f -- "rel/$name"
+              echo "bounded authenticated release download failed: $name" >&2
+              exit 1
+            fi
+            actual_size="$(stat -c %s -- "rel/$name")"
+            if [[ "$actual_size" != "$size" || "$actual_size" -gt "$limit" ]]; then
+              rm -f -- "rel/$name"
+              echo "release asset size changed during download: $name" >&2
+              exit 1
+            fi
+            actual_digest="$(sha256sum "rel/$name" | awk '{print $1}')"
+            if [[ "$actual_digest" != "${digest#sha256:}" ]]; then
+              rm -f -- "rel/$name"
+              echo "release asset digest changed during download: $name" >&2
+              exit 1
+            fi
+          done <<<"$asset_records"
+
           expected_nodes="$(printf '%s\n' "$expected" | sed 's/$/\tf/')"
           actual_nodes="$(find rel -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)"
           [[ "$actual_nodes" == "$expected_nodes" ]]
-          while IFS=$'\t' read -r name digest size; do
-            [[ "$digest" =~ ^sha256:([0-9a-f]{64})$ ]]
-            expected_digest="${BASH_REMATCH[1]}"
-            [[ "$size" =~ ^(0|[1-9][0-9]*)$ ]]
-            [[ "$(stat -c %s -- "rel/$name")" == "$size" ]]
-            [[ "$(sha256sum "rel/$name" | awk '{print $1}')" == "$expected_digest" ]]
-          done < <(jq -r '.assets[] | [.name, (.digest // ""), (.size | tostring)] | @tsv' <<<"$release_json")
 
       - name: Verify checksums and ed25519 signatures
         shell: bash

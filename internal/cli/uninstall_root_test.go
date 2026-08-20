@@ -15,6 +15,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/audit"
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/integrationtest"
 	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -228,9 +229,8 @@ func TestInventoryTreatsTheGECOSMarkerAsBlockOnly(t *testing.T) {
 
 	// A live account carrying the current managed marker and nothing else: exactly
 	// the footprint of --no-sudo --no-auto-revoke after its registry row is lost.
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGenerationGECOSPrefix+generation, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -558,9 +558,8 @@ func TestUninstallRemovesAWitnessOnlyArtifact(t *testing.T) {
 	a, _, _ := uninstallApp(t, "")
 	a.Users = user.New()
 
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	// No registry row or account. Only the durable privilege artifact remains.
 	mustWrite(t, a.Sudoers.FilePath(name), name+" ALL=(ALL) NOPASSWD:ALL\n")
 
@@ -820,9 +819,8 @@ func TestCompactSweepsAGrantWhoseNameARealAccountReused(t *testing.T) {
 	const name = "xxvcc-reuse09"
 	a, _, _ := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	// A real replacement can set its own GECOS full-name field. Without a current
 	// registry identity, even an exact managed marker must not hide the stale grant.
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
@@ -845,9 +843,8 @@ func TestCompactPreservesArtifactsForLiveLegacyIdentity(t *testing.T) {
 	const name = "ltalegacycompact1"
 	a, out, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -894,9 +891,8 @@ func TestCompactSweepsUnverifiedLegacyGrantsWithoutDeletingAccounts(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			a, _, _ := uninstallApp(t, "")
 			a.Users = user.New()
-			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
-			rm()
-			t.Cleanup(rm)
+			integrationtest.RequireUserAbsent(t, tc.name, true)
+			t.Cleanup(func() { integrationtest.CleanupUser(t, tc.name, true) })
 			if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, tc.name).CombinedOutput(); err != nil {
 				t.Fatalf("useradd: %v: %s", err, out)
 			}
@@ -1114,9 +1110,8 @@ func TestUninstallDoesNotDeleteLiveAccountNamedOnlyByStaleV1Row(t *testing.T) {
 	const name = "ltav1reuse1"
 	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -1144,9 +1139,8 @@ func TestUninstallDoesNotBulkDeleteLegacyV2Identity(t *testing.T) {
 	)
 	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -1178,9 +1172,8 @@ func TestUninstallDoesNotDeleteLiveAccountNamedOnlyByArtifact(t *testing.T) {
 	const name = "ltaartifact1"
 	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -1204,9 +1197,8 @@ func TestRevokeDoesNotDeleteLiveAccountNamedByPendingIntent(t *testing.T) {
 	const name = "ltapending1"
 	a, _, errb := uninstallApp(t, "")
 	a.Users = user.New()
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -1240,9 +1232,8 @@ func TestUninstallRequiresCompletedMatchingV2IdentityForLiveAccounts(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			a, _, errb := uninstallApp(t, "")
 			a.Users = user.New()
-			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
-			rm()
-			t.Cleanup(rm)
+			integrationtest.RequireUserAbsent(t, tc.name, true)
+			t.Cleanup(func() { integrationtest.CleanupUser(t, tc.name, true) })
 			if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, tc.name).CombinedOutput(); err != nil {
 				t.Fatalf("useradd: %v: %s", err, out)
 			}

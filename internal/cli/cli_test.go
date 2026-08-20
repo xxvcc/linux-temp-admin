@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/audit"
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
@@ -67,7 +68,7 @@ func (r *revokeRunner) RunInput(_ string, name string, args ...string) error {
 	return r.Run(name, args...)
 }
 
-func (*revokeRunner) Look(name string) bool { return name == "userdel" }
+func (*revokeRunner) Look(name string) bool { return name == "userdel" || name == "groupdel" }
 
 var (
 	testClearScheduledJobs = func(string, int) error { return nil }
@@ -84,21 +85,56 @@ func newTestApp(t *testing.T, in string) (*App, *bytes.Buffer, *bytes.Buffer) {
 	var out, errb bytes.Buffer
 	a := &App{
 		Out: &out, Err: &errb, In: strings.NewReader(in),
-		P:                        i18n.Printer{Lang: i18n.EN},
-		Registry:                 &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
-		InstallPath:              filepath.Join(dir, "lta"),
-		Now:                      func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
-		RandHex:                  func(int) (string, error) { return "abcdef0123", nil },
-		StdoutIsTTY:              func() bool { return true },
-		StdinIsTTY:               func() bool { return false },
-		Geteuid:                  func() int { return 0 },
-		SSHDHasUnverifiableMatch: func(bool) bool { return false },
-		ClearScheduledJobs:       testClearScheduledJobs,
-		DrainScheduledJobs:       testDrainScheduledJobs,
-		ListMarkerAccounts:       func() ([]string, error) { return nil, nil },
-		RunningLegacyRevoke:      func(string, string) (bool, error) { return false, nil },
+		P:           i18n.Printer{Lang: i18n.EN},
+		Registry:    &registry.Store{Dir: dir, File: filepath.Join(dir, "r.tsv"), Lock: filepath.Join(dir, "r.lock")},
+		InstallPath: filepath.Join(dir, "lta"),
+		SystemProbes: SystemProbes{
+			SSHDHasUnverifiableMatch: func(bool) bool { return false },
+			ListMarkerAccounts:       func() ([]string, error) { return nil, nil },
+			RunningLegacyRevoke:      func(string, string) (bool, error) { return false, nil },
+		},
+		HostOperations: HostOperations{
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
+		},
+		RuntimeHooks: RuntimeHooks{
+			Now:         func() time.Time { return time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC) },
+			RandHex:     func(int) (string, error) { return "abcdef0123", nil },
+			StdoutIsTTY: func() bool { return true },
+			StdinIsTTY:  func() bool { return false },
+			Geteuid:     func() int { return 0 },
+		},
 	}
 	return a, &out, &errb
+}
+
+func waitForOpenFileDescriptors(t *testing.T, path string, want int) {
+	t.Helper()
+	target, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		open := 0
+		for _, entry := range entries {
+			fi, err := os.Stat(filepath.Join("/proc/self/fd", entry.Name()))
+			if err == nil && os.SameFile(target, fi) {
+				open++
+			}
+		}
+		if open >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s has %d open descriptors, want at least %d", path, open, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func requireRootRegistryFixture(t *testing.T) {
@@ -452,6 +488,7 @@ func TestQueuedLifecycleMutationStopsAfterUninstallMarker(t *testing.T) {
 			return 0
 		})
 	}()
+	waitForOpenFileDescriptors(t, path, 2)
 	select {
 	case <-runs:
 		t.Fatal("queued mutation ran while the lifecycle lock was held")
@@ -508,6 +545,7 @@ func TestLegacyUnboundRevokeSkipsSameNameInviteBarrier(t *testing.T) {
 func TestGenerationBoundRevokeWaitsForSameNameInviteBarrier(t *testing.T) {
 	a, _, _ := newTestApp(t, "")
 	a.Lifecycle = lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	accountPath := a.Lifecycle.Path + ".account-xxvcc-a1"
 	release, err := a.accountLifecycleLock("xxvcc-a1").Acquire()
 	if err != nil {
 		t.Fatal(err)
@@ -519,6 +557,7 @@ func TestGenerationBoundRevokeWaitsForSameNameInviteBarrier(t *testing.T) {
 			"--expected-uid", "1001", "--generation", "0123456789abcdef0123456789abcdef",
 		})
 	}()
+	waitForOpenFileDescriptors(t, accountPath, 2)
 	select {
 	case rc := <-done:
 		_ = release()
@@ -549,6 +588,7 @@ func TestLegacyUnboundRevokeStillQueuesBehindUnrelatedGlobalMutation(t *testing.
 	go func() {
 		done <- a.revoke([]string{"--user", "xxvcc-a1", "--yes"})
 	}()
+	waitForOpenFileDescriptors(t, a.Lifecycle.Path, 2)
 	select {
 	case rc := <-done:
 		_ = release()
@@ -587,6 +627,7 @@ func TestLegacyUnboundRevokesShareSameNameBarrier(t *testing.T) {
 	done2 := make(chan int, 1)
 	go func() { done1 <- a1.revoke([]string{"--user", "xxvcc-a1", "--yes"}) }()
 	go func() { done2 <- a2.revoke([]string{"--user", "xxvcc-a1", "--yes"}) }()
+	waitForOpenFileDescriptors(t, path, 3)
 	for i, done := range []<-chan int{done1, done2} {
 		select {
 		case rc := <-done:
@@ -633,8 +674,8 @@ func TestReadRunningBinaryRejectsOversizedInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := &App{
-		Executable: func() (string, error) { return path, nil },
-		Selfmanage: &selfmanage.Manager{MaxBytes: 4},
+		RuntimeHooks: RuntimeHooks{Executable: func() (string, error) { return path, nil }},
+		Selfmanage:   &selfmanage.Manager{MaxBytes: 4},
 	}
 	if _, err := a.readRunningBinary(); err == nil || !strings.Contains(err.Error(), "exceeds 4-byte") {
 		t.Fatalf("oversized running binary error = %v, want bounded-read refusal", err)
@@ -768,7 +809,7 @@ func TestDoctorDependencyPolicyTreatsConditionalHelpersAsOptionalFeatures(t *tes
 			t.Errorf("missing %s should disable only its invite feature, not fail the base doctor report", label)
 		}
 	}
-	for _, label := range []string{"id", "useradd", "usermod", "chage", "userdel"} {
+	for _, label := range []string{"id", "useradd", "usermod", "chage", "userdel", "groupdel"} {
 		if !doctorDependencyIsFatal(label) {
 			t.Errorf("missing core dependency %s should fail the doctor report", label)
 		}
@@ -1244,16 +1285,18 @@ func TestTeardownLocalAccountStopsWhenDisableLoginIsIncomplete(t *testing.T) {
 			terminateCalls := 0
 			a := &App{
 				Users: &user.Manager{Runner: runner},
-				LookupUser: func(string) (user.Passwd, bool, error) {
-					return pw, true, nil
+				SystemProbes: SystemProbes{
+					LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil },
 				},
-				TerminateProcesses: func(int) error {
-					terminateCalls++
-					return nil
+				HostOperations: HostOperations{
+					TerminateProcesses: func(int) error {
+						terminateCalls++
+						return nil
+					},
 				},
 			}
 
-			stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil })
+			stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil }, false)
 			if err == nil || stage != revokeDisableLogin {
 				t.Fatalf("teardownLocalAccount = stage %v, err %v; want disable failure", stage, err)
 			}
@@ -1279,19 +1322,21 @@ func TestTeardownLocalAccountReachesDeleteOnlyAfterDisableSucceeds(t *testing.T)
 			RemoveManagedMail: func(user.Passwd) error { return nil },
 			RemoveManagedHome: func(user.Passwd) error { return nil },
 		},
-		TerminateProcesses: func(uid int) error {
-			terminateCalls++
-			if uid != 1001 {
-				t.Fatalf("TerminateProcesses uid = %d, want 1001", uid)
-			}
-			return nil
+		SystemProbes: SystemProbes{LookupUser: lookup},
+		HostOperations: HostOperations{
+			TerminateProcesses: func(uid int) error {
+				terminateCalls++
+				if uid != 1001 {
+					t.Fatalf("TerminateProcesses uid = %d, want 1001", uid)
+				}
+				return nil
+			},
+			ClearScheduledJobs: testClearScheduledJobs,
+			DrainScheduledJobs: testDrainScheduledJobs,
 		},
-		LookupUser:         lookup,
-		ClearScheduledJobs: testClearScheduledJobs,
-		DrainScheduledJobs: testDrainScheduledJobs,
 	}
 
-	stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil })
+	stage, err := a.teardownLocalAccount("xxvcc-a1", pw, func() error { return nil }, false)
 	if err == nil || stage != revokeDeleteAccount {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want delete failure", stage, err)
 	}
@@ -1308,9 +1353,11 @@ func TestRollbackInviteAccountRequiresCompleteCapturedIdentity(t *testing.T) {
 	terminateCalls := 0
 	a := &App{
 		Users: &user.Manager{Runner: runner},
-		TerminateProcesses: func(int) error {
-			terminateCalls++
-			return nil
+		HostOperations: HostOperations{
+			TerminateProcesses: func(int) error {
+				terminateCalls++
+				return nil
+			},
 		},
 	}
 
@@ -1349,16 +1396,18 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 				RemoveManagedMail: func(user.Passwd) error { return nil },
 				RemoveManagedHome: func(user.Passwd) error { return nil },
 			},
-			TerminateProcesses: func(uid int) error {
-				terminateCalls++
-				if uid != 1001 {
-					t.Fatalf("TerminateProcesses uid = %d, want 1001", uid)
-				}
-				return nil
+			SystemProbes: SystemProbes{LookupUser: lookup},
+			HostOperations: HostOperations{
+				TerminateProcesses: func(uid int) error {
+					terminateCalls++
+					if uid != 1001 {
+						t.Fatalf("TerminateProcesses uid = %d, want 1001", uid)
+					}
+					return nil
+				},
+				ClearScheduledJobs: testClearScheduledJobs,
+				DrainScheduledJobs: testDrainScheduledJobs,
 			},
-			LookupUser:         lookup,
-			ClearScheduledJobs: testClearScheduledJobs,
-			DrainScheduledJobs: testDrainScheduledJobs,
 		}
 		setTestRegistryRecord(t, a, rec)
 		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false); err != nil {
@@ -1373,11 +1422,13 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 		runner := &revokeRunner{}
 		wantErr := errors.New("process scan incomplete")
 		a := &App{
-			Users:              &user.Manager{Runner: runner},
-			TerminateProcesses: func(int) error { return wantErr },
-			LookupUser:         func(string) (user.Passwd, bool, error) { return pw, true, nil },
-			ClearScheduledJobs: testClearScheduledJobs,
-			DrainScheduledJobs: testDrainScheduledJobs,
+			Users:        &user.Manager{Runner: runner},
+			SystemProbes: SystemProbes{LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil }},
+			HostOperations: HostOperations{
+				TerminateProcesses: func(int) error { return wantErr },
+				ClearScheduledJobs: testClearScheduledJobs,
+				DrainScheduledJobs: testDrainScheduledJobs,
+			},
 		}
 		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false)
 		if !errors.Is(err, wantErr) {
@@ -1407,10 +1458,12 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 				RemoveManagedMail: func(user.Passwd) error { return nil },
 				RemoveManagedHome: func(user.Passwd) error { return nil },
 			},
-			TerminateProcesses: func(int) error { return nil },
-			LookupUser:         lookup,
-			ClearScheduledJobs: testClearScheduledJobs,
-			DrainScheduledJobs: testDrainScheduledJobs,
+			SystemProbes: SystemProbes{LookupUser: lookup},
+			HostOperations: HostOperations{
+				TerminateProcesses: func(int) error { return nil },
+				ClearScheduledJobs: testClearScheduledJobs,
+				DrainScheduledJobs: testDrainScheduledJobs,
+			},
 		}
 		setTestRegistryRecord(t, a, pendingRec)
 		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, true, false); err != nil {
@@ -1430,11 +1483,13 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 		runner := &revokeRunner{}
 		terminatedUID := 0
 		a := &App{
-			Users:              &user.Manager{Runner: runner},
-			TerminateProcesses: func(uid int) error { terminatedUID = uid; return nil },
-			LookupUser:         func(string) (user.Passwd, bool, error) { return pending, true, nil },
-			ClearScheduledJobs: testClearScheduledJobs,
-			DrainScheduledJobs: testDrainScheduledJobs,
+			Users:        &user.Manager{Runner: runner},
+			SystemProbes: SystemProbes{LookupUser: func(string) (user.Passwd, bool, error) { return pending, true, nil }},
+			HostOperations: HostOperations{
+				TerminateProcesses: func(uid int) error { terminatedUID = uid; return nil },
+				ClearScheduledJobs: testClearScheduledJobs,
+				DrainScheduledJobs: testDrainScheduledJobs,
+			},
 		}
 		if err := a.rollbackInviteAccount("xxvcc-a1", pendingRec, pending, false, false); err != nil {
 			t.Fatal(err)
@@ -1464,7 +1519,7 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 					return nil
 				},
 			},
-			LookupUser: lookup,
+			SystemProbes: SystemProbes{LookupUser: lookup},
 		}
 		setTestRegistryRecord(t, a, rec)
 		if err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false); err != nil {
@@ -1490,16 +1545,20 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 		replacement.GECOS = config.ManagedGenerationGECOSPrefix + "fedcba9876543210fedcba9876543210"
 		a := &App{
 			Users: &user.Manager{Runner: runner},
-			LookupUser: func(string) (user.Passwd, bool, error) {
-				lookups++
-				if lookups == 1 {
-					return pw, true, nil
-				}
-				return replacement, true, nil
+			SystemProbes: SystemProbes{
+				LookupUser: func(string) (user.Passwd, bool, error) {
+					lookups++
+					if lookups == 1 {
+						return pw, true, nil
+					}
+					return replacement, true, nil
+				},
 			},
-			TerminateProcesses: func(int) error {
-				t.Fatal("replacement reached process termination")
-				return nil
+			HostOperations: HostOperations{
+				TerminateProcesses: func(int) error {
+					t.Fatal("replacement reached process termination")
+					return nil
+				},
 			},
 		}
 		err := a.rollbackInviteAccount("xxvcc-a1", rec, pw, true, false)
@@ -1537,11 +1596,13 @@ func TestRollbackInviteAccountUsesFailClosedTeardown(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				runner := &revokeRunner{}
 				a := &App{
-					Users:              &user.Manager{Runner: runner},
-					LookupUser:         func(string) (user.Passwd, bool, error) { return current, true, nil },
-					TerminateProcesses: func(int) error { return nil },
-					ClearScheduledJobs: testClearScheduledJobs,
-					DrainScheduledJobs: testDrainScheduledJobs,
+					Users:        &user.Manager{Runner: runner},
+					SystemProbes: SystemProbes{LookupUser: func(string) (user.Passwd, bool, error) { return current, true, nil }},
+					HostOperations: HostOperations{
+						TerminateProcesses: func(int) error { return nil },
+						ClearScheduledJobs: testClearScheduledJobs,
+						DrainScheduledJobs: testDrainScheduledJobs,
+					},
 				}
 				err := a.rollbackInviteAccount(expected.Name, currentRec, expected, false, tc.activationStarted)
 				if (err != nil) != tc.wantErr {
@@ -1605,9 +1666,11 @@ func TestRecursiveRemovalRefusesSymlinkedParentEvenWithForce(t *testing.T) {
 	removeCalled := false
 	a := &App{
 		StateDir: filepath.Join(linkParent, "state"),
-		RemoveAll: func(path string) error {
-			removeCalled = true
-			return os.RemoveAll(path)
+		HostOperations: HostOperations{
+			RemoveAll: func(path string) error {
+				removeCalled = true
+				return os.RemoveAll(path)
+			},
 		},
 	}
 	err := a.removeStateDir(true)
@@ -2233,6 +2296,27 @@ func TestUpgradeRejectsUnsafeURLBeforePromptOrDownload(t *testing.T) {
 	}
 }
 
+func TestNoopUpgradeFailsWhenInstalledVersionCannotBeRechecked(t *testing.T) {
+	a, out, errb := newTestApp(t, "")
+	// An invalid layout makes the best-effort logger report its call without
+	// creating a root-owned audit fixture.
+	a.Audit = &audit.Logger{Dir: "relative", File: "relative/audit.log"}
+	result := a.reportNoopUpgrade(func() (string, error) {
+		return "", errors.New("injected installed-version probe failure")
+	})
+	if result.status != 1 || result.applied {
+		t.Fatalf("no-op probe failure result = %+v, want status=1 applied=false", result)
+	}
+	if out.Len() != 0 || strings.Contains(out.String(), "already up to date") {
+		t.Fatalf("no-op probe failure was reported as success: %q", out.String())
+	}
+	if got := errb.String(); !strings.Contains(got, "cannot confirm installed version after no-op upgrade") ||
+		!strings.Contains(got, "injected installed-version probe failure") ||
+		!strings.Contains(got, "audit log write failed") {
+		t.Fatalf("no-op probe failure diagnostics incomplete: %q", got)
+	}
+}
+
 func TestUpgradeURLFileUsesIndependentSignedURLs(t *testing.T) {
 	const (
 		binaryURL    = "https://binary.example.invalid/release?binary-token=one"
@@ -2451,6 +2535,8 @@ func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 	invalidGID := managed
 	reservedKernelID := uint64(^uint32(0))
 	invalidGID.GID = int(reservedKernelID)
+	changedPrimaryGID := managed
+	changedPrimaryGID.GID = 1002
 	homeMismatch := managed
 	homeMismatch.Home = "/srv/xxvcc-a1"
 	tests := []struct {
@@ -2471,6 +2557,8 @@ func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 		{name: "reserved kernel GID", rec: registry.Record{UID: 1001}, pw: invalidGID, exists: true, want: registeredIdentityUnverified},
 		{name: "reserved recorded UID", rec: registry.Record{UID: int(reservedKernelID)}, pw: managed, exists: true, want: registeredIdentityUnverified},
 		{name: "UID mismatch", rec: registry.Record{UID: 1002, Generation: generation, IdentityBound: true}, pw: managed, exists: true, want: registeredUIDMismatch},
+		{name: "sequential GID mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true, SequentialID: true}, pw: changedPrimaryGID, exists: true, want: registeredGIDMismatch},
+		{name: "quarantined sequential GID mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true, SequentialID: true, DeletionStarted: true, QuarantineUntil: "2026-08-19T00:00:00Z", QuarantineUnit: config.QuarantineUnitPrefix + "xxvcc-a1"}, pw: changedPrimaryGID, exists: true, want: registeredRecoveryManual},
 		{name: "legacy", rec: registry.Record{UID: 1001}, pw: legacy, exists: true, want: registeredLegacyIdentity},
 		{name: "marker mismatch", rec: registry.Record{UID: 1001, Generation: generation, IdentityBound: true}, pw: user.Passwd{UID: 1001, GID: 1001}, exists: true, want: registeredMarkerMismatch},
 		{name: "generation mismatch", rec: registry.Record{UID: 1001, Generation: "fedcba9876543210fedcba9876543210", IdentityBound: true}, pw: managed, exists: true, want: registeredMarkerMismatch},
@@ -2499,7 +2587,7 @@ func mustHours(t *testing.T, in string, def int) int {
 func TestPlanDepsAllPresent(t *testing.T) {
 	a, _, _ := newTestApp(t, "")
 	binDir := t.TempDir()
-	for _, name := range []string{"id", "useradd", "usermod", "chage", "userdel"} {
+	for _, name := range []string{"id", "useradd", "usermod", "chage", "userdel", "groupdel"} {
 		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -2534,7 +2622,7 @@ func TestPlanDepsRefusesAutomaticPacmanPartialUpgrade(t *testing.T) {
 func TestPlanDepsRequiresChpasswdOnlyForPasswordLogin(t *testing.T) {
 	a, _, errb := newTestApp(t, "")
 	binDir := t.TempDir()
-	for _, name := range []string{"id", "useradd", "usermod", "chage", "userdel"} {
+	for _, name := range []string{"id", "useradd", "usermod", "chage", "userdel", "groupdel"} {
 		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -2563,7 +2651,7 @@ func TestGeneratedInviteReachesDependencyGateWithoutID(t *testing.T) {
 	}
 	t.Setenv("PATH", t.TempDir())
 
-	rc := a.invite([]string{"--host", "192.0.2.1", "--no-sudo", "--no-auto-revoke", "--yes"})
+	rc := a.invite([]string{"--host", "192.0.2.1", "--port", "22", "--no-sudo", "--no-auto-revoke", "--yes"})
 	if rc != 1 {
 		t.Fatalf("invite rc=%d, want the missing-dependency refusal", rc)
 	}

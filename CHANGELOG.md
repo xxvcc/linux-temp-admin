@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.4 - 2026-08-20
+
+- Fail closed when the SSH port cannot be established reliably, while preserving
+  the effective-config and static-config diagnostics for `doctor`; an invite now
+  requires an explicit `--port` instead of silently presenting a guessed value.
+  Preserve both `apt-get update` and install failures, and make a no-op upgrade
+  fail when the installed version cannot be rechecked.
+- Reject invalid UTF-8 registry rows, centralize the append-only field indexes
+  and valid lifecycle-state combinations, and share one bounded, fail-closed
+  parser for `atq` inventories, job IDs, and root-controlled owner headers.
+- Close the account-deletion Home recreation window by revalidating the passwd
+  identity and repeating owner-checked Home cleanup after the final job/process
+  quiescence pass. Process-name fallback detection now ignores unprivileged
+  `cron`/`atd` lookalikes and validates root credentials plus trusted executable
+  metadata before treating a daemon as present.
+- Reconcile account-database residue explicitly after `userdel`: only a registry
+  `SequentialID` witness can authorize removing the corresponding same-name,
+  same-GID private group with `groupdel`, and the group shape and absence are
+  verified before and after the helper. A candidate private group must also have
+  an explicitly disabled `/etc/group` password field and no enabled `gshadow`
+  password, administrators, or members. Status, doctor, and
+  revoke now reject primary-GID drift on a `SequentialID` identity before it can
+  be reported active or handed to quarantine. Deletion also verifies that no
+  same-name `/etc/subuid` or `/etc/subgid` assignment remains; ambiguous legacy
+  recovery state stays registered instead of guessing which group to delete.
+  `groupdel` is now a checked, installable core dependency.
+- Prevent narrow-terminal rendering from panicking or exceeding the requested
+  display width on invalid UTF-8 and wide runes. Make lifecycle-lock tests prove
+  that a waiter reached lock acquisition, and make destructive integration tests
+  refuse unresolved stale users and report post-test cleanup failures.
+- Harden mirror synchronization by validating each GitHub asset's name, numeric
+  ID, authenticated API URL, digest, and exact size before a bounded authenticated
+  download under one aggregate deadline. Release scripts now stop when a file
+  size limit cannot be installed and generate their self-contained shared safety
+  primitives from one audited source.
+- Track installer redirect deadlines as integer centiseconds so a tiny positive
+  remainder cannot round to `0.00` and start another `timeout`/`curl` process;
+  zero-centisecond budgets now fail before the network call.
+- Split the invite, revoke, and doctor orchestration into explicit ordered phases,
+  group injectable `App` dependencies by responsibility, split the release-policy
+  test suite by subject, and add behavioral regression coverage for every changed
+  failure boundary.
+
 ## v2.10.3 - 2026-08-17
 
 - Fix the v2.10.2 registry migration regression that could publish a v5 row

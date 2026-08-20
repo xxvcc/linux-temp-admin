@@ -5,6 +5,8 @@ package user
 import (
 	"os/exec"
 	"testing"
+
+	"github.com/xxvcc/linux-temp-admin/internal/integrationtest"
 )
 
 // TestUserLifecycle exercises real useradd/usermod/chage/userdel end to end.
@@ -15,10 +17,9 @@ func TestUserLifecycle(t *testing.T) {
 	}
 	passwdPath = "/etc/passwd" // use the real database
 	const name = "ltatestacct"
-	// Best-effort pre-clean and guaranteed post-clean.
-	forceDelete := func() { _ = exec.Command("userdel", "-r", "--", name).Run() }
-	forceDelete()
-	t.Cleanup(forceDelete)
+	// Refuse to start with stale state, then report any post-test cleanup failure.
+	integrationtest.RequireUserAbsent(t, name, false)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, false) })
 
 	const generation = "0123456789abcdef0123456789abcdef"
 	m := New()

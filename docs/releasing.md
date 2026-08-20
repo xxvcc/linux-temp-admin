@@ -281,6 +281,12 @@ the air-gapped signing machine. Record the signer SHA-256 separately on that
 machine. Do not replace those trusted copies from a candidate tag; candidate
 files are inputs, never release tooling.
 
+The shared safety functions in those three scripts have one generation source,
+`scripts/release-safety-primitives.inc`, but each trusted script embeds only its
+required functions and remains self-contained. Before auditing or copying the
+tools, run `python3 -B scripts/sync-release-safety-primitives.py`; never source
+the generation input during a release ceremony.
+
 The offline and publishing scripts pin the trusted signer/verifier through an
 open `/proc` descriptor, then validate its owner and mode, hash it, and execute
 that descriptor throughout the run. Replacing its pathname after the hash
@@ -1070,9 +1076,13 @@ reload, and keep the release gate closed.
 Recovery is deliberately narrow:
 
 1. If a transfer stopped before all six immutable files arrived, dispatch the
-   mirror workflow again for the same immutable GitHub tag. Under the deployment
-   lock, the receiver first recovers only its strictly validated private commit
-   state, then checks every existing release byte and fills only missing files.
+   mirror workflow again for the same immutable GitHub tag only while that tag's
+   `scripts/install.sh` and `internal/selfmanage/release_pubkey.hex` remain
+   byte-identical to the trusted copies on the current default branch. Under the
+   deployment lock, the receiver first recovers only its strictly validated
+   private commit state, then checks every existing release byte and fills only
+   missing files. The workflow intentionally rejects an older tag after either
+   trust file changes; do not bypass either `cmp` as routine recovery.
 2. If `install.sh` changed but `latest.json` did not, rerun the current GitHub
    Latest tag. The workflow republishes the installer first and the manifest
    last; clients remain signature-verified during the interrupted state.
@@ -1085,8 +1095,13 @@ Recovery is deliberately narrow:
    that no `ltamirror` receiver or rsync process is active. `.deploy.lock` is
    persistent state and must not be treated as a stale transfer.
 5. After total mirror loss, rebuild this empty layout, restore the audited
-   receiver and Nginx include, rotate the deployment key, and dispatch each
-   required immutable tag. Dispatch the current GitHub Latest tag after its
+   receiver and Nginx include, and rotate the deployment key. The routine mirror
+   workflow can then restore only required immutable tags whose installer and
+   release keyring still satisfy the byte-identity rule above. Restoring an older
+   incompatible tag requires a separately reviewed incident change on the
+   default branch that binds the exact tag, commit, installer digest, and keyring
+   digest; never weaken the current comparisons or temporarily replace the
+   trusted branch copies. Dispatch the current GitHub Latest tag after its
    version bytes are present so stable files are reconstructed last. Repeat all
    independent public checks before reopening the announcement gate.
 
@@ -1099,9 +1114,10 @@ independent network check has fetched `latest.json`, the selected version's
 checksum manifest, binaries, and signatures from the public hostname, compared
 them with the immutable GitHub assets, verified both architectures, and run a
 real mirror bootstrap plus a routine self-upgrade canary. A mirror transport
-failure may be repaired and the exact immutable tag resynchronized with
-`workflow_dispatch`; a checksum, signature, tag, version, or manifest mismatch
-is an integrity incident, not a reason to announce with GitHub-only instructions.
+failure may be repaired and a trust-material-compatible immutable tag
+resynchronized with `workflow_dispatch`; a checksum, signature, tag, version,
+manifest, installer, or keyring mismatch is an integrity incident, not a reason
+to announce with GitHub-only instructions.
 
 `scripts/sign-release.sh` and `scripts/release.sh` intentionally exit with an
 error. The old online one-step signer and unchecked local fallback must not be

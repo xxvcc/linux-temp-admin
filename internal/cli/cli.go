@@ -34,25 +34,10 @@ import (
 	"golang.org/x/term"
 )
 
-// App holds the program's collaborators. Fields are exported/injectable so tests
-// can substitute fakes and temp paths.
-type App struct {
-	Out io.Writer
-	Err io.Writer
-	In  io.Reader
-
-	P i18n.Printer
-
-	Users      *user.Manager
-	Sudoers    *sudoers.Manager
-	SSHD       *sshdconf.Manager
-	Scheduler  *schedule.Scheduler
-	Registry   *registry.Store
-	Detector   *netdetect.Detector
-	Selfmanage *selfmanage.Manager
-	Audit      *audit.Logger
-	Lifecycle  *lifecycle.Lock
-
+// SystemProbes contains read-only host observations used by CLI orchestration.
+// Tests replace these probes to avoid consulting the host's account and sshd
+// state.
+type SystemProbes struct {
 	// SSHDConfig reads sshd's effective configuration for a user; injectable so a
 	// test's verdict comes from a fixture, not from the test host's own sshd.
 	SSHDConfig func(user string) (*sysinfo.SSHDConfig, error)
@@ -61,37 +46,6 @@ type App struct {
 	// beside SSHDConfig so tests can source the complete policy verdict from
 	// fixtures instead of the host.
 	SSHDHasUnverifiableMatch func(accountExists bool) bool
-
-	InstallPath string
-	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
-	// they are fields for the same reason InstallPath is: a test that ran the
-	// teardown against the constants would delete the real ones. CI runs the
-	// integration suite as root, so that is not a hypothetical — it would happen on
-	// every push, to the runner and to whatever box a developer ran it on.
-	StateDir      string
-	AuditLogDir   string
-	Now           func() time.Time
-	RandHex       func(nBytes int) (string, error)
-	RandPassword  func(nChars int) (string, error)
-	StdoutIsTTY   func() bool
-	StdinIsTTY    func() bool
-	TerminalWidth func() int
-	Geteuid       func() int
-	// Executable is a test hook. Production leaves it nil and reads /proc/self/exe,
-	// which remains bound to the running inode if its original pathname is replaced.
-	Executable func() (string, error)
-	// RemoveAll is a test hook for recursive teardown. Production uses
-	// os.RemoveAll; nil also falls back to os.RemoveAll for direct test Apps.
-	RemoveAll func(string) error
-	// TerminateProcesses is injectable so revoke's fail-closed handling can be
-	// exercised without signalling real processes in tests.
-	TerminateProcesses func(int) error
-	// ClearScheduledJobs removes personal cron and at/batch work before an account
-	// identity can be released. DrainScheduledJobs waits out a daemon that may have
-	// read a due job before its spool entry disappeared. Both are injected together
-	// in tests so no host queue is inspected or delayed accidentally.
-	ClearScheduledJobs func(string, int) error
-	DrainScheduledJobs func() error
 	// LookupUser is the single passwd snapshot source for identity-sensitive CLI
 	// operations. Production uses user.Lookup; tests inject account replacement
 	// sequences without modifying the host account database.
@@ -111,6 +65,24 @@ type App struct {
 	// InspectIdentityAllocation returns the allocation bounds and observed local
 	// high-water without treating an exhausted range as an inspection failure.
 	InspectIdentityAllocation func() (user.IdentityAllocationSnapshot, error)
+}
+
+// HostOperations contains host mutations whose failure must remain visible to
+// the command transaction. Nil hooks retain the command-specific production
+// fallback or fail-closed behavior.
+type HostOperations struct {
+	// RemoveAll is a test hook for recursive teardown. Production uses
+	// os.RemoveAll; nil also falls back to os.RemoveAll for direct test Apps.
+	RemoveAll func(string) error
+	// TerminateProcesses is injectable so revoke's fail-closed handling can be
+	// exercised without signalling real processes in tests.
+	TerminateProcesses func(int) error
+	// ClearScheduledJobs removes personal cron and at/batch work before an account
+	// identity can be released. DrainScheduledJobs waits out a daemon that may have
+	// read a due job before its spool entry disappeared. Both are injected together
+	// in tests so no host queue is inspected or delayed accidentally.
+	ClearScheduledJobs func(string, int) error
+	DrainScheduledJobs func() error
 	// EnsureScheduledCommand is a test hook for the stable-command preflight used
 	// before a revoke hands final deletion to systemd. Production leaves it nil and
 	// installs or verifies the running binary through ensureStableInstalled.
@@ -118,6 +90,53 @@ type App struct {
 	// BeginQuarantine is a test hook for the registry half of the finalizer
 	// handoff. Production leaves it nil and calls Registry.BeginQuarantine.
 	BeginQuarantine func(user string, uid int, generation string, deadline time.Time, unit string) error
+}
+
+// RuntimeHooks contains process-local facilities that tests make deterministic.
+type RuntimeHooks struct {
+	Now           func() time.Time
+	RandHex       func(nBytes int) (string, error)
+	RandPassword  func(nChars int) (string, error)
+	StdoutIsTTY   func() bool
+	StdinIsTTY    func() bool
+	TerminalWidth func() int
+	Geteuid       func() int
+	// Executable is a test hook. Production leaves it nil and reads /proc/self/exe,
+	// which remains bound to the running inode if its original pathname is replaced.
+	Executable func() (string, error)
+}
+
+// App holds the program's collaborators. Fields are exported/injectable so tests
+// can substitute fakes and temp paths.
+type App struct {
+	Out io.Writer
+	Err io.Writer
+	In  io.Reader
+
+	P i18n.Printer
+
+	Users      *user.Manager
+	Sudoers    *sudoers.Manager
+	SSHD       *sshdconf.Manager
+	Scheduler  *schedule.Scheduler
+	Registry   *registry.Store
+	Detector   *netdetect.Detector
+	Selfmanage *selfmanage.Manager
+	Audit      *audit.Logger
+	Lifecycle  *lifecycle.Lock
+
+	SystemProbes
+	HostOperations
+	RuntimeHooks
+
+	InstallPath string
+	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
+	// they are fields for the same reason InstallPath is: a test that ran the
+	// teardown against the constants would delete the real ones. CI runs the
+	// integration suite as root, so that is not a hypothetical — it would happen on
+	// every push, to the runner and to whatever box a developer ran it on.
+	StateDir    string
+	AuditLogDir string
 
 	inReader *bufio.Reader // lazily wraps In; reused so buffered stdin isn't lost between prompts
 }
@@ -125,48 +144,54 @@ type App struct {
 // NewApp builds an App with real collaborators and the resolved language.
 func NewApp(lang i18n.Lang) *App {
 	return &App{
-		Out:                      os.Stdout,
-		Err:                      os.Stderr,
-		In:                       os.Stdin,
-		P:                        i18n.Printer{Lang: lang},
-		Users:                    user.New(),
-		Sudoers:                  sudoers.New(),
-		SSHD:                     sshdconf.New(),
-		Scheduler:                schedule.New(),
-		Registry:                 registry.Default(),
-		Detector:                 netdetect.New(),
-		Selfmanage:               selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
-		Audit:                    audit.Default(),
-		Lifecycle:                lifecycle.New(config.LifecycleLockFile),
-		SSHDConfig:               sysinfo.SSHDEffective,
-		SSHDHasUnverifiableMatch: sysinfo.HasUnverifiableMatch,
-		InstallPath:              config.InstallPath,
-		StateDir:                 config.StateDir,
-		AuditLogDir:              config.AuditLogDir,
-		Now:                      time.Now,
-		RandHex:                  randHex,
-		RandPassword:             randPassword,
-		StdoutIsTTY:              func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
-		StdinIsTTY:               func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
-		TerminalWidth: func() int {
-			width, _, err := term.GetSize(int(os.Stdout.Fd()))
-			if err != nil {
-				return 0
-			}
-			return width
+		Out:        os.Stdout,
+		Err:        os.Stderr,
+		In:         os.Stdin,
+		P:          i18n.Printer{Lang: lang},
+		Users:      user.New(),
+		Sudoers:    sudoers.New(),
+		SSHD:       sshdconf.New(),
+		Scheduler:  schedule.New(),
+		Registry:   registry.Default(),
+		Detector:   netdetect.New(),
+		Selfmanage: selfmanage.New(config.InstallPath, config.MaxUpgradeBytes),
+		Audit:      audit.Default(),
+		Lifecycle:  lifecycle.New(config.LifecycleLockFile),
+		SystemProbes: SystemProbes{
+			SSHDConfig:               sysinfo.SSHDEffective,
+			SSHDHasUnverifiableMatch: sysinfo.HasUnverifiableMatch,
+			LookupUser:               user.Lookup,
+			ListMarkerAccounts:       user.LifecycleMarkerAccounts,
+			RunningLegacyRevoke: func(installPath, username string) (bool, error) {
+				return runningLegacyRevokeProcess("/proc", installPath, username)
+			},
+			IdentityAllocationRange:   user.IdentityAllocationRange,
+			InspectIdentityAllocation: user.InspectIdentityAllocation,
 		},
-		Geteuid:            os.Geteuid,
-		RemoveAll:          os.RemoveAll,
-		TerminateProcesses: user.TerminateProcesses,
-		ClearScheduledJobs: userjobs.Clear,
-		DrainScheduledJobs: userjobs.WaitForDrain,
-		LookupUser:         user.Lookup,
-		ListMarkerAccounts: user.LifecycleMarkerAccounts,
-		RunningLegacyRevoke: func(installPath, username string) (bool, error) {
-			return runningLegacyRevokeProcess("/proc", installPath, username)
+		HostOperations: HostOperations{
+			RemoveAll:          os.RemoveAll,
+			TerminateProcesses: user.TerminateProcesses,
+			ClearScheduledJobs: userjobs.Clear,
+			DrainScheduledJobs: userjobs.WaitForDrain,
 		},
-		IdentityAllocationRange:   user.IdentityAllocationRange,
-		InspectIdentityAllocation: user.InspectIdentityAllocation,
+		RuntimeHooks: RuntimeHooks{
+			Now:          time.Now,
+			RandHex:      randHex,
+			RandPassword: randPassword,
+			StdoutIsTTY:  func() bool { return term.IsTerminal(int(os.Stdout.Fd())) },
+			StdinIsTTY:   func() bool { return term.IsTerminal(int(os.Stdin.Fd())) },
+			TerminalWidth: func() int {
+				width, _, err := term.GetSize(int(os.Stdout.Fd()))
+				if err != nil {
+					return 0
+				}
+				return width
+			},
+			Geteuid: os.Geteuid,
+		},
+		InstallPath: config.InstallPath,
+		StateDir:    config.StateDir,
+		AuditLogDir: config.AuditLogDir,
 	}
 }
 

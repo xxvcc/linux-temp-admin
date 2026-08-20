@@ -59,7 +59,7 @@ func (r *orderedTeardownRunner) RunInput(_ string, name string, args ...string) 
 	return r.Run(name, args...)
 }
 
-func (*orderedTeardownRunner) Look(name string) bool { return name == "userdel" }
+func (*orderedTeardownRunner) Look(name string) bool { return name == "userdel" || name == "groupdel" }
 
 func newOrderedTeardownApp(t *testing.T, pw user.Passwd, failClearCall int, clearErr error) (*App, *[]string, *bool) {
 	t.Helper()
@@ -86,34 +86,39 @@ func newOrderedTeardownApp(t *testing.T, pw user.Passwd, failClearCall int, clea
 	clearCalls := 0
 	a := &App{
 		Users: &user.Manager{
-			Runner:            &orderedTeardownRunner{events: &events, present: &present},
-			LookupUser:        lookup,
-			NameInUse:         func(string) (bool, error) { return false, nil },
-			RemoveManagedMail: appendArtifact("mail"),
-			RemoveManagedHome: appendArtifact("home"),
+			Runner:                    &orderedTeardownRunner{events: &events, present: &present},
+			LookupUser:                lookup,
+			NameInUse:                 func(string) (bool, error) { return false, nil },
+			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
+			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
+			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			RemoveManagedMail:         appendArtifact("mail"),
+			RemoveManagedHome:         appendArtifact("home"),
 		},
-		LookupUser: lookup,
-		ClearScheduledJobs: func(name string, uid int) error {
-			if name != pw.Name || uid != pw.UID {
-				t.Fatalf("ClearScheduledJobs(%q, %d), want (%q, %d)", name, uid, pw.Name, pw.UID)
-			}
-			clearCalls++
-			events = append(events, "clear")
-			if clearCalls == failClearCall {
-				return clearErr
-			}
-			return nil
-		},
-		DrainScheduledJobs: func() error {
-			events = append(events, "drain")
-			return nil
-		},
-		TerminateProcesses: func(uid int) error {
-			if uid != pw.UID {
-				t.Fatalf("TerminateProcesses UID = %d, want %d", uid, pw.UID)
-			}
-			events = append(events, "kill")
-			return nil
+		SystemProbes: SystemProbes{LookupUser: lookup},
+		HostOperations: HostOperations{
+			ClearScheduledJobs: func(name string, uid int) error {
+				if name != pw.Name || uid != pw.UID {
+					t.Fatalf("ClearScheduledJobs(%q, %d), want (%q, %d)", name, uid, pw.Name, pw.UID)
+				}
+				clearCalls++
+				events = append(events, "clear")
+				if clearCalls == failClearCall {
+					return clearErr
+				}
+				return nil
+			},
+			DrainScheduledJobs: func() error {
+				events = append(events, "drain")
+				return nil
+			},
+			TerminateProcesses: func(uid int) error {
+				if uid != pw.UID {
+					t.Fatalf("TerminateProcesses UID = %d, want %d", uid, pw.UID)
+				}
+				events = append(events, "kill")
+				return nil
+			},
 		},
 	}
 	return a, &events, &present
@@ -263,6 +268,13 @@ func TestPendingCreationRecordRequiresExactBoundShape(t *testing.T) {
 	withUID.UID = pw.UID
 	if !pendingCreationRecordMatchesPasswd(withUID, pw) {
 		t.Fatal("exact UID-bound pending identity was rejected")
+	}
+	sequential := withUID
+	sequential.SequentialID = true
+	changedPrimaryGroup := pw
+	changedPrimaryGroup.GID++
+	if pendingCreationRecordMatchesPasswd(sequential, changedPrimaryGroup) {
+		t.Fatal("sequential pending identity accepted a changed primary GID")
 	}
 
 	tests := []struct {
@@ -903,6 +915,128 @@ func TestInteractivePendingRecoveryReturnsAfterDurableIdentityQuarantine(t *test
 	}
 }
 
+func TestSequentialGIDMismatchRefusesQuarantineAfterGrantCleanup(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-gid-drift"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	rec := registry.Record{
+		User: username, UID: 1001, Port: 22, Generation: generation,
+		IdentityBound: true, SequentialID: true,
+	}
+	pw := user.Passwd{
+		Name: username, UID: rec.UID, GID: rec.UID + 1,
+		GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+	a, _, errb := newTestApp(t, "")
+	setTestRegistryRecord(t, a, rec)
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	a.Users = &user.Manager{Runner: &revokeRunner{}}
+	a.TerminateProcesses = func(int) error { return nil }
+	a.ClearScheduledJobs = func(string, int) error { return nil }
+	a.EnsureScheduledCommand = func() error { return nil }
+	a.Scheduler = &schedule.Scheduler{
+		SystemdDir: t.TempDir(), InstallPath: t.TempDir() + "/linux-temp-admin",
+		UnitPrefix: config.AutoRevokeUnitPrefix, Now: a.Now,
+		Sys: revokeTestScheduleSystem{hasSystemctl: true},
+	}
+	grantRemovals := 0
+	a.Sudoers = &sudoers.Manager{
+		Dir: t.TempDir(),
+		RemoveFile: func(string) error {
+			grantRemovals++
+			return nil
+		},
+	}
+	quarantineCalls := 0
+	a.BeginQuarantine = func(string, int, string, time.Time, string) error {
+		quarantineCalls++
+		return nil
+	}
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, yes: true, manualInvocation: true, liveConfirmed: true,
+	}); rc != 1 {
+		t.Fatalf("revoke rc = %d, want GID-mismatch refusal", rc)
+	}
+	if grantRemovals != 1 {
+		t.Fatalf("sudo grant removals = %d, want 1 before refusal", grantRemovals)
+	}
+	if quarantineCalls != 0 {
+		t.Fatalf("GID-mismatched identity reached quarantine %d times", quarantineCalls)
+	}
+	stored, found, err := a.Registry.Lookup(username)
+	if err != nil || !found || stored.DeletionStarted {
+		t.Fatalf("GID-mismatch refusal changed registry: found=%v rec=%+v err=%v", found, stored, err)
+	}
+	if got := errb.String(); !strings.Contains(got, "primary GID was changed") || !strings.Contains(got, "quarantine") {
+		t.Fatalf("GID-mismatch refusal hid its reason: %q", got)
+	}
+}
+
+func TestSequentialUIDOnlyRecoveryKeepsGIDMismatchProtected(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		username   = "xxvcc-gid-recovery"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, _, errb := newTestApp(t, "")
+	a.StdinIsTTY = func() bool { return true }
+	setTestRegistryRecord(t, a, registry.Record{
+		User: username, UID: 1001, Port: 22, Generation: generation,
+		IdentityBound: true, SequentialID: true, Pending: true,
+	})
+	if err := a.Registry.BeginDeletion(username, 1001, ""); err != nil {
+		t.Fatal(err)
+	}
+	storedBefore, found, err := a.Registry.Lookup(username)
+	if err != nil || !found || !storedBefore.DeletionStarted || storedBefore.IdentityBound || !storedBefore.SequentialID {
+		t.Fatalf("UID-only sequential fixture = found=%v rec=%+v err=%v", found, storedBefore, err)
+	}
+	pw := user.Passwd{
+		Name: username, UID: storedBefore.UID, GID: storedBefore.UID + 1,
+		GECOS: config.PendingGenerationGECOSPrefix + generation,
+		Home:  "/home/" + username, Shell: "/bin/sh",
+	}
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	runner := &revokeRunner{}
+	a.Users = &user.Manager{Runner: runner}
+	terminated := 0
+	a.TerminateProcesses = func(int) error {
+		terminated++
+		return nil
+	}
+	grantRemovals := 0
+	a.Sudoers = &sudoers.Manager{
+		Dir: t.TempDir(),
+		RemoveFile: func(string) error {
+			grantRemovals++
+			return nil
+		},
+	}
+
+	if rc := a.revokeOptionsLocked(revokeOptions{
+		username: username, force: true, manualInvocation: true, liveConfirmed: true,
+	}); rc != 1 {
+		t.Fatalf("recovery revoke rc = %d, want GID-mismatch refusal", rc)
+	}
+	if grantRemovals != 1 {
+		t.Fatalf("sudo grant removals = %d, want 1 before refusal", grantRemovals)
+	}
+	if len(runner.calls) != 0 || terminated != 0 {
+		t.Fatalf("GID-mismatched recovery mutated the account: calls=%v terminated=%d", runner.calls, terminated)
+	}
+	storedAfter, found, err := a.Registry.Lookup(username)
+	if err != nil || !found || storedAfter != storedBefore {
+		t.Fatalf("GID-mismatch refusal changed recovery witness: found=%v before=%+v after=%+v err=%v", found, storedBefore, storedAfter, err)
+	}
+	if got := errb.String(); !strings.Contains(got, "primary GID was changed") {
+		t.Fatalf("GID-mismatch recovery refusal hid its reason: %q", got)
+	}
+}
+
 func TestIdentityQuarantineReconcilesCommittedRegistryDurabilityError(t *testing.T) {
 	requireRootRegistryFixture(t)
 	const (
@@ -1174,19 +1308,21 @@ func TestTeardownLocalAccountOrdersFinalCleanupBeforeUserdel(t *testing.T) {
 	stage, err := a.teardownLocalAccount(pw.Name, pw, func() error {
 		*events = append(*events, "persist")
 		return nil
-	})
+	}, false)
 	if err != nil || stage != revokeAccountRemoved {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want account removed", stage, err)
 	}
 	if *present {
 		t.Fatal("account still present after successful userdel")
 	}
+	// DeleteExpected repeats owner-checked Home cleanup after the final kill/clear
+	// pass, closing a recreation race while the passwd identity is still bound.
 	requireTeardownEvents(t, *events,
 		"chage", "usermod",
 		"kill", "clear", "drain", "kill", "clear",
 		"persist",
 		"mail", "home",
-		"kill", "clear",
+		"kill", "clear", "home",
 		"userdel", "mail",
 	)
 }
@@ -1218,22 +1354,26 @@ func TestTeardownContinuesAcrossConcurrentUserWritablePasswdChanges(t *testing.T
 	}
 	a := &App{
 		Users: &user.Manager{
-			Runner:            &orderedTeardownRunner{events: &events, present: &present},
-			LookupUser:        lookup,
-			NameInUse:         func(string) (bool, error) { return false, nil },
-			RemoveManagedMail: func(user.Passwd) error { events = append(events, "mail"); return nil },
-			RemoveManagedHome: func(user.Passwd) error { events = append(events, "home"); return nil },
+			Runner:                    &orderedTeardownRunner{events: &events, present: &present},
+			LookupUser:                lookup,
+			NameInUse:                 func(string) (bool, error) { return false, nil },
+			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
+			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			RemoveManagedMail:         func(user.Passwd) error { events = append(events, "mail"); return nil },
+			RemoveManagedHome:         func(user.Passwd) error { events = append(events, "home"); return nil },
 		},
-		LookupUser:         lookup,
-		TerminateProcesses: func(int) error { events = append(events, "kill"); return nil },
-		ClearScheduledJobs: func(string, int) error { events = append(events, "clear"); return nil },
-		DrainScheduledJobs: func() error { events = append(events, "drain"); return nil },
+		SystemProbes: SystemProbes{LookupUser: lookup},
+		HostOperations: HostOperations{
+			TerminateProcesses: func(int) error { events = append(events, "kill"); return nil },
+			ClearScheduledJobs: func(string, int) error { events = append(events, "clear"); return nil },
+			DrainScheduledJobs: func() error { events = append(events, "drain"); return nil },
+		},
 	}
 
 	stage, err := a.teardownLocalAccount(expected.Name, expected, func() error {
 		events = append(events, "persist")
 		return nil
-	})
+	}, false)
 	if err != nil || stage != revokeAccountRemoved {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want removal across chfn/chsh changes", stage, err)
 	}
@@ -1252,7 +1392,9 @@ func TestInviteAndRevokeIdentityComparisonsUseDifferentPolicies(t *testing.T) {
 	current := expected
 	current.GECOS = "Changed Name,room,work,home," + witness
 	current.Shell = "/bin/sh"
-	a := &App{LookupUser: func(string) (user.Passwd, bool, error) { return current, true, nil }}
+	a := &App{SystemProbes: SystemProbes{
+		LookupUser: func(string) (user.Passwd, bool, error) { return current, true, nil },
+	}}
 
 	if err := a.accountStillMatches(expected.Name, expected); err == nil {
 		t.Fatal("invite identity comparison accepted a changed passwd snapshot")
@@ -1286,7 +1428,7 @@ func TestRollbackInviteAccountUsesOrderedTeardown(t *testing.T) {
 		"chage", "usermod",
 		"kill", "clear", "drain", "kill", "clear",
 		"mail", "home",
-		"kill", "clear",
+		"kill", "clear", "home",
 		"userdel", "mail",
 	)
 }
@@ -1301,7 +1443,7 @@ func TestTeardownLocalAccountFinalScheduledCleanupFailureBlocksUserdel(t *testin
 	wantErr := errors.New("final scheduled cleanup failed")
 	a, events, present := newOrderedTeardownApp(t, pw, 3, wantErr)
 
-	stage, err := a.teardownLocalAccount(pw.Name, pw, func() error { return nil })
+	stage, err := a.teardownLocalAccount(pw.Name, pw, func() error { return nil }, false)
 	if stage != revokeDeleteAccount || !errors.Is(err, wantErr) {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want delete-stage %v", stage, err, wantErr)
 	}
@@ -1334,7 +1476,7 @@ func TestTeardownLocalAccountPersistsDeletionPhaseBeforeUserdel(t *testing.T) {
 		}
 		*events = append(*events, "persist")
 		return nil
-	})
+	}, false)
 	if err != nil || stage != revokeAccountRemoved {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want account removed", stage, err)
 	}
@@ -1348,7 +1490,7 @@ func TestTeardownLocalAccountPersistsDeletionPhaseBeforeUserdel(t *testing.T) {
 	requireTeardownEvents(t, *events,
 		"chage", "usermod",
 		"kill", "clear", "drain", "kill", "clear",
-		"persist", "mail", "home", "kill", "clear", "userdel", "mail",
+		"persist", "mail", "home", "kill", "clear", "home", "userdel", "mail",
 	)
 }
 
@@ -1385,7 +1527,7 @@ func TestAccountDisappearanceDuringTeardownRetainsMailRecoveryWitness(t *testing
 		*events = append(*events, "persist")
 		*present = false
 		return nil
-	})
+	}, false)
 	if stage != revokeDeleteAccount || !errors.Is(err, wantErr) {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want retained mail failure", stage, err)
 	}
@@ -1428,7 +1570,7 @@ func TestDeletionPhaseRegistryWriteFailureBlocksUserdel(t *testing.T) {
 
 	stage, err := a.teardownLocalAccount(pw.Name, pw, func() error {
 		return a.persistDeletionStarted(rec, true, pw)
-	})
+	}, false)
 	if err == nil || stage != revokeDeleteAccount || !strings.Contains(err.Error(), "deletion-started") {
 		t.Fatalf("teardownLocalAccount = stage %v, err %v; want durable-state failure", stage, err)
 	}
@@ -1455,7 +1597,14 @@ func TestRevokeRetriesPostDeletionMailAndKeepsOrdinaryAbsentRowsNarrow(t *testin
 		setTestRegistryRecord(t, a, rec)
 		lookup := func(string) (user.Passwd, bool, error) { return user.Passwd{}, false, nil }
 		a.LookupUser = lookup
-		a.Users = &user.Manager{LookupUser: lookup, RemoveManagedMail: removeMail}
+		a.Users = &user.Manager{
+			LookupUser:                lookup,
+			NameInUse:                 func(string) (bool, error) { return false, nil },
+			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
+			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
+			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			RemoveManagedMail:         removeMail,
+		}
 		a.Scheduler = &schedule.Scheduler{
 			SystemdDir: t.TempDir(), InstallPath: t.TempDir() + "/linux-temp-admin",
 			UnitPrefix: config.AutoRevokeUnitPrefix, Sys: revokeTestScheduleSystem{},
@@ -1704,6 +1853,148 @@ func TestCompactUsesTheInjectedAccountSnapshotSource(t *testing.T) {
 	}
 }
 
+func TestCompactRetainsWholeRegistryWhenAbsentAccountDatabaseIsUnclean(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name      string
+		wantError string
+		configure func(*user.Manager, string)
+	}{
+		{
+			name:      "pending sequential private group remains",
+			wantError: "managed private group",
+			configure: func(m *user.Manager, blocked string) {
+				m.InspectPrivateGroupState = func(name string, _ int, _ bool) (bool, error) {
+					return name == blocked, nil
+				}
+			},
+		},
+		{
+			name:      "subordinate ID remains",
+			wantError: "injected subordinate ID residue",
+			configure: func(m *user.Manager, blocked string) {
+				m.CheckSubordinateIDsAbsent = func(name string) error {
+					if name == blocked {
+						return errors.New("injected subordinate ID residue")
+					}
+					return nil
+				}
+			},
+		},
+		{
+			name:      "group database unreadable",
+			wantError: "injected group database failure",
+			configure: func(m *user.Manager, blocked string) {
+				m.InspectPrivateGroupState = func(name string, _ int, _ bool) (bool, error) {
+					if name == blocked {
+						return false, errors.New("injected group database failure")
+					}
+					return false, nil
+				}
+			},
+		},
+		{
+			name:      "account reappears during inspection",
+			wantError: "reappeared during account-database inspection",
+			configure: func(m *user.Manager, blocked string) {
+				lookups := 0
+				m.LookupUser = func(name string) (user.Passwd, bool, error) {
+					if name != blocked {
+						return user.Passwd{}, false, nil
+					}
+					lookups++
+					if lookups == 1 {
+						return user.Passwd{}, false, nil
+					}
+					return user.Passwd{Name: name, UID: 1002, GID: 1002}, true, nil
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clean := registry.Record{User: "xxvcc-compact-clean", UID: 1001, Port: 22}
+			blocked := registry.Record{
+				User: "xxvcc-compact-blocked", UID: 1002, Generation: generation,
+				IdentityBound: true, SequentialID: true, Pending: true, Port: 22,
+			}
+			a, _, errb := newTestApp(t, "")
+			setTestRegistryRecord(t, a, clean)
+			reserveTestIdentity(t, a, blocked.UID)
+			if err := a.Registry.Record(blocked); err != nil {
+				t.Fatal(err)
+			}
+			a.LookupUser = func(string) (user.Passwd, bool, error) {
+				return user.Passwd{}, false, nil
+			}
+			a.Users = &user.Manager{
+				LookupUser: func(string) (user.Passwd, bool, error) {
+					return user.Passwd{}, false, nil
+				},
+				NameInUse: func(string) (bool, error) { return false, nil },
+				InspectPrivateGroupState: func(string, int, bool) (bool, error) {
+					return false, nil
+				},
+				InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
+				CheckSubordinateIDsAbsent: func(string) error { return nil },
+			}
+			tc.configure(a.Users, blocked.User)
+
+			if rc := a.compactLocked(); rc != 1 {
+				t.Fatalf("compact rc = %d, want failure", rc)
+			}
+			for _, rec := range []registry.Record{clean, blocked} {
+				if _, found, err := a.Registry.Lookup(rec.User); err != nil || !found {
+					t.Fatalf("compact partially pruned registry after verification failure: user=%s found=%v err=%v", rec.User, found, err)
+				}
+			}
+			if !strings.Contains(errb.String(), tc.wantError) {
+				t.Fatalf("compact error = %q, want %q", errb.String(), tc.wantError)
+			}
+		})
+	}
+}
+
+func TestCompactRemovesCleanAbsentAccountDatabaseRow(t *testing.T) {
+	rec := registry.Record{User: "xxvcc-compact-clean2", UID: 1001, Port: 22}
+	a, _, _ := newTestApp(t, "")
+	setTestRegistryRecord(t, a, rec)
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		return user.Passwd{}, false, nil
+	}
+	groupChecks := 0
+	subIDChecks := 0
+	a.Users = &user.Manager{
+		LookupUser: func(string) (user.Passwd, bool, error) {
+			return user.Passwd{}, false, nil
+		},
+		NameInUse: func(string) (bool, error) { return false, nil },
+		InspectSameNameGroupState: func(name string) (bool, error) {
+			groupChecks++
+			if name != rec.User {
+				t.Fatalf("same-name group inspection = %q, want %q", name, rec.User)
+			}
+			return false, nil
+		},
+		CheckSubordinateIDsAbsent: func(name string) error {
+			subIDChecks++
+			if name != rec.User {
+				t.Fatalf("subordinate-ID inspection = %q, want %q", name, rec.User)
+			}
+			return nil
+		},
+	}
+
+	if rc := a.compactLocked(); rc != 0 {
+		t.Fatalf("compact rc = %d, want success", rc)
+	}
+	if _, found, err := a.Registry.Lookup(rec.User); err != nil || found {
+		t.Fatalf("compact retained a clean absent row: found=%v err=%v", found, err)
+	}
+	if groupChecks != 1 || subIDChecks != 1 {
+		t.Fatalf("account database checks = group:%d subid:%d, want 1 each", groupChecks, subIDChecks)
+	}
+}
+
 func TestAutoRevokeRetentionSeparatesRetryableAndManualRecovery(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
 	boundPW := user.Passwd{
@@ -1747,6 +2038,19 @@ func TestAutoRevokeRetentionSeparatesRetryableAndManualRecovery(t *testing.T) {
 			pw: boundPW, exists: true, want: true,
 		},
 		{
+			name: "live sequential GID mismatch cancels unattended timer",
+			rec: registry.Record{
+				User: boundPW.Name, UID: boundPW.UID, Generation: generation,
+				IdentityBound: true, SequentialID: true, DeletionStarted: true, Port: 22,
+			},
+			pw: func() user.Passwd {
+				pw := boundPW
+				pw.GID++
+				return pw
+			}(),
+			exists: true, want: false,
+		},
+		{
 			name: "live mismatched bound witness cancels unattended timer",
 			rec: registry.Record{
 				User: boundPW.Name, UID: boundPW.UID, Generation: generation,
@@ -1776,17 +2080,19 @@ func TestFinalScheduledAccountCheckClearsWorkQueuedBeforeTerminationCompletes(t 
 	pw := user.Passwd{Name: "xxvcc-a1", UID: 1001, GID: 1001, Home: "/home/xxvcc-a1", Shell: "/bin/sh"}
 	queued := false
 	a := &App{
-		LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil },
-		TerminateProcesses: func(int) error {
-			queued = true
-			return nil
-		},
-		ClearScheduledJobs: func(string, int) error {
-			if !queued {
-				t.Fatal("scheduled-job inventory ran before process termination completed")
-			}
-			queued = false
-			return nil
+		SystemProbes: SystemProbes{LookupUser: func(string) (user.Passwd, bool, error) { return pw, true, nil }},
+		HostOperations: HostOperations{
+			TerminateProcesses: func(int) error {
+				queued = true
+				return nil
+			},
+			ClearScheduledJobs: func(string, int) error {
+				if !queued {
+					t.Fatal("scheduled-job inventory ran before process termination completed")
+				}
+				queued = false
+				return nil
+			},
 		},
 	}
 

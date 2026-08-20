@@ -17,6 +17,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/cli"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
+	"github.com/xxvcc/linux-temp-admin/internal/integrationtest"
 	"github.com/xxvcc/linux-temp-admin/internal/netdetect"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
@@ -61,28 +62,34 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 			UnitPrefix: config.AutoRevokeUnitPrefix, LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
 			Now: now, Sys: fakeSched{},
 		},
-		Registry:                 &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
-		SSHD:                     sshdMgr,
-		SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
-		SSHDHasUnverifiableMatch: func(bool) bool { return false },
-		Detector:                 netdetect.New(),
-		Selfmanage:               &selfmanage.Manager{InstallPath: installPath},
-		Audit:                    &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
-		InstallPath:              installPath,
-		Executable:               func() (string, error) { return installPath, nil },
-		Now:                      now,
-		RandHex: func(n int) (string, error) {
-			if n == 16 {
-				return "0123456789abcdef0123456789abcdef", nil
-			}
-			return "abcdef0123", nil
+		Registry:   &registry.Store{Dir: regDir, File: filepath.Join(regDir, "registry.tsv"), Lock: filepath.Join(regDir, "registry.lock")},
+		SSHD:       sshdMgr,
+		Detector:   netdetect.New(),
+		Selfmanage: &selfmanage.Manager{InstallPath: installPath},
+		Audit:      &audit.Logger{Dir: filepath.Dir(auditFile), File: auditFile, Now: now, Actor: func() (string, int) { return "test", 0 }},
+		SystemProbes: cli.SystemProbes{
+			SSHDConfig:               func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(sshdOK), nil },
+			SSHDHasUnverifiableMatch: func(bool) bool { return false },
 		},
-		RandPassword:       func(int) (string, error) { return "pw-abcdefgh", nil },
-		StdoutIsTTY:        func() bool { return true },
-		StdinIsTTY:         func() bool { return false },
-		Geteuid:            func() int { return 0 },
-		ClearScheduledJobs: noDeferredJobs,
-		DrainScheduledJobs: noDeferredJobDrain,
+		HostOperations: cli.HostOperations{
+			ClearScheduledJobs: noDeferredJobs,
+			DrainScheduledJobs: noDeferredJobDrain,
+		},
+		RuntimeHooks: cli.RuntimeHooks{
+			Executable: func() (string, error) { return installPath, nil },
+			Now:        now,
+			RandHex: func(n int) (string, error) {
+				if n == 16 {
+					return "0123456789abcdef0123456789abcdef", nil
+				}
+				return "abcdef0123", nil
+			},
+			RandPassword: func(int) (string, error) { return "pw-abcdefgh", nil },
+			StdoutIsTTY:  func() bool { return true },
+			StdinIsTTY:   func() bool { return false },
+			Geteuid:      func() int { return 0 },
+		},
+		InstallPath: installPath,
 	}
 	return a, sudoMgr, sshdMgr, installPath
 }
@@ -128,9 +135,8 @@ func reserveIntegrationIdentity(t *testing.T, store *registry.Store, uid int) {
 func TestInviteNoSudoDoesNotInheritAStaleGrant(t *testing.T) {
 	a, sudoMgr, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-reuse01"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	// A stale NOPASSWD grant and a stale sshd exception for a name with no account.
 	grant := sudoMgr.FilePath(name)
@@ -176,9 +182,8 @@ func TestPasswordNoSudoRevokeUsesTrailingWitnessAfterFullNameChange(t *testing.T
 				}
 			}
 			a, sudoMgr, sshdMgr, _ := inviteApp(t)
-			remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.username).Run() }
-			remove()
-			t.Cleanup(remove)
+			integrationtest.RequireUserAbsent(t, tc.username, true)
+			t.Cleanup(func() { integrationtest.CleanupUser(t, tc.username, true) })
 
 			passwordSSHD := "passwordauthentication yes\npubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sysinfo.ParseSSHD(passwordSSHD), nil }
@@ -228,9 +233,8 @@ func TestPasswordNoSudoRevokeUsesTrailingWitnessAfterFullNameChange(t *testing.T
 func TestInviteRetriesSSHDGrantCleanupBeforeAccountRollback(t *testing.T) {
 	a, _, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-sshretry1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	// The grant reload fails. Its first removal attempt also fails, but the CLI's
 	// independent cleanup retry succeeds before account rollback frees the name.
@@ -271,9 +275,8 @@ func TestInviteRetriesSSHDGrantCleanupBeforeAccountRollback(t *testing.T) {
 func TestInviteRetainsAccountAndRegistryWhenLaterSSHDRemovalIsUnconfirmed(t *testing.T) {
 	a, _, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-sshhold1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	// Grant succeeds and reaches the running daemon. Scheduling then fails, forcing
 	// invite rollback; that rollback must not free the username when its removal
@@ -317,9 +320,8 @@ func TestInviteRetainsAccountAndRegistryWhenLaterSSHDRemovalIsUnconfirmed(t *tes
 func TestRevokeRetainsAccountAndRegistryWithoutReloadMechanism(t *testing.T) {
 	a, _, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-sshnoreload1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--no-sudo", "--no-auto-revoke", "--no-fix-sshd", "--yes"}); rc != 0 {
@@ -354,9 +356,8 @@ func TestRevokeRetainsAccountAndRegistryWithoutReloadMechanism(t *testing.T) {
 func TestAutoRevokeSkipsWhenRegistryRowIsLost(t *testing.T) {
 	a, sudoMgr, _, installPath := inviteApp(t)
 	const name = "xxvcc-lostrow1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -402,9 +403,8 @@ func TestAutoRevokeProtectsSameUIDMarkerReplacement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			a, _, _, installPath := inviteApp(t)
 			testUID := unusedHighIntegrationUID(t)
-			rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", tc.name).Run() }
-			rm()
-			t.Cleanup(rm)
+			integrationtest.RequireUserAbsent(t, tc.name, true)
+			t.Cleanup(func() { integrationtest.CleanupUser(t, tc.name, true) })
 			originalMarker := config.ManagedGenerationGECOSPrefix + generation
 			if out, err := exec.Command("useradd", "-m", "-u", strconv.Itoa(testUID), "-s", "/bin/bash", "-c", originalMarker, tc.name).CombinedOutput(); err != nil {
 				t.Fatalf("useradd: %v: %s", err, out)
@@ -464,9 +464,8 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 		name       = "ltalegacyacct1"
 		generation = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	)
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -529,9 +528,8 @@ func TestLegacyIdentityRequiresDirectForceConfirmation(t *testing.T) {
 func TestLegacyNineFieldRegistryInteractiveRevokeMigratesBeforeDeletion(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	const name = "ltalegacyacct2"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -591,9 +589,8 @@ func TestLegacyNineFieldRegistryInteractiveRevokeMigratesBeforeDeletion(t *testi
 func TestAutoRevokeSkipsStaleGeneration(t *testing.T) {
 	a, sudoMgr, _, installPath := inviteApp(t)
 	const name = "xxvcc-stalegen1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}
@@ -636,9 +633,8 @@ func TestInviteOutputFailureRollsBackAllState(t *testing.T) {
 	a.Scheduler.Sys = tracker
 	a.Out = failingWriter{}
 	const name = "xxvcc-outputfail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--hours", "24", "--sudo", "--confirm-sudo", name, "--yes"})
@@ -665,9 +661,8 @@ func TestInviteOutputFailureRollsBackAllState(t *testing.T) {
 func TestInviteOutputFailureRetainsAccountWhenProcessCleanupIsUncertain(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	const name = "xxvcc-outputhold1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	partial := &partialFailingWriter{}
 	a.Out = partial
@@ -703,9 +698,8 @@ func TestInviteOutputFailureRetainsAccountWhenProcessCleanupIsUncertain(t *testi
 func TestInviteRetainsAccountWhenFailedSudoGrantCannotBeRemoved(t *testing.T) {
 	a, sudoMgr, _, _ := inviteApp(t)
 	const name = "xxvcc-sudograntfail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	// The preflight removal must still see an ordinary absent file. Once Grant has
 	// written the live drop-in, make both its own rollback and the CLI's independent
@@ -754,9 +748,8 @@ func TestInviteRetainsAccountWhenLaterSudoRollbackCannotRemoveGrant(t *testing.T
 	a, sudoMgr, _, _ := inviteApp(t)
 	a.Scheduler.Sys = unavailableSched{}
 	const name = "xxvcc-sudolaterfail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	// Grant succeeds, then scheduling fails. Fail removal only after Verify proves
 	// that the drop-in was live, so preflight remains unaffected.
@@ -802,9 +795,8 @@ func TestInviteRetainsRegistryWhenPostDeleteMailCleanupFails(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	a.Scheduler.Sys = unavailableSched{}
 	const name = "xxvcc-mailhold1"
-	remove := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	remove()
-	t.Cleanup(remove)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	wantErr := errors.New("injected final mail cleanup failure")
 	mailCalls := 0
@@ -847,9 +839,8 @@ func TestRevokeSudoCleanupFailureKeepsDisabledAccountAndRecoveryState(t *testing
 	tracker := newTrackingSched()
 	a.Scheduler.Sys = tracker
 	const name = "xxvcc-sudofail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--hours", "24", "--sudo", "--confirm-sudo", name, "--yes"}); rc != 0 {
@@ -885,9 +876,8 @@ func TestRevokeScheduleCleanupFailureReturnsNonzeroAndKeepsRegistry(t *testing.T
 	tracker := newTrackingSched()
 	a.Scheduler.Sys = tracker
 	const name = "xxvcc-schedfail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--hours", "24", "--no-sudo", "--yes"}); rc != 0 {
@@ -910,9 +900,8 @@ func TestRevokeKeepsDisabledAccountWhenProcessesCannotBeCleared(t *testing.T) {
 	tracker := newTrackingSched()
 	a.Scheduler.Sys = tracker
 	const name = "xxvcc-procfail1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	if rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--hours", "24", "--no-sudo", "--no-fix-sshd", "--auto-revoke", "--yes"}); rc != 0 {
@@ -951,9 +940,8 @@ func TestRevokeKeepsDisabledAccountWhenProcessesCannotBeCleared(t *testing.T) {
 func TestInviteExistingLiveAccountDoesNotStripItsGrant(t *testing.T) {
 	a, sudoMgr, sshdMgr, _ := inviteApp(t)
 	const name = "xxvcc-live01"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	// A live managed account with a real sudo grant and sshd exception on disk.
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGECOS, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
@@ -993,9 +981,8 @@ func TestInvitePermanentWhenNoAutoRevoke(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	out := a.Out.(*bytes.Buffer)
 	const name = "xxvcc-perm01"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--no-sudo", "--no-auto-revoke", "--yes", "--allow-non-tty-private-key-output"})
@@ -1046,9 +1033,8 @@ func TestInviteInteractiveDefaultsSudoOn(t *testing.T) {
 	// hours prompt either); then the confirmation YES.
 	a.In = strings.NewReader("n\nYES\n")
 	const name = "xxvcc-defsudo1"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 
 	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
 		"--allow-non-tty-private-key-output"})

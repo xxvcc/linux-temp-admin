@@ -82,6 +82,52 @@ func TestCompletedAccountIdentityRejectsUnsafeLiveAccountGID(t *testing.T) {
 	}
 }
 
+func TestStatusAndDoctorReportSequentialGIDMismatch(t *testing.T) {
+	requireRootRegistryFixture(t)
+	const (
+		name       = "xxvcc-gid-drift"
+		generation = "0123456789abcdef0123456789abcdef"
+	)
+	a, out, errb := newTestApp(t, "")
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	reserveTestIdentity(t, a, 1001)
+	rec := registry.Record{
+		User: name, UID: 1001, Generation: generation, IdentityBound: true,
+		SequentialID: true, Port: 22,
+	}
+	if err := a.Registry.Record(rec); err != nil {
+		t.Fatal(err)
+	}
+	a.LookupUser = func(string) (user.Passwd, bool, error) {
+		return user.Passwd{
+			Name: name, UID: 1001, GID: 1002,
+			GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
+			Home:  "/home/" + name, Shell: "/bin/sh",
+		}, true, nil
+	}
+	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
+		return sysinfo.ParseSSHD("pubkeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys\n"), nil
+	}
+
+	if rc := a.status([]string{"--user", name}); rc != 0 {
+		t.Fatalf("status rc = %d", rc)
+	}
+	if got := out.String(); !strings.Contains(got, "identity=gid-mismatch") {
+		t.Fatalf("status hid SequentialID GID mismatch: %q", got)
+	}
+	if got := a.userCells(rec)[1]; got != "GID mismatch" {
+		t.Fatalf("userCells state = %q, want GID mismatch", got)
+	}
+	if rc := a.doctor(nil); rc != 1 {
+		t.Fatalf("doctor rc = %d, want identity failure", rc)
+	}
+	if got := errb.String(); !strings.Contains(got, "primary GID mismatch") || !strings.Contains(got, name) {
+		t.Fatalf("doctor hid SequentialID GID mismatch: %q", got)
+	}
+}
+
 func TestDoctorDistinguishesIdentitySequenceIntegrityFailures(t *testing.T) {
 	requireRootRegistryFixture(t)
 	const (
@@ -229,7 +275,7 @@ func TestDoctorDistinguishesDeletionRecoveryStates(t *testing.T) {
 			rec: registry.Record{
 				User: "xxvcc-recovery-a", UID: 1001, DeletionStarted: true, Port: 22,
 			},
-			wantMsg: "account is absent; the witness authorizes only an owner-checked UID-bound mail cleanup retry",
+			wantMsg: "the witness authorizes an owner-checked UID-bound mail retry",
 		},
 		{
 			name: "live bound retry",

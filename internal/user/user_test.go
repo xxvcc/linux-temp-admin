@@ -693,8 +693,18 @@ func (f *fakeRunner) RunInput(stdin string, name string, args ...string) error {
 
 func (f *fakeRunner) Look(name string) bool { return f.available[name] }
 
+// stubAbsentAccountDatabaseChecks keeps tests that exercise other Manager
+// behavior independent of the host's privileged account databases. Tests for
+// the real parsers and private-group state machine live in accountdb_test.go.
+func stubAbsentAccountDatabaseChecks(m *Manager) *Manager {
+	m.InspectPrivateGroupState = func(string, int, bool) (bool, error) { return false, nil }
+	m.InspectSameNameGroupState = func(string) (bool, error) { return false, nil }
+	m.CheckSubordinateIDsAbsent = func(string) error { return nil }
+	return m
+}
+
 func managerWithStubbedHomeChecks(r Runner) *Manager {
-	return &Manager{
+	return stubAbsentAccountDatabaseChecks(&Manager{
 		Runner:                   r,
 		NameInUse:                func(string) (bool, error) { return false, nil },
 		ValidateManagedMailRoots: func() error { return nil },
@@ -703,16 +713,16 @@ func managerWithStubbedHomeChecks(r Runner) *Manager {
 		ValidateManagedHome:      func(Passwd) error { return nil },
 		RemoveManagedMail:        func(Passwd) error { return nil },
 		RemoveManagedHome:        func(Passwd) error { return nil },
-	}
+	})
 }
 
 func managerWithStubbedHomeRemoval(r Runner) *Manager {
-	return &Manager{
+	return stubAbsentAccountDatabaseChecks(&Manager{
 		Runner:            r,
 		NameInUse:         func(string) (bool, error) { return false, nil },
 		RemoveManagedMail: func(Passwd) error { return nil },
 		RemoveManagedHome: func(Passwd) error { return nil },
-	}
+	})
 }
 
 func TestAccountMutationsRejectInvalidUsernameBeforeRunningHelpers(t *testing.T) {
@@ -887,7 +897,7 @@ func TestCreatePendingIdentityPinsReservedUIDAndGID(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	m := managerWithStubbedHomeChecks(f)
 	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, reserved)
 	if err != nil || pw.UID != reserved || pw.GID != reserved {
@@ -905,7 +915,7 @@ func TestCreatePendingIdentityRejectsReservedIDMismatch(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2346:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	m := managerWithStubbedHomeChecks(f)
 	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
 	if err == nil || pw.GID != 2346 || !strings.Contains(err.Error(), "want reserved 2345:2345") {
@@ -1014,7 +1024,7 @@ func TestCreateReturnsTheIdentityItReadOnFieldMismatch(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	m := managerWithStubbedHomeChecks(f)
 	pw, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
 	if err == nil || !strings.Contains(err.Error(), "rollback or manual recovery") {
@@ -2448,7 +2458,7 @@ func TestDeleteExpectedIdentityPolicyPersistsAcrossLateBoundaries(t *testing.T) 
 					exists = false
 				}
 			}
-			m := &Manager{
+			m := stubAbsentAccountDatabaseChecks(&Manager{
 				Runner:            f,
 				LookupUser:        func(string) (Passwd, bool, error) { return current, exists, nil },
 				RemoveManagedMail: func(Passwd) error { return nil },
@@ -2456,7 +2466,7 @@ func TestDeleteExpectedIdentityPolicyPersistsAcrossLateBoundaries(t *testing.T) 
 					current = mutable
 					return nil
 				},
-			}
+			})
 			err := policy.delete(m, expected.Name, expected, noOpBeforeDelete)
 			if policy.wantIdentity {
 				if err == nil || !strings.Contains(err.Error(), "identity changed") {
@@ -2855,11 +2865,55 @@ func TestDeleteExpectedRemovesManagedArtifactsThenAccountWithoutRecursiveHelper(
 	if !reflect.DeepEqual(f.calls, [][]string{{"userdel", "--", "xxvcc-u"}}) {
 		t.Fatalf("account helper argv = %v", f.calls)
 	}
-	if !reflect.DeepEqual(order, []string{"mail", "home", "quiesce", "account", "mail"}) {
-		t.Fatalf("deletion order = %v, want artifacts then final quiescence before account helper and mail resweep", order)
+	if !reflect.DeepEqual(order, []string{"mail", "home", "quiesce", "home", "account", "mail"}) {
+		t.Fatalf("deletion order = %v, want artifacts, final quiescence, Home resweep, account helper, and mail resweep", order)
 	}
 	if _, err := os.Lstat(home); !os.IsNotExist(err) {
 		t.Fatalf("managed home survived controlled cleanup: %v", err)
+	}
+}
+
+func TestDeleteExpectedRemovesHomeRecreatedDuringFinalQuiescence(t *testing.T) {
+	expected := Passwd{Name: "xxvcc-u", UID: 1001, GID: 1001, Home: "/home/xxvcc-u", Shell: "/bin/sh"}
+	exists := true
+	homePresent := true
+	homeCalls := 0
+	f := &fakeRunner{available: map[string]bool{"userdel": true}}
+	f.onRun = func(name string) {
+		if name != "userdel" {
+			return
+		}
+		if homePresent {
+			t.Error("userdel ran while Home recreated during final quiescence was still present")
+		}
+		exists = false
+	}
+	m := stubAbsentAccountDatabaseChecks(&Manager{
+		Runner:     f,
+		LookupUser: func(string) (Passwd, bool, error) { return expected, exists, nil },
+		RemoveManagedMail: func(Passwd) error {
+			return nil
+		},
+		RemoveManagedHome: func(Passwd) error {
+			homeCalls++
+			homePresent = false
+			return nil
+		},
+	})
+	if err := m.DeleteExpected(expected.Name, expected, func() error {
+		if homeCalls != 1 || homePresent {
+			t.Fatalf("initial Home cleanup state: calls=%d present=%v", homeCalls, homePresent)
+		}
+		homePresent = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if homeCalls != 2 || homePresent {
+		t.Fatalf("final Home cleanup state: calls=%d present=%v, want two sweeps and absence", homeCalls, homePresent)
+	}
+	if exists || len(f.calls) != 1 || f.calls[0][0] != "userdel" {
+		t.Fatalf("account deletion state: exists=%v calls=%v", exists, f.calls)
 	}
 }
 
@@ -2904,7 +2958,7 @@ func TestDeleteExpectedStopsBeforeHomeAndHelperWhenMailCleanupFails(t *testing.T
 func TestDeleteExpectedAbsentAccountOnlyCleansOwnerCheckedMail(t *testing.T) {
 	expected := Passwd{Name: "xxvcc-u", UID: 1001, GID: 1001, Home: "/home/xxvcc-u", Shell: "/bin/sh"}
 	var order []string
-	m := &Manager{
+	m := stubAbsentAccountDatabaseChecks(&Manager{
 		LookupUser: func(string) (Passwd, bool, error) { return Passwd{}, false, nil },
 		NameInUse:  func(string) (bool, error) { return false, nil },
 		RemoveManagedMail: func(Passwd) error {
@@ -2915,7 +2969,7 @@ func TestDeleteExpectedAbsentAccountOnlyCleansOwnerCheckedMail(t *testing.T) {
 			order = append(order, "home")
 			return nil
 		},
-	}
+	})
 	if err := m.DeleteExpected(expected.Name, expected, noOpBeforeDelete); err != nil {
 		t.Fatal(err)
 	}
@@ -2927,7 +2981,7 @@ func TestDeleteExpectedAbsentAccountOnlyCleansOwnerCheckedMail(t *testing.T) {
 func TestDeleteExpectedRechecksAbsenceBetweenMailSweeps(t *testing.T) {
 	expected := Passwd{Name: "xxvcc-u", UID: 1001, GID: 1001, Home: "/home/xxvcc-u", Shell: "/bin/sh"}
 	var events []string
-	m := &Manager{
+	m := stubAbsentAccountDatabaseChecks(&Manager{
 		LookupUser: func(string) (Passwd, bool, error) {
 			events = append(events, "local")
 			return Passwd{}, false, nil
@@ -2940,11 +2994,11 @@ func TestDeleteExpectedRechecksAbsenceBetweenMailSweeps(t *testing.T) {
 			events = append(events, "mail")
 			return nil
 		},
-	}
+	})
 	if err := m.DeleteExpected(expected.Name, expected, noOpBeforeDelete); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"local", "nss", "mail", "local", "nss", "mail", "local", "nss"}
+	want := []string{"local", "nss", "mail", "local", "nss", "mail", "local", "nss", "local", "nss", "local", "nss"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("absent-account sweep sequence = %v, want %v", events, want)
 	}
@@ -2961,7 +3015,7 @@ func TestDeleteExpectedFinalMailSweepRemovesSpoolRecreatedDuringHomeCleanup(t *t
 			exists = false
 		}
 	}
-	m := &Manager{
+	m := stubAbsentAccountDatabaseChecks(&Manager{
 		Runner:     f,
 		LookupUser: func(string) (Passwd, bool, error) { return expected, exists, nil },
 		RemoveManagedMail: func(Passwd) error {
@@ -2974,7 +3028,7 @@ func TestDeleteExpectedFinalMailSweepRemovesSpoolRecreatedDuringHomeCleanup(t *t
 		RemoveManagedHome: func(Passwd) error {
 			return os.WriteFile(spool, []byte("delivery raced with Home cleanup"), 0o600)
 		},
-	}
+	})
 	if err := m.DeleteExpected(expected.Name, expected, noOpBeforeDelete); err != nil {
 		t.Fatal(err)
 	}
@@ -3107,8 +3161,8 @@ func TestDeleteExpectedRefusesAccountReappearanceAtSuccessBoundary(t *testing.T)
 		if len(f.calls) != 0 {
 			t.Fatalf("account replacement reached helper: %v", f.calls)
 		}
-		if mailCalls != 2 {
-			t.Fatalf("mail cleanup calls = %d, want initial and disappearance sweeps", mailCalls)
+		if mailCalls != 1 {
+			t.Fatalf("mail cleanup calls = %d, want replacement detection before another old-identity sweep", mailCalls)
 		}
 	})
 }

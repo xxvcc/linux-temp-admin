@@ -80,6 +80,7 @@ timeout -k 1 1 /bin/true \
 sleep 0 || { echo "sleep command is not usable" >&2; exit 1; }
 [[ -x /usr/bin/gpg ]] || { echo "required trusted command not found: /usr/bin/gpg" >&2; exit 1; }
 
+# BEGIN GENERATED RELEASE SAFETY PRIMITIVES
 local_with_timeout() {
   timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" "$@"
 }
@@ -95,7 +96,6 @@ require_trusted_tmp() {
   (( (8#$tmp_mode & 8#7000) == 8#1000 )) \
     || { echo "/tmp must have exactly the sticky special bit" >&2; return 1; }
 }
-require_trusted_tmp
 
 require_safe_directory_path() {
   local path=$1 label=$2 allow_sticky_leaf=${3:-0} canonical meta type uid mode extra parent leaf=1
@@ -167,6 +167,22 @@ require_safe_source_repo() {
       || { echo "source repo uses an external Git object or metadata store: $external_git_store" >&2; return 1; }
   done
 }
+
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks=$(( (max + 1023) / 1024 ))
+  if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
+    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
+    echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2
+    return 1
+  fi
+  size="$(local_with_timeout stat -Lc '%s' -- "$destination")" \
+    || { echo "copied file could not be measured: $destination" >&2; return 1; }
+  (( size <= max )) \
+    || { echo "file exceeds its bounded-copy limit: $source" >&2; return 1; }
+}
+# END GENERATED RELEASE SAFETY PRIMITIVES
+require_trusted_tmp
 require_real_directory_path "$SIGNED_DIR" "signed bundle"
 require_safe_file_path "$LTA_TRUSTED_SIGNER" "trusted verifier"
 require_safe_source_repo
@@ -214,19 +230,6 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size
-  blocks=$(( (max + 1023) / 1024 ))
-  if ! ( ulimit -f "$blocks"; timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" \
-    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
-    echo "input exceeds its snapshot limit or could not be copied: $source" >&2
-    return 1
-  fi
-  size="$(local_with_timeout stat -Lc '%s' -- "$destination")" \
-    || { echo "copied file could not be measured: $destination" >&2; return 1; }
-  (( size <= max )) || { echo "input exceeds its snapshot limit: $source" >&2; return 1; }
-}
 
 # Pin the verifier by descriptor so the inode hashed here is the one every
 # subsequent verify command executes.
@@ -699,10 +702,10 @@ require_recoverable_draft_assets() {
 }
 require_exact_signed_assets() {
   local got expected
-  got="$(remote_asset_names)"
+  got="$(remote_asset_names)" || return 1
   expected=$'SHA256SUMS\nlinux-temp-admin-linux-amd64\nlinux-temp-admin-linux-amd64.sig\nlinux-temp-admin-linux-arm64\nlinux-temp-admin-linux-arm64.sig'
   [[ "$got" == "$expected" ]] \
-    || { echo "release does not contain exactly the signed release assets" >&2; printf '%s\n' "$got" >&2; exit 1; }
+    || { echo "release does not contain exactly the signed release assets" >&2; printf '%s\n' "$got" >&2; return 1; }
 }
 require_remote_asset_digests() {
   local got expected name digest size
@@ -729,7 +732,7 @@ download_draft_asset() {
   [[ "$api_url" == "https://api.github.com/repos/${REPO}/releases/assets/"* ]] \
     || { echo "unexpected GitHub asset API URL for $name" >&2; return 1; }
   blocks=$(( (max + 1023) / 1024 ))
-  ( ulimit -f "$blocks"; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$out" ) \
+  ( ulimit -f "$blocks" || exit 1; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$out" ) \
     || { echo "bounded draft download failed: $name" >&2; return 1; }
   actual_size="$(wc -c < "$out")"
   [[ "$actual_size" -eq "$advertised_size" && "$actual_size" -le "$max" ]] \
@@ -922,7 +925,7 @@ public_fetch() {
     if (( attempt >= 4 )); then
       fetch_url="${url}?download=1"
     fi
-    if ( ulimit -f "$blocks"; timeout -k 5 120 curl -q -fsSL --connect-timeout 10 --max-time 120 \
+    if ( ulimit -f "$blocks" || exit 1; timeout -k 5 120 curl -q -fsSL --connect-timeout 10 --max-time 120 \
          --proto '=https' --proto-redir '=https' "$fetch_url" -o "$out" ) \
        && [[ -s "$out" && "$(wc -c < "$out")" -le "$max" ]]; then
       return 0

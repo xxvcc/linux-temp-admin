@@ -49,6 +49,73 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRecordLifecycleStates(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	deadline := time.Date(2026, 8, 19, 12, 2, 0, 0, time.UTC).Format(time.RFC3339)
+	tests := []struct {
+		name string
+		rec  Record
+		want recordLifecycleState
+	}{
+		{
+			name: "legacy active",
+			rec:  Record{User: "xxvcc-legacy", Port: 22},
+			want: recordLegacyActive,
+		},
+		{
+			name: "pending creation intent",
+			rec: Record{User: "xxvcc-pending", Port: 22, Generation: generation,
+				IdentityBound: true, Pending: true},
+			want: recordPending,
+		},
+		{
+			name: "active identity",
+			rec: Record{User: "xxvcc-active", Port: 22, UID: 1001, Generation: generation,
+				IdentityBound: true, SequentialID: true},
+			want: recordActive,
+		},
+		{
+			name: "sequential uid-only deletion recovery",
+			rec: Record{User: "xxvcc-uid", UID: 1002, DeletionStarted: true,
+				SequentialID: true},
+			want: recordDeletingUIDOnly,
+		},
+		{
+			name: "bound synchronous deletion",
+			rec: Record{User: "xxvcc-delete", Port: 22, UID: 1003, Generation: generation,
+				IdentityBound: true, DeletionStarted: true},
+			want: recordDeletingBound,
+		},
+		{
+			name: "bound quarantine",
+			rec: Record{User: "xxvcc-quarantine", Port: 22, UID: 1004, Generation: generation,
+				IdentityBound: true, DeletionStarted: true, QuarantineUntil: deadline,
+				QuarantineUnit: config.QuarantineUnitPrefix + "xxvcc-quarantine"},
+			want: recordQuarantined,
+		},
+		{
+			name: "pending recovery quarantine",
+			rec: Record{User: "xxvcc-pending-q", Port: 22, UID: 1005, Generation: generation,
+				IdentityBound: true, Pending: true, DeletionStarted: true,
+				QuarantineUntil: deadline,
+				QuarantineUnit:  config.QuarantineUnitPrefix + "xxvcc-pending-q"},
+			want: recordQuarantined,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state, err := tc.rec.lifecycleState()
+			if err != nil || state != tc.want {
+				t.Fatalf("lifecycleState(%+v) = (%d, %v), want (%d, nil)", tc.rec, state, err, tc.want)
+			}
+			got, ok, err := ParseLine(tc.rec.TSV())
+			if err != nil || !ok || got != tc.rec {
+				t.Fatalf("state round trip = ok %v record %+v err %v", ok, got, err)
+			}
+		})
+	}
+}
+
 func TestSanitizeFlattensControlChars(t *testing.T) {
 	in := Record{User: "userx", Host: "a\nb\rc", Port: 22}
 	line := in.TSV()
@@ -103,6 +170,29 @@ func TestParseLineRejectsCorruptFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, _, err := ParseLine(strings.Join(fields, "\t")); err == nil {
 				t.Fatal("corrupt record must return an error")
+			}
+		})
+	}
+}
+
+func TestRegistryParsersRejectInvalidUTF8(t *testing.T) {
+	fields := strings.Split(Record{User: "xxvcc-a1", Port: 22}.TSV(), "\t")
+	fields[4] += "\xff"
+	tests := []struct {
+		name   string
+		width  int
+		parser func(string) (Record, bool, error)
+	}{
+		{name: "current", width: currentFieldCount, parser: ParseLine},
+		{name: "legacy v2", width: legacyFieldCount, parser: parseLegacyV2Line},
+		{name: "legacy v3", width: legacyV3FieldCount, parser: parseLegacyV3Line},
+		{name: "legacy v4", width: legacyV4FieldCount, parser: parseLegacyV4Line},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			line := strings.Join(fields[:tc.width], "\t")
+			if _, ok, err := tc.parser(line); err == nil || ok || !strings.Contains(err.Error(), "valid UTF-8") {
+				t.Fatalf("invalid UTF-8 parse = ok %v err %v, want explicit refusal", ok, err)
 			}
 		})
 	}
@@ -171,21 +261,29 @@ func TestParseLineAcceptsOnlyDurablePendingDeletionQuarantine(t *testing.T) {
 	}
 }
 
-func TestParseLineRequiresSequentialIdentityBinding(t *testing.T) {
+func TestParseLineRequiresSequentialIdentityProofState(t *testing.T) {
 	const generation = "0123456789abcdef0123456789abcdef"
-	valid := Record{
-		User: "xxvcc-sequence", Port: 22, UID: 1001, Generation: generation,
-		IdentityBound: true, SequentialID: true,
-	}
-	if _, ok, err := ParseLine(valid.TSV()); err != nil || !ok {
-		t.Fatalf("valid sequential identity rejected: ok=%v err=%v", ok, err)
+	for _, valid := range []Record{
+		{
+			User: "xxvcc-sequence", Port: 22, UID: 1001, Generation: generation,
+			IdentityBound: true, SequentialID: true,
+		},
+		{
+			User: "xxvcc-sequence", UID: 1001, DeletionStarted: true,
+			SequentialID: true,
+		},
+	} {
+		if _, ok, err := ParseLine(valid.TSV()); err != nil || !ok {
+			t.Fatalf("valid sequential identity state rejected: rec=%+v ok=%v err=%v", valid, ok, err)
+		}
 	}
 	for _, bad := range []Record{
 		{User: "xxvcc-sequence", Port: 22, UID: 1001, SequentialID: true},
 		{User: "xxvcc-sequence", Port: 22, Generation: generation, IdentityBound: true, SequentialID: true, Pending: true},
+		{User: "xxvcc-sequence", DeletionStarted: true, SequentialID: true},
 	} {
 		if _, _, err := ParseLine(bad.TSV()); err == nil {
-			t.Fatalf("unbound sequential identity accepted: %+v", bad)
+			t.Fatalf("unsafe sequential identity state accepted: %+v", bad)
 		}
 	}
 }

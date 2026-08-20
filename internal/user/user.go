@@ -749,15 +749,18 @@ func (execRunner) Look(name string) bool { _, err := exec.LookPath(name); return
 
 // Manager performs account mutations via its Runner.
 type Manager struct {
-	Runner                   Runner
-	LookupUser               func(string) (Passwd, bool, error)
-	NameInUse                func(string) (bool, error)
-	ValidateManagedMailRoots func() error
-	PrepareManagedHome       func(string) error
-	CreateManagedHome        func(Passwd) error
-	ValidateManagedHome      func(Passwd) error
-	RemoveManagedMail        func(Passwd) error
-	RemoveManagedHome        func(Passwd) error
+	Runner                    Runner
+	LookupUser                func(string) (Passwd, bool, error)
+	NameInUse                 func(string) (bool, error)
+	InspectPrivateGroupState  func(string, int, bool) (bool, error)
+	InspectSameNameGroupState func(string) (bool, error)
+	CheckSubordinateIDsAbsent func(string) error
+	ValidateManagedMailRoots  func() error
+	PrepareManagedHome        func(string) error
+	CreateManagedHome         func(Passwd) error
+	ValidateManagedHome       func(Passwd) error
+	RemoveManagedMail         func(Passwd) error
+	RemoveManagedHome         func(Passwd) error
 }
 
 // New returns a Manager using real command execution.
@@ -780,7 +783,7 @@ func New() *Manager {
 func (m *Manager) Create(name, shell, generation string) error {
 	gecos, err := ManagedGECOSForGeneration(generation)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
 	}
 	_, err = m.create(name, shell, gecos, true, 0)
 	return err
@@ -793,7 +796,7 @@ func (m *Manager) Create(name, shell, generation string) error {
 func (m *Manager) CreatePending(name, shell, generation string) error {
 	gecos, err := pendingGECOSForGeneration(generation)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
 	}
 	_, err = m.create(name, shell, gecos, true, 0)
 	return err
@@ -806,7 +809,7 @@ func (m *Manager) CreatePending(name, shell, generation string) error {
 func (m *Manager) CreatePendingIdentity(name, shell, generation string) (Passwd, error) {
 	gecos, err := pendingGECOSForGeneration(generation)
 	if err != nil {
-		return Passwd{}, err
+		return Passwd{}, fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
 	}
 	return m.create(name, shell, gecos, false, 0)
 }
@@ -820,7 +823,7 @@ func (m *Manager) CreatePendingIdentityWithID(name, shell, generation string, re
 	}
 	gecos, err := pendingGECOSForGeneration(generation)
 	if err != nil {
-		return Passwd{}, err
+		return Passwd{}, fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
 	}
 	return m.create(name, shell, gecos, false, reservedID)
 }
@@ -845,6 +848,11 @@ func DefaultHome(name string) (string, error) {
 func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool, reservedID int) (Passwd, error) {
 	if err := validateMutationName(name); err != nil {
 		return Passwd{}, fmt.Errorf("%w: %w", ErrAccountCreationNotStarted, err)
+	}
+	if reservedID > 0 {
+		if err := m.preflightSequentialAccountCreation(name, reservedID); err != nil {
+			return Passwd{}, fmt.Errorf("%w: validate account databases before account creation: %w", ErrAccountCreationNotStarted, err)
+		}
 	}
 	validateMailRoots := m.ValidateManagedMailRoots
 	if validateMailRoots == nil {
@@ -893,7 +901,10 @@ func (m *Manager) create(name, shell, gecos string, shouldCreateHome bool, reser
 			return Passwd{}, errors.Join(err, fmt.Errorf("inspect account after failed useradd: %w", lookupErr))
 		}
 		if !exists {
-			return Passwd{}, fmt.Errorf("%w: useradd failed without creating an account: %v", ErrAccountCreationNotStarted, err)
+			// The helper ran and may have committed a private group or subordinate-ID
+			// assignment before failing. The caller's durable SequentialID intent must
+			// remain available for absent-account reconciliation.
+			return Passwd{}, fmt.Errorf("useradd failed after account creation started, but no passwd entry exists: %w", err)
 		}
 		return pw, fmt.Errorf("useradd reported failure after creating an account: %w", err)
 	}
@@ -1168,16 +1179,23 @@ func (m *Manager) DisableLogin(name string) error {
 // GECOS/shell fields to move; old identities retain byte-for-byte comparison.
 // The caller has already disabled login and reached an initial
 // cron/at/process fixed point. beforeDelete is mandatory and runs after controlled
-// Home/mail cleanup but immediately before the name-scoped account helper, so the
-// caller can repeat its scheduled-work and process checks at the last point where
-// the UID is still bound. System helpers are invoked without recursive Home/mail
-// options. In particular, userdel must not receive -f: on shadow-utils that flag
+// Home/mail cleanup, so the caller can repeat its scheduled-work and process checks
+// while the UID is still bound. The manager then revalidates that binding and
+// repeats owner-checked Home cleanup before the name-scoped account helper. System
+// helpers are invoked without recursive Home/mail options. In particular, userdel
+// must not receive -f: on shadow-utils that flag
 // may delete the same-name group even while another account still uses it as a
 // primary group. Distro deluser and arbitrary BusyBox builds are not fallbacks:
 // their configuration and compiled account-database semantics cannot be proven
 // equivalent to shadow-utils userdel.
 func (m *Manager) DeleteExpected(name string, expected Passwd, beforeDelete func() error) error {
-	return m.deleteExpected(name, expected, beforeDelete, SameAccountIdentity)
+	return m.deleteExpected(name, expected, beforeDelete, SameAccountIdentity, false)
+}
+
+// DeleteExpectedSequential is DeleteExpected plus cleanup of the private group
+// proven by a durable SequentialID registry witness.
+func (m *Manager) DeleteExpectedSequential(name string, expected Passwd, beforeDelete func() error) error {
+	return m.deleteExpected(name, expected, beforeDelete, SameAccountIdentity, true)
 }
 
 // DeleteExpectedExact is the pre-activation rollback counterpart of
@@ -1189,10 +1207,18 @@ func (m *Manager) DeleteExpected(name string, expected Passwd, beforeDelete func
 func (m *Manager) DeleteExpectedExact(name string, expected Passwd, beforeDelete func() error) error {
 	return m.deleteExpected(name, expected, beforeDelete, func(expected, current Passwd) bool {
 		return expected == current
-	})
+	}, false)
 }
 
-func (m *Manager) deleteExpected(name string, expected Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool) error {
+// DeleteExpectedExactSequential is the pre-activation counterpart that also
+// carries the durable SequentialID authority for private-group cleanup.
+func (m *Manager) DeleteExpectedExactSequential(name string, expected Passwd, beforeDelete func() error) error {
+	return m.deleteExpected(name, expected, beforeDelete, func(expected, current Passwd) bool {
+		return expected == current
+	}, true)
+}
+
+func (m *Manager) deleteExpected(name string, expected Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool, removePrivateGroup bool) error {
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
@@ -1202,10 +1228,13 @@ func (m *Manager) deleteExpected(name string, expected Passwd, beforeDelete func
 	if beforeDelete == nil {
 		return fmt.Errorf("final account quiescence check is not configured")
 	}
-	return m.delete(name, &expected, beforeDelete, identityMatches)
+	if removePrivateGroup && expected.UID != expected.GID {
+		return fmt.Errorf("invalid sequential account identity for %q", name)
+	}
+	return m.delete(name, &expected, beforeDelete, identityMatches, removePrivateGroup)
 }
 
-func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool) error {
+func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() error, identityMatches func(Passwd, Passwd) bool, removePrivateGroup bool) error {
 	absent, err := m.deletionState(name, expected, identityMatches)
 	if err != nil {
 		return fmt.Errorf("verify account identity before deletion: %w", err)
@@ -1229,7 +1258,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 				return fmt.Errorf("account %s reappeared during artifact cleanup sweep %d", name, sweep)
 			}
 		}
-		return nil
+		return m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
 	}
 	type helper struct {
 		name string
@@ -1242,6 +1271,11 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 	if len(helpers) == 0 {
 		return fmt.Errorf("userdel not available")
 	}
+	if removePrivateGroup {
+		if err := m.preflightPrivateGroupRemoval(*expected); err != nil {
+			return fmt.Errorf("validate managed private group before account deletion: %w", err)
+		}
+	}
 	// Keep the account and registry witness if artifact cleanup cannot be proved
 	// safe. Once a helper removes the passwd entry, a later retry no longer has the
 	// complete snapshot needed to validate an orphaned mail spool or home.
@@ -1253,6 +1287,18 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 	}
 	if err := beforeDelete(); err != nil {
 		return fmt.Errorf("final account quiescence check before userdel: %w", err)
+	}
+	// The final process/job pass can race with a service that recreates Home after
+	// the first sweep. Recheck the passwd binding before authorizing another
+	// recursive owner-checked cleanup; after userdel, UID reuse makes that unsafe.
+	absentAfterQuiescence, err := m.deletionState(name, expected, identityMatches)
+	if err != nil {
+		return fmt.Errorf("verify account after final quiescence: %w", err)
+	}
+	if !absentAfterQuiescence {
+		if err := m.removeManagedHome(*expected); err != nil {
+			return fmt.Errorf("final managed Home cleanup after account quiescence: %w", err)
+		}
 	}
 	var attemptErrs []error
 	for _, helper := range helpers {
@@ -1271,7 +1317,15 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if !absent {
 				return fmt.Errorf("account %s reappeared during final managed mail cleanup", name)
 			}
-			return nil
+			return m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
+		}
+		if removePrivateGroup {
+			// The artifact cleanup and final job drain above can be long. Repeat the
+			// complete group proof immediately before userdel, whose distro policy may
+			// otherwise remove a same-name group implicitly.
+			if err := m.preflightPrivateGroupRemoval(*expected); err != nil {
+				return errors.Join(errors.Join(attemptErrs...), fmt.Errorf("revalidate managed private group before %s: %w", helper.name, err))
+			}
 		}
 		runErr := m.Runner.Run(helper.name, helper.args...)
 		absent, stateErr := m.deletionState(name, expected, identityMatches)
@@ -1287,13 +1341,15 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if finalStateErr == nil && !stillAbsent {
 				finalStateErr = fmt.Errorf("account %s reappeared during final managed mail cleanup", name)
 			}
+			accountDBErr := m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
 			if runErr != nil {
 				return errors.Join(errors.Join(attemptErrs...),
 					fmt.Errorf("%s removed the account but reported incomplete cleanup: %w", helper.name, runErr),
 					mailErr,
-					finalStateErr)
+					finalStateErr,
+					accountDBErr)
 			}
-			if finalErr := errors.Join(mailErr, finalStateErr); finalErr != nil {
+			if finalErr := errors.Join(mailErr, finalStateErr, accountDBErr); finalErr != nil {
 				return errors.Join(errors.Join(attemptErrs...), fmt.Errorf("final cleanup after %s: %w", helper.name, finalErr))
 			}
 			return nil
@@ -1381,6 +1437,22 @@ func (m *Manager) ReconcileManagedMailAfterDeletion(name string, uid int) error 
 	}
 	if !absent {
 		return fmt.Errorf("account %s reappeared during post-deletion mail cleanup", name)
+	}
+	return nil
+}
+
+// ConfirmAccountAbsent performs the same local-plus-NSS absence proof used at
+// post-deletion mutation boundaries without touching any account artifact.
+func (m *Manager) ConfirmAccountAbsent(name string) error {
+	if err := validateMutationName(name); err != nil {
+		return err
+	}
+	absent, err := m.deletionState(name, nil, nil)
+	if err != nil {
+		return err
+	}
+	if !absent {
+		return fmt.Errorf("account %s exists", name)
 	}
 	return nil
 }
@@ -1594,7 +1666,7 @@ func validateManagedMailRoots() error {
 		if err != nil {
 			return err
 		}
-		return dir.Close()
+		return closeManagedMailRoot(dir, root)
 	})
 }
 
@@ -1640,25 +1712,38 @@ func openManagedMailRoot(root string) (*os.File, error) {
 	}
 	fi, err := dir.Stat()
 	if err != nil {
-		dir.Close()
-		return nil, fmt.Errorf("stat managed mail root %s: %w", root, err)
+		return nil, errors.Join(
+			fmt.Errorf("stat managed mail root %s: %w", root, err),
+			closeManagedMailRoot(dir, root),
+		)
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	mode := fi.Mode()
 	worldWritableWithoutSticky := mode.Perm()&0o002 != 0 && mode&os.ModeSticky == 0
 	if !ok || !fi.IsDir() || st.Uid != 0 || mode&os.ModeSetuid != 0 || worldWritableWithoutSticky {
-		dir.Close()
-		return nil, fmt.Errorf("managed mail root %s is not a safe root-owned directory (world-writable roots require sticky protection and setuid is forbidden)", root)
+		return nil, errors.Join(
+			fmt.Errorf("managed mail root %s is not a safe root-owned directory (world-writable roots require sticky protection and setuid is forbidden)", root),
+			closeManagedMailRoot(dir, root),
+		)
 	}
 	return dir, nil
 }
 
-func removeManagedMailAt(root string, expected Passwd) error {
+func closeManagedMailRoot(dir *os.File, root string) error {
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("close managed mail root %s: %w", root, err)
+	}
+	return nil
+}
+
+func removeManagedMailAt(root string, expected Passwd) (returnErr error) {
 	dir, err := openManagedMailRoot(root)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, closeManagedMailRoot(dir, root))
+	}()
 
 	var spool unix.Stat_t
 	err = unix.Fstatat(int(dir.Fd()), expected.Name, &spool, unix.AT_SYMLINK_NOFOLLOW)

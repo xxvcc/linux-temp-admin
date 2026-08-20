@@ -15,6 +15,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/expiry"
+	"github.com/xxvcc/linux-temp-admin/internal/integrationtest"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/schedule"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
@@ -36,7 +37,7 @@ func (fakeSys) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
 
 type failedCreateRunner struct{}
 
-func (failedCreateRunner) Look(name string) bool { return name == "useradd" }
+func (failedCreateRunner) Look(name string) bool { return name == "useradd" || name == "groupdel" }
 func (failedCreateRunner) Run(string, ...string) error {
 	return os.ErrInvalid
 }
@@ -77,7 +78,7 @@ func (w *inviteBundleFailWriter) Write(p []byte) (int, error) {
 
 func (*inviteTimingRunner) Look(name string) bool {
 	switch name {
-	case "useradd", "usermod", "chpasswd", "chage", "userdel":
+	case "useradd", "usermod", "chpasswd", "chage", "userdel", "groupdel":
 		return true
 	default:
 		return false
@@ -193,8 +194,10 @@ func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
 	}
 	wantErr := errors.New("unsafe mail root")
 	a.Users = &user.Manager{
-		Runner:                   failedCreateRunner{},
-		ValidateManagedMailRoots: func() error { return wantErr },
+		Runner:                    failedCreateRunner{},
+		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
+		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		ValidateManagedMailRoots:  func() error { return wantErr },
 		PrepareManagedHome: func(string) error {
 			t.Fatal("managed Home preflight ran after mail-root preflight failed")
 			return nil
@@ -254,8 +257,10 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 				Home:  "/home/" + username, Shell: resolveShell(),
 			}, true, nil
 		},
-		PrepareManagedHome: func(string) error { return nil },
-		CreateManagedHome:  func(user.Passwd) error { return nil },
+		PrepareManagedHome:        func(string) error { return nil },
+		CreateManagedHome:         func(user.Passwd) error { return nil },
+		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
+		CheckSubordinateIDsAbsent: func(string) error { return nil },
 	}
 	a.LookupUser = a.Users.LookupUser
 	a.IdentityAllocationRange = func() (int, int, error) { return 4242, 4242, nil }
@@ -493,9 +498,13 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				account: user.Passwd{UID: uid, GID: uid}, events: &events, registry: store,
 			}
 			a.Users = &user.Manager{
-				Runner:             runner,
-				LookupUser:         runner.lookup,
-				PrepareManagedHome: func(string) error { return nil },
+				Runner:                    runner,
+				LookupUser:                runner.lookup,
+				NameInUse:                 func(string) (bool, error) { return false, nil },
+				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
+				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
+				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
 					return errors.New("stop after identity isolation check")
@@ -723,9 +732,13 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 				runner.activationMutation = mutateIdentity
 			}
 			a.Users = &user.Manager{
-				Runner:             runner,
-				LookupUser:         runner.lookup,
-				PrepareManagedHome: func(string) error { return nil },
+				Runner:                    runner,
+				LookupUser:                runner.lookup,
+				NameInUse:                 func(string) (bool, error) { return false, nil },
+				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
+				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
+				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
 					return nil
@@ -809,6 +822,13 @@ func newManageApp(t *testing.T, in string, users ...string) (*App, *bytes.Buffer
 	a.Scheduler = &schedule.Scheduler{
 		SystemdDir: dir, InstallPath: a.InstallPath, UnitPrefix: "lta-test-",
 		Now: a.Now, Sys: fakeSys{},
+	}
+	a.Users = &user.Manager{
+		LookupUser:                func(name string) (user.Passwd, bool, error) { return a.lookupUser(name) },
+		NameInUse:                 func(string) (bool, error) { return false, nil },
+		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
+		InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
+		CheckSubordinateIDsAbsent: func(string) error { return nil },
 	}
 	// The store's dir has to be root-owned for its symlink-safety checks to pass;
 	// t.TempDir() belongs to whoever runs the suite.
@@ -1023,9 +1043,8 @@ func TestManageUsersDisplayedNumberIsTheOneThatActs(t *testing.T) {
 func newRealAccount(t *testing.T, a *App, name string) int {
 	t.Helper()
 	const generation = "0123456789abcdef0123456789abcdef"
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", config.ManagedGenerationGECOSPrefix+generation, name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd %s: %v: %s", name, err, out)
 	}
@@ -1207,9 +1226,8 @@ func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	a, _, errb := newManageApp(t, "")
 	a.Users = user.New()
 
-	rm := func() { _ = exec.Command("userdel", "-r", "-f", "--", name).Run() }
-	rm()
-	t.Cleanup(rm)
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
 	if out, err := exec.Command("useradd", "-m", "-s", "/bin/bash", "-c", "linux-temp-admin temporary admin", name).CombinedOutput(); err != nil {
 		t.Fatalf("useradd: %v: %s", err, out)
 	}

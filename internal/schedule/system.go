@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
@@ -20,7 +21,6 @@ const (
 	atQueueOutputLimit      = int64(4 << 20)
 	atJobBodyLimit          = int64(1 << 20)
 	atOwnerProbeLimit       = int64(64 << 10)
-	maxAtJobs               = 4096
 	maxLoadedSystemdUnits   = 16384
 )
 
@@ -249,7 +249,7 @@ func parseAtJobID(out string) string {
 	matches := 0
 	for sc.Scan() {
 		fields := strings.Fields(sc.Text())
-		if len(fields) >= 3 && fields[0] == "job" && fields[2] == "at" && numericJobID(fields[1]) {
+		if len(fields) >= 3 && fields[0] == "job" && fields[2] == "at" && atqueue.ValidJobID(fields[1]) {
 			id = fields[1]
 			matches++
 		}
@@ -347,7 +347,7 @@ func atJobQueuedContext(ctx context.Context, id string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("atq: %w", err)
 	}
-	ids, err := parseAtQueueIDs(string(out))
+	ids, err := atqueue.ParseInventory(out, int(schedulerOutputLimit))
 	if err != nil {
 		return false, err
 	}
@@ -357,41 +357,6 @@ func atJobQueuedContext(ctx context.Context, id string) (bool, error) {
 		}
 	}
 	return false, nil
-}
-
-// parseAtQueueIDs treats every non-empty atq line as inventory evidence. A
-// malformed or duplicate line must not be skipped: doing so can turn an
-// incomplete queue into "job absent" and authorize cleanup of the last witness.
-func parseAtQueueIDs(out string) ([]string, error) {
-	var ids []string
-	seen := make(map[string]bool)
-	sc := bufio.NewScanner(strings.NewReader(out))
-	sc.Buffer(make([]byte, 1024), int(schedulerOutputLimit))
-	lineNo := 0
-	for sc.Scan() {
-		lineNo++
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 || !numericJobID(fields[0]) {
-			return nil, fmt.Errorf("parse atq line %d: invalid job id in %q", lineNo, line)
-		}
-		id := fields[0]
-		if seen[id] {
-			return nil, fmt.Errorf("parse atq line %d: duplicate job id %s", lineNo, id)
-		}
-		seen[id] = true
-		ids = append(ids, id)
-		if len(ids) > maxAtJobs {
-			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs", maxAtJobs)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("parse atq: %w", err)
-	}
-	return ids, nil
 }
 
 func (r realSystem) RemoveAtJobsFor(command string) error {
@@ -442,7 +407,7 @@ func (r realSystem) RemoveAtJobsFor(command string) error {
 // GNU/POSIX at exposes no atomic compare-and-delete primitive; this recheck makes
 // the remaining read-to-atrm interval as small as the external interface allows.
 func (r realSystem) removeAtJobIf(ctx context.Context, id string, match func(string) (bool, error)) error {
-	if !numericJobID(id) {
+	if !atqueue.ValidJobID(id) {
 		return fmt.Errorf("invalid at job id %q", id)
 	}
 	if match == nil {
@@ -509,7 +474,7 @@ func (r realSystem) removeAtJobIf(ctx context.Context, id string, match func(str
 // letting their size poison cleanup or uninstall. Root jobs are read in full
 // under the ordinary body bound and their owner header is checked again.
 func readAtJobContext(ctx context.Context, id string) (string, uint32, bool, error) {
-	if !numericJobID(id) {
+	if !atqueue.ValidJobID(id) {
 		return "", 0, false, fmt.Errorf("invalid at job id %q", id)
 	}
 	opts := schedulerCommandOptions(atOwnerProbeLimit)
@@ -528,7 +493,7 @@ func readAtJobContext(ctx context.Context, id string) (string, uint32, bool, err
 		}
 		return "", 0, false, fmt.Errorf("read at job %s: %w", id, err)
 	}
-	owner, ownerErr := parseAtOwner(prefix)
+	owner, ownerErr := atqueue.ParseOwner(prefix, int(atJobBodyLimit))
 	if ownerErr != nil {
 		return "", 0, false, ownerErr
 	}
@@ -557,7 +522,7 @@ func readAtJobContext(ctx context.Context, id string) (string, uint32, bool, err
 		}
 		return "", 0, false, fmt.Errorf("read at job %s: %w", id, err)
 	}
-	owner, ownerErr = parseAtOwner(body)
+	owner, ownerErr = atqueue.ParseOwner(body, int(atJobBodyLimit))
 	if ownerErr != nil {
 		return "", 0, false, ownerErr
 	}
@@ -582,7 +547,7 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 	if err != nil {
 		return nil, fmt.Errorf("atq: %w", err)
 	}
-	ids, err := parseAtQueueIDs(string(out))
+	ids, err := atqueue.ParseInventory(out, int(schedulerOutputLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -609,45 +574,8 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 	return jobs, nil
 }
 
-// parseAtOwner reads the first root-controlled atrun header emitted by at -c.
-// User-supplied command text can contain an identical-looking comment later, so
-// the first atrun-shaped header is authoritative and malformed data fails closed.
-func parseAtOwner(body []byte) (uint32, error) {
-	sc := bufio.NewScanner(strings.NewReader(string(body)))
-	sc.Buffer(make([]byte, 1024), int(atJobBodyLimit))
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) < 2 || fields[0] != "#" || fields[1] != "atrun" {
-			continue
-		}
-		if len(fields) != 4 || !strings.HasPrefix(fields[2], "uid=") || !strings.HasPrefix(fields[3], "gid=") {
-			return 0, fmt.Errorf("invalid atrun owner header")
-		}
-		uid, err := parseAtKernelID(strings.TrimPrefix(fields[2], "uid="))
-		if err != nil {
-			return 0, fmt.Errorf("invalid atrun UID %q", fields[2])
-		}
-		if _, err := parseAtKernelID(strings.TrimPrefix(fields[3], "gid=")); err != nil {
-			return 0, fmt.Errorf("invalid atrun GID %q", fields[3])
-		}
-		return uid, nil
-	}
-	if err := sc.Err(); err != nil {
-		return 0, fmt.Errorf("scan at job: %w", err)
-	}
-	return 0, fmt.Errorf("job has no atrun owner header")
-}
-
-func parseAtKernelID(value string) (uint32, error) {
-	id, err := strconv.ParseUint(value, 10, 32)
-	if err != nil || id == uint64(^uint32(0)) {
-		return 0, fmt.Errorf("invalid kernel ID %q", value)
-	}
-	return uint32(id), nil
-}
-
 func rootAtBodyMatches(body string, match func(string) (bool, error)) (bool, error) {
-	owner, err := parseAtOwner([]byte(body))
+	owner, err := atqueue.ParseOwner([]byte(body), int(atJobBodyLimit))
 	if err != nil {
 		return false, err
 	}

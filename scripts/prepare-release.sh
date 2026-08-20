@@ -50,6 +50,7 @@ LOCAL_COMMAND_TIMEOUT_SECONDS=120
 GO_BUILD_TIMEOUT_SECONDS=900
 : "${LTA_EXPECTED_TAG_SIGNER_FINGERPRINT:?set the independently recorded OpenPGP tag-signer fingerprint}"
 
+# BEGIN GENERATED RELEASE SAFETY PRIMITIVES
 local_with_timeout() {
   timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" "$@"
 }
@@ -125,6 +126,35 @@ require_safe_new_output_path() {
   parent="$(dirname -- "$path")"
   require_safe_directory_path "$parent" "$label parent" 1
 }
+
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks=$(( (max + 1023) / 1024 ))
+  if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
+    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
+    echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2
+    return 1
+  fi
+  size="$(local_with_timeout stat -Lc '%s' -- "$destination")" \
+    || { echo "copied file could not be measured: $destination" >&2; return 1; }
+  (( size <= max )) \
+    || { echo "file exceeds its bounded-copy limit: $source" >&2; return 1; }
+}
+
+sync_output_directory() {
+  local directory=$1 label=$2 path parent
+  shift 2
+  for path in "$@"; do
+    local_with_timeout sync -- "$directory/$path" \
+      || { echo "cannot sync $label file: $path" >&2; return 1; }
+  done
+  local_with_timeout sync -- "$directory" \
+    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
+  parent="$(dirname -- "$directory")"
+  local_with_timeout sync -- "$parent" \
+    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
+}
+# END GENERATED RELEASE SAFETY PRIMITIVES
 
 [[ -z "${LTA_SIGN_KEY:-}" ]] || { echo "LTA_SIGN_KEY must not be present on the online preparation machine" >&2; exit 1; }
 [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] \
@@ -245,33 +275,6 @@ current_latest_tag() {
   return 1
 }
 
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size
-  blocks=$(( (max + 1023) / 1024 ))
-  if ! ( ulimit -f "$blocks"; timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" \
-    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
-    echo "file exceeds its transfer limit or could not be copied: $source" >&2
-    return 1
-  fi
-  size="$(timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" stat -Lc '%s' -- "$destination")" \
-    || { echo "copied file could not be measured: $destination" >&2; return 1; }
-  (( size <= max )) || { echo "file exceeds its transfer limit: $source" >&2; return 1; }
-}
-
-sync_output_directory() {
-  local directory=$1 label=$2 path parent
-  shift 2
-  for path in "$@"; do
-    local_with_timeout sync -- "$directory/$path" \
-      || { echo "cannot sync $label file: $path" >&2; return 1; }
-  done
-  local_with_timeout sync -- "$directory" \
-    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
-  parent="$(dirname -- "$directory")"
-  local_with_timeout sync -- "$parent" \
-    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
-}
-
 echo ">> [prepare 1/6] authenticate tag, main ancestry, workflow, and draft"
 if ! tag_object="$(git_with_timeout -C "$SOURCE_DIR" rev-parse --verify "refs/tags/${TAG}^{tag}")"; then
   echo "$TAG must resolve to an annotated tag object" >&2
@@ -343,7 +346,7 @@ download_draft_asset() {
   [[ "$api_url" == "https://api.github.com/repos/${REPO}/releases/assets/"* ]] \
     || { echo "unexpected GitHub asset API URL for $name" >&2; return 1; }
   blocks=$(( (max + 1023) / 1024 ))
-  ( ulimit -f "$blocks"; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$work/ci/$name" ) \
+  ( ulimit -f "$blocks" || exit 1; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$work/ci/$name" ) \
     || { echo "bounded draft download failed: $name" >&2; return 1; }
   actual_size="$(wc -c < "$work/ci/$name")"
   [[ "$actual_size" -eq "$advertised_size" && "$actual_size" -le "$max" ]] \
@@ -368,7 +371,7 @@ echo ">> [prepare 3/6] export committed source only (no candidate scripts execut
 mkdir "$work/source"
 source_archive="$work/source.tar"
 source_blocks=$(( (MAX_SOURCE_ARCHIVE_BYTES + 1023) / 1024 ))
-( ulimit -f "$source_blocks"; git_with_timeout -C "$SOURCE_DIR" archive --format=tar "$tag_commit" > "$source_archive" ) \
+( ulimit -f "$source_blocks" || exit 1; git_with_timeout -C "$SOURCE_DIR" archive --format=tar "$tag_commit" > "$source_archive" ) \
   || { echo "tag source archive is oversized or could not be exported" >&2; exit 1; }
 [[ -s "$source_archive" && "$(wc -c < "$source_archive")" -le "$MAX_SOURCE_ARCHIVE_BYTES" ]] \
   || { echo "tag source archive is empty or oversized" >&2; exit 1; }
@@ -445,6 +448,7 @@ for name in "${prepared_output_files[@]}"; do
 done
 [[ "$(timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" sha256sum "$OUT_DIR/PREPARED_SHA256SUMS" | awk '{print $1}')" == "$prepared_manifest_sha256" ]] \
   || { echo "prepared output manifest changed during transfer" >&2; exit 1; }
+# shellcheck disable=SC2016 # $1 is intentionally expanded by the bounded child shell.
 timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" /bin/sh -c \
   'cd -- "$1" && exec sha256sum -c --strict PREPARED_SHA256SUMS' sh "$OUT_DIR"
 sync_output_directory "$OUT_DIR" "prepared output" "${prepared_output_files[@]}"

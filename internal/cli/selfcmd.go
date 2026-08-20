@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
@@ -367,16 +366,25 @@ func (a *App) upgradePreparedLocked(candidate *selfmanage.UpgradeCandidate, forc
 		return statusResult(1)
 	}
 	if newVer == "" {
-		current, probeErr := a.Selfmanage.InstalledVersion()
-		if probeErr != nil {
-			current = buildinfo.Version
-		}
-		a.success(a.P.M("已是最新版本："+current, "already up to date: "+current))
-		return statusResult(0)
+		return a.reportNoopUpgrade(a.Selfmanage.InstalledVersion)
 	}
 	a.audit("upgrade", "", "ok", versionTransition(previous, newVer), nil)
 	a.success(a.P.M("已升级到 "+newVer, "upgraded to "+newVer))
 	return commandResult{applied: true}
+}
+
+func (a *App) reportNoopUpgrade(installedVersion func() (string, error)) commandResult {
+	current, err := installedVersion()
+	if err != nil {
+		a.errorf("%s: %v", a.P.M(
+			"升级未应用，但无法再次确认已安装版本",
+			"cannot confirm installed version after no-op upgrade"), err)
+		a.audit("upgrade", "", "fail",
+			"upgrade candidate was not applied; installed version recheck failed: "+err.Error(), nil)
+		return statusResult(1)
+	}
+	a.success(a.P.M("已是最新版本："+current, "already up to date: "+current))
+	return statusResult(0)
 }
 
 func versionTransition(previous, next string) string {

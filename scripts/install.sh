@@ -459,11 +459,18 @@ fetch_once() {
   # One monotonic deadline covers the initial request, redirect DNS lookups,
   # and every subsequent hop. No DNS fallback or redirect can reset it.
   if ! fetch_deadline_ticks=$(awk -v budget="$fetch_timeout" '
+    function centiseconds(value, parts, fraction) {
+      split(value, parts, ".")
+      fraction=(length(parts) > 1 ? substr(parts[2] "00", 1, 2) : "00")
+      return (parts[1] + 0) * 100 + (fraction + 0)
+    }
     BEGIN {
       if (budget !~ /^[0-9]+([.][0-9]+)?$/ || budget + 0 <= 0) exit 1
     }
     NR == 1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ {
-      printf "%.0f\n", ($1 + budget) * 100
+      budget_ticks=centiseconds(budget)
+      if (budget_ticks <= 0) exit 1
+      printf "%.0f\n", centiseconds($1) + budget_ticks
       found=1
     }
     END { if (!found) exit 1 }
@@ -473,15 +480,24 @@ fetch_once() {
   fetch_remaining_timeout() {
     fetch_timeout_cap=${1-}
     awk -v deadline="$fetch_deadline_ticks" -v cap="$fetch_timeout_cap" '
+      function centiseconds(value, parts, fraction) {
+        split(value, parts, ".")
+        fraction=(length(parts) > 1 ? substr(parts[2] "00", 1, 2) : "00")
+        return (parts[1] + 0) * 100 + (fraction + 0)
+      }
       BEGIN {
         if (deadline !~ /^[0-9]+$/ ||
             (cap != "" && (cap !~ /^[0-9]+([.][0-9]+)?$/ || cap + 0 <= 0))) exit 1
       }
       NR == 1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ {
-        remaining=(deadline - ($1 * 100)) / 100
-        if (remaining <= 0) exit 1
-        if (cap != "" && remaining > cap + 0) remaining=cap + 0
-        printf "%.2f\n", remaining
+        remaining_ticks=deadline - centiseconds($1)
+        if (remaining_ticks <= 0) exit 1
+        if (cap != "") {
+          cap_ticks=centiseconds(cap)
+          if (cap_ticks <= 0) exit 1
+          if (remaining_ticks > cap_ticks) remaining_ticks=cap_ticks
+        }
+        printf "%d.%02d\n", int(remaining_ticks / 100), remaining_ticks % 100
         found=1
       }
       END { if (!found) exit 1 }

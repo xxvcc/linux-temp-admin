@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
@@ -35,7 +36,7 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 
 	if strings.HasPrefix(recordedUnit, "at:") {
 		id := strings.TrimPrefix(recordedUnit, "at:")
-		if !numericJobID(id) {
+		if !atqueue.ValidJobID(id) {
 			return false, nil
 		}
 		if s.Sys == nil {
@@ -184,21 +185,6 @@ func systemctlTimerStateNegative(err error, query, timer string) bool {
 		return exitErr.ExitCode() == 3 || exitErr.ExitCode() == 4
 	}
 	return false
-}
-
-func numericJobID(id string) bool {
-	// at/atq emit canonical positive decimal identifiers. Reject leading zeroes
-	// and unbounded digit strings so a corrupt registry/queue cannot be passed as
-	// a giant helper argument or alias the same job under two textual ids.
-	if id == "" || len(id) > 20 || id[0] == '0' {
-		return false
-	}
-	for _, r := range id {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func uniqueCalendar(content []byte) (string, bool) {

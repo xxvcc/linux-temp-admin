@@ -24,6 +24,7 @@ done
 timeout -k 1 1 /bin/true \
   || { echo "timeout does not support the required kill-after option" >&2; exit 1; }
 
+# BEGIN GENERATED RELEASE SAFETY PRIMITIVES
 local_with_timeout() {
   timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" "$@"
 }
@@ -39,7 +40,6 @@ require_trusted_tmp() {
   (( (8#$tmp_mode & 8#7000) == 8#1000 )) \
     || { echo "/tmp must have exactly the sticky special bit" >&2; return 1; }
 }
-require_trusted_tmp
 
 require_safe_directory_path() {
   local path=$1 label=$2 allow_sticky_leaf=${3:-0} canonical meta type uid mode extra parent leaf=1
@@ -120,6 +120,36 @@ require_safe_new_output_path() {
   require_safe_directory_path "$parent" "$label parent" 1
 }
 
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks=$(( (max + 1023) / 1024 ))
+  if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
+    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
+    echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2
+    return 1
+  fi
+  size="$(local_with_timeout stat -Lc '%s' -- "$destination")" \
+    || { echo "copied file could not be measured: $destination" >&2; return 1; }
+  (( size <= max )) \
+    || { echo "file exceeds its bounded-copy limit: $source" >&2; return 1; }
+}
+
+sync_output_directory() {
+  local directory=$1 label=$2 path parent
+  shift 2
+  for path in "$@"; do
+    local_with_timeout sync -- "$directory/$path" \
+      || { echo "cannot sync $label file: $path" >&2; return 1; }
+  done
+  local_with_timeout sync -- "$directory" \
+    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
+  parent="$(dirname -- "$directory")"
+  local_with_timeout sync -- "$parent" \
+    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
+}
+# END GENERATED RELEASE SAFETY PRIMITIVES
+require_trusted_tmp
+
 PREPARED_DIR="${1:?usage: offline-sign-release.sh /absolute/prepared-dir /absolute/signed-dir}"
 SIGNED_DIR="${2:?usage: offline-sign-release.sh /absolute/prepared-dir /absolute/signed-dir}"
 : "${LTA_SIGN_KEY:?set LTA_SIGN_KEY to the offline ed25519 private key}"
@@ -175,33 +205,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size
-  blocks=$(( (max + 1023) / 1024 ))
-  if ! ( ulimit -f "$blocks"; timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" \
-    cp --reflink=never --sparse=never -- "$source" "$destination" ); then
-    echo "input exceeds its snapshot limit or could not be copied: $source" >&2
-    return 1
-  fi
-  size="$(timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" stat -Lc '%s' -- "$destination")" \
-    || { echo "copied file could not be measured: $destination" >&2; return 1; }
-  (( size <= max )) || { echo "input exceeds its snapshot limit: $source" >&2; return 1; }
-}
-
-sync_output_directory() {
-  local directory=$1 label=$2 path parent
-  shift 2
-  for path in "$@"; do
-    local_with_timeout sync -- "$directory/$path" \
-      || { echo "cannot sync $label file: $path" >&2; return 1; }
-  done
-  local_with_timeout sync -- "$directory" \
-    || { echo "cannot sync $label directory: $directory" >&2; return 1; }
-  parent="$(dirname -- "$directory")"
-  local_with_timeout sync -- "$parent" \
-    || { echo "cannot sync $label parent directory: $parent" >&2; return 1; }
-}
 
 # Pin the audited executable by an open descriptor. Hashing and every later
 # execution address this same inode even if its pathname is replaced.
@@ -306,6 +309,7 @@ for name in COMMIT PREPARED_SHA256SUMS RELEASE_SIGNER_PUBKEY SHA256SUMS SIGNER_S
 done
 [[ "$(timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" sha256sum "$SIGNED_DIR/SIGNED_BUNDLE_SHA256SUMS" | awk '{print $1}')" == "$signed_manifest_sha256" ]] \
   || { echo "signed output manifest changed during transfer" >&2; exit 1; }
+# shellcheck disable=SC2016 # $1 is intentionally expanded by the bounded child shell.
 timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" /bin/sh -c \
   'cd -- "$1" && exec sha256sum -c --strict SIGNED_BUNDLE_SHA256SUMS' sh "$SIGNED_DIR"
 sync_output_directory "$SIGNED_DIR" "signed output" "${signed_output_files[@]}"
