@@ -2161,6 +2161,7 @@ func signalUID(sig unix.Signal, uid int) ([]int, error) {
 
 func processesForUID(uid int) ([]int, error) {
 	stableEmpty := 0
+	disturbed := 0
 	for attempt := 0; attempt < processScanAttempts; attempt++ {
 		pids, stable, err := processSnapshotForUID(uid)
 		if err != nil {
@@ -2174,6 +2175,7 @@ func processesForUID(uid int) ([]int, error) {
 		}
 		if !stable {
 			stableEmpty = 0
+			disturbed++
 			continue
 		}
 		stableEmpty++
@@ -2182,7 +2184,21 @@ func processesForUID(uid int) ([]int, error) {
 		}
 		processScanSleep(processScanRetryDelay)
 	}
-	return nil, fmt.Errorf("scan %s: no consecutive stable empty process snapshots after %d attempts", procRoot, processScanAttempts)
+	// Name the cause. Every attempt reporting a disturbance means the snapshot kept
+	// racing process activity this scan could not rule out, which is host state
+	// rather than a fault in the account being revoked. Without this the operator
+	// sees only a bare refusal and cannot tell an attributable problem from a busy
+	// or deliberately churning host.
+	return nil, fmt.Errorf("scan %s: no consecutive stable empty process snapshots after %d attempts (%d disturbed by process activity this scan could not attribute to another account; a busy host, or a local account forking continuously, can cause this)",
+		procRoot, processScanAttempts, disturbed)
+}
+
+// procEntry is one numeric /proc entry with the directory owner captured in the
+// snapshot's fast first pass. known is false when the entry was already gone.
+type procEntry struct {
+	tgid  int
+	owner int
+	known bool
 }
 
 func processSnapshotForUID(uid int) ([]int, bool, error) {
@@ -2190,22 +2206,50 @@ func processSnapshotForUID(uid int) ([]int, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("scan %s: %w", procRoot, err)
 	}
-	var pids []int
-	stable := true
+	// First pass: one cheap stat per entry, taken while the listing is still fresh,
+	// records who owns each process directory. /proc/<pid> carries the process's
+	// real UID, and moving a thread to another UID needs privilege this threat
+	// model does not grant an unprivileged local user. An entry owned by some other
+	// unprivileged account therefore cannot host a thread carrying the target UID,
+	// and neither can anything it forks, so its disappearance says nothing about
+	// whether the target UID is absent.
+	//
+	// This matters because the old snapshot let ANY vanishing entry invalidate the
+	// whole scan. Ordinary background churn on a busy host — let alone a deliberate
+	// fork loop from any local account — then denied every invite and every account
+	// deletion, since processesForUID needs two consecutive stable empty snapshots.
+	//
+	// Root and the target UID stay conservative: root can move a thread to the
+	// target UID, and the target's own processes are exactly what is being looked
+	// for. An entry that vanished before it could be attributed also stays
+	// conservative. Residual, deliberately accepted: a multi-threaded process whose
+	// leader has dropped to another UID while a worker thread still holds root
+	// would be attributed to the leader's UID.
+	procEntries := make([]procEntry, 0, len(entries))
 	for _, entry := range entries {
-		tgid, err := strconv.Atoi(entry.Name())
-		if err != nil {
+		tgid, convErr := strconv.Atoi(entry.Name())
+		if convErr != nil {
 			continue
 		}
-		matched, groupStable, err := processGroupHasUID(tgid, uid)
-		if err != nil {
-			return nil, false, fmt.Errorf("read thread credentials for process %d: %w", tgid, err)
+		var st unix.Stat_t
+		if statErr := unix.Fstatat(unix.AT_FDCWD, filepath.Join(procRoot, entry.Name()), &st, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
+			procEntries = append(procEntries, procEntry{tgid: tgid, owner: int(st.Uid), known: true})
+			continue
 		}
-		if !groupStable {
+		procEntries = append(procEntries, procEntry{tgid: tgid})
+	}
+	var pids []int
+	stable := true
+	for _, entry := range procEntries {
+		matched, groupStable, err := processGroupHasUID(entry.tgid, uid)
+		if err != nil {
+			return nil, false, fmt.Errorf("read thread credentials for process %d: %w", entry.tgid, err)
+		}
+		if !groupStable && (!entry.known || entry.owner == 0 || entry.owner == uid) {
 			stable = false
 		}
 		if matched {
-			pids = append(pids, tgid)
+			pids = append(pids, entry.tgid)
 		}
 	}
 	sort.Ints(pids)

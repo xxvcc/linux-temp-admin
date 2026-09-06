@@ -1788,6 +1788,51 @@ func TestValidateCreatedHomeRequiresNonRootOwnedRealDirectory(t *testing.T) {
 	}
 }
 
+// TestProcessSnapshotAttributesInstabilityByOwner pins the rule that keeps an
+// unrelated account's process churn from denying every invite and revoke: a
+// vanishing entry owned by another unprivileged account cannot host or fork a
+// target-UID thread, so it must not invalidate the snapshot, while a root-owned
+// one still must.
+func TestProcessSnapshotAttributesInstabilityByOwner(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("attribution test needs root to set a foreign directory owner")
+	}
+	const target = 1111
+	const foreignUID = 65534
+	for _, tc := range []struct {
+		name       string
+		owner      int
+		wantStable bool
+	}{
+		{name: "third-party owner does not destabilise", owner: foreignUID, wantStable: true},
+		{name: "root owner still destabilises", owner: 0, wantStable: false},
+		{name: "target owner still destabilises", owner: target, wantStable: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setProcRoot(t, nil)
+			// A process directory with no numeric task entries is exactly the shape
+			// processGroupHasUID reports as unstable.
+			pidDir := filepath.Join(procRoot, "4242")
+			if err := os.MkdirAll(filepath.Join(pidDir, "task"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(pidDir, tc.owner, tc.owner); err != nil {
+				t.Fatal(err)
+			}
+			pids, stable, err := processSnapshotForUID(target)
+			if err != nil {
+				t.Fatalf("processSnapshotForUID: %v", err)
+			}
+			if len(pids) != 0 {
+				t.Fatalf("pids = %v, want none", pids)
+			}
+			if stable != tc.wantStable {
+				t.Fatalf("stable = %v, want %v for owner %d", stable, tc.wantStable, tc.owner)
+			}
+		})
+	}
+}
+
 func setProcRoot(t *testing.T, statuses map[int]string) {
 	t.Helper()
 	dir := t.TempDir()

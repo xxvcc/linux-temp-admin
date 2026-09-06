@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.6 - 2026-09-06
+
+- Attribute `/proc` snapshot instability to the process directory's owner so an
+  unrelated account's churn can no longer deny every invite and every account
+  deletion. The scan needs two consecutive stable empty snapshots, and any
+  vanishing entry used to invalidate the whole snapshot, so ordinary background
+  activity on a busy host — or a deliberate fork loop from any local account —
+  made the scan fail outright. A cheap first pass now records each entry's
+  owner while the listing is fresh; only root, the target UID, and entries that
+  vanished before they could be attributed still count, because changing a
+  thread to another UID needs privilege an unprivileged account does not have.
+  Measured on a four-core host: continuous unrelated forking went from 27-29
+  failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
+  to none. The refusal also now reports how many attempts were disturbed, so
+  the operator can tell host churn from a fault in the account being revoked.
+- Record why the `at` inventory bound is not raised and what it does and does
+  not risk: each job costs one probe under a 30-second deadline, so a larger
+  bound would only trade a fast refusal for a slow timeout, and the refusal now
+  says the count spans every account's jobs and points at `atq`. This cleanup
+  runs only after revoke has already removed the sudo grant and the sshd
+  exception and disabled the login, so a filled queue delays deletion and
+  leaves the account retained and disabled rather than privileged.
+
 ## v2.10.5 - 2026-09-06
 
 - Keep a live legacy account's auto-revoke task instead of sweeping it as an
