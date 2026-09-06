@@ -2012,9 +2012,23 @@ func TestAutoRevokeRetentionSeparatesRetryableAndManualRecovery(t *testing.T) {
 		want   bool
 	}{
 		{
-			name: "legacy identity cancels unattended timer",
+			// A live legacy row is not a deletion recovery: its task is what strips
+			// this tool's sudo and sshd grants at expiry, and accountIsOursAndLive
+			// deliberately preserves those grants. Cancelling the task while keeping
+			// the grant would make a time-limited sudo grant permanent.
+			name: "live legacy identity keeps the grant-stripping timer",
 			rec: registry.Record{
 				User: boundPW.Name, UID: boundPW.UID, AutoRevoke: true,
+				AutoUnit: "linux-temp-admin-revoke-xxvcc-timer1", Port: 22,
+			},
+			pw: legacyPW, exists: true, want: true,
+		},
+		{
+			// A UID-mismatched legacy row cannot prove the account is still ours, so
+			// accountIsOursAndLive sweeps its grants; the task must go with them.
+			name: "uid-mismatched legacy identity cancels unattended timer",
+			rec: registry.Record{
+				User: boundPW.Name, UID: boundPW.UID + 1, AutoRevoke: true,
 				AutoUnit: "linux-temp-admin-revoke-xxvcc-timer1", Port: 22,
 			},
 			pw: legacyPW, exists: true, want: false,
