@@ -1226,7 +1226,20 @@ func (tx *inviteTransaction) reserveAndCreatePendingIdentity() bool {
 		if exists {
 			return fmt.Errorf("account still exists; keeping registry record")
 		}
-		return a.releaseRegistryAfterCleanup(tx.username)
+		if err := a.releaseRegistryAfterCleanup(tx.username); err != nil {
+			return err
+		}
+		// Only now that the account is provably gone is the scheduled fallback safe
+		// to remove, the same rule revoke states when it deliberately leaves the
+		// task armed on a failed teardown. Cancelling earlier destroyed the one
+		// mechanism that would have retried this cleanup: rollbackInviteAccount may
+		// only delete when both grant removals are confirmed, so a rollback that
+		// retains a disabled account used to leave it with a stale sudo drop-in and
+		// nothing scheduled to come back for it.
+		if tx.autoScheduled {
+			return a.Scheduler.Cancel(tx.username, tx.autoUnit)
+		}
+		return nil
 	})
 
 	// useradd can create the account before reporting an error. Close the
@@ -1523,7 +1536,10 @@ func (tx *inviteTransaction) scheduleActivateAndReport() int {
 		}
 		tx.autoUnit = unit
 		tx.autoScheduled = true
-		tx.cleanups = append(tx.cleanups, func() error { return a.Scheduler.Cancel(tx.username, unit) })
+		// No cleanup is registered here on purpose. Reverse-order rollback would run
+		// it first, before the account teardown that decides whether the account can
+		// be deleted at all. The cancellation is performed by the first-registered
+		// cleanup instead, which runs last and only after every confirmation passes.
 		tx.rec.AutoUnit = unit
 		if err := a.Registry.Record(tx.rec); err != nil {
 			tx.failf("%s: %v", a.P.M("登记自动删除任务失败", "recording the auto-delete task failed"), err)

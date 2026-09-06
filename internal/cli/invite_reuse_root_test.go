@@ -1050,3 +1050,71 @@ func TestInviteInteractiveDefaultsSudoOn(t *testing.T) {
 		t.Errorf("interactive invite should not ask about sudo anymore")
 	}
 }
+
+// expiryFailRunner fails the first chage -E carrying a real date, so an invite
+// fails at its expiry step — after the auto-revoke task already exists. The
+// epoch and never sentinels pass through so the rollback can still disable the
+// account it must retain.
+type expiryFailRunner struct {
+	user.Runner
+	failed *bool
+}
+
+func (r expiryFailRunner) Run(name string, args ...string) error {
+	if !*r.failed && name == "chage" && len(args) >= 2 && args[0] == "-E" &&
+		args[1] != "-1" && args[1] != "1970-01-01" {
+		*r.failed = true
+		return errors.New("injected expiry failure")
+	}
+	return r.Runner.Run(name, args...)
+}
+
+// TestInviteRollbackKeepsScheduleWhenAccountMustBeRetained pins the ordering
+// rule revoke states as "only now that the account is provably gone is the
+// fallback safe to remove". Rollback runs cleanups in reverse, so a cancellation
+// registered at scheduling time would run FIRST — before the teardown that
+// decides whether the account may be deleted at all. rollbackInviteAccount may
+// only delete when both grant removals are confirmed, so a failed sudo removal
+// retains a disabled account; cancelling first left that account with a live
+// sudo drop-in and nothing scheduled to come back for it.
+func TestInviteRollbackKeepsScheduleWhenAccountMustBeRetained(t *testing.T) {
+	a, sudoMgr, _, _ := inviteApp(t)
+	tracker := newTrackingSched()
+	a.Scheduler.Sys = tracker
+	const name = "xxvcc-schedhold1"
+	integrationtest.RequireUserAbsent(t, name, true)
+	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })
+
+	expiryFailed := false
+	a.Users.Runner = expiryFailRunner{Runner: a.Users.Runner, failed: &expiryFailed}
+
+	grantVerified := false
+	sudoMgr.Verify = func(string) error {
+		grantVerified = true
+		return nil
+	}
+	sudoMgr.RemoveFile = func(path string) error {
+		if !grantVerified {
+			return os.Remove(path)
+		}
+		return errors.New("injected sudo rollback failure")
+	}
+
+	rc := a.Dispatch([]string{"invite", "--user", name, "--host", "203.0.113.5",
+		"--hours", "1", "--sudo", "--confirm-sudo", name, "--auto-revoke", "--no-fix-sshd", "--yes"})
+	if rc != 1 {
+		t.Fatalf("invite rc=%d, want the injected expiry failure\nstderr:\n%s", rc, a.Err.(*bytes.Buffer).String())
+	}
+	if !expiryFailed {
+		t.Fatal("the expiry step never ran, so this test did not reach the scheduled state it exists to cover")
+	}
+	if !mustExternalUserExists(t, name) {
+		t.Fatalf("invite freed the username after its sudo rollback failed\nstderr:\n%s", a.Err.(*bytes.Buffer).String())
+	}
+	if _, err := os.Lstat(sudoMgr.FilePath(name)); err != nil {
+		t.Fatalf("test did not retain the live sudo drop-in: %v", err)
+	}
+	if len(tracker.jobs) == 0 {
+		t.Fatal("rollback cancelled the auto-revoke task while retaining an account that still holds a sudo drop-in")
+	}
+}

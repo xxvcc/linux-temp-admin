@@ -17,6 +17,16 @@ All notable changes to this project are documented here.
   failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
   to none. The refusal also now reports how many attempts were disturbed, so
   the operator can tell host churn from a fault in the account being revoked.
+- Keep the auto-revoke task armed when an invite rollback must retain the
+  account. Rollback runs its cleanups in reverse, so the cancellation registered
+  at scheduling time ran first — before the teardown that decides whether the
+  account may be deleted at all. That teardown may only delete once both grant
+  removals are confirmed, so a failed sudo removal retained a disabled account
+  whose live drop-in now had nothing scheduled to come back for it. The
+  cancellation moves to the first-registered cleanup, which runs last and only
+  after every confirmation passes, matching the rule revoke already states:
+  only once the account is provably gone is the fallback safe to remove.
+
 - Close three latent gaps found alongside it. `planLogin`'s deferred Match-Group
   branch carried a repair authorization without the `a.SSHD == nil` guard its
   sibling path applies, so an unwired manager would have dereferenced nil after
