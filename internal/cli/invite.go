@@ -508,7 +508,13 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 		// phase; confirmLogin will either discover no blocker, update report with the
 		// real fixable blockers, or fail closed before credentials are installed.
 		return loginPlan{
-			fixSSHD:    fix == "yes",
+			// Mirror the blocker path's a.SSHD == nil guard below. An unwired sshd
+			// manager must not travel as a repair authorization through the deferred
+			// phase: the repair is applied after useradd and after the key is
+			// written, where a nil dereference would abort mid-transaction and leave
+			// a created account with a completed registry row. With no repair
+			// authorized, confirmLogin fails closed before any credential lands.
+			fixSSHD:    fix == "yes" && a.SSHD != nil,
 			report:     rep,
 			verified:   false,
 			unverified: "sshd Match Group cannot be evaluated until the account exists",
@@ -1145,13 +1151,12 @@ func (tx *inviteTransaction) clearReusedUsername() bool {
 		return tx.failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
 	}
 	// A stale scheduled command is name-keyed, so it must be gone before useradd
-	// makes that name live again. Reading its recorded id before writing the new
-	// intent also preserves the only direct handle to an at job from an older run.
-	staleUnit, err := a.Registry.UnitFor(tx.username)
-	if err != nil {
-		return tx.failf("%s: %v", a.P.M("读取旧自动删除任务失败", "reading stale auto-delete task failed"), err)
-	}
-	if err := a.Scheduler.Cancel(tx.username, staleUnit); err != nil {
+	// makes that name live again. No recorded unit id can accompany it: the Lookup
+	// above already refused every username that still holds a registry row, and
+	// UnitFor scans that same row set, so it could only ever return "" here.
+	// Cancel sweeps by name across every namespace, which is what actually clears
+	// an older run's unit or at job.
+	if err := a.Scheduler.Cancel(tx.username, ""); err != nil {
 		return tx.failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
 	}
 	// Cancel can remove queued work, but an older at/systemd command may already be

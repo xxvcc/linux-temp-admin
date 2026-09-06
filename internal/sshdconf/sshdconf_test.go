@@ -680,3 +680,24 @@ func TestAllRejectsMalformedManagedArtifact(t *testing.T) {
 		t.Fatalf("All error = %v, want malformed managed artifact", err)
 	}
 }
+
+// TestMatchBlockRefusesInvalidUsername pins MatchBlock to the same defence in
+// depth Grant and Remove apply. Its output is handed to the operator as a
+// copy-paste heredoc for a privileged sshd config, so a name carrying a newline
+// must never reach the rendered directive.
+func TestMatchBlockRefusesInvalidUsername(t *testing.T) {
+	for _, name := range []string{
+		"a\n PermitRootLogin yes\nMatch all\nMatch User b",
+		"bad name",
+		"-leadingdash",
+		"",
+	} {
+		block, err := MatchBlock(name, []string{"g"}, sysinfo.LoginReport{})
+		if err == nil {
+			t.Fatalf("MatchBlock(%q) = %q, want a refusal", name, block)
+		}
+		if block != "" {
+			t.Fatalf("MatchBlock(%q) returned %q alongside its error, want no block", name, block)
+		}
+	}
+}

@@ -17,6 +17,16 @@ All notable changes to this project are documented here.
   failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
   to none. The refusal also now reports how many attempts were disturbed, so
   the operator can tell host churn from a fault in the account being revoked.
+- Close three latent gaps found alongside it. `planLogin`'s deferred Match-Group
+  branch carried a repair authorization without the `a.SSHD == nil` guard its
+  sibling path applies, so an unwired manager would have dereferenced nil after
+  the account and its key already existed; `MatchBlock` now validates the
+  username like `Grant` and `Remove` do, because its output is handed to the
+  operator as a copy-paste heredoc for a privileged sshd config where an
+  embedded newline would carry extra directives; and the stale-unit lookup in
+  invite's username reuse path is removed, since the registry check above it
+  already refuses every username that could have produced a non-empty result.
+
 - Record why the `at` inventory bound is not raised and what it does and does
   not risk: each job costs one probe under a 30-second deadline, so a larger
   bound would only trade a fast refusal for a slow timeout, and the refusal now

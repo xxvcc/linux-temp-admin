@@ -533,6 +533,15 @@ func (m *Manager) ensureDir() error {
 // cli can show an operator who declined the automatic fix exactly what to apply
 // by hand — the same block, not a canned global directive.
 func MatchBlock(user string, groups []string, report sysinfo.LoginReport) (string, error) {
+	// The same defence in depth Grant and Remove apply, and for a sharper reason:
+	// printSSHDFixHint renders this block as a copy-paste heredoc that the operator
+	// is told to write into a privileged sshd config and then reload. An
+	// unvalidated name embedding a newline would carry arbitrary extra directives
+	// into that paste, so refuse it here even though every current caller is
+	// already downstream of validation.
+	if !validate.Username(user) {
+		return "", fmt.Errorf("refusing an sshd match block for invalid username %q", user)
+	}
 	b, err := dropIn(user, groups, report)
 	return string(b), err
 }
