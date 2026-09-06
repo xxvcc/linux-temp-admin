@@ -1733,8 +1733,24 @@ func (b inviteBundle) loginLine() string {
 	return login + " (UNVERIFIED: " + reason + ")"
 }
 
+// inviteRenderReserve is the capacity printInvite reserves before it writes
+// anything. It is far above any real invite (the largest part, an ed25519
+// OpenSSH PEM, is well under a kilobyte) so the render never outgrows its first
+// allocation. See printInvite for why that matters.
+const inviteRenderReserve = 16 << 10
+
 func (a *App) printInvite(b inviteBundle) error {
 	var out bytes.Buffer
+	// Reserve the whole render up front. clear() below can only zero the buffer's
+	// CURRENT backing array, and every write past capacity makes bytes.Buffer
+	// allocate a new array, copy into it, and orphan the old one. Writes continue
+	// after the private-key heredoc — the security note always, the sshd and
+	// permanent-account notes sometimes — so without this the orphaned array still
+	// holds the complete one-time PEM, unreachable and unclearable, for the rest of
+	// the process's life. In menu mode that is until the operator quits, across
+	// later privileged actions and into any swap or hibernation image. Reserving
+	// once keeps the key in a single array the deferred clear actually reaches.
+	out.Grow(inviteRenderReserve)
 	defer func() { clear(out.Bytes()) }()
 	if b.kp != nil {
 		defer clear(b.kp.PrivatePEM)

@@ -17,6 +17,13 @@ All notable changes to this project are documented here.
   failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
   to none. The refusal also now reports how many attempts were disturbed, so
   the operator can tell host churn from a fault in the account being revoked.
+- Reserve the invite render up front so the one-time private key cannot survive
+  in an orphaned buffer. `clear` reaches only a `bytes.Buffer`'s current backing
+  array, and writes continue after the private-key heredoc, so each growth left
+  an unreachable array still holding the complete PEM for the rest of the
+  process's life — in menu mode across every later privileged action, and into
+  any swap image.
+
 - Keep the auto-revoke task armed when an invite rollback must retain the
   account. Rollback runs its cleanups in reverse, so the cancellation registered
   at scheduling time ran first — before the teardown that decides whether the
