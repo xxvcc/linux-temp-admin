@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.5 - 2026-09-06
+
+- Keep a live legacy account's auto-revoke task instead of sweeping it as an
+  orphan. `compact` and the matching `doctor` scan classified a migrated v2
+  legacy identity as manual-only and cancelled its expiry task, while the
+  sudoers and sshd sweeps deliberately preserved that same account's
+  `NOPASSWD:ALL` drop-in and sshd exception. The cancelled task is what strips
+  those grants at expiry, so the one state that kept the grant also destroyed
+  the only mechanism that removes it: a time-limited sudo grant became
+  permanent, `status` and the manage table kept reporting `AUTO-DELETE=yes`
+  with a future expiry, and the run that caused it reported the deletion as a
+  removed orphan. Auto-revoke retention now applies the same recorded-UID test
+  the grant sweeps already use, so an account whose grants are preserved keeps
+  the task that removes them, and a UID-mismatched row still has its grants and
+  its task swept together.
+
 ## v2.10.4 - 2026-08-20
 
 - Fail closed when the SSH port cannot be established reliably, while preserving

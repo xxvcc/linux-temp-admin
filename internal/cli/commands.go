@@ -563,10 +563,21 @@ func (a *App) accountIsOursAndLive(name string) (bool, error) {
 
 // accountNeedsAutoRevoke reports whether a managed auto-revoke task must be
 // retained. An absent recovery row needs its retry path for owner-checked mail
-// cleanup, and an exactly bound live recovery may safely retry deletion. A legacy
-// identity and a live UID-only or generation-mismatched recovery are manual-only,
-// so their old unattended tasks are stale and must be swept while the registry
-// witness remains.
+// cleanup, and an exactly bound live recovery may safely retry deletion. A live
+// UID-only or generation-mismatched recovery is manual-only, so its old unattended
+// task is stale and must be swept while the registry witness remains.
+//
+// A live legacy identity is NOT such a recovery state: classifyRegisteredAccount
+// only reaches registeredLegacyIdentity when DeletionStarted is false, so the row
+// is a live account with a pending expiry rather than a deletion retry. Its task
+// is the mechanism that strips this tool's grants at expiry — an exactly matching
+// v2-shaped unit reaches revokeLegacyScheduledAccess, whose first act is to remove
+// the sudo grant and sshd exception, and a name-only v1-shaped unit reaches
+// stripGrantsAndCheckProtection, which removes the same two before refusing
+// deletion. accountIsOursAndLive deliberately preserves that account's grants, so
+// this predicate must preserve the task that removes them on the same terms;
+// cancelling it while keeping the grant is the one combination that turns a
+// time-limited sudo grant into a permanent one.
 func (a *App) accountNeedsAutoRevoke(name string) (bool, error) {
 	if a.Registry == nil {
 		return false, fmt.Errorf("no registry available to verify %s", name)
@@ -580,6 +591,9 @@ func (a *App) accountNeedsAutoRevoke(name string) (bool, error) {
 		return false, err
 	}
 	state := classifyRegisteredAccount(rec, pw, exists, nil)
+	if state == registeredLegacyIdentity {
+		return validate.AccountID(rec.UID) && rec.UID == pw.UID, nil
+	}
 	return state == registeredActive || state == registeredFirstFieldWitness || state == registeredQuarantine || state == registeredRecoveryAbsent ||
 		state == registeredRecoveryBound, nil
 }
