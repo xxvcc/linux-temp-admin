@@ -2,6 +2,78 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.6 - 2026-09-06
+
+- Attribute `/proc` snapshot instability to the process directory's owner so an
+  unrelated account's churn can no longer deny every invite and every account
+  deletion. The scan needs two consecutive stable empty snapshots, and any
+  vanishing entry used to invalidate the whole snapshot, so ordinary background
+  activity on a busy host — or a deliberate fork loop from any local account —
+  made the scan fail outright. A cheap first pass now records each entry's
+  owner while the listing is fresh; only root, the target UID, and entries that
+  vanished before they could be attributed still count, because changing a
+  thread to another UID needs privilege an unprivileged account does not have.
+  Measured on a four-core host: continuous unrelated forking went from 27-29
+  failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
+  to none. The refusal also now reports how many attempts were disturbed, so
+  the operator can tell host churn from a fault in the account being revoked.
+- Never allocate an identity below the boundary the deletion protection uses.
+  The allocator honoured `login.defs` `UID_MIN`/`GID_MIN` down to 1, while a
+  system-range UID is protected unless its registry row is present,
+  identity-bound and marker-matched — so on a host configured with the legacy
+  500 floor the tool could mint an account that a lost or legacy-degraded row
+  would make permanently undeletable, where the same situation above the
+  boundary still has recovery paths. Both sides now read one constant.
+- Report a registry data file that was recreated while its identity sequence
+  already recorded allocations. That is not a fresh install: it is the mirror of
+  the state this tool already treats as corruption in the other direction, and
+  every account created before the loss no longer has the row that proves this
+  tool owns it. `Init` cannot fail closed without taking `doctor` and
+  `uninstall` down with it, so it records the condition and `doctor` reports it
+  with the surviving high-water mark.
+
+- Bind the quarantine re-gating to the identity the revoke transaction captured.
+  `honorExistingQuarantine` disabled the login by name alone while every other
+  destructive-adjacent step in that file re-confirms the passwd snapshot first,
+  so an account replaced out of band between the load and the re-gate would have
+  been disabled and then reported as a successfully re-gated quarantine. The
+  phase had no test at all; it has three now.
+
+- Reserve the invite render up front so the one-time private key cannot survive
+  in an orphaned buffer. `clear` reaches only a `bytes.Buffer`'s current backing
+  array, and writes continue after the private-key heredoc, so each growth left
+  an unreachable array still holding the complete PEM for the rest of the
+  process's life — in menu mode across every later privileged action, and into
+  any swap image.
+
+- Keep the auto-revoke task armed when an invite rollback must retain the
+  account. Rollback runs its cleanups in reverse, so the cancellation registered
+  at scheduling time ran first — before the teardown that decides whether the
+  account may be deleted at all. That teardown may only delete once both grant
+  removals are confirmed, so a failed sudo removal retained a disabled account
+  whose live drop-in now had nothing scheduled to come back for it. The
+  cancellation moves to the first-registered cleanup, which runs last and only
+  after every confirmation passes, matching the rule revoke already states:
+  only once the account is provably gone is the fallback safe to remove.
+
+- Close three latent gaps found alongside it. `planLogin`'s deferred Match-Group
+  branch carried a repair authorization without the `a.SSHD == nil` guard its
+  sibling path applies, so an unwired manager would have dereferenced nil after
+  the account and its key already existed; `MatchBlock` now validates the
+  username like `Grant` and `Remove` do, because its output is handed to the
+  operator as a copy-paste heredoc for a privileged sshd config where an
+  embedded newline would carry extra directives; and the stale-unit lookup in
+  invite's username reuse path is removed, since the registry check above it
+  already refuses every username that could have produced a non-empty result.
+
+- Record why the `at` inventory bound is not raised and what it does and does
+  not risk: each job costs one probe under a 30-second deadline, so a larger
+  bound would only trade a fast refusal for a slow timeout, and the refusal now
+  says the count spans every account's jobs and points at `atq`. This cleanup
+  runs only after revoke has already removed the sudo grant and the sshd
+  exception and disabled the login, so a filled queue delays deletion and
+  leaves the account retained and disabled rather than privileged.
+
 ## v2.10.5 - 2026-09-06
 
 - Keep a live legacy account's auto-revoke task instead of sweeping it as an

@@ -508,7 +508,13 @@ func (a *App) planLogin(username string, wantPassword bool, fix string, yes bool
 		// phase; confirmLogin will either discover no blocker, update report with the
 		// real fixable blockers, or fail closed before credentials are installed.
 		return loginPlan{
-			fixSSHD:    fix == "yes",
+			// Mirror the blocker path's a.SSHD == nil guard below. An unwired sshd
+			// manager must not travel as a repair authorization through the deferred
+			// phase: the repair is applied after useradd and after the key is
+			// written, where a nil dereference would abort mid-transaction and leave
+			// a created account with a completed registry row. With no repair
+			// authorized, confirmLogin fails closed before any credential lands.
+			fixSSHD:    fix == "yes" && a.SSHD != nil,
 			report:     rep,
 			verified:   false,
 			unverified: "sshd Match Group cannot be evaluated until the account exists",
@@ -1145,13 +1151,12 @@ func (tx *inviteTransaction) clearReusedUsername() bool {
 		return tx.failf("%s: %v", a.P.M("无法清除同名账号的遗留授权，拒绝创建", "cannot remove grants left by this username; refusing creation"), err)
 	}
 	// A stale scheduled command is name-keyed, so it must be gone before useradd
-	// makes that name live again. Reading its recorded id before writing the new
-	// intent also preserves the only direct handle to an at job from an older run.
-	staleUnit, err := a.Registry.UnitFor(tx.username)
-	if err != nil {
-		return tx.failf("%s: %v", a.P.M("读取旧自动删除任务失败", "reading stale auto-delete task failed"), err)
-	}
-	if err := a.Scheduler.Cancel(tx.username, staleUnit); err != nil {
+	// makes that name live again. No recorded unit id can accompany it: the Lookup
+	// above already refused every username that still holds a registry row, and
+	// UnitFor scans that same row set, so it could only ever return "" here.
+	// Cancel sweeps by name across every namespace, which is what actually clears
+	// an older run's unit or at job.
+	if err := a.Scheduler.Cancel(tx.username, ""); err != nil {
 		return tx.failf("%s: %v", a.P.M("无法确认旧自动删除任务已清除", "cannot confirm stale auto-delete tasks were removed"), err)
 	}
 	// Cancel can remove queued work, but an older at/systemd command may already be
@@ -1221,7 +1226,20 @@ func (tx *inviteTransaction) reserveAndCreatePendingIdentity() bool {
 		if exists {
 			return fmt.Errorf("account still exists; keeping registry record")
 		}
-		return a.releaseRegistryAfterCleanup(tx.username)
+		if err := a.releaseRegistryAfterCleanup(tx.username); err != nil {
+			return err
+		}
+		// Only now that the account is provably gone is the scheduled fallback safe
+		// to remove, the same rule revoke states when it deliberately leaves the
+		// task armed on a failed teardown. Cancelling earlier destroyed the one
+		// mechanism that would have retried this cleanup: rollbackInviteAccount may
+		// only delete when both grant removals are confirmed, so a rollback that
+		// retains a disabled account used to leave it with a stale sudo drop-in and
+		// nothing scheduled to come back for it.
+		if tx.autoScheduled {
+			return a.Scheduler.Cancel(tx.username, tx.autoUnit)
+		}
+		return nil
 	})
 
 	// useradd can create the account before reporting an error. Close the
@@ -1518,7 +1536,10 @@ func (tx *inviteTransaction) scheduleActivateAndReport() int {
 		}
 		tx.autoUnit = unit
 		tx.autoScheduled = true
-		tx.cleanups = append(tx.cleanups, func() error { return a.Scheduler.Cancel(tx.username, unit) })
+		// No cleanup is registered here on purpose. Reverse-order rollback would run
+		// it first, before the account teardown that decides whether the account can
+		// be deleted at all. The cancellation is performed by the first-registered
+		// cleanup instead, which runs last and only after every confirmation passes.
 		tx.rec.AutoUnit = unit
 		if err := a.Registry.Record(tx.rec); err != nil {
 			tx.failf("%s: %v", a.P.M("登记自动删除任务失败", "recording the auto-delete task failed"), err)
@@ -1712,8 +1733,24 @@ func (b inviteBundle) loginLine() string {
 	return login + " (UNVERIFIED: " + reason + ")"
 }
 
+// inviteRenderReserve is the capacity printInvite reserves before it writes
+// anything. It is far above any real invite (the largest part, an ed25519
+// OpenSSH PEM, is well under a kilobyte) so the render never outgrows its first
+// allocation. See printInvite for why that matters.
+const inviteRenderReserve = 16 << 10
+
 func (a *App) printInvite(b inviteBundle) error {
 	var out bytes.Buffer
+	// Reserve the whole render up front. clear() below can only zero the buffer's
+	// CURRENT backing array, and every write past capacity makes bytes.Buffer
+	// allocate a new array, copy into it, and orphan the old one. Writes continue
+	// after the private-key heredoc — the security note always, the sshd and
+	// permanent-account notes sometimes — so without this the orphaned array still
+	// holds the complete one-time PEM, unreachable and unclearable, for the rest of
+	// the process's life. In menu mode that is until the operator quits, across
+	// later privileged actions and into any swap or hibernation image. Reserving
+	// once keeps the key in a single array the deferred clear actually reaches.
+	out.Grow(inviteRenderReserve)
 	defer func() { clear(out.Bytes()) }()
 	if b.kp != nil {
 		defer clear(b.kp.PrivatePEM)

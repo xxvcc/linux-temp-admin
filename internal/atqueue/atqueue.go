@@ -10,6 +10,20 @@ import (
 )
 
 // MaxJobs bounds a complete queue inventory before callers inspect each job.
+//
+// The bound is deliberately not raised. Each inventoried job costs one `at -c`
+// probe, and the caller's whole inventory runs under a 30-second deadline, so
+// 4096 already sits at what that deadline can complete: a larger bound would
+// only trade a fast, explicit refusal for a slow timeout. The inventory also
+// spans every account's jobs, because atq's owner column is not trusted and the
+// owner is established per job from the atrun header instead. A local account
+// with at access can therefore fill the queue and stop this inventory from
+// completing.
+//
+// That is contained rather than dangerous: the caller reaches this cleanup only
+// after revoke has already removed the sudo grant and the sshd exception and
+// disabled the login, so a filled queue delays account deletion and leaves the
+// account retained and disabled. It never leaves privileged access in place.
 const MaxJobs = 4096
 
 // ValidJobID reports whether id is a canonical positive decimal at job ID.
@@ -51,7 +65,9 @@ func ParseInventory(out []byte, maxTokenBytes int) ([]string, error) {
 		seen[id] = true
 		ids = append(ids, id)
 		if len(ids) > MaxJobs {
-			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs", MaxJobs)
+			// Name what the operator can act on: the count spans every account's
+			// jobs, so the blocker is usually not the account being cleaned up.
+			return nil, fmt.Errorf("at queue contains more than %d inspectable jobs across all accounts, so this inventory cannot complete; list the queue with atq to find the owner filling it", MaxJobs)
 		}
 	}
 	if err := scanner.Err(); err != nil {

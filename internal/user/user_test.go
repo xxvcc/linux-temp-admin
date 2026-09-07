@@ -938,6 +938,36 @@ func TestIdentityAllocationRangeScansLocalUIDsAndGIDs(t *testing.T) {
 	}
 }
 
+// TestIdentityAllocationNeverDescendsBelowTheProtectionBoundary pins the
+// allocator's floor to the same boundary the deletion protection uses. Below it
+// an account is protected unless its registry row is present, identity-bound and
+// marker-matched, so a lost or legacy-degraded row would leave an account this
+// tool created and can never delete — while the same situation above the
+// boundary still has recovery paths.
+func TestIdentityAllocationNeverDescendsBelowTheProtectionBoundary(t *testing.T) {
+	// The legacy RHEL-era range: an administrator's configured floor of 500.
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nlegacy:x:600:600::/home/legacy:/bin/sh\n",
+		"root:x:0:\nlegacy:x:600:\n",
+		"UID_MIN 500\nUID_MAX 60000\nGID_MIN 500\nGID_MAX 60000\n")
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil {
+		t.Fatalf("InspectIdentityAllocation: %v", err)
+	}
+	if snapshot.Lower != minAllocatableID {
+		t.Fatalf("allocation lower bound = %d, want the protection boundary %d", snapshot.Lower, minAllocatableID)
+	}
+	// The account at 600 sits below the clamped range and must not raise the
+	// starting point either: CurrentHighest only counts identities inside it.
+	if snapshot.CurrentHighest >= minAllocatableID {
+		t.Fatalf("CurrentHighest = %d, want nothing counted below the clamped range", snapshot.CurrentHighest)
+	}
+	minimum, _, err := IdentityAllocationRange()
+	if err != nil || minimum < minAllocatableID {
+		t.Fatalf("IdentityAllocationRange minimum = %d err=%v, want at least %d", minimum, err, minAllocatableID)
+	}
+}
+
 func TestInspectIdentityAllocationReturnsExhaustedSnapshot(t *testing.T) {
 	setIdentityDatabases(t,
 		"root:x:0:0:root:/root:/bin/sh\nlast:x:1900:1500::/home/last:/bin/sh\n",
@@ -1785,6 +1815,51 @@ func TestValidateCreatedHomeRequiresNonRootOwnedRealDirectory(t *testing.T) {
 	}
 	if err := validateCreatedHome(expected); err == nil || !strings.Contains(err.Error(), "was not created") {
 		t.Fatalf("missing created home error = %v", err)
+	}
+}
+
+// TestProcessSnapshotAttributesInstabilityByOwner pins the rule that keeps an
+// unrelated account's process churn from denying every invite and revoke: a
+// vanishing entry owned by another unprivileged account cannot host or fork a
+// target-UID thread, so it must not invalidate the snapshot, while a root-owned
+// one still must.
+func TestProcessSnapshotAttributesInstabilityByOwner(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("attribution test needs root to set a foreign directory owner")
+	}
+	const target = 1111
+	const foreignUID = 65534
+	for _, tc := range []struct {
+		name       string
+		owner      int
+		wantStable bool
+	}{
+		{name: "third-party owner does not destabilise", owner: foreignUID, wantStable: true},
+		{name: "root owner still destabilises", owner: 0, wantStable: false},
+		{name: "target owner still destabilises", owner: target, wantStable: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setProcRoot(t, nil)
+			// A process directory with no numeric task entries is exactly the shape
+			// processGroupHasUID reports as unstable.
+			pidDir := filepath.Join(procRoot, "4242")
+			if err := os.MkdirAll(filepath.Join(pidDir, "task"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chown(pidDir, tc.owner, tc.owner); err != nil {
+				t.Fatal(err)
+			}
+			pids, stable, err := processSnapshotForUID(target)
+			if err != nil {
+				t.Fatalf("processSnapshotForUID: %v", err)
+			}
+			if len(pids) != 0 {
+				t.Fatalf("pids = %v, want none", pids)
+			}
+			if stable != tc.wantStable {
+				t.Fatalf("stable = %v, want %v for owner %d", stable, tc.wantStable, tc.owner)
+			}
+		})
 	}
 }
 

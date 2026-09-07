@@ -245,6 +245,41 @@ func TestPrintInviteClearsPrivateKeySource(t *testing.T) {
 	}
 }
 
+// TestPrintInviteFitsItsReservation guards the reservation printInvite makes so
+// its buffer never reallocates and orphans an array still holding the one-time
+// private key.
+//
+// What this does NOT do is observe the reallocation itself: Go gives no way to
+// reach an orphaned backing array, so removing the Grow call would leave this
+// test green. It covers the part that can rot — the render outgrowing the
+// reserve as notes and fields are added — and nothing else. Read it as a bound
+// check, not as a regression test for the clearing behaviour.
+func TestPrintInviteFitsItsReservation(t *testing.T) {
+	a, out, _ := newTestApp(t, "")
+	kp, err := sshkey.GenerateEd25519("xxvcc-a1@example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The widest render this tool produces: a real key plus every optional note.
+	if err := a.printInvite(inviteBundle{
+		user: "xxvcc-a1", host: "203.0.113.10", port: 22, hours: 24,
+		sudo: true, auto: true, permanent: true, expires: "2026-09-07 12:00:00 UTC",
+		autoUnit: "linux-temp-admin-v2-revoke-xxvcc-a1.timer", registered: true,
+		kp:         kp,
+		sshdDropIn: "/etc/ssh/sshd_config.d/10-linux-temp-admin-xxvcc-a1.conf",
+		unverified: "sshd Match Group cannot be evaluated until the account exists",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "BEGIN OPENSSH PRIVATE KEY") {
+		t.Fatal("invite did not write the one-time private key")
+	}
+	if n := out.Len(); n >= inviteRenderReserve {
+		t.Fatalf("invite rendered %d bytes into a %d-byte reservation; raise inviteRenderReserve, or the render will reallocate and orphan an array holding the private key",
+			n, inviteRenderReserve)
+	}
+}
+
 func TestExtractLang(t *testing.T) {
 	cases := []struct {
 		args     []string

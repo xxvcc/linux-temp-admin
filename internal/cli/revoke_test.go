@@ -2117,3 +2117,62 @@ func TestFinalScheduledAccountCheckClearsWorkQueuedBeforeTerminationCompletes(t 
 		t.Fatal("work queued by a dying process survived the final inventory")
 	}
 }
+
+// TestQuarantineRegateBindsToTheCapturedIdentity covers honorExistingQuarantine,
+// which had no coverage at all. Removing the two grants by name is safe against
+// any target because those files are this tool's own, but DisableLogin mutates
+// the account, so the phase must confirm it is still acting on the identity the
+// transaction captured — the same check beginIdentityQuarantine makes after its
+// own DisableLogin.
+func TestQuarantineRegateBindsToTheCapturedIdentity(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	captured := user.Passwd{
+		Name: "xxvcc-quar1", UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-quar1", Shell: "/bin/sh",
+	}
+	replaced := captured
+	replaced.UID = captured.UID + 1
+	replaced.GID = captured.GID + 1
+
+	for _, tc := range []struct {
+		name    string
+		current user.Passwd
+		exists  bool
+		wantRC  int
+	}{
+		{name: "same identity holds the quarantine", current: captured, exists: true, wantRC: 0},
+		{name: "replaced identity refuses", current: replaced, exists: true, wantRC: 1},
+		{name: "vanished account refuses", exists: false, wantRC: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, errb := newTestApp(t, "")
+			runner := &revokeRunner{}
+			a.Users = &user.Manager{Runner: runner}
+			a.LookupUser = func(string) (user.Passwd, bool, error) { return tc.current, tc.exists, nil }
+			deadline := a.Now().Add(24 * time.Hour).UTC()
+			tx := &revokeTransaction{
+				app: a, username: captured.Name, registered: true, pw: captured,
+				rec: registry.Record{
+					User: captured.Name, UID: captured.UID, Generation: generation,
+					IdentityBound: true, DeletionStarted: true, Port: 22,
+					QuarantineUntil: deadline.Format(time.RFC3339),
+					QuarantineUnit:  config.QuarantineUnitPrefix + captured.Name,
+				},
+			}
+			res := tx.honorExistingQuarantine()
+			if !res.done || res.status != tc.wantRC {
+				t.Fatalf("honorExistingQuarantine = done:%v status:%d, want done:true status:%d\nstderr:\n%s",
+					res.done, res.status, tc.wantRC, errb.String())
+			}
+			// The gates are re-asserted either way; what is under test is what the
+			// phase does when the identity behind them no longer matches.
+			if len(runner.calls) == 0 {
+				t.Fatal("the access gates were never re-asserted")
+			}
+			if tc.wantRC == 1 && !strings.Contains(errb.String(), "identity changed") {
+				t.Fatalf("refusal did not name the identity change:\n%s", errb.String())
+			}
+		})
+	}
+}

@@ -984,6 +984,15 @@ func (a *App) doctorRegistryIdentity() (doctorRegistryState, doctorResult) {
 	}
 	state.records = records
 	state.readable = true
+	if highest := a.Registry.LostRegistryHighest(); highest > 0 {
+		// CheckIntegrity cannot see this: by the time it runs, Init has already
+		// recreated the data file, and an empty registry trivially satisfies every
+		// sequence invariant. Only Init observes the absence, so it records it.
+		a.warnf("%s", a.P.M(
+			fmt.Sprintf("登记表数据文件缺失但身份序列已记录到 %d：这不是全新安装，本工具此前创建的账号已失去证明其归属的登记行。撤销和孤儿清扫都依赖该证据。请从可信备份恢复登记表，不要以当前这份空表继续运作。", highest),
+			fmt.Sprintf("the registry data file was missing while the identity sequence already recorded %d: this is not a fresh install, and every account this tool created before now has lost the row that proves it owns them. Revoke and the orphan sweeps rely on that evidence. Restore the registry from trusted backup rather than continuing on the empty one it had to recreate.", highest)))
+		result.fail()
+	}
 	if integrityErr := a.Registry.CheckIntegrity(); integrityErr != nil {
 		if errors.Is(integrityErr, registry.ErrIdentitySequenceMissing) {
 			a.warnf("%s", a.P.M(
