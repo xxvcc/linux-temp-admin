@@ -17,6 +17,13 @@ All notable changes to this project are documented here.
   failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
   to none. The refusal also now reports how many attempts were disturbed, so
   the operator can tell host churn from a fault in the account being revoked.
+- Bind the quarantine re-gating to the identity the revoke transaction captured.
+  `honorExistingQuarantine` disabled the login by name alone while every other
+  destructive-adjacent step in that file re-confirms the passwd snapshot first,
+  so an account replaced out of band between the load and the re-gate would have
+  been disabled and then reported as a successfully re-gated quarantine. The
+  phase had no test at all; it has three now.
+
 - Reserve the invite render up front so the one-time private key cannot survive
   in an orphaned buffer. `clear` reaches only a `bytes.Buffer`'s current backing
   array, and writes continue after the private-key heredoc, so each growth left

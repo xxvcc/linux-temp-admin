@@ -513,6 +513,19 @@ func (tx *revokeTransaction) honorExistingQuarantine() revokePhaseResult {
 				a.errorf("%s: %v", a.P.M("账号处于身份隔离期，但无法重新确认全部访问门已关闭", "the account is quarantined, but not every access gate could be reconfirmed closed"), err)
 				return finishRevoke(1)
 			}
+			// Bind the disable to the identity this transaction captured, the same
+			// check beginIdentityQuarantine makes immediately after its own
+			// DisableLogin. Removing the two grants by name is safe against any
+			// target because those files are this tool's own, but DisableLogin
+			// mutates the account itself: an out-of-band replacement created between
+			// loadAccount and here would be disabled and then reported as a
+			// successfully re-gated quarantine, which is exactly the
+			// "disable one generation, signal another" mistake this file refuses
+			// elsewhere.
+			if err := a.revokeAccountStillMatches(username, tx.pw); err != nil {
+				a.errorf("%s: %v", a.P.M("隔离期内的账号身份已改变，无法确认关闭的是同一个账号", "the quarantined account's identity changed; cannot confirm the gates were closed on the same account"), err)
+				return finishRevoke(1)
+			}
 			a.info(a.P.M("账号访问已撤销，用户名和 UID 隔离保留至：", "account access is revoked; name and UID remain quarantined until: ") + deadline.Local().Format("2006-01-02 15:04:05 MST"))
 			return finishRevoke(0)
 		}
