@@ -938,6 +938,36 @@ func TestIdentityAllocationRangeScansLocalUIDsAndGIDs(t *testing.T) {
 	}
 }
 
+// TestIdentityAllocationNeverDescendsBelowTheProtectionBoundary pins the
+// allocator's floor to the same boundary the deletion protection uses. Below it
+// an account is protected unless its registry row is present, identity-bound and
+// marker-matched, so a lost or legacy-degraded row would leave an account this
+// tool created and can never delete — while the same situation above the
+// boundary still has recovery paths.
+func TestIdentityAllocationNeverDescendsBelowTheProtectionBoundary(t *testing.T) {
+	// The legacy RHEL-era range: an administrator's configured floor of 500.
+	setIdentityDatabases(t,
+		"root:x:0:0:root:/root:/bin/sh\nlegacy:x:600:600::/home/legacy:/bin/sh\n",
+		"root:x:0:\nlegacy:x:600:\n",
+		"UID_MIN 500\nUID_MAX 60000\nGID_MIN 500\nGID_MAX 60000\n")
+	snapshot, err := InspectIdentityAllocation()
+	if err != nil {
+		t.Fatalf("InspectIdentityAllocation: %v", err)
+	}
+	if snapshot.Lower != minAllocatableID {
+		t.Fatalf("allocation lower bound = %d, want the protection boundary %d", snapshot.Lower, minAllocatableID)
+	}
+	// The account at 600 sits below the clamped range and must not raise the
+	// starting point either: CurrentHighest only counts identities inside it.
+	if snapshot.CurrentHighest >= minAllocatableID {
+		t.Fatalf("CurrentHighest = %d, want nothing counted below the clamped range", snapshot.CurrentHighest)
+	}
+	minimum, _, err := IdentityAllocationRange()
+	if err != nil || minimum < minAllocatableID {
+		t.Fatalf("IdentityAllocationRange minimum = %d err=%v, want at least %d", minimum, err, minAllocatableID)
+	}
+}
+
 func TestInspectIdentityAllocationReturnsExhaustedSnapshot(t *testing.T) {
 	setIdentityDatabases(t,
 		"root:x:0:0:root:/root:/bin/sh\nlast:x:1900:1500::/home/last:/bin/sh\n",

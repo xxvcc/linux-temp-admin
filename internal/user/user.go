@@ -165,6 +165,13 @@ func InspectIdentityAllocation() (IdentityAllocationSnapshot, error) {
 	if gidMin > lower {
 		lower = gidMin
 	}
+	// login.defs may configure a range that reaches below the protection boundary
+	// (legacy RHEL-era hosts used UID_MIN 500, and an administrator can narrow it
+	// further). Honour the administrator's range only where this tool can still
+	// revoke what it creates.
+	if lower < minAllocatableID {
+		lower = minAllocatableID
+	}
 	upper := uidMax
 	if gidMax < upper {
 		upper = gidMax
@@ -233,8 +240,17 @@ func IdentityAllocationRange() (minimum, maximum int, err error) {
 	return minimum, snapshot.Upper, nil
 }
 
+// minAllocatableID is the lowest identity this tool may create. It is the same
+// boundary the deletion protection uses for a system-range UID, and the two must
+// not drift apart: below it, an account is protected unless its registry row is
+// present, identity-bound, and marker-matched, so a lost or legacy-degraded row
+// makes it permanently undeletable — while the identical situation above the
+// boundary still has recovery paths. Minting an identity this tool could be
+// unable to revoke is exactly what it exists to prevent.
+const minAllocatableID = 1000
+
 func loginIdentityBounds() (uidMin, uidMax, gidMin, gidMax int, err error) {
-	uidMin, uidMax, gidMin, gidMax = 1000, 60000, 1000, 60000
+	uidMin, uidMax, gidMin, gidMax = minAllocatableID, 60000, minAllocatableID, 60000
 	b, err := readPasswdDatabase(loginDefsPath, maxLoginDefsBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		// shadow's own useradd falls back to its compiled-in range when
@@ -666,7 +682,7 @@ func IsProtectedRevokeEntry(name string, pw Passwd, exists bool, identity Revoke
 		// comparing it with passwd. Only the direct interactive recovery gate may
 		// authorize the exact fixed legacy marker, and never for a system-range UID.
 		if !identity.IdentityBound {
-			return pw.UID < 1000 || !allowLegacy || !IsLegacyManagedEntry(pw)
+			return pw.UID < minAllocatableID || !allowLegacy || !IsLegacyManagedEntry(pw)
 		}
 		if identity.RecordedUID < 1 {
 			return true
@@ -684,7 +700,7 @@ func IsProtectedRevokeEntry(name string, pw Passwd, exists bool, identity Revoke
 	if identity.Registered {
 		managed = identity.IdentityBound && MatchesManagedGeneration(pw, identity.RecordedGeneration)
 	}
-	if pw.UID < 1000 {
+	if pw.UID < minAllocatableID {
 		return !(identity.Registered && identity.IdentityBound && managed)
 	}
 	// UIDs are reusable. Even a matching recorded UID cannot prove that this is the

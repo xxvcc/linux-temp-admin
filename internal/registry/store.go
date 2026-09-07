@@ -31,6 +31,12 @@ type Store struct {
 	Lock     string
 	Sequence string
 	Now      func() time.Time
+
+	// lostRegistryHighest is nonzero when Init found no registry data file while
+	// the identity sequence already recorded allocations. It is process-local
+	// state for doctor, not persisted: the condition is only observable at the
+	// moment Init recreates the file.
+	lostRegistryHighest int
 }
 
 // Default returns a Store using the configured registry paths.
@@ -100,6 +106,18 @@ func (s *Store) Init() error {
 		return registryErr
 	}
 	if registryMissing {
+		// A sequence that already records allocations proves this is not a fresh
+		// install: the registry data file was lost while its identity history
+		// survived. That is the exact mirror of the state this module treats as
+		// corruption in the other direction (a v5 header with no sequence, which
+		// fails closed and has recover-identity-sequence to repair it), and it is
+		// just as consequential — every managed account loses the row that proves
+		// this tool owns it. Init cannot fail closed here without taking doctor and
+		// uninstall down with it, which would turn a recoverable state into an
+		// unrecoverable one, so it records the fact for doctor to report instead.
+		if seq, seqErr := s.requireIdentitySequence(); seqErr == nil && seq.highest > 0 {
+			s.lostRegistryHighest = seq.highest
+		}
 		if err := s.ensureIdentitySequence(0, true, time.Time{}); err != nil {
 			return err
 		}
@@ -810,4 +828,16 @@ func (s *Store) completelyAbsent() (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// LostRegistryHighest reports the identity-sequence high-water mark that was
+// present when Init had to recreate a missing registry data file, or zero when
+// the registry was intact or genuinely fresh. A nonzero value means rows were
+// lost: every account this tool created before that point no longer has the
+// registry witness its revoke and orphan sweeps rely on.
+func (s *Store) LostRegistryHighest() int {
+	if s == nil {
+		return 0
+	}
+	return s.lostRegistryHighest
 }

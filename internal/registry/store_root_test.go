@@ -1355,3 +1355,43 @@ func TestBeginDeletionUIDOnlyAdvanceRejectsInvalidSequenceState(t *testing.T) {
 		})
 	}
 }
+
+// TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse covers the mirror
+// of the state this package already treats as corruption. A v5 header with no
+// sequence fails closed and has recover-identity-sequence to repair it; a
+// sequence that records allocations with no registry data file was silently
+// accepted as a fresh install, publishing an empty registry in which every
+// account this tool created has lost the row that proves it owns them.
+//
+// Init cannot fail closed here without taking doctor and uninstall down with it,
+// so it records the condition and doctor reports it. Only Init can observe the
+// absence: once it recreates the file, an empty registry satisfies every
+// sequence invariant trivially.
+func TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse(t *testing.T) {
+	s := newStore(t)
+	if got := s.LostRegistryHighest(); got != 0 {
+		t.Fatalf("a genuinely fresh store reported LostRegistryHighest = %d, want 0", got)
+	}
+	reserveThrough(t, s, 1500)
+	if err := s.Record(registry.Record{User: "xxvcc-lost1", UID: 1500, Host: "203.0.113.5", Port: 22}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the data file is lost: a partial restore, or a stray delete of *.tsv.
+	if err := os.Remove(s.File); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := &registry.Store{Dir: s.Dir, File: s.File, Lock: s.Lock, Now: s.Now}
+	if err := reopened.Init(); err != nil {
+		t.Fatalf("Init on the surviving state directory: %v", err)
+	}
+	if got := reopened.LostRegistryHighest(); got != 1500 {
+		t.Fatalf("LostRegistryHighest = %d, want the surviving sequence high-water mark 1500", got)
+	}
+	// The row really is gone, which is what makes the report necessary rather than
+	// merely informative.
+	if _, found, err := reopened.Lookup("xxvcc-lost1"); err != nil || found {
+		t.Fatalf("Lookup after the loss: found=%v err=%v, want the row to be gone", found, err)
+	}
+}

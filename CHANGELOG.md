@@ -17,6 +17,21 @@ All notable changes to this project are documented here.
   failures in 30 scans to 2-3, and a steady 50 processes per second from 8-19
   to none. The refusal also now reports how many attempts were disturbed, so
   the operator can tell host churn from a fault in the account being revoked.
+- Never allocate an identity below the boundary the deletion protection uses.
+  The allocator honoured `login.defs` `UID_MIN`/`GID_MIN` down to 1, while a
+  system-range UID is protected unless its registry row is present,
+  identity-bound and marker-matched — so on a host configured with the legacy
+  500 floor the tool could mint an account that a lost or legacy-degraded row
+  would make permanently undeletable, where the same situation above the
+  boundary still has recovery paths. Both sides now read one constant.
+- Report a registry data file that was recreated while its identity sequence
+  already recorded allocations. That is not a fresh install: it is the mirror of
+  the state this tool already treats as corruption in the other direction, and
+  every account created before the loss no longer has the row that proves this
+  tool owns it. `Init` cannot fail closed without taking `doctor` and
+  `uninstall` down with it, so it records the condition and `doctor` reports it
+  with the surviving high-water mark.
+
 - Bind the quarantine re-gating to the identity the revoke transaction captured.
   `honorExistingQuarantine` disabled the login by name alone while every other
   destructive-adjacent step in that file re-confirms the passwd snapshot first,
