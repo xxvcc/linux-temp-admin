@@ -3412,7 +3412,7 @@ func TestDisableLoginExpiresBeforeLocking(t *testing.T) {
 	if len(f.calls) != 2 {
 		t.Fatalf("DisableLogin calls = %v, want chage then usermod", f.calls)
 	}
-	if !reflect.DeepEqual(f.calls[0], []string{"chage", "-E", "1970-01-01", "xxvcc-u"}) {
+	if !reflect.DeepEqual(f.calls[0], []string{"chage", "-E", "1970-01-02", "xxvcc-u"}) {
 		t.Errorf("first call = %v, want the account expired to a past date", f.calls[0])
 	}
 	if !reflect.DeepEqual(f.calls[1], []string{"usermod", "-L", "xxvcc-u"}) {
@@ -3449,5 +3449,27 @@ func TestTerminateProcessesNeverSignalsRootOrAll(t *testing.T) {
 		if len(opened) != 0 {
 			t.Fatalf("reserved uid must open no pidfds, opened %v", opened)
 		}
+	}
+}
+
+// TestExpiredDateStoresANonZeroExpiry pins expiredDate away from the one value
+// shadow(5) singles out as unusable: "The value 0 should not be used as it is
+// interpreted as either an account with no expiration, or as an expiration on
+// Jan 1, 1970." shadow's isexpired() takes the first reading and requires
+// sp_expire > 0, and DisableLogin leans on that expiry as the gate that stops a
+// public-key login, which the password lock does not.
+func TestExpiredDateStoresANonZeroExpiry(t *testing.T) {
+	parsed, err := time.Parse("2006-01-02", expiredDate)
+	if err != nil {
+		t.Fatalf("expiredDate %q is not a chage date: %v", expiredDate, err)
+	}
+	// chage stores days since the epoch; this is the value that lands in the
+	// eighth /etc/shadow field.
+	days := int(parsed.UTC().Sub(time.Unix(0, 0).UTC()).Hours() / 24)
+	if days < 1 {
+		t.Fatalf("expiredDate %q stores sp_expire=%d, which shadow may read as no expiration at all", expiredDate, days)
+	}
+	if !parsed.Before(time.Now()) {
+		t.Fatalf("expiredDate %q is not safely in the past", expiredDate)
 	}
 }

@@ -1062,7 +1062,7 @@ type expiryFailRunner struct {
 
 func (r expiryFailRunner) Run(name string, args ...string) error {
 	if !*r.failed && name == "chage" && len(args) >= 2 && args[0] == "-E" &&
-		args[1] != "-1" && args[1] != "1970-01-01" {
+		args[1] != "-1" && args[1] != "1970-01-02" {
 		*r.failed = true
 		return errors.New("injected expiry failure")
 	}

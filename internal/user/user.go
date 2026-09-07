@@ -1156,9 +1156,23 @@ func (m *Manager) ClearExpiry(name string) error {
 }
 
 // expiredDate is a date safely in the past; chage -E it to make an account
-// expired as of now. A literal date is used rather than "0" because chage's
-// numeric form is days-since-epoch and reads ambiguously next to -E -1 ("never").
-const expiredDate = "1970-01-01"
+// expired as of now.
+//
+// It must not be the epoch itself. chage stores this field as days since
+// 1970-01-01, so -E 1970-01-01 writes a literal 0, and shadow(5) says of that
+// value: "The value 0 should not be used as it is interpreted as either an
+// account with no expiration, or as an expiration on Jan 1, 1970." shadow's own
+// isexpired() takes the first reading — it requires sp_expire > 0 before it will
+// call an account expired — so the epoch would leave the account unexpired on
+// the very path DisableLogin relies on. That gate is the one that stops a
+// public-key login; the password lock does not. One day past the epoch is still
+// unambiguously in the past and encodes as 1.
+//
+// Passing a literal "0" as the argument would be wrong for a second, unrelated
+// reason: chage's numeric form is days-since-epoch and reads ambiguously next to
+// -E -1 ("never"). Avoiding that is what the previous value was reaching for; it
+// simply moved the same ambiguity one layer down, into the stored field.
+const expiredDate = "1970-01-02"
 
 // initialLockedPasswordHash is passed to useradd as an encrypted hash. It is not
 // a valid crypt(3) result, and the leading '!' has the conventional shadow meaning

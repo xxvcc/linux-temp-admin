@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.7 - 2026-09-07
+
+- Stop writing the one account-expiry value shadow documents as unusable.
+  `DisableLogin` expired an account with `chage -E 1970-01-01`, and chage stores
+  that field as days since the epoch, so the literal date encoded to `0` —
+  the value `shadow(5)` describes as "interpreted as either an account with no
+  expiration, or as an expiration on Jan 1, 1970", and which shadow's own
+  `isexpired()` reads the first way because it requires `sp_expire > 0`. That
+  expiry is the gate which stops a public-key login on a disabled account; the
+  password lock does not. The date moves one day past the epoch, which is
+  equally in the past and encodes as `1`. The old comment reached for exactly
+  this ambiguity and avoided it only in the argument, not in the stored field.
+
 ## v2.10.6 - 2026-09-06
 
 - Attribute `/proc` snapshot instability to the process directory's owner so an
