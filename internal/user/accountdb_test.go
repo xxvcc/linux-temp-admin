@@ -523,3 +523,23 @@ func TestSubordinateIDsAbsentMatchesTheNumericOwnerForm(t *testing.T) {
 		})
 	}
 }
+
+// TestPrivateGroupRemovalRefusesSystemRangeGIDs pins the groupdel authorization
+// to the same floor the account protection and the identity allocator use.
+// validate.AccountID only asks for gid > 0, so a system-range GID could have
+// authorized removing a group this tool never created.
+func TestPrivateGroupRemovalRefusesSystemRangeGIDs(t *testing.T) {
+	m := &Manager{}
+	for _, gid := range []int{1, 99, 999} {
+		err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", gid, true)
+		if err == nil || !strings.Contains(err.Error(), "out-of-range GID") {
+			t.Errorf("ReconcileAccountDatabaseAfterDeletion(gid=%d) = %v, want an out-of-range refusal", gid, err)
+		}
+	}
+	// Without the removal request the GID is not an authorization and is not
+	// bounded here, so the call must get past this check.
+	if err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", 99, false); err != nil &&
+		strings.Contains(err.Error(), "out-of-range GID") {
+		t.Errorf("a non-removing reconcile was refused on its GID: %v", err)
+	}
+}

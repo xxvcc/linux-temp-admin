@@ -904,7 +904,10 @@ chmod 0755 -- "$stage"
 # candidate prints forever; timeout kills a hanging candidate and its children.
 if ! (
   ulimit -f 1 || exit 1
-  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err"
+  # stdin is still the pipe carrying the rest of this script when the documented
+  # `curl ... | sh` path is used, and the candidate is an untrusted binary at this
+  # point. Hand it /dev/null so it cannot consume or observe the installer text.
+  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err" < /dev/null
 ); then
   fail "downloaded binary failed its pre-install version probe"
 fi
@@ -930,7 +933,7 @@ if [ "$DEST" = "$MANAGED_DEST" ]; then
   # Delegating the managed-path commit to it serializes reinstall with every
   # other mutation and reactivates a deliberately uninstalled host. An unsafe
   # marker is rejected before the candidate changes the stable command.
-  if ! timeout -k 1 30 "$stage" --lang en install --force >/dev/null 2>&1; then
+  if ! timeout -k 1 30 "$stage" --lang en install --force >/dev/null 2>&1 < /dev/null; then
     fail "signed candidate could not complete the managed install/reactivation"
   fi
   rm -f -- "$stage" || fail "could not remove the verified staging file"

@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Record the kernel's audit login uid alongside the actor. The actor name comes
+  from `SUDO_USER`, which the invoking environment supplies; loginuid is set once
+  per login session by PAM and is the value to reconcile against when an actor
+  name is in question. The unset sentinel is recorded as absent, not as a uid.
+- Bound the GID that may authorize removing a private group to the same floor the
+  account protection and the identity allocator use. `validate.AccountID` only
+  asks for a positive value, so a system-range GID could have authorized
+  `groupdel` for a group this tool never created.
+- Refuse a symlinked systemd unit directory when scanning for orphans, the
+  discipline the sudoers and sshd managers already apply to every directory they
+  open.
+- Give the downloaded upgrade candidate `/dev/null` for stdin. On the documented
+  `curl … | sh` install path, stdin is the pipe still carrying the rest of the
+  installer, and the candidate is untrusted at that point.
+- Probe the shell's `ulimit -f` block unit in `bounded_copy` instead of assuming
+  1024 bytes. Under POSIX or sh mode the unit is 512, which halved the effective
+  cap and rejected files that were within the limit; `install.sh` already probed
+  it the same way.
+- Add `chmod` to publish-release.sh's required-command preflight, sanitize
+  `GNUPGHOME` alongside the other trust-affecting variables, and stop closing an
+  already-closed descriptor number in `atomic_write`'s handler, where a later
+  open can inherit it.
 - Refuse a corrupt quarantine deadline instead of letting it choose a teardown.
   The discarded parse error left the zero time, which is before every real clock
   reading, so an unparseable value silently selected the path that skips the

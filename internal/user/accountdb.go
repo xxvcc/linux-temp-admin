@@ -67,8 +67,11 @@ func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, re
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
-	if removePrivateGroup && !validate.AccountID(gid) {
-		return fmt.Errorf("invalid expected private-group GID %d", gid)
+	// The same floor the account protection and the allocator use. groupdel is
+	// destructive and validate.AccountID only asks for gid > 0, so a system-range
+	// GID could authorize removing a group this tool never created.
+	if removePrivateGroup && (!validate.AccountID(gid) || gid < minAllocatableID) {
+		return fmt.Errorf("refusing to authorize private-group removal for out-of-range GID %d", gid)
 	}
 	absent, err := m.deletionState(name, nil, nil)
 	if err != nil {
