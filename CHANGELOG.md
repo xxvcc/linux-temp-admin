@@ -66,9 +66,6 @@ All notable changes to this project are documented here.
 - Recognise every form of `--yes` when deciding a run is unattended. Go's flag
   package accepts `--yes=true` and friends, and an exact token match let those
   runs be stopped by the first-run language prompt.
-- Count only live accounts in the `--remove-users` gate. The plan is a union of
-  witnesses, so orphaned grants, timers and stale rows demanded the mass-deletion
-  flag on hosts with no live account at all.
 - Say so when the official mirror index offers a version older than the installed
   one, instead of reporting "already up to date" and exiting silently. A stale,
   rolled-back or tampered index is exactly what an operator would want to see.

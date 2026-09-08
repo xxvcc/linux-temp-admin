@@ -610,12 +610,16 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 	// would name a deletion that is not going to happen.
 	pending := 0
 	for _, acc := range plan.accounts {
-		// plan.accounts is a union of witnesses, not of live accounts: a stale v1
-		// row, an orphaned sudoers drop-in, an orphaned timer and a stale v2 row all
-		// appear here without a passwd entry behind them. Counting those demanded
-		// the mass-deletion flag to authorize deletions that are not going to
-		// happen, on hosts with no live account at all.
-		if acc.exists && !plan.ignores(opts, acc) {
+		// Deliberately counts witnesses, not just live accounts. An audit finding
+		// read this as demanding a mass-deletion flag for deletions that will not
+		// happen, and narrowing it to acc.exists broke
+		// TestUninstallWithAccountsRefusesNonInteractivelyWithoutTheFlag, whose
+		// prose states the intent: the gate covers the whole teardown of
+		// account-related state, so a run nobody is watching never removes a
+		// registry row, a sudoers drop-in or a scheduled task implicitly either.
+		// The flag name is about what it authorizes, not about what each host
+		// happens to hold.
+		if !plan.ignores(opts, acc) {
 			pending++
 		}
 	}
