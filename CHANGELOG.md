@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Read the SSH port from the listeners rather than the reported default.
+  OpenSSH's `ListenAddress addr:port` creates a listener without adding to
+  `options->ports`, so `sshd -T` prints `port 22` on a host that listens only on
+  2222 — verified against OpenSSH 9.2 — and the invite handed the collaborator a
+  port nothing was listening on, confidently and without a warning. Every
+  listener sshd reports is now read; several distinct ports fail closed and ask
+  for an explicit `--port` rather than guessing.
+- Parse `mountinfo` on the separator the kernel writes. The mount-boundary check
+  that stops a recursive removal split on any Unicode space, while the kernel
+  escapes only space, tab, newline and backslash inside path fields, so an
+  unescaped vertical tab or form feed added a field and shifted the positional
+  mountpoint — reporting no mount under a removal root that had one.
 - Match the numeric-owner form when checking that `userdel` left no
   subordinate-ID assignments. `subuid(5)`/`subgid(5)` define the first field as
   "login name or UID" and recommend the numeric form on hosts with many
