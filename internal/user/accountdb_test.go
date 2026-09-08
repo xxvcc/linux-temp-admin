@@ -495,3 +495,31 @@ func TestFailedUseraddWithoutPasswdIsStillCreationStarted(t *testing.T) {
 		t.Fatalf("failed useradd calls = %v", f.calls)
 	}
 }
+
+// TestSubordinateIDsAbsentMatchesTheNumericOwnerForm pins the numeric-owner form
+// subuid(5) defines alongside the login name ("login name or UID"), and which
+// the manual page recommends on hosts with many entries. Missing it reported
+// real residue as clean, after which the caller dropped the registry row that
+// was its last recovery pointer.
+func TestSubordinateIDsAbsentMatchesTheNumericOwnerForm(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		entry     string
+		owner     int
+		wantError bool
+	}{
+		{name: "login name form", entry: "xxvcc-db1:100000:65536\n", owner: 2001, wantError: true},
+		{name: "numeric uid form", entry: "2001:100000:65536\n", owner: 2001, wantError: true},
+		{name: "unrelated numeric owner", entry: "2002:100000:65536\n", owner: 2001, wantError: false},
+		{name: "unrelated name", entry: "someone:100000:65536\n", owner: 2001, wantError: false},
+		{name: "no numeric identity known", entry: "2001:100000:65536\n", owner: 0, wantError: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setAccountDBContents(t, accountDBContents{subuid: tc.entry, subgid: tc.entry})
+			err := ensureSubordinateIDsAbsent("xxvcc-db1", tc.owner)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("ensureSubordinateIDsAbsent = %v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+}

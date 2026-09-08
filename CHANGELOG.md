@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Match the numeric-owner form when checking that `userdel` left no
+  subordinate-ID assignments. `subuid(5)`/`subgid(5)` define the first field as
+  "login name or UID" and recommend the numeric form on hosts with many
+  entries, but only the login name was compared, so real residue was reported
+  clean and the caller then dropped the registry row that was its last recovery
+  pointer.
+- Reload sshd when a failed grant rolls back over a drop-in that was already
+  live. The rollback skipped the reload on the invariant that the daemon cannot
+  have seen a file this call just created, but the write replaces an existing
+  drop-in in place, and one left by an earlier granted-and-reloaded call may
+  already be in daemon memory — unlinking it silently left sshd enforcing a
+  grant this tool believed it had removed.
 - Stop writing the one account-expiry value shadow documents as unusable.
   `DisableLogin` expired an account with `chage -E 1970-01-01`, and chage stores
   that field as days since the epoch, so the literal date encoded to `0` —

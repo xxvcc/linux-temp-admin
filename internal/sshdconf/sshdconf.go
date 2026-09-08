@@ -179,6 +179,16 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			return fmt.Errorf("the host's sshd configuration is already invalid; refusing to touch it: %w", err)
 		}
 		path := m.FilePath(user)
+		// A drop-in already on disk may already be in daemon memory from an earlier
+		// granted-and-reloaded call, and WriteRootFile below replaces it in place.
+		// The rollback's "the daemon has not seen this file" shortcut is only true
+		// for a file this call created, so record which case this is before writing.
+		preexisting := false
+		if _, statErr := os.Lstat(path); statErr == nil {
+			preexisting = true
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("inspect the existing sshd drop-in: %w", statErr)
+		}
 		rollback := func(cause error, restoreDaemon bool) error {
 			pendingExisted, staged, err := m.stageRemovalLocked(path)
 			if err != nil {
@@ -187,10 +197,13 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			if !staged {
 				return cause
 			}
-			// Before the first reload attempt, a newly-created drop-in cannot be in
-			// daemon memory. Its unlink still goes through the durable marker protocol,
-			// but no reload is needed unless this call inherited older pending state.
-			if !restoreDaemon && !pendingExisted {
+			// Before the first reload attempt, a drop-in THIS CALL created cannot be
+			// in daemon memory. Its unlink still goes through the durable marker
+			// protocol, but no reload is needed unless this call inherited older
+			// pending state, or replaced a file the daemon may already be enforcing —
+			// unlinking that one without a reload would leave the running sshd holding
+			// a grant whose file this tool believes it has removed.
+			if !restoreDaemon && !pendingExisted && !preexisting {
 				if err := clearPending(path + removePendingSuffix); err != nil {
 					return errors.Join(cause, fmt.Errorf("complete failed sshd grant removal: %w", err))
 				}
