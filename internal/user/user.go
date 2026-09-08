@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"bytes"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
@@ -1122,19 +1123,29 @@ func (m *Manager) LockPassword(name string) error {
 // SetPassword sets name's login password, for the --password-login invite on a
 // host whose sshd will not take a key. The password goes to chpasswd on stdin,
 // never in argv, so it cannot be read out of the process table.
-func (m *Manager) SetPassword(name, password string) error {
+func (m *Manager) SetPassword(name string, password []byte) error {
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
 	if !m.Runner.Look("chpasswd") {
 		return fmt.Errorf("chpasswd not available")
 	}
-	if strings.ContainsAny(password, ":\n") {
+	if bytes.ContainsAny(password, ":\n") {
 		// chpasswd's line format is user:password — a colon or newline would split
 		// the record and set a different password than the one we printed.
 		return fmt.Errorf("refusing a password containing ':' or a newline")
 	}
-	return m.Runner.RunInput(name+":"+password+"\n", "chpasswd")
+	// Build the chpasswd line in a buffer this function owns and clear it before
+	// returning. RunInput still takes a string, so one copy remains beyond reach;
+	// zeroing what can be zeroed is the difference between one unclearable copy
+	// and four.
+	line := make([]byte, 0, len(name)+len(password)+2)
+	line = append(line, name...)
+	line = append(line, ':')
+	line = append(line, password...)
+	line = append(line, '\n')
+	defer clear(line)
+	return m.Runner.RunInput(string(line), "chpasswd")
 }
 
 // SetExpiry sets the account expiry date (YYYY-MM-DD) via chage.

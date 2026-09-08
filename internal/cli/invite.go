@@ -930,8 +930,10 @@ type inviteTransaction struct {
 	plan              loginPlan
 	generatedUsername bool
 
-	kp               *sshkey.KeyPair
-	password         string
+	kp *sshkey.KeyPair
+	// password is the issued login secret for a --password-login invite, kept as
+	// bytes so rollback and the printer can clear it; a Go string could not be.
+	password         []byte
 	generation       string
 	fingerprint      string
 	permanent        bool
@@ -1723,7 +1725,7 @@ type inviteBundle struct {
 	autoUnit    string
 	registered  bool
 	kp          *sshkey.KeyPair // nil for a password invite
-	password    string          // empty for a key invite
+	password    []byte          // nil for a key invite
 	sshdDropIn  string          // empty when sshd was not touched
 	verified    bool            // the effective-config check completed without a blocker or unknown
 	unverified  string          // why it could not be confirmed; set exactly when verified is false
@@ -1739,7 +1741,7 @@ func loginKind(p loginPlan) string {
 // byPassword reports whether this invite's credential is a password. Exactly one
 // secret is ever issued, so a non-empty password is what distinguishes the two
 // kinds of invite.
-func (b inviteBundle) byPassword() bool { return b.password != "" }
+func (b inviteBundle) byPassword() bool { return len(b.password) != 0 }
 
 // loginLine renders the invite's Login: field. It is a computed value, never a
 // literal: the old invite asserted "SSH key only" on every host, including the
@@ -1780,6 +1782,12 @@ func (a *App) printInvite(b inviteBundle) error {
 	defer func() { clear(out.Bytes()) }()
 	if b.kp != nil {
 		defer clear(b.kp.PrivatePEM)
+	}
+	// The password gets the same treatment the key already had. It is the only
+	// other credential this function renders, and it is equally unrecoverable once
+	// the invite is printed.
+	if len(b.password) != 0 {
+		defer clear(b.password)
 	}
 	yesno := func(v bool) string {
 		if v {

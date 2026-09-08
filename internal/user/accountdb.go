@@ -219,7 +219,7 @@ func inspectPrivateGroup(name string, expectedGID int, allowPrimaryUser bool) (b
 	seenNames := make(map[string]bool)
 	found := false
 	for lineNumber, line := range strings.Split(string(groups), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -273,7 +273,7 @@ func inspectPrivateGroup(name string, expectedGID int, allowPrimaryUser bool) (b
 	}
 	seenUsers := make(map[string]bool)
 	for lineNumber, line := range strings.Split(string(passwd), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		pw, parseErr := parsePasswdEntry(line)
@@ -301,7 +301,7 @@ func inspectSameNameGroup(name string) (bool, error) {
 	seen := make(map[string]bool)
 	found := false
 	for lineNumber, line := range strings.Split(string(groups), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -343,7 +343,7 @@ func inspectPrivateGShadow(name string) (found, exists bool, err error) {
 	}
 	seen := make(map[string]bool)
 	for lineNumber, line := range strings.Split(string(data), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -394,7 +394,7 @@ func ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 			continue
 		}
 		for lineNumber, line := range strings.Split(string(data), "\n") {
-			if line == "" {
+			if skipNonEntryLine(line) {
 				continue
 			}
 			parts := strings.Split(line, ":")
@@ -415,4 +415,21 @@ func ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// skipNonEntryLine reports a line the system's own readers ignore rather than a
+// record this tool must parse. glibc's nss_files skips blank and '#'-comment
+// lines in passwd, group and gshadow, and both glibc and shadow-utils accept the
+// NIS compatibility entries that begin with '+' or '-'. Treating any of them as a
+// malformed record hard-failed every sequential invite on a host that carries
+// one, for lines that define no group and no subordinate range.
+func skipNonEntryLine(line string) bool {
+	if line == "" {
+		return true
+	}
+	switch line[0] {
+	case '#', '+', '-':
+		return true
+	}
+	return false
 }

@@ -1340,7 +1340,11 @@ func (a *App) selectUser() string {
 		a.warnf("%s", a.P.M("没有已登记的临时用户；如需删除未登记账号，请输入完整用户名（配合 --force）。",
 			"no registered temporary users; to delete an unregistered account, type its full username (with --force)."))
 	} else {
-		a.printf("%s", a.usersTable(recs, true).String())
+		// usersView, not the raw table: the 7-column account table is wider than a
+		// normal terminal, and every other picker (status, manageUsers,
+		// cleanupExpired) already falls back to its numbered vertical form. This one
+		// asks the operator to choose a row it may have garbled.
+		a.printf("%s", a.usersView(recs, true))
 	}
 	choice := strings.TrimSpace(a.prompt(a.P.M("请输入编号或用户名: ", "enter a number or a username: ")))
 	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(recs) {

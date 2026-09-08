@@ -2913,3 +2913,28 @@ func TestShouldAskLangRecognisesEveryYesForm(t *testing.T) {
 		t.Error("shouldAskLang treated an unrelated flag as an unattended marker")
 	}
 }
+
+// TestRandPasswordYieldsClearableBytes pins the password to a form that can be
+// zeroed. A Go string cannot be, and this is the only credential the invite
+// issues besides the key, which the code already clears.
+func TestRandPasswordYieldsClearableBytes(t *testing.T) {
+	pw, err := randPassword(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pw) != 24 {
+		t.Fatalf("randPassword returned %d bytes, want 24", len(pw))
+	}
+	for _, b := range pw {
+		if !strings.ContainsRune(passwordAlphabet, rune(b)) {
+			t.Fatalf("password byte %q is outside the alphabet", b)
+		}
+	}
+	// The caller can destroy it, which is the whole point of the byte slice.
+	clear(pw)
+	for i, b := range pw {
+		if b != 0 {
+			t.Fatalf("byte %d survived clear()", i)
+		}
+	}
+}

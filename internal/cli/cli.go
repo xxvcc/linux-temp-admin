@@ -98,9 +98,12 @@ type HostOperations struct {
 
 // RuntimeHooks contains process-local facilities that tests make deterministic.
 type RuntimeHooks struct {
-	Now           func() time.Time
-	RandHex       func(nBytes int) (string, error)
-	RandPassword  func(nChars int) (string, error)
+	Now     func() time.Time
+	RandHex func(nBytes int) (string, error)
+	// RandPassword yields the secret as bytes so the caller can clear it. A Go
+	// string cannot be zeroed, and this is the one credential the key path already
+	// takes that care with.
+	RandPassword  func(nChars int) ([]byte, error)
 	StdoutIsTTY   func() bool
 	StdinIsTTY    func() bool
 	TerminalWidth func() int
@@ -283,20 +286,23 @@ const passwordLen = 24
 // randPassword returns a uniformly random password. Rejection sampling keeps the
 // distribution flat: taking a raw byte modulo 62 would quietly favour the first
 // few letters of the alphabet.
-func randPassword(nChars int) (string, error) {
+func randPassword(nChars int) ([]byte, error) {
 	out := make([]byte, 0, nChars)
 	buf := make([]byte, 1)
 	const limit = 256 - (256 % len(passwordAlphabet)) // 248: the unbiased range
 	for len(out) < nChars {
 		if _, err := rand.Read(buf); err != nil {
-			return "", err
+			clear(out)
+			return nil, err
 		}
 		if int(buf[0]) >= limit {
 			continue
 		}
 		out = append(out, passwordAlphabet[int(buf[0])%len(passwordAlphabet)])
 	}
-	return string(out), nil
+	// Returned as bytes on purpose: string(out) would mint an immutable copy that
+	// nothing can ever zero, and every later hop would copy it again.
+	return out, nil
 }
 
 // EnvLang overrides the language for one run without changing what is

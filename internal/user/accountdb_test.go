@@ -543,3 +543,37 @@ func TestPrivateGroupRemovalRefusesSystemRangeGIDs(t *testing.T) {
 		t.Errorf("a non-removing reconcile was refused on its GID: %v", err)
 	}
 }
+
+// TestAccountDBParsersSkipWhatTheSystemSkips pins these parsers to the lines
+// glibc's nss_files and shadow-utils already ignore. Treating a '#' comment or a
+// NIS compatibility entry as a malformed record hard-failed every sequential
+// invite on a host that carries one, for lines that define no group and no
+// subordinate range at all.
+func TestAccountDBParsersSkipWhatTheSystemSkips(t *testing.T) {
+	const name = accountDBTestName
+	// Exactly the shapes the system readers skip, in every database these parsers
+	// read. Each would otherwise trip the "not exactly N fields" rule.
+	noise := "# a local comment\n+::::::\n-badguy\n\n"
+	live := accountDBLiveContents()
+	live.group = noise + live.group
+	live.gshadow = noise + live.gshadow
+	live.subuid = noise
+	live.subgid = noise
+	setAccountDBContents(t, live)
+
+	// Only a parse verdict is under test here; each of these may still return its
+	// own business error for the fixture's live account.
+	rejected := func(what string, err error) {
+		t.Helper()
+		if err != nil && strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("%s treated a line the system skips as a malformed record: %v", what, err)
+		}
+	}
+	rejected("subordinate-ID scan", ensureSubordinateIDsAbsent(name, 2001))
+	_, groupErr := inspectPrivateGroup(name, 2001, false)
+	rejected("private-group inspection", groupErr)
+	_, _, gshadowErr := inspectPrivateGShadow(name)
+	rejected("gshadow inspection", gshadowErr)
+	_, sameNameErr := inspectSameNameGroup(name)
+	rejected("same-name group inspection", sameNameErr)
+}

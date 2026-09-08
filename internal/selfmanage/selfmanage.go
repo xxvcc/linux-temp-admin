@@ -28,6 +28,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"github.com/xxvcc/linux-temp-admin/internal/version"
+	"golang.org/x/sys/unix"
 )
 
 // Manager performs install/uninstall/upgrade. Fields are injectable for tests.
@@ -348,6 +349,18 @@ func (m *Manager) FetchReleaseManifest(manifestURL, expectedRoot string) (Releas
 	if !canonicalPublishedAt(manifest.PublishedAt) {
 		return ReleaseManifest{}, fmt.Errorf("published_at is not canonical UTC RFC3339")
 	}
+	// published_at was validated for shape and then used only to rebuild the
+	// canonical bytes, so it constrained nothing about WHICH release the mirror
+	// names. A future timestamp is the one reading that is wrong on its face
+	// rather than merely old: no release can be published after now, so it means a
+	// skewed or fabricated index. Staleness itself stays a judgement this code
+	// cannot make without a trusted clock reference; the version lower bound in
+	// the caller is what covers a rolled-back index.
+	if published, parseErr := time.Parse(time.RFC3339, manifest.PublishedAt); parseErr == nil {
+		if published.After(time.Now().UTC().Add(publishedAtSkewAllowance)) {
+			return ReleaseManifest{}, fmt.Errorf("published_at %s is in the future", manifest.PublishedAt)
+		}
+	}
 	canonical, err := json.Marshal(struct {
 		Version     string `json:"version"`
 		Tag         string `json:"tag"`
@@ -363,6 +376,10 @@ func (m *Manager) FetchReleaseManifest(manifestURL, expectedRoot string) (Releas
 	}
 	return manifest, nil
 }
+
+// publishedAtSkewAllowance tolerates ordinary clock disagreement between the
+// mirror and this host without accepting a timestamp that is meaningfully ahead.
+const publishedAtSkewAllowance = 24 * time.Hour
 
 func canonicalPublishedAt(value string) bool {
 	if len(value) < 20 || len(value) > 30 || value[4] != '-' || value[7] != '-' ||
@@ -945,12 +962,31 @@ func (m *Manager) probeVersion(bin []byte) (string, error) {
 	if err := fsutil.RootSafeDir(dir); err != nil {
 		return "", fmt.Errorf("install dir unsafe: %w", err)
 	}
+	// RootSafeDir and CreateTemp resolve dir separately, and this is the one
+	// privileged write+exec in the tree that works by name rather than through a
+	// pinned directory fd. Restructuring it to openat/fexecve is a larger change
+	// than this warrants, but the gap it leaves — dir being replaced between the
+	// safety verdict and the write — is closed by binding the two resolutions to
+	// the same inode.
+	var before unix.Stat_t
+	if err := unix.Lstat(dir, &before); err != nil {
+		return "", fmt.Errorf("pin install dir: %w", err)
+	}
 	f, err := os.CreateTemp(dir, ".lta-upgrade-*")
 	if err != nil {
 		return "", err
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
+	var after unix.Stat_t
+	if err := unix.Lstat(dir, &after); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("recheck install dir: %w", err)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino {
+		_ = f.Close()
+		return "", fmt.Errorf("install dir %s was replaced while staging the version probe", dir)
+	}
 	if _, err := io.Copy(f, bytes.NewReader(bin)); err != nil {
 		_ = f.Close()
 		return "", err

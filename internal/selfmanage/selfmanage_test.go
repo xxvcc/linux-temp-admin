@@ -913,3 +913,36 @@ func TestDownloadDoesNotRetryPermanentStatus(t *testing.T) {
 		t.Fatalf("404 made %d requests, want 1", requests)
 	}
 }
+
+// TestFetchReleaseManifestRejectsAFuturePublishedAt pins the one reading of
+// published_at that is wrong on its face. The field was validated for shape and
+// then used only to rebuild the canonical bytes, so it constrained nothing about
+// which release the mirror names; a timestamp ahead of now cannot describe a
+// published release and means a skewed or fabricated index.
+func TestFetchReleaseManifestRejectsAFuturePublishedAt(t *testing.T) {
+	root := "https://dl.ll.cd/linux-temp-admin"
+	body := func(published string) string {
+		return `{"version":"2.8.0","tag":"v2.8.0","base_url":"` + root + `/v2.8.0","published_at":"` + published + `"}` + "\n"
+	}
+	fetch := func(published string) error {
+		m := &Manager{Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(body(published))), Request: req}, nil
+		})}, RetryDelay: 0}
+		_, err := m.FetchReleaseManifest(root+"/latest.json", root)
+		return err
+	}
+	future := time.Now().UTC().Add(72 * time.Hour).Format("2006-01-02T15:04:05Z")
+	if err := fetch(future); err == nil || !strings.Contains(err.Error(), "in the future") {
+		t.Fatalf("a manifest published %s was accepted: %v", future, err)
+	}
+	// Ordinary clock disagreement stays acceptable, and so does any past date.
+	for _, ok := range []string{
+		time.Now().UTC().Add(time.Hour).Format("2006-01-02T15:04:05Z"),
+		"2026-07-27T05:00:00Z",
+	} {
+		if err := fetch(ok); err != nil {
+			t.Fatalf("a manifest published %s was rejected: %v", ok, err)
+		}
+	}
+}

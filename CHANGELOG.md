@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Skip the lines the system's own readers skip when parsing group, gshadow and
+  the subordinate-ID databases. glibc ignores blank and `#` lines and both glibc
+  and shadow-utils accept the `+`/`-` NIS compatibility entries, but any of them
+  was treated as a malformed record and hard-failed every sequential invite on a
+  host that carries one. The same rule was missing from the integration
+  suite's own group reader.
+- Show revoke's account picker through the narrow-terminal view every other
+  picker already uses, and label a row the uninstall plan is going to excuse as
+  left alone rather than listing it under what will be removed.
+- Reject a mirror manifest whose `published_at` is in the future, bound the
+  published-installer scan that hashes one file per release while holding the
+  deployment lock, and pass `-munge` to rrsync so a transferred symlink cannot
+  name a path outside the staging directory.
+- Carry the invite password as bytes end to end so it can be zeroed, the way the
+  private key already is. A Go string cannot be cleared, and the secret was
+  copied into several of them.
+- Bind the install directory's safety verdict to a single inode in the version
+  probe, closing the window between the check and the write in the one
+  privileged write-and-exec that works by name rather than through a pinned
+  directory descriptor.
 - Refuse to delete an account outside this suite's own namespace from the
   integration cleanup helper, which runs `userdel -r -f` as root from every
   fixture in the tree and previously took whatever name it was handed.

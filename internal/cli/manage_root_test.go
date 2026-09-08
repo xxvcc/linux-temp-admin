@@ -414,7 +414,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 		}
 		return generation, nil
 	}
-	a.RandPassword = func(int) (string, error) { return "password-for-timing-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-timing-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
@@ -534,7 +534,7 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				}
 				return generation, nil
 			}
-			a.RandPassword = func(int) (string, error) { return "password-for-migration-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-migration-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
@@ -621,7 +621,7 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 	a.RandHex = func(int) (string, error) { return generation, nil }
-	a.RandPassword = func(int) (string, error) { return "password-for-permanent-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-permanent-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
@@ -762,7 +762,7 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 			a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 			a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 			a.RandHex = func(int) (string, error) { return "fedcba9876543210fedcba9876543210", nil }
-			a.RandPassword = func(int) (string, error) { return "password-for-activation-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-activation-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
