@@ -401,7 +401,12 @@ func shouldAskLang(rest []string, stdinTTY, stderrTTY, stdoutTTY bool) bool {
 		return false
 	}
 	for _, arg := range rest {
-		if arg == "--yes" || arg == "-y" { // an unattended run must not be stopped by a question
+		// An unattended run must not be stopped by a question. Go's flag package
+		// accepts --yes=true, -y=1 and so on for the boolean flags every mutating
+		// subcommand registers, so an exact token match let those forms reach the
+		// first-run language prompt and abort the run.
+		if arg == "--yes" || arg == "-y" ||
+			strings.HasPrefix(arg, "--yes=") || strings.HasPrefix(arg, "-yes=") || strings.HasPrefix(arg, "-y=") {
 			return false
 		}
 	}

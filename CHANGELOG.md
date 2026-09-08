@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Refuse a corrupt quarantine deadline instead of letting it choose a teardown.
+  The discarded parse error left the zero time, which is before every real clock
+  reading, so an unparseable value silently selected the path that skips the
+  synchronous drain.
+- Stop reporting an account as disabled when disabling it is what failed. The
+  quarantine handoff calls `DisableLogin` first, so that error reached the branch
+  claiming "the account is disabled and retained" — the one thing that message
+  must never say while the door may still be open.
+- Recognise every form of `--yes` when deciding a run is unattended. Go's flag
+  package accepts `--yes=true` and friends, and an exact token match let those
+  runs be stopped by the first-run language prompt.
+- Count only live accounts in the `--remove-users` gate. The plan is a union of
+  witnesses, so orphaned grants, timers and stale rows demanded the mass-deletion
+  flag on hosts with no live account at all.
+- Say so when the official mirror index offers a version older than the installed
+  one, instead of reporting "already up to date" and exiting silently. A stale,
+  rolled-back or tampered index is exactly what an operator would want to see.
+- Print usage instead of panicking when the process is exec'd with `argc == 0`.
 - Fail closed on an sshd config line whose keyword is empty. sshd treats a
   leading `=` as the keyword/value separator and honours the directive after it,
   but the Match/Include scan skipped such a line as if it were blank — hiding a

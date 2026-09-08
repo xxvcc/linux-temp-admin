@@ -603,7 +603,12 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 	// would name a deletion that is not going to happen.
 	pending := 0
 	for _, acc := range plan.accounts {
-		if !plan.ignores(opts, acc) {
+		// plan.accounts is a union of witnesses, not of live accounts: a stale v1
+		// row, an orphaned sudoers drop-in, an orphaned timer and a stale v2 row all
+		// appear here without a passwd entry behind them. Counting those demanded
+		// the mass-deletion flag to authorize deletions that are not going to
+		// happen, on hosts with no live account at all.
+		if acc.exists && !plan.ignores(opts, acc) {
 			pending++
 		}
 	}

@@ -15,6 +15,11 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
+// errQuarantineLoginStillOpen marks a quarantine attempt that failed at its very
+// first step, disabling the login. The caller must not then report the account as
+// disabled.
+var errQuarantineLoginStillOpen = errors.New("could not disable the login")
+
 var errPersistentQuarantineUnavailable = errors.New("persistent identity quarantine unavailable")
 
 func (a *App) revoke(args []string) int {
@@ -616,6 +621,15 @@ func (tx *revokeTransaction) revalidateAndPrepareDeletion() revokePhaseResult {
 			return finishRevoke(0)
 		}
 		if quarantineErr != nil && !errors.Is(quarantineErr, errPersistentQuarantineUnavailable) {
+			// Do not claim the account is disabled when disabling it is what failed:
+			// beginIdentityQuarantine calls DisableLogin before anything else, so that
+			// error arrives here too, and telling the operator the door is shut when
+			// it may still be open is the one thing this message must never do.
+			if errors.Is(quarantineErr, errQuarantineLoginStillOpen) {
+				a.errorf("%s: %v", a.P.M("无法禁用登录，因此无法建立身份隔离；账号保留且可能仍可登录，请立即人工处理",
+					"could not disable the login, so no identity quarantine was established; the account is retained and may still be reachable; inspect immediately"), quarantineErr)
+				return finishRevoke(1)
+			}
 			a.errorf("%s: %v", a.P.M("无法安全建立身份隔离；账号已禁用并保留", "cannot safely establish identity quarantine; the account is disabled and retained"), quarantineErr)
 			return finishRevoke(1)
 		}
@@ -639,7 +653,17 @@ func (tx *revokeTransaction) deleteAndFinalize() revokePhaseResult {
 	if rec.QuarantineUntil != "" && !opts.synchronousFinalization {
 		teardown = a.teardownQuarantinedAccount
 	} else if rec.QuarantineUntil != "" {
-		deadline, _ := time.Parse(time.RFC3339, rec.QuarantineUntil)
+		// Never let a corrupt deadline select a teardown. Discarding this error left
+		// deadline at the zero time, which is before every real clock reading, so an
+		// unparseable value silently chose the quarantined path — the one that skips
+		// the synchronous drain. honorExistingQuarantine refuses the same value
+		// earlier, so this is defence in depth rather than a live path; it must not
+		// be the weaker of the two readings.
+		deadline, parseErr := time.Parse(time.RFC3339, rec.QuarantineUntil)
+		if parseErr != nil {
+			a.errorf("%s: %v", a.P.M("隔离删除截止时间损坏，拒绝继续", "quarantine deletion deadline is corrupt; refusing to continue"), parseErr)
+			return finishRevoke(1)
+		}
 		if !a.Now().Before(deadline) {
 			teardown = a.teardownQuarantinedAccount
 		}
@@ -762,7 +786,7 @@ func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd)
 		return false, fmt.Errorf("%w: finalizer command is unavailable: %v", errPersistentQuarantineUnavailable, err)
 	}
 	if err := a.Users.DisableLogin(rec.User); err != nil {
-		return false, err
+		return false, fmt.Errorf("%w: %v", errQuarantineLoginStillOpen, err)
 	}
 	if err := a.revokeAccountStillMatches(rec.User, expected); err != nil {
 		return false, err
