@@ -1199,8 +1199,18 @@ func (tx *inviteTransaction) reserveAndCreatePendingIdentity() bool {
 	// creation must leave a registry witness even if no sudo/sshd/schedule artifact
 	// exists. The reserved UID is already known and is verified against passwd as
 	// soon as the helper returns.
-	if err := a.Registry.Record(tx.rec); err != nil {
-		return tx.failf("%s: %v", a.P.M("登记账号创建意图失败", "recording account creation intent failed"), err)
+	// A DurabilityError means AtomicWriteFileAt already renamed the new registry
+	// into place and only the directory fsync failed: the row IS on disk while
+	// Record reports failure. Adopting it before failing is what lets rollback
+	// release it — bailing out here left a pending row that tx.registered = false
+	// and the unregistered cleanup below could never clean up. Every other module
+	// that writes through this primitive handles the same case explicitly.
+	recordErr := a.Registry.Record(tx.rec)
+	if recordErr != nil {
+		var committed *fsutil.DurabilityError
+		if !errors.As(recordErr, &committed) {
+			return tx.failf("%s: %v", a.P.M("登记账号创建意图失败", "recording account creation intent failed"), recordErr)
+		}
 	}
 	tx.registered = true
 	// This cleanup was registered first, so reverse-order rollback runs it last,
@@ -1241,6 +1251,13 @@ func (tx *inviteTransaction) reserveAndCreatePendingIdentity() bool {
 		}
 		return nil
 	})
+	if recordErr != nil {
+		// Committed but not durable. The row and its release cleanup are registered
+		// above, so rollback can now let it go; the transaction still fails, because
+		// a registry this tool cannot prove is on stable storage is not a witness it
+		// may rely on for anything that follows.
+		return tx.failf("%s: %v", a.P.M("登记账号创建意图失败", "recording account creation intent failed"), recordErr)
+	}
 
 	// useradd can create the account before reporting an error. Close the
 	// registry-removal gate before invoking it. CreatePendingIdentity returns a
@@ -1395,6 +1412,15 @@ func (tx *inviteTransaction) drainAndFinalizeIdentity() bool {
 	completed := tx.rec
 	completed.Pending = false
 	if err := a.Registry.Record(completed); err != nil {
+		// Same committed-but-unsynced case: the completed row is already the one on
+		// disk. Keeping tx.rec on the superseded Pending shape would desynchronize
+		// this transaction from the registry, and persistDeletionStarted compares
+		// the recorded fields strictly — so invite's own rollback would abort and
+		// leave the live account behind.
+		var committed *fsutil.DurabilityError
+		if errors.As(err, &committed) {
+			tx.rec = completed
+		}
 		return tx.failf("%s: %v", a.P.M("完成新账号身份登记失败", "finalizing the new account identity record failed"), err)
 	}
 	tx.rec = completed

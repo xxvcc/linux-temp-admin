@@ -137,6 +137,19 @@ func (s *Store) CheckIntegrity() error {
 		} else if err != nil {
 			return err
 		}
+		// A sequence sitting beside a legacy-header registry is validated as an
+		// object, but its high-water mark is NOT yet required to cover the rows.
+		// The doc comment above states the rule — the sequence becomes mandatory
+		// once a v5 header is visible — and Init implements it: the legacy
+		// migration branch reseeds the sequence from the highest recorded UID
+		// before it writes the v5 header. Demanding coverage here reported a state
+		// Init fixes silently as an integrity failure, and one that neither
+		// recover-identity-sequence nor RepairMissingIdentitySequence will touch,
+		// because it is not ErrIdentitySequenceMissing and the registry is not v5.
+		if _, err := s.requireIdentitySequence(); err != nil {
+			return fmt.Errorf("identity sequence integrity: %w", err)
+		}
+		return nil
 	}
 	_, err = s.requireIdentitySequenceCovering(recs)
 	if err != nil {

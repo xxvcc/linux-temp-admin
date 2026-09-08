@@ -1395,3 +1395,26 @@ func TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse(t *testing.T) 
 		t.Fatalf("Lookup after the loss: found=%v err=%v, want the row to be gone", found, err)
 	}
 }
+
+// TestCheckIntegrityLeavesALegacyRegistryToInit pins the rule the package's own
+// doc comment states: a legacy registry may legitimately predate the sequence,
+// and the sequence becomes mandatory only once a v5 header is visible. The check
+// demanded coverage as soon as a sequence file merely existed beside a legacy
+// header — a state Init fixes silently on its migration path, and one that
+// neither recover-identity-sequence nor RepairMissingIdentitySequence will
+// touch, because the error is not ErrIdentitySequenceMissing and the registry is
+// not v5. The operator was told to restore from backup for a host that was fine.
+func TestCheckIntegrityLeavesALegacyRegistryToInit(t *testing.T) {
+	s := newStore(t)
+	reserveThrough(t, s, 1200)
+
+	// A v4 registry restored from backup beside the sequence this install already
+	// created, carrying a row above the sequence's high-water mark.
+	legacy := "# linux-temp-admin registry v4\n" + "xxvcc-legacy1\t2026-01-01 00:00:00 UTC\tnever\tno\t203.0.113.5\t22\tSHA256:x\tno\t\t1500\t\tno\tno\tno\n"
+	if err := os.WriteFile(s.File, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckIntegrity(); err != nil {
+		t.Fatalf("CheckIntegrity on a legacy registry with a present sequence = %v, want nil", err)
+	}
+}

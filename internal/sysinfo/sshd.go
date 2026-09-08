@@ -229,6 +229,18 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 		if !parsed {
 			return false, false
 		}
+		if keyword == "" && len(fields) != 0 {
+			// Not a blank line: sshd treats a leading '=' as the keyword/value
+			// separator and honours the directive after it. Verified against
+			// OpenSSH 9.2 — a config carrying "=Match Address 203.0.113.0/24" then
+			// "PubkeyAuthentication no" reports pubkeyauthentication no for a
+			// matching connection, and yes without that line. parseSSHDDirective
+			// reports an empty keyword for it, and skipping it as whitespace hid a
+			// connection-scoped Match from this scan, letting an invite claim a
+			// verified login that sshd will deny. This parser cannot model the line,
+			// so the scan fails closed instead of guessing.
+			return false, false
+		}
 		if keyword == "" || len(fields) == 0 {
 			continue
 		}

@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Fail closed on an sshd config line whose keyword is empty. sshd treats a
+  leading `=` as the keyword/value separator and honours the directive after it,
+  but the Match/Include scan skipped such a line as if it were blank — hiding a
+  connection-scoped `Match` and letting an invite report a verified login that
+  sshd denies.
+- Arm `atd` for later boots on OpenRC and sysvinit hosts, as the systemd branch
+  already did. Those are exactly the hosts where the `at` fallback is the
+  auto-revoke mechanism, so an atd that ran only until the next reboot meant
+  every queued revocation silently stopped firing.
+- Stop reporting a legacy registry beside an existing identity sequence as an
+  unrepairable integrity failure. The sequence becomes mandatory only once a v5
+  header is visible — `Init` reseeds it on the migration path — and neither
+  recovery command would touch the state the check was flagging.
+- Adopt a committed-but-unsynced registry write in invite instead of abandoning
+  it. `AtomicWriteFileAt` renames the new registry into place before the
+  directory fsync, so a durability failure leaves the row on disk while `Record`
+  reports an error; the creation-intent row then had no release cleanup, and the
+  pending-to-completed row left the transaction comparing against a superseded
+  shape, which aborted invite's own rollback and left a live account behind.
 - Read the SSH port from the listeners rather than the reported default.
   OpenSSH's `ListenAddress addr:port` creates a listener without adding to
   `options->ports`, so `sshd -T` prints `port 22` on a host that listens only on
