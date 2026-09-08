@@ -32,6 +32,9 @@ LOCK_PATH = INCOMING_ROOT / ".deploy.lock"
 RRSYNC = Path("/usr/bin/rrsync")
 MIRROR_BASE_URL = "https://dl.ll.cd/linux-temp-admin"
 TRANSFER_TIMEOUT_SECONDS = 300
+# Bounds the published-installer scan, which hashes one file per release while
+# holding the deployment lock.
+INSTALLER_SCAN_TIMEOUT_SECONDS = 120
 STAGING_SCAN_INTERVAL_SECONDS = 0.1
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
@@ -554,9 +557,19 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
 def matching_stable_installer_versions(
     project_root: Path, installer: Path, *, owner: int
 ) -> list[VersionKey]:
+    # This runs under the deployment lock and fully hashes the installer of every
+    # published release, so its cost grows with the archive while every other
+    # publication waits. Bound it the way every other long step here is bounded:
+    # a deadline that fails the publication instead of holding the lock forever.
+    deadline = time.monotonic() + INSTALLER_SCAN_TIMEOUT_SECONDS
     matches: list[VersionKey] = []
     with os.scandir(project_root) as entries:
         for entry in entries:
+            if time.monotonic() > deadline:
+                raise ReceiverError(
+                    "scanning published installers exceeded "
+                    f"{INSTALLER_SCAN_TIMEOUT_SECONDS}s under the deployment lock"
+                )
             if not entry.is_dir(follow_symlinks=False):
                 continue
             try:
@@ -796,7 +809,10 @@ def run_rrsync(stage: Path, original_command: str) -> None:
         "USER": str(os.getuid()),
     }
     process = subprocess.Popen(
-        [str(RRSYNC), "-wo", "-no-del", str(stage)],
+        # -munge is what confines symlinks the sender may transfer: the mandated
+        # option profile enables --links, so without it a link can name a path
+        # outside the staging directory and later resolve there.
+        [str(RRSYNC), "-munge", "-wo", "-no-del", str(stage)],
         env=environment,
         preexec_fn=limit_receiver,
         start_new_session=True,

@@ -113,7 +113,7 @@ func TestInviteReconcilesPartialUseraddAccountDatabaseState(t *testing.T) {
 				t.Fatalf("runInvite rc = %d, want original useradd failure", rc)
 			}
 			wantCalls := [][]string{
-				{"useradd", "-M", "-d", "/home/" + username, "-s", resolveShell(), "-c", ",,,," + config.PendingGenerationGECOSWitnessPrefix + "0123456789abcdef0123456789abcdef", "-e", "1970-01-01", "-p", "!", "-U", "-u", "4000000", "-K", "GID_MIN=4000000", "-K", "GID_MAX=4000000", username},
+				{"useradd", "-M", "-d", "/home/" + username, "-s", resolveShell(), "-c", ",,,," + config.PendingGenerationGECOSWitnessPrefix + "0123456789abcdef0123456789abcdef", "-e", "1970-01-02", "-p", "!", "-U", "-u", "4000000", "-K", "GID_MIN=4000000", "-K", "GID_MAX=4000000", username},
 				{"groupdel", "--", username},
 			}
 			if !reflect.DeepEqual(runner.calls, wantCalls) {

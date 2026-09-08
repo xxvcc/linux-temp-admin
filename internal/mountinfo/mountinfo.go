@@ -41,9 +41,24 @@ func RejectUnder(r io.Reader, root string) error {
 	seen := false
 	for sc.Scan() {
 		seen = true
-		fields := strings.Fields(sc.Text())
+		// Split on the separator the kernel actually writes, not on "any Unicode
+		// space". mountinfo fields are single-space separated and the kernel escapes
+		// exactly four bytes inside path fields — space, tab, newline and backslash
+		// (fs/proc_namespace.c passes " \t\n\\" to seq_dentry and seq_path_root).
+		// strings.Fields splits on unicode.IsSpace, which also covers \v, \f and \r,
+		// so an unescaped one of those inside a path added a field and shifted the
+		// positional mountpoint this check reads — turning a real mount under the
+		// removal root into a "no mount here" verdict for a destructive sweep.
+		fields := strings.Split(strings.TrimSuffix(sc.Text(), "\r"), " ")
 		if len(fields) < 10 {
 			return fmt.Errorf("malformed mountinfo line")
+		}
+		for _, field := range fields {
+			if field == "" {
+				// The kernel never writes an empty field: every separator is exactly one
+				// space. Refuse rather than guess at a line this parser cannot model.
+				return fmt.Errorf("malformed mountinfo line")
+			}
 		}
 		if _, err := strconv.ParseUint(fields[0], 10, 64); err != nil {
 			return fmt.Errorf("malformed mountinfo mount id %q", fields[0])

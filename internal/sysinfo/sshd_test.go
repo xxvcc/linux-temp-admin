@@ -775,3 +775,41 @@ func TestBracketAllowUsersIsNotAFalseVerify(t *testing.T) {
 		t.Errorf("expected the whitelist to block; blockers=%v", rep.Blockers)
 	}
 }
+
+// TestConnectionScopedMatchFailsClosedOnAnEmptyKeyword pins a line sshd honours
+// but this parser cannot model. sshd treats a leading '=' as the keyword/value
+// separator, so "=Match Address 203.0.113.0/24" applies — verified against
+// OpenSSH 9.2, where that line plus "PubkeyAuthentication no" yields
+// pubkeyauthentication no for a matching connection and yes without it.
+// parseSSHDDirective reports an empty keyword for such a line; skipping it as
+// whitespace hid the Match and let an invite claim a verified login sshd denies.
+func TestConnectionScopedMatchFailsClosedOnAnEmptyKeyword(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "sshd_config")
+	dropins := filepath.Join(dir, "sshd_config.d")
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "leading equals hides a Match", content: "PubkeyAuthentication yes\n=Match Address 203.0.113.0/24\nPubkeyAuthentication no\n", want: true},
+		{name: "quoted empty first token", content: "PubkeyAuthentication yes\n\"\" Match Address 203.0.113.0/24\n", want: true},
+		{name: "genuinely blank lines still scan clean", content: "PubkeyAuthentication yes\n\n   \n# comment\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(main, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := HasConnectionScopedMatch(); got != tc.want {
+				t.Fatalf("HasConnectionScopedMatch = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

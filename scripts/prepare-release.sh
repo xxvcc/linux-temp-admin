@@ -128,8 +128,22 @@ require_safe_new_output_path() {
 }
 
 bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size
-  blocks=$(( (max + 1023) / 1024 ))
+  local source=$1 destination=$2 max=$3 blocks size unit
+  # Bash uses 1024-byte `ulimit -f` blocks normally but 512-byte blocks in POSIX
+  # or sh mode. Assuming 1024 halved the effective cap wherever the unit is 512,
+  # rejecting files that are within the limit. Probe the inherited kernel value in
+  # a command-substitution child, exactly as install.sh does, so the temporary
+  # soft limit cannot escape into the caller.
+  unit=$(
+    ulimit -f 1 || exit 1
+    awk '$1 == "Max" && $2 == "file" && $3 == "size" { print $4; found=1 }
+         END { if (!found) exit 1 }' /proc/self/limits
+  ) || { echo "could not determine the shell file-size limit unit" >&2; return 1; }
+  case "$unit" in
+    512 | 1024) ;;
+    *) echo "unsupported shell file-size limit unit: $unit" >&2; return 1 ;;
+  esac
+  blocks=$(( (max + unit - 1) / unit ))
   if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
     cp --reflink=never --sparse=never -- "$source" "$destination" ); then
     echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2

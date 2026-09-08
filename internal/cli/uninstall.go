@@ -391,7 +391,7 @@ func (a *App) v1RegistryUsers() ([]string, error) {
 }
 
 // printTeardownPlan shows what is about to happen while it can still be stopped.
-func (a *App) printTeardownPlan(p teardownPlan) {
+func (a *App) printTeardownPlan(p teardownPlan, opts uninstallOptions) {
 	a.info(a.P.M("卸载将移除：", "The uninstall will remove:"))
 
 	if len(p.accounts) == 0 {
@@ -415,6 +415,13 @@ func (a *App) printTeardownPlan(p teardownPlan) {
 				if acc.exists {
 					state = a.P.M("存在（身份核验后尝试撤销）", "live (revoke after identity checks)")
 				}
+			}
+			// This table is printed under "The uninstall will remove:", so a row the
+			// run is going to excuse must not be listed as one it will act on. The
+			// plan alone cannot tell: only opts decides which foreign markers are
+			// ignored.
+			if p.ignores(opts, acc) {
+				state = a.P.M("保留（已按 --ignore-foreign-markers 跳过）", "left alone (skipped by --ignore-foreign-markers)")
 			}
 			ws := make([]string, 0, len(acc.witnesses))
 			for _, w := range acc.witnesses {
@@ -520,7 +527,7 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 		return false
 	}
 
-	a.printTeardownPlan(plan)
+	a.printTeardownPlan(plan, opts)
 
 	if ignored := plan.ignoredForeignMarkers(opts); len(ignored) > 0 {
 		a.warnf("%s %s", a.P.M(
@@ -603,6 +610,15 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 	// would name a deletion that is not going to happen.
 	pending := 0
 	for _, acc := range plan.accounts {
+		// Deliberately counts witnesses, not just live accounts. An audit finding
+		// read this as demanding a mass-deletion flag for deletions that will not
+		// happen, and narrowing it to acc.exists broke
+		// TestUninstallWithAccountsRefusesNonInteractivelyWithoutTheFlag, whose
+		// prose states the intent: the gate covers the whole teardown of
+		// account-related state, so a run nobody is watching never removes a
+		// registry row, a sudoers drop-in or a scheduled task implicitly either.
+		// The flag name is about what it authorizes, not about what each host
+		// happens to hold.
 		if !plan.ignores(opts, acc) {
 			pending++
 		}

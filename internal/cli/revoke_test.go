@@ -2176,3 +2176,66 @@ func TestQuarantineRegateBindsToTheCapturedIdentity(t *testing.T) {
 		})
 	}
 }
+
+// systemctlSched reports a systemd host so beginIdentityQuarantine gets past its
+// availability gate; everything else comes from the existing fake.
+type systemctlSched struct{ failingScheduleSystem }
+
+func (systemctlSched) HasSystemctl() bool { return true }
+
+// TestQuarantineHandoffDoesNotClaimADisabledAccount pins the distinction the
+// operator message depends on. beginIdentityQuarantine disables the login as its
+// very first step, so that failure reaches the same branch that otherwise
+// reports "the account is disabled and retained" — the one claim this path must
+// never make while the door may still be open.
+func TestQuarantineHandoffDoesNotClaimADisabledAccount(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{
+		Name: "xxvcc-quar2", UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-quar2", Shell: "/bin/sh",
+	}
+	a, _, _ := newTestApp(t, "")
+	a.Users = &user.Manager{Runner: &revokeRunner{failOn: "chage"}}
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	a.EnsureScheduledCommand = func() error { return nil }
+	a.Scheduler = &schedule.Scheduler{Sys: systemctlSched{}}
+
+	started, err := a.beginIdentityQuarantine(registry.Record{
+		User: pw.Name, UID: pw.UID, Generation: generation, IdentityBound: true, Port: 22,
+	}, pw)
+	if started {
+		t.Fatal("quarantine reported started while the login disable failed")
+	}
+	if !errors.Is(err, errQuarantineLoginStillOpen) {
+		t.Fatalf("beginIdentityQuarantine error = %v, want it to mark the login as still open", err)
+	}
+}
+
+// TestDeleteAndFinalizeRefusesACorruptQuarantineDeadline pins the parse error
+// that used to be discarded. The zero time it left behind is before every real
+// clock reading, so an unparseable deadline silently selected the quarantined
+// teardown — the one that skips the synchronous drain.
+func TestDeleteAndFinalizeRefusesACorruptQuarantineDeadline(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.Users = &user.Manager{Runner: &revokeRunner{}}
+	pw := user.Passwd{Name: "xxvcc-quar3", UID: 1001, GID: 1001, Home: "/home/xxvcc-quar3", Shell: "/bin/sh"}
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	tx := &revokeTransaction{
+		app: a, username: pw.Name, registered: true, pw: pw,
+		// The parse is on the synchronous-finalization branch; the asynchronous one
+		// selects the quarantined teardown without reading the deadline at all.
+		opts: revokeOptions{synchronousFinalization: true},
+		rec: registry.Record{
+			User: pw.Name, UID: pw.UID, Port: 22, DeletionStarted: true, IdentityBound: true,
+			Generation: "0123456789abcdef0123456789abcdef", QuarantineUntil: "not-a-timestamp",
+		},
+	}
+	res := tx.deleteAndFinalize()
+	if !res.done || res.status != 1 {
+		t.Fatalf("deleteAndFinalize = done:%v status:%d, want a refusal\nstderr:\n%s", res.done, res.status, errb.String())
+	}
+	if !strings.Contains(errb.String(), "corrupt") {
+		t.Fatalf("refusal did not name the corrupt deadline:\n%s", errb.String())
+	}
+}

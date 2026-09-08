@@ -2893,3 +2893,48 @@ func TestAskLangInputDefaultsAndEOF(t *testing.T) {
 		})
 	}
 }
+
+// TestShouldAskLangRecognisesEveryYesForm pins the unattended detection to the
+// forms Go's flag package actually accepts for the boolean --yes/-y that every
+// mutating subcommand registers. An exact token match let --yes=true reach the
+// first-run language prompt, which stops the run.
+func TestShouldAskLangRecognisesEveryYesForm(t *testing.T) {
+	for _, arg := range []string{"--yes", "-y", "--yes=true", "-y=true", "--yes=1", "-y=1", "--yes=false"} {
+		if shouldAskLang([]string{"invite", arg}, true, true, true) {
+			t.Errorf("shouldAskLang stopped an unattended run carrying %q", arg)
+		}
+	}
+	// A run with no such flag still gets the question.
+	if !shouldAskLang([]string{"invite"}, true, true, true) {
+		t.Error("shouldAskLang skipped the language question for an interactive run")
+	}
+	// And a flag that merely starts with the same letters must not disarm it.
+	if !shouldAskLang([]string{"invite", "--yesterday"}, true, true, true) {
+		t.Error("shouldAskLang treated an unrelated flag as an unattended marker")
+	}
+}
+
+// TestRandPasswordYieldsClearableBytes pins the password to a form that can be
+// zeroed. A Go string cannot be, and this is the only credential the invite
+// issues besides the key, which the code already clears.
+func TestRandPasswordYieldsClearableBytes(t *testing.T) {
+	pw, err := randPassword(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pw) != 24 {
+		t.Fatalf("randPassword returned %d bytes, want 24", len(pw))
+	}
+	for _, b := range pw {
+		if !strings.ContainsRune(passwordAlphabet, rune(b)) {
+			t.Fatalf("password byte %q is outside the alphabet", b)
+		}
+	}
+	// The caller can destroy it, which is the whole point of the byte slice.
+	clear(pw)
+	for i, b := range pw {
+		if b != 0 {
+			t.Fatalf("byte %d survived clear()", i)
+		}
+	}
+}

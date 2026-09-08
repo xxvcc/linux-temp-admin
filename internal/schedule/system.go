@@ -277,11 +277,20 @@ func ensureAtd() bool {
 			return true
 		}
 	}
+	// The two branches below also arm atd for later boots, matching what the
+	// systemd branch gets from `enable --now`. These are exactly the hosts where
+	// the at fallback is the auto-revoke mechanism, so an atd that runs only until
+	// the next reboot means every queued revocation silently stops firing. Both
+	// enablement calls are best effort, like the start above them: the status
+	// probe, not the command's exit code, decides the result.
 	if has("rc-service") {
 		if run("rc-service", "atd", "status") {
 			return true
 		}
 		_ = executil.Run("rc-service", []string{"atd", "start"}, schedulerCommandOptions(schedulerOutputLimit))
+		if has("rc-update") {
+			_ = executil.Run("rc-update", []string{"add", "atd", "default"}, schedulerCommandOptions(schedulerOutputLimit))
+		}
 		if run("rc-service", "atd", "status") {
 			return true
 		}
@@ -291,6 +300,12 @@ func ensureAtd() bool {
 			return true
 		}
 		_ = run("service", "atd", "start")
+		switch {
+		case has("chkconfig"):
+			_ = executil.Run("chkconfig", []string{"atd", "on"}, schedulerCommandOptions(schedulerOutputLimit))
+		case has("update-rc.d"):
+			_ = executil.Run("update-rc.d", []string{"atd", "enable"}, schedulerCommandOptions(schedulerOutputLimit))
+		}
 		if run("service", "atd", "status") {
 			return true
 		}

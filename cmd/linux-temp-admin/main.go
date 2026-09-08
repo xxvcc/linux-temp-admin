@@ -15,7 +15,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "cannot disable core dumps:", err)
 		os.Exit(1)
 	}
-	os.Exit(cli.Run(os.Args[1:]))
+	// os.Args is built as make([]string, argc), so an exec with argc == 0 leaves it
+	// zero-length and os.Args[1:] panics with a goroutine dump instead of reaching
+	// the usage text. cmd/lta-release guards the same way before it indexes.
+	args := os.Args
+	if len(args) > 0 {
+		args = args[1:]
+	}
+	os.Exit(cli.Run(args))
 }
 
 func disableCoreDumps() error {

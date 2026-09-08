@@ -16,6 +16,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"golang.org/x/sys/unix"
+	"net"
 )
 
 // sshdConfigPath is overridable in tests.
@@ -223,12 +224,55 @@ func sshPortFromSshdT() (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// listenaddress is authoritative, not port. OpenSSH's ListenAddress with an
+	// explicit port creates a listener on it without adding to options->ports, and
+	// fill_default_server_options still leaves ports[0] = 22, so `sshd -T` prints
+	// "port 22" for a host that listens only on 2222. Reading port alone therefore
+	// hands the invitee a port nothing is listening on, confidently and without a
+	// warning. sshd -T always renders every listener as a listenaddress with an
+	// explicit port, including the default one, so the listener set is complete.
+	if ports, ok := sshdListenPorts(cfg); ok {
+		switch len(ports) {
+		case 1:
+			for port := range ports {
+				return port, nil
+			}
+		default:
+			// Several distinct listener ports: which one an invitee should use is the
+			// operator's decision, not a guess this tool may make. Fail closed so the
+			// caller demands an explicit --port.
+			return 0, fmt.Errorf("sshd listens on %d different ports; pass an explicit port", len(ports))
+		}
+	}
 	raw := cfg.First("port")
 	p, err := strconv.Atoi(raw)
 	if err != nil || p < 1 || p > 65535 {
 		return 0, fmt.Errorf("sshd -T returned invalid port %q", raw)
 	}
 	return p, nil
+}
+
+// sshdListenPorts returns the distinct ports of every listenaddress sshd -T
+// reported. ok is false when there are none to read, or when any entry cannot be
+// parsed — an unreadable listener must not silently narrow the set.
+func sshdListenPorts(cfg *SSHDConfig) (map[int]struct{}, bool) {
+	values := cfg.Values("listenaddress")
+	if len(values) == 0 {
+		return nil, false
+	}
+	ports := make(map[int]struct{}, len(values))
+	for _, value := range values {
+		_, rawPort, splitErr := net.SplitHostPort(strings.TrimSpace(value))
+		if splitErr != nil {
+			return nil, false
+		}
+		port, convErr := strconv.Atoi(rawPort)
+		if convErr != nil || port < 1 || port > 65535 {
+			return nil, false
+		}
+		ports[port] = struct{}{}
+	}
+	return ports, true
 }
 
 func sshPortFromConfig(path string) (int, bool, error) {

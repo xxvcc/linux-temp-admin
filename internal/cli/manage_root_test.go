@@ -121,7 +121,7 @@ func (r *inviteTimingRunner) Run(name string, args ...string) error {
 			return fmt.Errorf("unexpected chage arguments: %v", args)
 		}
 		*r.events = append(*r.events, "expiry:"+args[1])
-		if args[1] != "1970-01-01" && (r.activationMutation != nil || r.activationErr != nil) {
+		if args[1] != "1970-01-02" && (r.activationMutation != nil || r.activationErr != nil) {
 			if r.activationMutation != nil {
 				r.activationMutation(&r.account)
 			}
@@ -414,7 +414,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 		}
 		return generation, nil
 	}
-	a.RandPassword = func(int) (string, error) { return "password-for-timing-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-timing-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
@@ -427,7 +427,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	if runner.recordErr != nil || !runner.recordFound {
 		t.Fatalf("registry row at credential: found=%v err=%v", runner.recordFound, runner.recordErr)
 	}
-	if got, want := strings.Join(runner.eventsBeforeCredential, ","), "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate"; got != want {
+	if got, want := strings.Join(runner.eventsBeforeCredential, ","), "mail,expiry:1970-01-02,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate"; got != want {
 		t.Fatalf("events before credential = %q, want %q", got, want)
 	}
 	if mailCalls < 2 {
@@ -534,7 +534,7 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				}
 				return generation, nil
 			}
-			a.RandPassword = func(int) (string, error) { return "password-for-migration-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-migration-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
@@ -621,14 +621,14 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 	a.RandHex = func(int) (string, error) { return generation, nil }
-	a.RandPassword = func(int) (string, error) { return "password-for-permanent-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-permanent-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
 	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}, false); rc != 0 {
 		t.Fatalf("permanent runInvite rc = %d: %s", rc, errb.String())
 	}
-	want := "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
+	want := "mail,expiry:1970-01-02,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
 	if got := strings.Join(events, ","); got != want {
 		t.Fatalf("permanent invite events = %q, want %q", got, want)
 	}
@@ -762,7 +762,7 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 			a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 			a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 			a.RandHex = func(int) (string, error) { return "fedcba9876543210fedcba9876543210", nil }
-			a.RandPassword = func(int) (string, error) { return "password-for-activation-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-activation-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}

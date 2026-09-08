@@ -24,6 +24,8 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"golang.org/x/sys/unix"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -42,15 +44,21 @@ type Event struct {
 
 // record is the on-disk JSON shape.
 type record struct {
-	Time   string            `json:"time"`
-	PID    int               `json:"pid"`
-	Actor  string            `json:"actor"`
-	UID    int               `json:"uid"`
-	Action string            `json:"action"`
-	Target string            `json:"target,omitempty"`
-	Result string            `json:"result"`
-	Detail string            `json:"detail,omitempty"`
-	Fields map[string]string `json:"fields,omitempty"`
+	Time  string `json:"time"`
+	PID   int    `json:"pid"`
+	Actor string `json:"actor"`
+	UID   int    `json:"uid"`
+	// LoginUID is the kernel's audit login uid for this process, omitted when the
+	// kernel does not provide one. Actor comes from SUDO_USER, which the invoking
+	// environment supplies and a root-equivalent caller can therefore choose;
+	// loginuid is set once per login session by PAM and is the value to reconcile
+	// against when an actor name is in question.
+	LoginUID *int              `json:"loginuid,omitempty"`
+	Action   string            `json:"action"`
+	Target   string            `json:"target,omitempty"`
+	Result   string            `json:"result"`
+	Detail   string            `json:"detail,omitempty"`
+	Fields   map[string]string `json:"fields,omitempty"`
 }
 
 // Logger appends events to File, which must be a direct child of the absolute
@@ -81,6 +89,27 @@ func realActor() (string, int) {
 		return su, euid
 	}
 	return "root", euid
+}
+
+// loginUID reads the kernel's audit login uid, the one identity in this record
+// an invoking environment cannot simply assert. It is nil when the kernel does
+// not expose it, or when it holds the unset sentinel (4294967295) — a value that
+// says "no login session", not "uid 4294967295".
+// loginUIDPath is a var so tests can supply the kernel's shapes, matching how
+// this codebase makes its other /proc and /etc readers testable.
+var loginUIDPath = "/proc/self/loginuid"
+
+func loginUID() *int {
+	raw, err := os.ReadFile(loginUIDPath)
+	if err != nil {
+		return nil
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 32)
+	if err != nil || value == uint64(^uint32(0)) {
+		return nil
+	}
+	id := int(value)
+	return &id
 }
 
 // Log appends one event. It is best-effort from the caller's perspective (it
@@ -117,15 +146,16 @@ func (l *Logger) Log(ev Event) error {
 		result = "ok"
 	}
 	line, err := json.Marshal(record{
-		Time:   now().UTC().Format(time.RFC3339),
-		PID:    os.Getpid(),
-		Actor:  actor,
-		UID:    uid,
-		Action: ev.Action,
-		Target: ev.Target,
-		Result: result,
-		Detail: ev.Detail,
-		Fields: ev.Fields,
+		Time:     now().UTC().Format(time.RFC3339),
+		PID:      os.Getpid(),
+		Actor:    actor,
+		UID:      uid,
+		LoginUID: loginUID(),
+		Action:   ev.Action,
+		Target:   ev.Target,
+		Result:   result,
+		Detail:   ev.Detail,
+		Fields:   ev.Fields,
 	})
 	if err != nil {
 		return err

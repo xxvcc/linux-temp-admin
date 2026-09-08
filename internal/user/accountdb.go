@@ -35,7 +35,7 @@ func (m *Manager) preflightSequentialAccountCreation(name string, reservedID int
 	if present {
 		return fmt.Errorf("same-name private group %s already exists before account creation", name)
 	}
-	return m.ensureSubordinateIDsAbsent(name)
+	return m.ensureSubordinateIDsAbsent(name, reservedID)
 }
 
 // preflightPrivateGroupRemoval proves that the same-name, same-GID private
@@ -67,8 +67,11 @@ func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, re
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
-	if removePrivateGroup && !validate.AccountID(gid) {
-		return fmt.Errorf("invalid expected private-group GID %d", gid)
+	// The same floor the account protection and the allocator use. groupdel is
+	// destructive and validate.AccountID only asks for gid > 0, so a system-range
+	// GID could authorize removing a group this tool never created.
+	if removePrivateGroup && (!validate.AccountID(gid) || gid < minAllocatableID) {
+		return fmt.Errorf("refusing to authorize private-group removal for out-of-range GID %d", gid)
 	}
 	absent, err := m.deletionState(name, nil, nil)
 	if err != nil {
@@ -78,7 +81,7 @@ func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, re
 		return fmt.Errorf("account %s exists; refusing account-database reconciliation", name)
 	}
 	groupErr := m.reconcilePrivateGroupAfterDeletion(name, gid, removePrivateGroup)
-	subIDErr := m.ensureSubordinateIDsAbsent(name)
+	subIDErr := m.ensureSubordinateIDsAbsent(name, gid)
 	absent, stateErr := m.deletionState(name, nil, nil)
 	if stateErr != nil {
 		stateErr = fmt.Errorf("verify account absence after account-database reconciliation: %w", stateErr)
@@ -121,7 +124,7 @@ func (m *Manager) VerifyAccountDatabaseAfterExternalDeletion(name string, gid in
 			groupErr = fmt.Errorf("same-name group %s remains after external account deletion, but the registry does not prove its GID; remove it manually, then retry", name)
 		}
 	}
-	subIDErr := m.ensureSubordinateIDsAbsent(name)
+	subIDErr := m.ensureSubordinateIDsAbsent(name, gid)
 	absent, stateErr := m.deletionState(name, nil, nil)
 	if stateErr != nil {
 		stateErr = fmt.Errorf("verify account absence after account-database inspection: %w", stateErr)
@@ -197,11 +200,11 @@ func (m *Manager) inspectSameNameGroup(name string) (bool, error) {
 	return inspectSameNameGroup(name)
 }
 
-func (m *Manager) ensureSubordinateIDsAbsent(name string) error {
+func (m *Manager) ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 	if m.CheckSubordinateIDsAbsent != nil {
 		return m.CheckSubordinateIDsAbsent(name)
 	}
-	return ensureSubordinateIDsAbsent(name)
+	return ensureSubordinateIDsAbsent(name, numericOwner)
 }
 
 // inspectPrivateGroup accepts only the shape created by useradd -U: one local
@@ -216,7 +219,7 @@ func inspectPrivateGroup(name string, expectedGID int, allowPrimaryUser bool) (b
 	seenNames := make(map[string]bool)
 	found := false
 	for lineNumber, line := range strings.Split(string(groups), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -270,7 +273,7 @@ func inspectPrivateGroup(name string, expectedGID int, allowPrimaryUser bool) (b
 	}
 	seenUsers := make(map[string]bool)
 	for lineNumber, line := range strings.Split(string(passwd), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		pw, parseErr := parsePasswdEntry(line)
@@ -298,7 +301,7 @@ func inspectSameNameGroup(name string) (bool, error) {
 	seen := make(map[string]bool)
 	found := false
 	for lineNumber, line := range strings.Split(string(groups), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -340,7 +343,7 @@ func inspectPrivateGShadow(name string) (found, exists bool, err error) {
 	}
 	seen := make(map[string]bool)
 	for lineNumber, line := range strings.Split(string(data), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -366,7 +369,14 @@ func inspectPrivateGShadow(name string) (found, exists bool, err error) {
 	return found, true, nil
 }
 
-func ensureSubordinateIDsAbsent(name string) error {
+// numericOwner is the account's numeric identity, matched alongside the login
+// name because subuid(5)/subgid(5) define the first field as "login name or
+// UID" and newuidmap/newgidmap honour both. The manual page even recommends the
+// numeric form on hosts with many entries, so a config-management or container
+// tool writing it is ordinary rather than exotic. Checking only the name
+// reported such residue as clean, and the caller then dropped the registry row
+// that was its last recovery pointer. Pass 0 when no numeric identity is known.
+func ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 	var errs []error
 	for _, database := range []struct {
 		label string
@@ -384,7 +394,7 @@ func ensureSubordinateIDsAbsent(name string) error {
 			continue
 		}
 		for lineNumber, line := range strings.Split(string(data), "\n") {
-			if line == "" {
+			if skipNonEntryLine(line) {
 				continue
 			}
 			parts := strings.Split(line, ":")
@@ -398,11 +408,28 @@ func ensureSubordinateIDsAbsent(name string) error {
 				errs = append(errs, fmt.Errorf("malformed %s range at line %d", database.label, lineNumber+1))
 				break
 			}
-			if parts[0] == name {
+			if parts[0] == name || (numericOwner > 0 && parts[0] == strconv.Itoa(numericOwner)) {
 				errs = append(errs, fmt.Errorf("%s assignment remains for deleted account %s", database.label, name))
 				break
 			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// skipNonEntryLine reports a line the system's own readers ignore rather than a
+// record this tool must parse. glibc's nss_files skips blank and '#'-comment
+// lines in passwd, group and gshadow, and both glibc and shadow-utils accept the
+// NIS compatibility entries that begin with '+' or '-'. Treating any of them as a
+// malformed record hard-failed every sequential invite on a host that carries
+// one, for lines that define no group and no subordinate range.
+func skipNonEntryLine(line string) bool {
+	if line == "" {
+		return true
+	}
+	switch line[0] {
+	case '#', '+', '-':
+		return true
+	}
+	return false
 }

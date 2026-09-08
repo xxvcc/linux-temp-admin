@@ -495,3 +495,85 @@ func TestFailedUseraddWithoutPasswdIsStillCreationStarted(t *testing.T) {
 		t.Fatalf("failed useradd calls = %v", f.calls)
 	}
 }
+
+// TestSubordinateIDsAbsentMatchesTheNumericOwnerForm pins the numeric-owner form
+// subuid(5) defines alongside the login name ("login name or UID"), and which
+// the manual page recommends on hosts with many entries. Missing it reported
+// real residue as clean, after which the caller dropped the registry row that
+// was its last recovery pointer.
+func TestSubordinateIDsAbsentMatchesTheNumericOwnerForm(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		entry     string
+		owner     int
+		wantError bool
+	}{
+		{name: "login name form", entry: "xxvcc-db1:100000:65536\n", owner: 2001, wantError: true},
+		{name: "numeric uid form", entry: "2001:100000:65536\n", owner: 2001, wantError: true},
+		{name: "unrelated numeric owner", entry: "2002:100000:65536\n", owner: 2001, wantError: false},
+		{name: "unrelated name", entry: "someone:100000:65536\n", owner: 2001, wantError: false},
+		{name: "no numeric identity known", entry: "2001:100000:65536\n", owner: 0, wantError: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setAccountDBContents(t, accountDBContents{subuid: tc.entry, subgid: tc.entry})
+			err := ensureSubordinateIDsAbsent("xxvcc-db1", tc.owner)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("ensureSubordinateIDsAbsent = %v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+}
+
+// TestPrivateGroupRemovalRefusesSystemRangeGIDs pins the groupdel authorization
+// to the same floor the account protection and the identity allocator use.
+// validate.AccountID only asks for gid > 0, so a system-range GID could have
+// authorized removing a group this tool never created.
+func TestPrivateGroupRemovalRefusesSystemRangeGIDs(t *testing.T) {
+	m := &Manager{}
+	for _, gid := range []int{1, 99, 999} {
+		err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", gid, true)
+		if err == nil || !strings.Contains(err.Error(), "out-of-range GID") {
+			t.Errorf("ReconcileAccountDatabaseAfterDeletion(gid=%d) = %v, want an out-of-range refusal", gid, err)
+		}
+	}
+	// Without the removal request the GID is not an authorization and is not
+	// bounded here, so the call must get past this check.
+	if err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", 99, false); err != nil &&
+		strings.Contains(err.Error(), "out-of-range GID") {
+		t.Errorf("a non-removing reconcile was refused on its GID: %v", err)
+	}
+}
+
+// TestAccountDBParsersSkipWhatTheSystemSkips pins these parsers to the lines
+// glibc's nss_files and shadow-utils already ignore. Treating a '#' comment or a
+// NIS compatibility entry as a malformed record hard-failed every sequential
+// invite on a host that carries one, for lines that define no group and no
+// subordinate range at all.
+func TestAccountDBParsersSkipWhatTheSystemSkips(t *testing.T) {
+	const name = accountDBTestName
+	// Exactly the shapes the system readers skip, in every database these parsers
+	// read. Each would otherwise trip the "not exactly N fields" rule.
+	noise := "# a local comment\n+::::::\n-badguy\n\n"
+	live := accountDBLiveContents()
+	live.group = noise + live.group
+	live.gshadow = noise + live.gshadow
+	live.subuid = noise
+	live.subgid = noise
+	setAccountDBContents(t, live)
+
+	// Only a parse verdict is under test here; each of these may still return its
+	// own business error for the fixture's live account.
+	rejected := func(what string, err error) {
+		t.Helper()
+		if err != nil && strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("%s treated a line the system skips as a malformed record: %v", what, err)
+		}
+	}
+	rejected("subordinate-ID scan", ensureSubordinateIDsAbsent(name, 2001))
+	_, groupErr := inspectPrivateGroup(name, 2001, false)
+	rejected("private-group inspection", groupErr)
+	_, _, gshadowErr := inspectPrivateGShadow(name)
+	rejected("gshadow inspection", gshadowErr)
+	_, sameNameErr := inspectSameNameGroup(name)
+	rejected("same-name group inspection", sameNameErr)
+}

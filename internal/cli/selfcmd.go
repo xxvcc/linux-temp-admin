@@ -15,6 +15,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"github.com/xxvcc/linux-temp-admin/internal/version"
 	"golang.org/x/sys/unix"
 )
 
@@ -236,6 +237,18 @@ func (a *App) prepareOfficialUpgrade() (*selfmanage.UpgradeCandidate, error) {
 			"official mirror index transfer failed; falling back to GitHub."))
 		return a.Selfmanage.PrepareReleaseUpgrade(
 			config.GitHubLatestReleaseBaseURL, asset, "")
+	}
+	// The mirror's manifest is the sole version selector on this path, and nothing
+	// downstream distinguishes "you already have the newest" from "the mirror is
+	// offering something older than what you run". Both surfaced as a silent
+	// already-up-to-date exit, which is the wrong report for a stale, rolled-back
+	// or hostile index — the one case an operator would want to see. Say it, and
+	// leave a record: the upgrade itself still declines, as it did before.
+	if installed, verErr := a.Selfmanage.InstalledVersion(); verErr == nil && version.Greater(installed, manifest.Version) {
+		a.warnf("%s", a.P.M(
+			"官方镜像索引提供的版本 "+manifest.Version+" 低于当前安装的 "+installed+"；未升级。索引可能陈旧、被回滚或被篡改，请核实后再重试。",
+			"the official mirror index offers "+manifest.Version+", which is older than the installed "+installed+"; nothing was upgraded. The index may be stale, rolled back or tampered with; verify it before retrying."))
+		a.audit("upgrade", "", "skip", "mirror manifest offered "+manifest.Version+" below installed "+installed, nil)
 	}
 	candidate, err := a.Selfmanage.PrepareMirrorReleaseUpgrade(manifest.BaseURL, asset, manifest.Version)
 	if err == nil {

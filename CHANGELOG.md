@@ -2,6 +2,128 @@
 
 All notable changes to this project are documented here.
 
+## v2.10.7 - 2026-09-07
+
+- Skip the lines the system's own readers skip when parsing group, gshadow and
+  the subordinate-ID databases. glibc ignores blank and `#` lines and both glibc
+  and shadow-utils accept the `+`/`-` NIS compatibility entries, but any of them
+  was treated as a malformed record and hard-failed every sequential invite on a
+  host that carries one. The same rule was missing from the integration
+  suite's own group reader.
+- Show revoke's account picker through the narrow-terminal view every other
+  picker already uses, and label a row the uninstall plan is going to excuse as
+  left alone rather than listing it under what will be removed.
+- Reject a mirror manifest whose `published_at` is in the future, bound the
+  published-installer scan that hashes one file per release while holding the
+  deployment lock, and pass `-munge` to rrsync so a transferred symlink cannot
+  name a path outside the staging directory.
+- Carry the invite password as bytes end to end so it can be zeroed, the way the
+  private key already is. A Go string cannot be cleared, and the secret was
+  copied into several of them.
+- Bind the install directory's safety verdict to a single inode in the version
+  probe, closing the window between the check and the write in the one
+  privileged write-and-exec that works by name rather than through a pinned
+  directory descriptor.
+- Refuse to delete an account outside this suite's own namespace from the
+  integration cleanup helper, which runs `userdel -r -f` as root from every
+  fixture in the tree and previously took whatever name it was handed.
+- Sweep the quarantine unit namespace in the uninstall test fixture, as
+  production does, so the one prefix naming a disabled-but-still-present account
+  is no longer absent from every uninstall case.
+- Anchor the expiry model to what `chage` actually stores rather than to its own
+  assumption, and pin the sshd drop-in's trailing `Match all` directly. Both
+  tests previously agreed with the code by construction and could not fail.
+- Record the kernel's audit login uid alongside the actor. The actor name comes
+  from `SUDO_USER`, which the invoking environment supplies; loginuid is set once
+  per login session by PAM and is the value to reconcile against when an actor
+  name is in question. The unset sentinel is recorded as absent, not as a uid.
+- Bound the GID that may authorize removing a private group to the same floor the
+  account protection and the identity allocator use. `validate.AccountID` only
+  asks for a positive value, so a system-range GID could have authorized
+  `groupdel` for a group this tool never created.
+- Refuse a symlinked systemd unit directory when scanning for orphans, the
+  discipline the sudoers and sshd managers already apply to every directory they
+  open.
+- Give the downloaded upgrade candidate `/dev/null` for stdin. On the documented
+  `curl … | sh` install path, stdin is the pipe still carrying the rest of the
+  installer, and the candidate is untrusted at that point.
+- Probe the shell's `ulimit -f` block unit in `bounded_copy` instead of assuming
+  1024 bytes. Under POSIX or sh mode the unit is 512, which halved the effective
+  cap and rejected files that were within the limit; `install.sh` already probed
+  it the same way.
+- Add `chmod` to publish-release.sh's required-command preflight, sanitize
+  `GNUPGHOME` alongside the other trust-affecting variables, and stop closing an
+  already-closed descriptor number in `atomic_write`'s handler, where a later
+  open can inherit it.
+- Refuse a corrupt quarantine deadline instead of letting it choose a teardown.
+  The discarded parse error left the zero time, which is before every real clock
+  reading, so an unparseable value silently selected the path that skips the
+  synchronous drain.
+- Stop reporting an account as disabled when disabling it is what failed. The
+  quarantine handoff calls `DisableLogin` first, so that error reached the branch
+  claiming "the account is disabled and retained" — the one thing that message
+  must never say while the door may still be open.
+- Recognise every form of `--yes` when deciding a run is unattended. Go's flag
+  package accepts `--yes=true` and friends, and an exact token match let those
+  runs be stopped by the first-run language prompt.
+- Say so when the official mirror index offers a version older than the installed
+  one, instead of reporting "already up to date" and exiting silently. A stale,
+  rolled-back or tampered index is exactly what an operator would want to see.
+- Print usage instead of panicking when the process is exec'd with `argc == 0`.
+- Fail closed on an sshd config line whose keyword is empty. sshd treats a
+  leading `=` as the keyword/value separator and honours the directive after it,
+  but the Match/Include scan skipped such a line as if it were blank — hiding a
+  connection-scoped `Match` and letting an invite report a verified login that
+  sshd denies.
+- Arm `atd` for later boots on OpenRC and sysvinit hosts, as the systemd branch
+  already did. Those are exactly the hosts where the `at` fallback is the
+  auto-revoke mechanism, so an atd that ran only until the next reboot meant
+  every queued revocation silently stopped firing.
+- Stop reporting a legacy registry beside an existing identity sequence as an
+  unrepairable integrity failure. The sequence becomes mandatory only once a v5
+  header is visible — `Init` reseeds it on the migration path — and neither
+  recovery command would touch the state the check was flagging.
+- Adopt a committed-but-unsynced registry write in invite instead of abandoning
+  it. `AtomicWriteFileAt` renames the new registry into place before the
+  directory fsync, so a durability failure leaves the row on disk while `Record`
+  reports an error; the creation-intent row then had no release cleanup, and the
+  pending-to-completed row left the transaction comparing against a superseded
+  shape, which aborted invite's own rollback and left a live account behind.
+- Read the SSH port from the listeners rather than the reported default.
+  OpenSSH's `ListenAddress addr:port` creates a listener without adding to
+  `options->ports`, so `sshd -T` prints `port 22` on a host that listens only on
+  2222 — verified against OpenSSH 9.2 — and the invite handed the collaborator a
+  port nothing was listening on, confidently and without a warning. Every
+  listener sshd reports is now read; several distinct ports fail closed and ask
+  for an explicit `--port` rather than guessing.
+- Parse `mountinfo` on the separator the kernel writes. The mount-boundary check
+  that stops a recursive removal split on any Unicode space, while the kernel
+  escapes only space, tab, newline and backslash inside path fields, so an
+  unescaped vertical tab or form feed added a field and shifted the positional
+  mountpoint — reporting no mount under a removal root that had one.
+- Match the numeric-owner form when checking that `userdel` left no
+  subordinate-ID assignments. `subuid(5)`/`subgid(5)` define the first field as
+  "login name or UID" and recommend the numeric form on hosts with many
+  entries, but only the login name was compared, so real residue was reported
+  clean and the caller then dropped the registry row that was its last recovery
+  pointer.
+- Reload sshd when a failed grant rolls back over a drop-in that was already
+  live. The rollback skipped the reload on the invariant that the daemon cannot
+  have seen a file this call just created, but the write replaces an existing
+  drop-in in place, and one left by an earlier granted-and-reloaded call may
+  already be in daemon memory — unlinking it silently left sshd enforcing a
+  grant this tool believed it had removed.
+- Stop writing the one account-expiry value shadow documents as unusable.
+  `DisableLogin` expired an account with `chage -E 1970-01-01`, and chage stores
+  that field as days since the epoch, so the literal date encoded to `0` —
+  the value `shadow(5)` describes as "interpreted as either an account with no
+  expiration, or as an expiration on Jan 1, 1970", and which shadow's own
+  `isexpired()` reads the first way because it requires `sp_expire > 0`. That
+  expiry is the gate which stops a public-key login on a disabled account; the
+  password lock does not. The date moves one day past the epoch, which is
+  equally in the past and encodes as `1`. The old comment reached for exactly
+  this ambiguity and avoided it only in the argument, not in the stored field.
+
 ## v2.10.6 - 2026-09-06
 
 - Attribute `/proc` snapshot instability to the process directory's owner so an

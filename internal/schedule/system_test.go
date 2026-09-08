@@ -659,3 +659,36 @@ func TestRemoveAtJobsForFailsClosedOnPartialAtBackend(t *testing.T) {
 		t.Fatalf("partial at backend error = %v, want inventory failure", err)
 	}
 }
+
+// TestEnsureAtdPersistsOnNonSystemdHosts pins the enablement the non-systemd
+// branches were missing. The systemd branch arms atd for later boots with
+// `enable --now`; OpenRC and sysvinit only started it, so on exactly the hosts
+// where the at fallback IS the auto-revoke mechanism, every queued revocation
+// stopped firing after the next reboot.
+func TestEnsureAtdPersistsOnNonSystemdHosts(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "enabled")
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// status never confirms, so ensureAtd runs the whole branch and returns false;
+	// what is under test is whether it armed atd for the next boot on the way.
+	write("rc-service", "exit 1\n")
+	write("rc-update", "printf '%s\\n' \"$*\" >> "+marker+"\nexit 0\n")
+	// PATH holds only these, so systemctl/service/pgrep are absent and the OpenRC
+	// branch is the one taken.
+	t.Setenv("PATH", dir)
+
+	if ensureAtd() {
+		t.Fatal("ensureAtd claimed success while rc-service status never confirmed")
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("atd was started but never armed for later boots: %v", err)
+	}
+	if want := "add atd default\n"; string(got) != want {
+		t.Fatalf("rc-update invocation = %q, want %q", got, want)
+	}
+}
