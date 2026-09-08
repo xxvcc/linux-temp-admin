@@ -344,3 +344,22 @@ func TestInspectLocalGroupDatabaseFilesIncludesGShadow(t *testing.T) {
 		t.Fatalf("malformed gshadow error = %v", err)
 	}
 }
+
+// TestRemoveUserRefusesNamesOutsideTheSuite pins the guard on a helper that runs
+// `userdel -r -f` as root from roughly thirty fixtures. It used to delete
+// whatever name it was handed, so a typo or a fixture reusing a real login would
+// have taken that account and its home directory with it.
+func TestRemoveUserRefusesNamesOutsideTheSuite(t *testing.T) {
+	for _, name := range []string{"root", "nobody", "postgres", "", "not a name", "../etc"} {
+		if err := removeUser(name, true); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+			t.Errorf("removeUser(%q) = %v, want a namespace refusal", name, err)
+		}
+	}
+	// Names this suite does create must still be accepted by the guard; they fail
+	// later, on the absent account, not here.
+	for _, name := range []string{"xxvcc-a1b2c3d4e5", "ltalegacycompact1"} {
+		if err := removeUser(name, true); err != nil && strings.Contains(err.Error(), "refusing to remove") {
+			t.Errorf("removeUser(%q) was refused by the namespace guard: %v", name, err)
+		}
+	}
+}

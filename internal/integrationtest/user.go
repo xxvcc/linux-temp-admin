@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
 )
 
@@ -65,7 +66,27 @@ func RequireUserAbsent(t interface {
 	}
 }
 
+// testAccountName reports whether name is one this suite may delete. removeUser
+// runs `userdel -r -f` as root from every fixture in the tree, which is the exact
+// combination internal/user documents as unsafe for the production path, and it
+// took whatever name it was handed. A typo or a fixture reusing a real login
+// would have taken that account and its home directory with it.
+func testAccountName(name string) bool {
+	if !validate.Username(name) {
+		return false
+	}
+	for _, prefix := range []string{"xxvcc-", "lta"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func removeUser(name string, force bool) error {
+	if !testAccountName(name) {
+		return fmt.Errorf("refusing to remove %q: integration cleanup only deletes accounts in this suite's own namespace", name)
+	}
 	args := []string{"-r"}
 	if force {
 		args = append(args, "-f")

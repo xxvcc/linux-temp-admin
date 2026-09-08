@@ -215,6 +215,20 @@ func TestDropInRestoresScopeForLaterIncludedFiles(t *testing.T) {
 	if got := sysinfo.ParseSSHD(string(out)).First("passwordauthentication"); got != "no" {
 		t.Fatalf("later global drop-in was captured by the managed Match block: PasswordAuthentication=%q, want no", got)
 	}
+	// The assertion above does NOT discriminate on this host, and saying so is the
+	// point. Measured against OpenSSH 9.2 here: deleting the managed file's final
+	// `Match all` leaves this same query answering "no", because that sshd ends
+	// Match scope at the file boundary rather than carrying it into the next file
+	// expanded by the Include glob. The package doc gives the opposite behaviour as
+	// the guard's reason, so on this version the guard is defence against a
+	// behaviour that no longer reproduces.
+	//
+	// Keep the guard — older sshd is exactly what a compatibility guard is for —
+	// but pin its presence directly, so removing it from the renderer fails
+	// something instead of passing a test that cannot tell.
+	if !strings.HasSuffix(strings.TrimRight(string(body), "\n"), "Match all") {
+		t.Fatalf("the managed drop-in no longer ends with the Match all scope guard:\n%s", body)
+	}
 }
 
 func TestEnsureSSHDPrivilegeSeparationDirLifecycle(t *testing.T) {

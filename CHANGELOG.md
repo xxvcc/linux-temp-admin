@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## v2.10.7 - 2026-09-07
 
+- Refuse to delete an account outside this suite's own namespace from the
+  integration cleanup helper, which runs `userdel -r -f` as root from every
+  fixture in the tree and previously took whatever name it was handed.
+- Sweep the quarantine unit namespace in the uninstall test fixture, as
+  production does, so the one prefix naming a disabled-but-still-present account
+  is no longer absent from every uninstall case.
+- Anchor the expiry model to what `chage` actually stores rather than to its own
+  assumption, and pin the sshd drop-in's trailing `Match all` directly. Both
+  tests previously agreed with the code by construction and could not fail.
 - Record the kernel's audit login uid alongside the actor. The actor name comes
   from `SUDO_USER`, which the invoking environment supplies; loginuid is set once
   per login session by PAM and is the value to reconcile against when an actor
