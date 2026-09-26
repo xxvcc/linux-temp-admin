@@ -29,7 +29,7 @@ func TestAbsentAccountDatabaseFailureStillCleansNameScopedArtifacts(t *testing.T
 		InspectSameNameGroupState: func(string) (bool, error) {
 			return false, wantDBErr
 		},
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 	}
 
 	scheduleCalls := 0

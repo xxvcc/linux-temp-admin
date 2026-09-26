@@ -179,6 +179,16 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			return fmt.Errorf("the host's sshd configuration is already invalid; refusing to touch it: %w", err)
 		}
 		path := m.FilePath(user)
+		// A drop-in already on disk may already be in daemon memory from an earlier
+		// granted-and-reloaded call, and WriteRootFile below replaces it in place.
+		// The rollback's "the daemon has not seen this file" shortcut is only true
+		// for a file this call created, so record which case this is before writing.
+		preexisting := false
+		if _, statErr := os.Lstat(path); statErr == nil {
+			preexisting = true
+		} else if !os.IsNotExist(statErr) {
+			return fmt.Errorf("inspect the existing sshd drop-in: %w", statErr)
+		}
 		rollback := func(cause error, restoreDaemon bool) error {
 			pendingExisted, staged, err := m.stageRemovalLocked(path)
 			if err != nil {
@@ -187,10 +197,13 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 			if !staged {
 				return cause
 			}
-			// Before the first reload attempt, a newly-created drop-in cannot be in
-			// daemon memory. Its unlink still goes through the durable marker protocol,
-			// but no reload is needed unless this call inherited older pending state.
-			if !restoreDaemon && !pendingExisted {
+			// Before the first reload attempt, a drop-in THIS CALL created cannot be
+			// in daemon memory. Its unlink still goes through the durable marker
+			// protocol, but no reload is needed unless this call inherited older
+			// pending state, or replaced a file the daemon may already be enforcing —
+			// unlinking that one without a reload would leave the running sshd holding
+			// a grant whose file this tool believes it has removed.
+			if !restoreDaemon && !pendingExisted && !preexisting {
 				if err := clearPending(path + removePendingSuffix); err != nil {
 					return errors.Join(cause, fmt.Errorf("complete failed sshd grant removal: %w", err))
 				}
@@ -230,7 +243,12 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 		// Whether such an unevaluable rule downgrades the invite to UNVERIFIED is the
 		// caller's decision, taken from the same report; it is not this check's job.
 		if rep := sysinfo.CheckKeyLogin(cfg, user, groups); !rep.OK() {
-			return rollback(fmt.Errorf("the sshd drop-in is not present in the effective config (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir), false)
+			// Name the blocker that actually survived. A missing Include is only one
+			// possible cause: a Match block in a drop-in that sorts before this one
+			// wins the directive, and blaming the Include sent the operator to check a
+			// line that was already there.
+			return rollback(fmt.Errorf("the sshd exception did not take effect: %s still applies; either `Include %s/*.conf` is absent from /etc/ssh/sshd_config, or another Match block sets the same directive first",
+				describeSurvivingBlockers(rep), m.Dir), false)
 		}
 		switch err := m.Reload(); {
 		case err == nil:
@@ -852,4 +870,35 @@ func sshdProcessStartTime(pid int) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("process start time overflows kernel boot time")
 	}
 	return time.Unix(bootSeconds+seconds, nanos), nil
+}
+
+// describeSurvivingBlockers renders the blockers that are still in force, with
+// the effective value each one came from when the probe reported it.
+func describeSurvivingBlockers(rep sysinfo.LoginReport) string {
+	parts := make([]string, 0, len(rep.Blockers))
+	for _, b := range rep.Blockers {
+		name := b.String()
+		if b == sysinfo.BlockKeyAlgorithm && rep.AlgoDirective != "" {
+			// Name the directive under the spelling this host's sshd used: it was
+			// renamed in 8.5, and printing the other one sends the operator to grep
+			// for a line that is not in their config — the exact failure this
+			// message was rewritten to stop. invite.go:696 does the same.
+			name = rep.AlgoDirective
+		}
+		detail := rep.Detail[b]
+		// These two Blocker names already embed their value ("PubkeyAuthentication
+		// no"), so appending Detail would print it twice.
+		if b == sysinfo.BlockPubkeyDisabled || b == sysinfo.BlockPasswordDisabled {
+			detail = ""
+		}
+		if detail != "" {
+			parts = append(parts, name+" ("+detail+")")
+			continue
+		}
+		parts = append(parts, name)
+	}
+	if len(parts) == 0 {
+		return "an unnamed blocker"
+	}
+	return strings.Join(parts, "; ")
 }

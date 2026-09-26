@@ -64,8 +64,12 @@ func uninstallApp(t *testing.T, in string, users ...string) (*App, *strings.Buil
 	a.SSHD = nil // no sshd is touched by these tests
 	a.Scheduler = &schedule.Scheduler{
 		SystemdDir: mk("systemd", 0o755), SystemdTimerStateDir: mk("systemd-timer-state", 0o755), InstallPath: a.InstallPath,
-		UnitPrefix: config.AutoRevokeUnitPrefix, LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix},
-		Now: a.Now, Sys: fakeUninstallSystem{},
+		// Mirror schedule.New(): production sweeps the quarantine namespace too, and
+		// a fixture that omits it leaves the one prefix naming a disabled-but-present
+		// account untested by every uninstall case.
+		UnitPrefix:         config.AutoRevokeUnitPrefix,
+		LegacyUnitPrefixes: []string{config.V1AutoRevokeUnitPrefix, config.QuarantineUnitPrefix},
+		Now:                a.Now, Sys: fakeUninstallSystem{},
 	}
 	// Re-point the registry inside the state dir, so removing the state dir is the
 	// same act it is in production.
@@ -953,6 +957,7 @@ func TestDoctorReportsAutoDeleteAccountsWithNoTaskLeft(t *testing.T) {
 			t.Fatal(err)
 		}
 		rec.AutoRevoke = true
+		rec.Expires = "2099-07-08 12:00:00 UTC"
 		rec.AutoUnit = unit
 		if err := a.Registry.Record(rec); err != nil {
 			t.Fatal(err)

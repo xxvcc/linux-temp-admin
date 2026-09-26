@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -314,7 +315,7 @@ func TestPrepareVerifiedCandidateDoesNotExecuteSignedBytes(t *testing.T) {
 	}
 	evidence := filepath.Join(t.TempDir(), "candidate-executed")
 	bin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.9.5}\nprintf executed > '" + evidence + "'\nprintf '2.9.5\\n'\n")
-	m := &Manager{PublicKey: pub}
+	m := &Manager{PublicKey: pub, RequireHostMachine: func([]byte) error { return nil }}
 	candidate, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), "2.9.5")
 	if err != nil || candidate.Version() != "2.9.5" {
 		t.Fatalf("prepareVerifiedCandidate = version %q, err=%v", candidate.Version(), err)
@@ -911,5 +912,156 @@ func TestDownloadDoesNotRetryPermanentStatus(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("404 made %d requests, want 1", requests)
+	}
+}
+
+// TestFetchReleaseManifestRejectsAFuturePublishedAt pins the one reading of
+// published_at that is wrong on its face. The field was validated for shape and
+// then used only to rebuild the canonical bytes, so it constrained nothing about
+// which release the mirror names; a timestamp ahead of now cannot describe a
+// published release and means a skewed or fabricated index.
+func TestFetchReleaseManifestRejectsAFuturePublishedAt(t *testing.T) {
+	root := "https://dl.ll.cd/linux-temp-admin"
+	body := func(published string) string {
+		return `{"version":"2.8.0","tag":"v2.8.0","base_url":"` + root + `/v2.8.0","published_at":"` + published + `"}` + "\n"
+	}
+	fetch := func(published string) error {
+		m := &Manager{Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(body(published))), Request: req}, nil
+		})}, RetryDelay: 0}
+		_, err := m.FetchReleaseManifest(root+"/latest.json", root)
+		return err
+	}
+	future := time.Now().UTC().Add(72 * time.Hour).Format("2006-01-02T15:04:05Z")
+	if err := fetch(future); err == nil || !strings.Contains(err.Error(), "in the future") {
+		t.Fatalf("a manifest published %s was accepted: %v", future, err)
+	}
+	// Ordinary clock disagreement stays acceptable, and so does any past date.
+	for _, ok := range []string{
+		time.Now().UTC().Add(time.Hour).Format("2006-01-02T15:04:05Z"),
+		"2026-07-27T05:00:00Z",
+	} {
+		if err := fetch(ok); err != nil {
+			t.Fatalf("a manifest published %s was rejected: %v", ok, err)
+		}
+	}
+}
+
+// The detached signature covers raw bytes only — no asset name, no architecture —
+// and the release-version witness is byte-identical in the amd64 and arm64 builds
+// of one release. SHA256SUMS, the only artifact binding a name to a digest, is
+// unsigned. So a mirror that serves the other architecture's genuinely signed
+// binary under this architecture's asset name passes signature, checksum and
+// version checks alike. The bytes still say which machine they are for.
+func TestCandidateForAnotherArchitectureIsRefused(t *testing.T) {
+	elfHeader := func(machine uint16, class, data byte) []byte {
+		b := make([]byte, 64)
+		copy(b, []byte{0x7f, 'E', 'L', 'F'})
+		b[4], b[5], b[6] = class, data, 1
+		b[16], b[17] = 2, 0 // ET_EXEC
+		b[18], b[19] = byte(machine), byte(machine>>8)
+		b[20] = 1 // e_version
+		return b
+	}
+	const (
+		emX8664   = 62
+		emAarch64 = 183
+	)
+	var self, other uint16 = emX8664, emAarch64
+	if runtime.GOARCH == "arm64" {
+		self, other = emAarch64, emX8664
+	}
+
+	t.Run("this host's architecture is accepted", func(t *testing.T) {
+		if err := requireHostMachine(elfHeader(self, 2, 1)); err != nil {
+			t.Fatalf("requireHostMachine on a native ELF = %v, want nil", err)
+		}
+	})
+
+	t.Run("the other architecture is refused", func(t *testing.T) {
+		err := requireHostMachine(elfHeader(other, 2, 1))
+		if err == nil {
+			t.Fatal("a signed binary for the other architecture was accepted")
+		}
+		if !strings.Contains(err.Error(), "refusing to install another architecture") {
+			t.Fatalf("error = %v, want the architecture refusal", err)
+		}
+	})
+
+	t.Run("a 32-bit or big-endian build is refused", func(t *testing.T) {
+		for _, bad := range [][]byte{elfHeader(self, 1, 1), elfHeader(self, 2, 2)} {
+			if err := requireHostMachine(bad); err == nil {
+				t.Fatal("a non-64-bit-little-endian ELF was accepted")
+			}
+		}
+	})
+
+	t.Run("a non-ELF candidate is refused", func(t *testing.T) {
+		if err := requireHostMachine([]byte("#!/bin/sh\necho hi\n")); err == nil {
+			t.Fatal("a shell script was accepted as a release binary")
+		}
+	})
+
+	t.Run("the gate runs inside prepareVerifiedCandidate", func(t *testing.T) {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bin := elfHeader(other, 2, 1)
+		m := &Manager{PublicKey: pub}
+		if _, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), ""); err == nil {
+			t.Fatal("prepareVerifiedCandidate accepted a validly signed foreign-architecture binary")
+		}
+	})
+}
+
+// The architecture gate must accept the binaries this project actually ships. A
+// synthetic 64-byte header cannot catch a tightening that rejects a real static
+// Go build (ET_DYN when built as PIE, a larger header, extra program headers), so
+// this runs the gate over bytes produced by the real toolchain.
+func TestArchitectureGateAcceptsARealStaticReleaseBinary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a binary")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	dir := t.TempDir()
+	native := filepath.Join(dir, "native")
+	build := exec.Command("go", "build", "-buildvcs=false",
+		"-tags", "osusergo,netgo", "-ldflags", "-s -w",
+		"-o", native, "../../cmd/linux-temp-admin")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("could not build a native release binary: %v\n%s", err, out)
+	}
+	bin, err := os.ReadFile(native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireHostMachine(bin); err != nil {
+		t.Fatalf("the gate rejected a genuine static release binary for this host: %v", err)
+	}
+
+	// And the other architecture's genuine binary is still refused.
+	other := "arm64"
+	if runtime.GOARCH == "arm64" {
+		other = "amd64"
+	}
+	foreign := filepath.Join(dir, "foreign")
+	cross := exec.Command("go", "build", "-buildvcs=false",
+		"-tags", "osusergo,netgo", "-ldflags", "-s -w",
+		"-o", foreign, "../../cmd/linux-temp-admin")
+	cross.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+other)
+	if out, err := cross.CombinedOutput(); err != nil {
+		t.Skipf("could not cross-build for %s: %v\n%s", other, err, out)
+	}
+	foreignBin, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireHostMachine(foreignBin); err == nil {
+		t.Fatalf("the gate accepted a genuine %s binary on a %s host", other, runtime.GOARCH)
 	}
 }

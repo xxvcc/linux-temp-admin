@@ -215,6 +215,20 @@ func TestDropInRestoresScopeForLaterIncludedFiles(t *testing.T) {
 	if got := sysinfo.ParseSSHD(string(out)).First("passwordauthentication"); got != "no" {
 		t.Fatalf("later global drop-in was captured by the managed Match block: PasswordAuthentication=%q, want no", got)
 	}
+	// The assertion above does NOT discriminate on this host, and saying so is the
+	// point. Measured against OpenSSH 9.2 here: deleting the managed file's final
+	// `Match all` leaves this same query answering "no", because that sshd ends
+	// Match scope at the file boundary rather than carrying it into the next file
+	// expanded by the Include glob. The package doc gives the opposite behaviour as
+	// the guard's reason, so on this version the guard is defence against a
+	// behaviour that no longer reproduces.
+	//
+	// Keep the guard — older sshd is exactly what a compatibility guard is for —
+	// but pin its presence directly, so removing it from the renderer fails
+	// something instead of passing a test that cannot tell.
+	if !strings.HasSuffix(strings.TrimRight(string(body), "\n"), "Match all") {
+		t.Fatalf("the managed drop-in no longer ends with the Match all scope guard:\n%s", body)
+	}
 }
 
 func TestEnsureSSHDPrivilegeSeparationDirLifecycle(t *testing.T) {
@@ -592,5 +606,60 @@ func TestGrantSucceedsDespiteAnUnverifiableAllowUsers(t *testing.T) {
 	}
 	if _, err := os.Lstat(res.Path); err != nil {
 		t.Errorf("the working drop-in was rolled back: %v", err)
+	}
+}
+
+// TestGrantRollbackReloadsWhenItReplacedALiveDropIn pins the boundary of the
+// rollback's "the running daemon has not seen this file" shortcut. That holds
+// for a drop-in the failing call created, but WriteRootFile replaces one that is
+// already on disk, and such a file may already be in daemon memory from an
+// earlier granted-and-reloaded call. Unlinking it without a reload would leave
+// sshd enforcing a grant this tool believes it removed.
+func TestGrantRollbackReloadsWhenItReplacedALiveDropIn(t *testing.T) {
+	// Grant requires a root-owned config directory, so this belongs with the other
+	// root fixtures: in the non-root CI job t.TempDir() is owned by the runner and
+	// the very first Grant fails on the directory rather than on anything tested.
+	blocked := report("pubkeyauthentication no\n")
+	reloads, validates := 0, 0
+	// Grant validates once before it writes and once after. Only the post-write
+	// check may fail here: failing the pre-check would refuse the whole call
+	// before anything is written, and no rollback would run at all.
+	failAfterValidate := -1
+	m := &Manager{
+		Dir: rootDir(t),
+		Validate: func() error {
+			validates++
+			if failAfterValidate > 0 && validates == failAfterValidate {
+				return errors.New("injected sshd -t failure")
+			}
+			return nil
+		},
+		Effective: func(string) (*sysinfo.SSHDConfig, error) {
+			return sysinfo.ParseSSHD("pubkeyauthentication yes\n"), nil
+		},
+		Reload: func() error { reloads++; return nil },
+	}
+	if _, err := m.Grant(acct, []string{acct}, blocked); err != nil {
+		t.Fatalf("first Grant: %v", err)
+	}
+	if reloads != 1 {
+		t.Fatalf("first Grant reloads = %d, want 1", reloads)
+	}
+	if _, err := os.Lstat(m.FilePath(acct)); err != nil {
+		t.Fatalf("first Grant left no drop-in: %v", err)
+	}
+
+	// The daemon is now holding this account's grant. The second Grant replaces
+	// that file and then fails its post-write validation.
+	failAfterValidate = validates + 2
+	before := reloads
+	if _, err := m.Grant(acct, []string{acct}, blocked); err == nil {
+		t.Fatal("second Grant must fail on the injected post-write validation error")
+	}
+	if _, err := os.Lstat(m.FilePath(acct)); !os.IsNotExist(err) {
+		t.Fatalf("rollback left the drop-in behind: err=%v", err)
+	}
+	if reloads == before {
+		t.Fatal("rollback unlinked a drop-in the daemon may already enforce without asking sshd to re-read")
 	}
 }

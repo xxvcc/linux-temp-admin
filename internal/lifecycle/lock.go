@@ -22,6 +22,12 @@ var ErrBusy = errors.New("lifecycle lock is busy")
 // inode at the same pathname.
 type Lock struct {
 	Path string
+	// WriteRootFile is a filesystem fault-injection hook, following the same
+	// convention as selfmanage.Manager: production leaves it nil and uses
+	// fsutil.AtomicWriteFileAs. It exists so a test can drive the
+	// committed-but-unsynced marker branch, which no real filesystem produces on
+	// demand.
+	WriteRootFile func(path string, data []byte, perm os.FileMode, uid, gid int) error
 }
 
 // New returns a lifecycle lock at path.
@@ -111,11 +117,19 @@ func (l *Lock) acquire(operation int) (func() error, error) {
 // removable state or the stable binary is removed. The marker lives beside the
 // lock, outside removable application state, so a crash cannot leave state gone
 // without stopping already-running processes when they later acquire the lock.
+//
+// A *fsutil.DurabilityError means the marker IS on disk and IsUninstalled will
+// read it — only the parent-directory fsync failed. Callers must not report that
+// as "the marker was not recorded": the gate it arms is already in force.
 func (l *Lock) MarkUninstalled() error {
 	if l == nil || l.Path == "" {
 		return nil
 	}
-	return fsutil.AtomicWriteFileAs(l.tombstonePath(), []byte(tombstoneContent), 0o600, os.Geteuid(), os.Getegid())
+	write := fsutil.AtomicWriteFileAs
+	if l.WriteRootFile != nil {
+		write = l.WriteRootFile
+	}
+	return write(l.tombstonePath(), []byte(tombstoneContent), 0o600, os.Geteuid(), os.Getegid())
 }
 
 // IsUninstalled validates and reads the marker. Unsafe marker metadata is an

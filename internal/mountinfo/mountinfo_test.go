@@ -53,3 +53,32 @@ func TestRejectUnderRejectsUnsafeRoot(t *testing.T) {
 		}
 	}
 }
+
+// TestRejectUnderSplitsOnlyOnTheKernelSeparator pins the parser to mountinfo's
+// actual format. The kernel escapes exactly space, tab, newline and backslash
+// inside path fields, so a vertical tab reaches this parser literally.
+//
+// The payload matters: strings.Fields turns "/home/u/x\v/etc" into two fields,
+// so the positional mountpoint read at index 4 becomes "/etc" — a perfectly
+// valid absolute path that is not under the removal root. The check then passes
+// the line as an unrelated mount and reports no mount under the root, while the
+// real mountpoint in field 5 is /home/u/hidden. A payload whose split halves are
+// not valid paths would merely trip the mountpoint validation and pass this test
+// against either implementation.
+func TestRejectUnderSplitsOnlyOnTheKernelSeparator(t *testing.T) {
+	shifted := "50 25 0:44 /home/u/x\v/etc /home/u/hidden rw,relatime - ext4 /dev/sda1 rw\n"
+	if err := RejectUnder(strings.NewReader(shifted), "/home/u"); err == nil {
+		t.Fatal("RejectUnder reported no mount under the root; the mountpoint field was shifted by an unescaped byte")
+	}
+	// The same line without the odd byte must still be caught, so the test is not
+	// merely detecting a parse refusal.
+	plain := "50 25 0:44 /home/u/xetc /home/u/hidden rw,relatime - ext4 /dev/sda1 rw\n"
+	if err := RejectUnder(strings.NewReader(plain), "/home/u"); err == nil {
+		t.Fatal("RejectUnder accepted a plain mount under the root")
+	}
+	// And an unrelated mount must still pass, so it is not refusing everything.
+	other := "50 25 0:44 / /var/lib/other rw,relatime - ext4 /dev/sda1 rw\n"
+	if err := RejectUnder(strings.NewReader(other), "/home/u"); err != nil {
+		t.Fatalf("RejectUnder rejected an unrelated mount: %v", err)
+	}
+}

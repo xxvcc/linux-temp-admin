@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -57,7 +59,22 @@ func (e *systemctlError) Unwrap() error { return e.err }
 
 func has(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
-func (realSystem) HasSystemctl() bool { return has("systemctl") }
+// HasSystemctl keeps uncertain/broken managers on the error-reporting path.
+// The binary alone is not evidence of systemd: distribution containers and
+// non-systemd hosts commonly install it. Require both sd_booted's marker to be
+// absent and a readable non-systemd PID 1 before treating the manager as absent.
+func (realSystem) HasSystemctl() bool {
+	return has("systemctl") && !systemdDefinitelyAbsent("/run/systemd/system", "/proc/1/comm")
+}
+
+func systemdDefinitelyAbsent(bootMarker, initComm string) bool {
+	if _, err := os.Stat(bootMarker); !os.IsNotExist(err) {
+		return false
+	}
+	comm, err := os.ReadFile(initComm)
+	name := strings.TrimSpace(string(comm))
+	return err == nil && name != "" && name != "systemd"
+}
 func (realSystem) HasAt() bool {
 	return has("at") || has("atq") || has("atrm") || has("atd") || has("batch")
 }
@@ -186,7 +203,7 @@ func (realSystem) ScheduleAt(command string, deadline time.Time) (string, error)
 		}
 	}
 	if !ensureAtd() {
-		return "", fmt.Errorf("atd is not running and could not be started; use systemd or start atd")
+		return "", fmt.Errorf("atd could not be confirmed running and enabled at boot; use systemd or configure a persistent atd service")
 	}
 	opts := schedulerCommandOptions(schedulerOutputLimit)
 	// POSIX at -t is minute-granular and interprets its operand in the process
@@ -260,48 +277,119 @@ func parseAtJobID(out string) string {
 	return id
 }
 
-// ensureAtd confirms or starts the atd daemon so queued jobs actually fire. It
-// fails closed when no available service manager or process probe can confirm it.
+// ensureAtd requires both a running daemon and persistent boot enablement.
+// A process-name probe cannot prove the latter and is never a submission backend.
 func ensureAtd() bool {
+	return ensureAtdWithSystemd((realSystem{}).HasSystemctl(), "/etc")
+}
+
+func ensureAtdWithSystemd(systemd bool, initDir string) bool {
 	run := func(name string, args ...string) bool {
 		return executil.Run(name, args, schedulerCommandOptions(schedulerOutputLimit)) == nil
 	}
-	// Try each init system in turn (not first-match), returning as soon as atd is
-	// confirmed runnable; do not claim success without confirmation.
-	if has("systemctl") {
-		if run("systemctl", "is-active", "--quiet", "atd") {
-			return true
+	if systemd {
+		// enable must succeed even when atd was already started manually. Then
+		// query both properties; active alone permits a reboot to strand jobs.
+		if !run("systemctl", "enable", "--now", "atd") {
+			return false
 		}
-		_ = executil.Run("systemctl", []string{"enable", "--now", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
-		if run("systemctl", "is-active", "--quiet", "atd") {
-			return true
-		}
+		out, err := executil.Output("systemctl", []string{"is-enabled", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
+		// A zero exit also covers static, indirect and enabled-runtime. Only
+		// persistent enabled proves that this service is armed for later boots.
+		return err == nil && strings.TrimSpace(string(out)) == "enabled" &&
+			run("systemctl", "is-active", "--quiet", "atd")
 	}
 	if has("rc-service") {
-		if run("rc-service", "atd", "status") {
-			return true
+		if !has("rc-update") || !run("rc-update", "add", "atd", "default") {
+			return false
 		}
-		_ = executil.Run("rc-service", []string{"atd", "start"}, schedulerCommandOptions(schedulerOutputLimit))
-		if run("rc-service", "atd", "status") {
-			return true
+		out, err := executil.Output("rc-update", []string{"show", "default"}, schedulerCommandOptions(schedulerOutputLimit))
+		if err != nil || !openRCAtdEnabled(string(out)) {
+			return false
 		}
+		if !run("rc-service", "atd", "status") && !run("rc-service", "atd", "start") {
+			return false
+		}
+		return run("rc-service", "atd", "status")
 	}
 	if has("service") {
-		if run("service", "atd", "status") {
-			return true
+		switch {
+		case has("chkconfig"):
+			if !run("chkconfig", "atd", "on") {
+				return false
+			}
+			out, err := executil.Output("chkconfig", []string{"--list", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
+			if err != nil || !sysVAtdEnabled(string(out)) {
+				return false
+			}
+		case has("update-rc.d"):
+			if !run("update-rc.d", "atd", "enable") || !sysVAtdLinksEnabled(initDir) {
+				return false
+			}
+		default:
+			return false
 		}
-		_ = run("service", "atd", "start")
-		if run("service", "atd", "status") {
-			return true
+		if !run("service", "atd", "status") && !run("service", "atd", "start") {
+			return false
 		}
-	}
-	if has("pgrep") {
-		// atd starts as root and may drop its effective credentials to the daemon
-		// account, but its real UID remains 0. Binding the fallback probe to real root
-		// prevents an unprivileged process from spoofing only the short name "atd".
-		return run("pgrep", "-x", "-U", "0", "atd")
+		return run("service", "atd", "status")
 	}
 	return false
+}
+
+func openRCAtdEnabled(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "atd" && fields[1] == "|" && fields[2] == "default" {
+			return true
+		}
+	}
+	return false
+}
+
+func sysVAtdEnabled(out string) bool {
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) != 8 || fields[0] != "atd" {
+		return false
+	}
+	for level := 2; level <= 5; level++ {
+		if fields[level+1] != strconv.Itoa(level)+":on" {
+			return false
+		}
+	}
+	return true
+}
+
+func sysVAtdLinksEnabled(initDir string) bool {
+	// Debian's atd init script declares multi-user levels 2,3,4,5. Check the
+	// enabled links update-rc.d persisted, including their executable target.
+	for level := 2; level <= 5; level++ {
+		entries, err := os.ReadDir(filepath.Join(initDir, "rc"+strconv.Itoa(level)+".d"))
+		if err != nil {
+			return false
+		}
+		found := false
+		for _, entry := range entries {
+			name := entry.Name()
+			if len(name) != 6 || name[0] != 'S' || name[1] < '0' || name[1] > '9' ||
+				name[2] < '0' || name[2] > '9' || name[3:] != "atd" {
+				continue
+			}
+			path := filepath.Join(initDir, "rc"+strconv.Itoa(level)+".d", name)
+			target, err := filepath.EvalSymlinks(path)
+			if err != nil || target != filepath.Join(initDir, "init.d", "atd") {
+				continue
+			}
+			info, err := os.Stat(target)
+			if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (realSystem) AtrmJob(id string) error {
@@ -543,17 +631,24 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 	defer cancel()
 	queueOpts := schedulerCommandOptions(atQueueOutputLimit)
 	queueOpts.Context = ctx
+	// Pin the read-back zone the same way ScheduleAt pins the submission zone.
+	// executil gives helpers no TZ, so atq would otherwise render queued times in
+	// /etc/localtime while this process parses them in its own $TZ — on a host
+	// where those differ, a pending deadline reads as already passed (or the
+	// reverse) by the zone offset.
+	queueOpts.ExtraEnv = append(queueOpts.ExtraEnv, "TZ=UTC")
 	out, err := executil.Output("atq", nil, queueOpts)
 	if err != nil {
 		return nil, fmt.Errorf("atq: %w", err)
 	}
-	ids, err := atqueue.ParseInventory(out, int(schedulerOutputLimit))
+	entries, err := atqueue.ParseInventoryEntries(out, int(schedulerOutputLimit))
 	if err != nil {
 		return nil, err
 	}
 	var jobs []AtJob
 	totalBodyBytes := int64(0)
-	for _, id := range ids {
+	for _, entry := range entries {
+		id := entry.ID
 		body, owner, present, err := readAtJobContext(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("inspect at job %s: %w", id, err)
@@ -562,16 +657,69 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 			continue
 		}
 		if owner != 0 {
-			jobs = append(jobs, AtJob{ID: id, OwnerUID: owner})
+			jobs = append(jobs, AtJob{ID: id, OwnerUID: owner, ScheduledAt: entry.ScheduledAt})
 			continue
 		}
 		totalBodyBytes += int64(len(body))
 		if totalBodyBytes > atInventoryMaxBodyBytes {
 			return nil, fmt.Errorf("at job inventory exceeds %d bytes", atInventoryMaxBodyBytes)
 		}
-		jobs = append(jobs, AtJob{ID: id, Body: body, OwnerUID: owner})
+		jobs = append(jobs, AtJob{ID: id, Body: body, OwnerUID: owner, ScheduledAt: entry.ScheduledAt})
 	}
 	return jobs, nil
+}
+
+// AtDaemonRunning probes atd without starting or enabling it. Each branch only
+// reports a definite answer; when no probe on this host can answer, the caller
+// gets an error rather than a healthy-looking false negative.
+func (realSystem) AtDaemonRunning() (bool, error) {
+	probe := func(name string, args ...string) error {
+		return executil.Run(name, args, schedulerCommandOptions(schedulerOutputLimit))
+	}
+	if has("systemctl") {
+		if probe("systemctl", "is-active", "--quiet", "atd") == nil {
+			return true, nil
+		}
+		// `is-active` exits non-zero for a known-but-inactive unit and for an
+		// unknown one alike, so only a unit systemd actually knows is evidence.
+		if probe("systemctl", "cat", "--no-pager", "atd.service") == nil {
+			return false, nil
+		}
+	}
+	if has("rc-service") {
+		if probe("rc-service", "atd", "status") == nil {
+			return true, nil
+		}
+		if probe("rc-service", "--exists", "atd") == nil {
+			return false, nil
+		}
+	}
+	if has("service") {
+		if probe("service", "atd", "status") == nil {
+			return true, nil
+		}
+	}
+	if has("pgrep") {
+		// Bind to real root: atd keeps real UID 0 even after dropping its effective
+		// credentials, so an unprivileged process that merely names itself "atd"
+		// must not satisfy this probe. Without -U 0 any local user — including the
+		// temporary account this tool creates — could make a dead at backend report
+		// healthy, defeating the check this probe exists for.
+		switch err := probe("pgrep", "-x", "-U", "0", "atd"); {
+		case err == nil:
+			return true, nil
+		case isExitCode(err, 1):
+			return false, nil
+		}
+	}
+	return false, fmt.Errorf("no available probe could confirm whether atd is running")
+}
+
+// isExitCode reports whether err is a plain non-zero exit with the given status,
+// which distinguishes "the probe ran and said no" from "the probe never ran".
+func isExitCode(err error, code int) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == code
 }
 
 func rootAtBodyMatches(body string, match func(string) (bool, error)) (bool, error) {
@@ -696,4 +844,39 @@ func atBodyHasExactCommand(body, command string) bool {
 		}
 	}
 	return false
+}
+
+// atBodyRunsFromAPinnedDirectory reports whether the queued script's own `cd`
+// prologue — at(1) records getcwd() at submission time — names a directory that
+// will still be there when the job fires. Jobs queued by releases before the
+// working directory was pinned carry the submitting operator's CWD, and the
+// script exits 1 at that cd without ever reaching revoke. Such a job is in the
+// queue but is not a schedule, so ValidSchedule must not accept it.
+func atBodyRunsFromAPinnedDirectory(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(trimmed, "cd ")
+		if !ok {
+			continue
+		}
+		// at writes `cd <dir> || {` — take the directory up to the first separator.
+		dir := strings.TrimSpace(rest)
+		if i := strings.Index(dir, "||"); i >= 0 {
+			dir = strings.TrimSpace(dir[:i])
+		}
+		dir = strings.Trim(dir, `"'`)
+		if dir == "" {
+			continue
+		}
+		if dir == executil.HelperWorkingDir {
+			continue
+		}
+		// Anything else is the caller's inherited CWD. Accept it only while it is
+		// still present: an existing directory still runs, and reporting every
+		// pre-upgrade job as stranded would be its own false alarm.
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
 }

@@ -344,3 +344,64 @@ func TestInspectLocalGroupDatabaseFilesIncludesGShadow(t *testing.T) {
 		t.Fatalf("malformed gshadow error = %v", err)
 	}
 }
+
+// TestRemoveUserRefusesNamesOutsideTheSuite pins the guard on a helper that runs
+// `userdel -r -f` as root from roughly thirty fixtures. It used to delete
+// whatever name it was handed, so a typo or a fixture reusing a real login would
+// have taken that account and its home directory with it.
+func TestRemoveUserRefusesNamesOutsideTheSuite(t *testing.T) {
+	for _, name := range []string{"root", "nobody", "postgres", "", "not a name", "../etc"} {
+		if err := removeUser(name, true); err == nil || !strings.Contains(err.Error(), "refusing to remove") {
+			t.Errorf("removeUser(%q) = %v, want a namespace refusal", name, err)
+		}
+	}
+	// Names this suite does create must still be accepted by the guard; they fail
+	// later, on the absent account, not here.
+	for _, name := range []string{"xxvcc-a1b2c3d4e5", "ltalegacycompact1"} {
+		if err := removeUser(name, true); err != nil && strings.Contains(err.Error(), "refusing to remove") {
+			t.Errorf("removeUser(%q) was refused by the namespace guard: %v", name, err)
+		}
+	}
+}
+
+// TestRealGroupInspectorReadsBothDatabases drives inspectLocalGroupDatabaseFiles
+// itself. Every behavioural subtest in this file replaces it with a fake that
+// derives the whole artifacts value from lookupSystemGroup, so the real reader —
+// the one that parses /etc/group and /etc/gshadow and decides what
+// removeSameNameGroup may touch — was never exercised by any of them.
+func TestRealGroupInspectorReadsBothDatabases(t *testing.T) {
+	dir := t.TempDir()
+	oldGroup, oldGShadow := groupDatabasePath, gshadowDatabasePath
+	t.Cleanup(func() { groupDatabasePath, gshadowDatabasePath = oldGroup, oldGShadow })
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, tc := range []struct {
+		name        string
+		group       string
+		gshadow     string
+		wantGroup   bool
+		wantGShadow bool
+	}{
+		{name: "present in both", group: "xxvcc-g1:x:2001:\n", gshadow: "xxvcc-g1:!::\n", wantGroup: true, wantGShadow: true},
+		{name: "group only", group: "xxvcc-g1:x:2001:\n", gshadow: "other:!::\n", wantGroup: true},
+		{name: "absent from both", group: "other:x:2002:\n", gshadow: "other:!::\n"},
+		{name: "comment and NIS lines are not entries", group: "# c\n+::::\nother:x:2002:\n", gshadow: "# c\nother:!::\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groupDatabasePath = write("group", tc.group)
+			gshadowDatabasePath = write("gshadow", tc.gshadow)
+			got, err := inspectLocalGroupDatabaseFiles("xxvcc-g1")
+			if err != nil {
+				t.Fatalf("inspectLocalGroupDatabaseFiles: %v", err)
+			}
+			if got.group != tc.wantGroup || got.gshadow != tc.wantGShadow {
+				t.Fatalf("artifacts = %+v, want group=%v gshadow=%v", got, tc.wantGroup, tc.wantGShadow)
+			}
+		})
+	}
+}

@@ -190,3 +190,93 @@ func TestUninstallMarkerRejectsSymlink(t *testing.T) {
 		t.Fatal("symlink uninstall marker was accepted")
 	}
 }
+
+// The marker arms the gate that refuses every mutation. Its own doc comment says
+// an unsafe or malformed marker must be an ERROR, never "installed" — otherwise a
+// local user who can create a file at that path re-enables the tool by making the
+// marker unreadable. Only the symlink case was covered; turning either of the
+// other two branches into (false, nil) used to pass the whole suite.
+func TestUninstallMarkerFailsClosedOnUnsafeMetadataAndBadContent(t *testing.T) {
+	newMarked := func(t *testing.T) *Lock {
+		t.Helper()
+		l := New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+		if err := l.MarkUninstalled(); err != nil {
+			t.Fatal(err)
+		}
+		if uninstalled, err := l.IsUninstalled(); err != nil || !uninstalled {
+			t.Fatalf("freshly written marker = %v, %v; want true, nil", uninstalled, err)
+		}
+		return l
+	}
+
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, l *Lock)
+		want   string
+	}{
+		{
+			name: "group- or world-readable mode",
+			damage: func(t *testing.T, l *Lock) {
+				if err := os.Chmod(l.tombstonePath(), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "unsafe metadata",
+		},
+		{
+			name: "not a regular file",
+			damage: func(t *testing.T, l *Lock) {
+				if err := os.Remove(l.tombstonePath()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(l.tombstonePath(), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "unsafe metadata",
+		},
+		{
+			name: "content from another version",
+			damage: func(t *testing.T, l *Lock) {
+				if err := os.WriteFile(l.tombstonePath(), []byte("uninstalled-v2\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "invalid content",
+		},
+		{
+			name: "truncated content",
+			damage: func(t *testing.T, l *Lock) {
+				if err := os.WriteFile(l.tombstonePath(), []byte("uninstalled-v1"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "invalid content",
+		},
+		{
+			name: "empty marker",
+			damage: func(t *testing.T, l *Lock) {
+				if err := os.WriteFile(l.tombstonePath(), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "invalid content",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newMarked(t)
+			tc.damage(t, l)
+
+			uninstalled, err := l.IsUninstalled()
+			if err == nil {
+				t.Fatalf("IsUninstalled() = %v, nil; a damaged marker must fail closed, not read as installed", uninstalled)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("IsUninstalled() error = %v, want it to name %q", err, tc.want)
+			}
+			if uninstalled {
+				t.Fatal("IsUninstalled() returned true alongside an error")
+			}
+		})
+	}
+}

@@ -78,9 +78,15 @@ def replace_block(path: Path, expected: str) -> tuple[bool, str]:
 def atomic_write(path: Path, content: str) -> None:
     mode = path.stat().st_mode & 0o777
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    # Ownership of fd moves to fdopen below; until then this frame must close it.
+    owned = False
     try:
         os.fchmod(fd, mode)
+        # From here fdopen owns fd and closes it; the handler below must not close
+        # that number again, because anything opened afterwards (directory_fd, just
+        # below) can inherit it and would be closed out from under its owner.
         with os.fdopen(fd, "w", encoding="ascii", newline="") as handle:
+            owned = True
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -91,10 +97,11 @@ def atomic_write(path: Path, content: str) -> None:
         finally:
             os.close(directory_fd)
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if not owned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(temporary)
         except FileNotFoundError:

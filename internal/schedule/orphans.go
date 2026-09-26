@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"syscall"
 )
 
 // UnitUsers returns every account named by an auto-revoke unit file on disk,
@@ -63,7 +64,18 @@ func (s *Scheduler) UnitUsers() ([]string, error) {
 	return users, nil
 }
 
-var readSystemdDir = os.ReadDir
+// readSystemdDir refuses a symlinked directory, the discipline the sibling
+// artifact managers apply to every directory they scan (sshdconf and sudoers
+// both open with O_NOFOLLOW|O_DIRECTORY). os.ReadDir resolves the path, so a
+// replaced unit directory would have been enumerated as if it were ours.
+var readSystemdDir = func(name string) ([]os.DirEntry, error) {
+	f, err := os.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
 
 // ScheduledUsers returns accounts named by either systemd units or queued at
 // jobs. This is the complete uninstall inventory even when registry rows vanish.

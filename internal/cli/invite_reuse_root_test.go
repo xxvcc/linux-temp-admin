@@ -85,7 +85,7 @@ func inviteApp(t *testing.T) (*cli.App, *sudoers.Manager, *sshdconf.Manager, str
 				}
 				return "abcdef0123", nil
 			},
-			RandPassword: func(int) (string, error) { return "pw-abcdefgh", nil },
+			RandPassword: func(int) ([]byte, error) { return []byte("pw-abcdefgh"), nil },
 			StdoutIsTTY:  func() bool { return true },
 			StdinIsTTY:   func() bool { return false },
 			Geteuid:      func() int { return 0 },
@@ -1062,7 +1062,7 @@ type expiryFailRunner struct {
 
 func (r expiryFailRunner) Run(name string, args ...string) error {
 	if !*r.failed && name == "chage" && len(args) >= 2 && args[0] == "-E" &&
-		args[1] != "-1" && args[1] != "1970-01-01" {
+		args[1] != "-1" && args[1] != "1970-01-02" {
 		*r.failed = true
 		return errors.New("injected expiry failure")
 	}

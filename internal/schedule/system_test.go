@@ -380,13 +380,13 @@ func TestEnsureAtdRejectsWhenNoProbeCanConfirmIt(t *testing.T) {
 	}
 }
 
-func TestEnsureAtdPgrepFallbackRequiresRootRealUID(t *testing.T) {
+func TestEnsureAtdRejectsPgrepWithoutBootEnablement(t *testing.T) {
 	dir := t.TempDir()
 	writeCommand(t, dir, "pgrep", `[ "$1" = -x ] && [ "$2" = -U ] && [ "$3" = 0 ] && [ "$4" = atd ]`)
 	t.Setenv("PATH", dir)
 
-	if !ensureAtd() {
-		t.Fatal("ensureAtd did not accept the root-bound pgrep confirmation")
+	if ensureAtd() {
+		t.Fatal("ensureAtd accepted process presence without persistent boot enablement")
 	}
 }
 
@@ -399,8 +399,8 @@ func TestEnsureAtdDoesNotTrustServiceStartExitAlone(t *testing.T) {
 	if ensureAtd() {
 		t.Fatal("ensureAtd trusted service start without a successful status or process probe")
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("service start was not attempted: %v", err)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("service was started without a persistent boot backend: %v", err)
 	}
 }
 
@@ -424,7 +424,8 @@ func TestScheduleAtForcesCLocaleBeforeParsingJobID(t *testing.T) {
 	dir := t.TempDir()
 	writeCommand(t, dir, "atq", "exit 0")
 	writeCommand(t, dir, "atrm", "exit 0")
-	writeCommand(t, dir, "pgrep", "exit 0")
+	writeCommand(t, dir, "rc-service", "exit 0")
+	writeCommand(t, dir, "rc-update", `if [ "$1" = show ]; then printf 'atd | default\n'; fi`)
 	writeCommand(t, dir, "at", "[ \"$LC_ALL\" = C ] || { echo localized-output >&2; exit 9; }; [ \"$TZ\" = UTC ] || { echo wrong-timezone >&2; exit 8; }; [ \"$1\" = -t ] && [ \"$2\" = 203001020804 ] || { echo wrong-deadline >&2; exit 7; }; IFS= read -r first; IFS= read -r second; [ \"$first\" = 'unset TZ' ] && [ \"$second\" = true ] || { echo wrong-job-body >&2; exit 6; }; echo 'job 7 at Fri Jul 24 00:00:00 2026'")
 	t.Setenv("PATH", dir)
 	t.Setenv("LC_ALL", "C.UTF-8")
@@ -449,7 +450,8 @@ func TestScheduleAtRollsBackAmbiguouslySubmittedJob(t *testing.T) {
 			queued := filepath.Join(dir, "queued")
 			body := filepath.Join(dir, "body")
 			removed := filepath.Join(dir, "removed")
-			writeCommand(t, dir, "pgrep", "exit 0")
+			writeCommand(t, dir, "rc-service", "exit 0")
+			writeCommand(t, dir, "rc-update", `if [ "$1" = show ]; then printf 'atd | default\n'; fi`)
 			writeCommand(t, dir, "atq", "[ -f '"+queued+"' ] && printf '42 x\\n'; exit 0")
 			writeCommand(t, dir, "atrm", "/bin/rm -f '"+queued+"'; printf '%s\\n' \"$1\" > '"+removed+"'")
 			writeCommand(t, dir, "at", `if [ "$1" = "-c" ]; then
@@ -658,4 +660,114 @@ func TestRemoveAtJobsForFailsClosedOnPartialAtBackend(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "atq is unavailable") {
 		t.Fatalf("partial at backend error = %v, want inventory failure", err)
 	}
+}
+
+// TestEnsureAtdPersistsOnNonSystemdHosts pins the enablement the non-systemd
+// branches were missing. The systemd branch arms atd for later boots with
+// `enable --now`; OpenRC and sysvinit only started it, so on exactly the hosts
+// where the at fallback IS the auto-revoke mechanism, every queued revocation
+// stopped firing after the next reboot.
+func TestEnsureAtdPersistsOnNonSystemdHosts(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "enabled")
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// status never confirms, so ensureAtd runs the whole branch and returns false;
+	// what is under test is whether it armed atd for the next boot on the way.
+	write("rc-service", "exit 1\n")
+	write("rc-update", "printf '%s\\n' \"$*\" >> "+marker+"\nexit 0\n")
+	// PATH holds only these, so systemctl/service/pgrep are absent and the OpenRC
+	// branch is the one taken.
+	t.Setenv("PATH", dir)
+
+	if ensureAtd() {
+		t.Fatal("ensureAtd claimed success while rc-service status never confirmed")
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("atd was started but never armed for later boots: %v", err)
+	}
+	if want := "add atd default\nshow default\n"; string(got) != want {
+		t.Fatalf("rc-update invocation = %q, want %q", got, want)
+	}
+}
+
+// AtDaemonRunning decides whether a queued at job will ever be dispatched, so a
+// spoofable probe makes doctor report a dead backend as healthy. It must bind to
+// real root exactly as ensureAtd's fallback does, and — unlike ensureAtd — it must
+// never start or enable anything: a validity check reports on a host, it does not
+// change one.
+func TestAtDaemonRunningProbesWithoutMutatingAndBindsPgrepToRealRoot(t *testing.T) {
+	t.Run("pgrep must be bound to real UID 0", func(t *testing.T) {
+		dir := t.TempDir()
+		// Accepts ONLY the root-bound form; a bare `pgrep -x atd` exits 1 here,
+		// which is the spoofable call this test exists to forbid.
+		writeCommand(t, dir, "pgrep", `[ "$1" = -x ] && [ "$2" = -U ] && [ "$3" = 0 ] && [ "$4" = atd ]`)
+		t.Setenv("PATH", dir)
+
+		running, err := realSystem{}.AtDaemonRunning()
+		if err != nil || !running {
+			t.Fatalf("AtDaemonRunning = %v, %v; want the root-bound pgrep form accepted", running, err)
+		}
+	})
+
+	t.Run("an unprivileged process merely named atd does not count", func(t *testing.T) {
+		dir := t.TempDir()
+		// Mimics pgrep on a host where only a non-root process is named atd: the
+		// root-bound query finds nothing and exits 1.
+		writeCommand(t, dir, "pgrep", `exit 1`)
+		t.Setenv("PATH", dir)
+
+		running, err := realSystem{}.AtDaemonRunning()
+		if err != nil {
+			t.Fatalf("AtDaemonRunning error = %v, want a definite negative", err)
+		}
+		if running {
+			t.Fatal("AtDaemonRunning accepted a process that is not real-root atd")
+		}
+	})
+
+	t.Run("it never starts or enables atd", func(t *testing.T) {
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "mutated")
+		for _, name := range []string{"systemctl", "rc-service", "service", "rc-update"} {
+			// Any start/enable/add verb records itself and succeeds, so a probe that
+			// mutates would both be detected and look successful.
+			writeCommand(t, dir, name, "case \"$*\" in *start*|*enable*|*add*) : > '"+marker+"'; exit 0;; esac; exit 1")
+		}
+		writeCommand(t, dir, "pgrep", `exit 1`)
+		t.Setenv("PATH", dir)
+
+		if _, err := (realSystem{}).AtDaemonRunning(); err != nil {
+			t.Fatalf("AtDaemonRunning error = %v", err)
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatal("AtDaemonRunning started or enabled atd; a validity probe must not change the host")
+		}
+	})
+
+	t.Run("no probe available fails closed with an error", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		running, err := realSystem{}.AtDaemonRunning()
+		if err == nil {
+			t.Fatalf("AtDaemonRunning = %v, nil; want an error when nothing can answer", running)
+		}
+		if running {
+			t.Fatal("AtDaemonRunning returned true alongside an error")
+		}
+	})
+
+	t.Run("a systemctl-confirmed active unit is enough", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCommand(t, dir, "systemctl", `[ "$1" = is-active ]`)
+		t.Setenv("PATH", dir)
+
+		running, err := realSystem{}.AtDaemonRunning()
+		if err != nil || !running {
+			t.Fatalf("AtDaemonRunning = %v, %v; want the systemctl confirmation accepted", running, err)
+		}
+	})
 }

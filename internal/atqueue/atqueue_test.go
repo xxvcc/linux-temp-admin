@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidJobID(t *testing.T) {
@@ -120,5 +121,70 @@ func TestParseKernelID(t *testing.T) {
 		if !test.ok && err == nil {
 			t.Errorf("parseKernelID(%q) = (%d, nil), want error", test.value, got)
 		}
+	}
+}
+
+// ScheduledAt is produced in exactly one place, and it decides whether a queued
+// job's deadline has passed. A silent regression here restores the pre-fix
+// behaviour where a long-passed deadline reads as a healthy schedule, so the
+// parse is pinned against real atq output shapes.
+func TestParseInventoryEntriesReadsTheQueuedDeadline(t *testing.T) {
+	// atq under the pinned C locale, with TZ=UTC forced by the caller. %e
+	// space-pads a single-digit day, which strings.Fields collapses.
+	out := []byte("" +
+		"41\tFri Jul  3 00:00:00 2026 a root\n" +
+		"42\tTue Sep 15 12:34:56 2026 a root\n")
+	entries, err := ParseInventoryEntries(out, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	want := []time.Time{
+		time.Date(2026, 7, 3, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 9, 15, 12, 34, 56, 0, time.UTC),
+	}
+	for i, e := range entries {
+		if !e.ScheduledAt.Equal(want[i]) {
+			t.Fatalf("entry %d ScheduledAt = %s, want %s", i, e.ScheduledAt, want[i])
+		}
+		if e.ScheduledAt.Location() != time.UTC {
+			t.Fatalf("entry %d parsed in %s, want UTC (the caller runs atq with TZ=UTC)", i, e.ScheduledAt.Location())
+		}
+	}
+
+	// ParseInventory keeps returning ids only, for the callers that want them.
+	ids, err := ParseInventory(out, 64<<10)
+	if err != nil || len(ids) != 2 || ids[0] != "41" || ids[1] != "42" {
+		t.Fatalf("ParseInventory = %v, %v; want the two ids", ids, err)
+	}
+}
+
+// A shape this parser cannot read means "the queue did not state a deadline",
+// never "the deadline passed" — the caller keys a stranded-schedule report on
+// exactly that distinction.
+func TestParseQueuedTimeReportsUnknownRatherThanGuessing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{"no date column at all", "7 queued"},
+		{"too few fields", "7 Fri Jul 3 2026"},
+		{"non-C-locale month", "7 ven. juil. 3 00:00:00 2026 a root"},
+		{"unparseable day", "7 Fri Jul XX 00:00:00 2026 a root"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, err := ParseInventoryEntries([]byte(tc.line+"\n"), 64<<10)
+			if err != nil {
+				t.Fatalf("ParseInventoryEntries = %v; an unreadable date must not fail the inventory", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("entries = %d, want the job still inventoried", len(entries))
+			}
+			if !entries[0].ScheduledAt.IsZero() {
+				t.Fatalf("ScheduledAt = %s, want the zero time (unknown), not a guess", entries[0].ScheduledAt)
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -140,9 +141,12 @@ func runFailedFileLimitFixture(t *testing.T, body string) {
 	t.Helper()
 	dir := t.TempDir()
 	script := filepath.Join(dir, "file-limit.sh")
-	fixture := `#!/bin/bash
-set -Eeuo pipefail
+	fixture := "#!/bin/bash\nset -Eeuo pipefail\n" + shellRegion(t, readReleaseFile(t, "../../scripts/prepare-release.sh"), "file_limit_blocks() {", "\nbounded_copy() {") + `
 ulimit() {
+  if [[ "$*" == '-f 1' ]]; then
+    builtin ulimit "$@"
+    return
+  fi
   printf 'limit\n' >> "$TEST_CALL_LOG"
   return 1
 }
@@ -191,7 +195,7 @@ func TestTrustedReleaseWritersStopWhenFileLimitCannotBeSet(t *testing.T) {
 
 	prepareDownload := shellRegion(t, prepare, "download_draft_asset() {", "\ndownload_draft_asset linux-temp-admin-linux-amd64")
 	publishDownload := extractPublisherFunction(t, "download_draft_asset", "replace_bound_draft_assets")
-	archiveExport := shellRegion(t, prepare, `source_blocks=$(( (MAX_SOURCE_ARCHIVE_BYTES + 1023) / 1024 ))`, "\n[[ -s \"$source_archive\"")
+	archiveExport := shellRegion(t, prepare, `source_blocks="$(file_limit_blocks "$MAX_SOURCE_ARCHIVE_BYTES")" || exit 1`, "\n[[ -s \"$source_archive\"")
 	publicFetch := extractPublisherFunction(t, "public_fetch", "verify_public_set")
 
 	t.Run("prepare draft download", func(t *testing.T) {
@@ -203,7 +207,7 @@ TEST_EXPECTED_OUTPUT="$work/ci/asset"
 draft_assets=$'asset\t1\thttps://api.github.com/repos/mock/repo/releases/assets/1'
 gh_with_timeout() { mark_writer; }
 `+prepareDownload+`
-if download_draft_asset asset 1024; then
+if download_draft_asset asset 2048; then
   echo "prepare download ignored the failed file-size limit" >&2
   exit 90
 fi
@@ -240,7 +244,7 @@ gh_with_timeout() {
   mark_writer
 }
 `+publishDownload+`
-if download_draft_asset asset 1024 "$TEST_EXPECTED_OUTPUT"; then
+if download_draft_asset asset 2048 "$TEST_EXPECTED_OUTPUT"; then
   echo "publisher draft download ignored the failed file-size limit" >&2
   exit 90
 fi
@@ -253,12 +257,102 @@ TEST_EXPECTED_OUTPUT="$TEST_STATE/public-asset"
 timeout() { mark_writer; }
 sleep() { :; }
 `+publicFetch+`
-if public_fetch https://example.test/asset "$TEST_EXPECTED_OUTPUT" 1024; then
+if public_fetch https://example.test/asset "$TEST_EXPECTED_OUTPUT" 2048; then
   echo "public download ignored the failed file-size limit" >&2
   exit 90
 fi
 `)
 	})
+}
+
+func TestTrustedReleaseFileLimitsAtBoundaryInPOSIXAndDefaultShells(t *testing.T) {
+	prepare := readReleaseFile(t, "../../scripts/prepare-release.sh")
+	primitives := shellRegion(t, prepare, "file_limit_blocks() {", "\nsync_output_directory() {")
+	prepareDownload := shellRegion(t, prepare, "download_draft_asset() {", "\ndownload_draft_asset linux-temp-admin-linux-amd64")
+	publishDownload := extractPublisherFunction(t, "download_draft_asset", "replace_bound_draft_assets")
+	archiveExport := shellRegion(t, prepare, `source_blocks="$(file_limit_blocks "$MAX_SOURCE_ARCHIVE_BYTES")" || exit 1`, "\ntimeout -k 5 \"$LOCAL_COMMAND_TIMEOUT_SECONDS\" tar")
+	publicFetch := extractPublisherFunction(t, "public_fetch", "verify_public_set")
+	paths := map[string]string{
+		"prepare draft": prepareDownload + `
+work="$TEST_STATE"
+mkdir "$work/ci"
+OUTPUT="$work/ci/asset"
+draft_assets=$'asset\t65536\thttps://api.github.com/repos/mock/repo/releases/assets/1'
+gh_with_timeout() { head -c "$TEST_BYTES" /dev/zero; }
+run_writer() { download_draft_asset asset 65536; }
+`,
+		"publisher draft": publishDownload + `
+EXPECTED_RELEASE_ID=12345
+gh_with_timeout() {
+  if [[ "$*" == *--paginate* ]]; then
+    printf '65536\thttps://api.github.com/repos/mock/repo/releases/assets/1\n'
+  else
+    head -c "$TEST_BYTES" /dev/zero
+  fi
+}
+run_writer() { download_draft_asset asset 65536 "$OUTPUT"; }
+`,
+		"source archive": `
+MAX_SOURCE_ARCHIVE_BYTES=65536
+SOURCE_DIR=/mock/source
+tag_commit=deadbeef
+source_archive="$OUTPUT"
+git_with_timeout() { head -c "$TEST_BYTES" /dev/zero; }
+run_writer() (
+` + archiveExport + `
+)
+`,
+		"public download": publicFetch + `
+timeout() {
+  local output= previous= argument
+  for argument do
+    [[ "$previous" != -o ]] || output=$argument
+    previous=$argument
+  done
+  head -c "$TEST_BYTES" /dev/zero > "$output"
+}
+sleep() { :; }
+run_writer() { public_fetch https://example.test/asset "$OUTPUT" 65536; }
+`,
+		"bounded copy": `
+head -c "$TEST_BYTES" /dev/zero > "$TEST_STATE/source"
+run_writer() { bounded_copy "$TEST_STATE/source" "$OUTPUT" 65536; }
+`,
+	}
+	for name, body := range paths {
+		for _, posix := range []bool{false, true} {
+			for _, size := range []int{65536, 65537} {
+				t.Run(fmt.Sprintf("%s/posix=%t/bytes=%d", name, posix, size), func(t *testing.T) {
+					dir := t.TempDir()
+					script := filepath.Join(dir, "boundary.sh")
+					fixture := "#!/bin/bash\nset -Eeuo pipefail\nulimit -c 0\n" + primitives + `
+REPO=mock/repo
+OUTPUT="$TEST_STATE/output"
+local_with_timeout() { "$@"; }
+` + body + `
+if run_writer; then
+  [[ "$TEST_BYTES" -le 65536 ]]
+  [[ "$(wc -c < "$OUTPUT")" -eq "$TEST_BYTES" ]]
+else
+  [[ "$TEST_BYTES" -gt 65536 ]]
+  [[ ! -f "$OUTPUT" || "$(wc -c < "$OUTPUT")" -le 65536 ]]
+fi
+`
+					if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					cmd := exec.Command("/bin/bash", script)
+					cmd.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C", "TEST_STATE=" + dir, fmt.Sprintf("TEST_BYTES=%d", size)}
+					if posix {
+						cmd.Env = append(cmd.Env, "POSIXLY_CORRECT=1")
+					}
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("bounded writer failed: %v\n%s", err, out)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestTrustedTemporaryDirectoryGuardWithMockStat(t *testing.T) {
@@ -2332,4 +2426,97 @@ func readReleaseFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// unsetVariables returns every variable name the script clears with `unset`.
+func unsetVariables(script string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(script, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, "unset ")
+		if !ok {
+			continue
+		}
+		for _, name := range strings.Fields(rest) {
+			if name == "" || strings.ContainsAny(name, "$\"'`") {
+				continue
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// The list-of-required-strings test above cannot notice a hardening line added to
+// only one of the two online scripts — which is exactly how prepare-release.sh
+// came to keep an inherited GNUPGHOME while publish-release.sh cleared it,
+// letting a caller's gpg.conf choose the policy for the earlier and more
+// decisive of the two tag verifications.
+//
+// This compares the two scripts against each other instead of against a list, so
+// any future variable cleared in one and forgotten in the other fails here.
+func TestBothOnlineReleaseScriptsClearTheSameInheritedVariables(t *testing.T) {
+	prepare := unsetVariables(readReleaseFile(t, "../../scripts/prepare-release.sh"))
+	publish := unsetVariables(readReleaseFile(t, "../../scripts/publish-release.sh"))
+
+	// prepare-release.sh also builds, so it alone clears the Go toolchain's
+	// environment. The exemption is an explicit list rather than a GO* prefix:
+	// a prefix would silently excuse any future variable that happens to start
+	// with those two letters, which is the same blind spot this test replaced.
+	buildOnly := map[string]bool{
+		"GOROOT": true, "GOEXPERIMENT": true, "GOFIPS140": true, "GO111MODULE": true,
+		"GOCACHE": true, "GOMODCACHE": true, "GOPATH": true, "GOTMPDIR": true,
+		"GOPROXY": true, "GOSUMDB": true, "GONOSUMDB": true, "GOPRIVATE": true,
+		"GONOPROXY": true, "GOINSECURE": true, "GOVCS": true, "GOAUTH": true,
+		"GOTELEMETRY": true, "GOFIPS": true,
+	}
+	toolchainOnly := func(name string) bool { return buildOnly[name] }
+
+	var missingFromPublish, missingFromPrepare []string
+	for name := range prepare {
+		if !publish[name] && !toolchainOnly(name) {
+			missingFromPublish = append(missingFromPublish, name)
+		}
+	}
+	for name := range publish {
+		if !prepare[name] {
+			missingFromPrepare = append(missingFromPrepare, name)
+		}
+	}
+	sort.Strings(missingFromPublish)
+	sort.Strings(missingFromPrepare)
+
+	if len(missingFromPublish) > 0 {
+		t.Errorf("publish-release.sh does not clear %v, which prepare-release.sh does", missingFromPublish)
+	}
+	if len(missingFromPrepare) > 0 {
+		t.Errorf("prepare-release.sh does not clear %v, which publish-release.sh does", missingFromPrepare)
+	}
+
+	// Both scripts must also EXPORT the same pinned values, not merely unset the
+	// same names: a hardening that pins a variable in one script and forgets the
+	// other is the same one-sided drift, and `unset` lines alone cannot see it.
+	for _, pinned := range []string{
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "LC_ALL=C",
+		"GIT_TERMINAL_PROMPT=0",
+	} {
+		for name, content := range map[string]string{
+			"prepare": readReleaseFile(t, "../../scripts/prepare-release.sh"),
+			"publish": readReleaseFile(t, "../../scripts/publish-release.sh"),
+		} {
+			if !strings.Contains(content, pinned) {
+				t.Errorf("%s-release.sh does not pin %s", name, pinned)
+			}
+		}
+	}
+
+	// The one this test was written for: both gpg callers must decide their own
+	// OpenPGP trust material rather than inherit the caller's.
+	for name, vars := range map[string]map[string]bool{"prepare": prepare, "publish": publish} {
+		for _, required := range []string{"GNUPGHOME", "GPG_TTY"} {
+			if !vars[required] {
+				t.Errorf("%s-release.sh does not unset %s before verifying the release tag", name, required)
+			}
+		}
+	}
 }

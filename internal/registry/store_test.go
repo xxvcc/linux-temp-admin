@@ -336,3 +336,210 @@ func TestFinishDeletionRecoveryRecordsRequiresExactModeAndIdentity(t *testing.T)
 		t.Fatalf("idempotent missing finish = changed %v records %+v err %v", changed, missing, err)
 	}
 }
+
+// A registry migrated from the released nine-column v2 format carries no UID
+// column, so its sequence is seeded with highest 0 and only a real isolation
+// deadline. Treating "highest > 0" as the sole proof of prior use meant losing
+// the data file on exactly those hosts reported a clean bill of health.
+func TestRegistryLossIsDetectedFromAnyEvidenceOfPriorUse(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root-owned registry and sequence metadata require root")
+	}
+	newDir := func(t *testing.T) *Store {
+		t.Helper()
+		dir := t.TempDir()
+		return &Store{
+			Dir:      dir,
+			File:     filepath.Join(dir, "registry.tsv"),
+			Lock:     filepath.Join(dir, "registry.lock"),
+			Sequence: filepath.Join(dir, "identity-sequence"),
+			Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+		}
+	}
+	writeSequence := func(t *testing.T, s *Store, body string) {
+		t.Helper()
+		if err := os.WriteFile(s.sequencePath(), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		sequence string
+		wantLost bool
+		wantHigh int
+	}{
+		{
+			name:     "migrated v2 registry: no UID column, but a real isolation deadline",
+			sequence: "# linux-temp-admin identity sequence v1\nhighest\t0\nsafe-after\t2026-08-01T12:01:05Z\n",
+			wantLost: true,
+		},
+		{
+			name:     "ordinary v5 host with allocations",
+			sequence: "# linux-temp-admin identity sequence v1\nhighest\t1500\nsafe-after\tnone\n",
+			wantLost: true,
+			wantHigh: 1500,
+		},
+		{
+			name:     "genuinely fresh install",
+			sequence: "# linux-temp-admin identity sequence v1\nhighest\t0\nsafe-after\tnone\n",
+			wantLost: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDir(t)
+			writeSequence(t, s, tc.sequence)
+			highest, lost, err := s.InspectRegistryLoss()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lost != tc.wantLost || highest != tc.wantHigh {
+				t.Fatalf("InspectRegistryLoss() = %d, %v; want %d, %v", highest, lost, tc.wantHigh, tc.wantLost)
+			}
+		})
+	}
+
+	t.Run("an existing data file is never reported as lost", func(t *testing.T) {
+		s := newDir(t)
+		writeSequence(t, s, "# linux-temp-admin identity sequence v1\nhighest\t1500\nsafe-after\tnone\n")
+		if err := os.WriteFile(s.File, []byte(Header+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, lost, err := s.InspectRegistryLoss(); err != nil || lost {
+			t.Fatalf("InspectRegistryLoss() with a present registry = %v, %v; want not lost", lost, err)
+		}
+	})
+
+	t.Run("no sequence at all is a fresh or uninstalled host", func(t *testing.T) {
+		s := newDir(t)
+		if _, lost, err := s.InspectRegistryLoss(); err != nil || lost {
+			t.Fatalf("InspectRegistryLoss() with no sequence = %v, %v; want not lost", lost, err)
+		}
+	})
+}
+
+// The read cap is the only thing between an oversized registry file and a silent
+// partial read, and Record's refusal is what keeps deletion-recovery witnesses
+// exclusive to BeginDeletion. Neither had a test.
+func TestReadCapAndRecoveryRowRefusalAreEnforced(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root-owned registry metadata requires root")
+	}
+	newStore := func(t *testing.T) *Store {
+		t.Helper()
+		dir := t.TempDir()
+		return &Store{
+			Dir:      dir,
+			File:     filepath.Join(dir, "registry.tsv"),
+			Lock:     filepath.Join(dir, "registry.lock"),
+			Sequence: filepath.Join(dir, "identity-sequence"),
+			Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+		}
+	}
+
+	t.Run("a registry above the read cap fails closed instead of truncating", func(t *testing.T) {
+		s := newStore(t)
+		f, err := os.OpenFile(s.File, os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(Header + "\n"); err != nil {
+			t.Fatal(err)
+		}
+		// One byte past the cap is enough; the reader must not report the rows it
+		// did manage to read as the whole registry.
+		if err := f.Truncate(maxRegistryBytes + 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = s.readAllWithHeader()
+		if err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("readAllWithHeader on an oversized registry = %v, want a size refusal", err)
+		}
+	})
+
+	t.Run("Record refuses to create a deletion-recovery row", func(t *testing.T) {
+		s := newStore(t)
+		err := s.Record(Record{
+			User: "xxvcc-a1", Port: 22, UID: 1500,
+			DeletionStarted: true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "BeginDeletion") {
+			t.Fatalf("Record(DeletionStarted) = %v, want it routed to BeginDeletion", err)
+		}
+		// It must be refused before any lock or file is touched: a recovery witness
+		// that Record could mint is a deletion authorization nobody proved.
+		if _, statErr := os.Lstat(s.File); !os.IsNotExist(statErr) {
+			t.Fatalf("Record created registry state before refusing: %v", statErr)
+		}
+	})
+}
+
+// The sequence is monotonic in both dimensions. Inverting either comparison left
+// the whole registry suite green while handing out a retired UID, or erasing an
+// active isolation deadline.
+func TestIdentitySequenceNeverMovesBackwards(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("writing a root-owned identity sequence requires root")
+	}
+	dir := t.TempDir()
+	s := &Store{
+		Dir:      dir,
+		File:     filepath.Join(dir, "registry.tsv"),
+		Lock:     filepath.Join(dir, "registry.lock"),
+		Sequence: filepath.Join(dir, "identity-sequence"),
+		Now:      func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
+	}
+	safeAfter := time.Date(2026, 8, 1, 12, 1, 5, 0, time.UTC)
+	if err := s.ensureIdentitySequence(5000, true, safeAfter); err != nil {
+		t.Fatal(err)
+	}
+	read := func(t *testing.T) identitySequence {
+		t.Helper()
+		seq, err := readIdentitySequence(s.sequencePath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seq
+	}
+
+	t.Run("a lower seed does not lower the high-water mark", func(t *testing.T) {
+		if err := s.ensureIdentitySequence(1000, false, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t); got.highest != 5000 {
+			t.Fatalf("highest = %d after seeding 1000, want it held at 5000", got.highest)
+		}
+	})
+
+	t.Run("a zero safe-after does not erase an active isolation deadline", func(t *testing.T) {
+		if err := s.ensureIdentitySequence(0, false, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t); !got.safeAfter.Equal(safeAfter) {
+			t.Fatalf("safe-after = %v, want the active deadline %v preserved", got.safeAfter, safeAfter)
+		}
+	})
+
+	t.Run("an earlier safe-after does not shorten the isolation window", func(t *testing.T) {
+		if err := s.ensureIdentitySequence(0, false, safeAfter.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t); !got.safeAfter.Equal(safeAfter) {
+			t.Fatalf("safe-after = %v, want the later deadline %v kept", got.safeAfter, safeAfter)
+		}
+	})
+
+	t.Run("higher values still advance both", func(t *testing.T) {
+		later := safeAfter.Add(time.Hour)
+		if err := s.ensureIdentitySequence(6000, false, later); err != nil {
+			t.Fatal(err)
+		}
+		got := read(t)
+		if got.highest != 6000 || !got.safeAfter.Equal(later) {
+			t.Fatalf("sequence = highest %d safe-after %v, want 6000 and %v", got.highest, got.safeAfter, later)
+		}
+	})
+}

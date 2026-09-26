@@ -1,6 +1,11 @@
 package expiry
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,6 +116,123 @@ func TestDateIsFirstUTCMidnightAfterDeadline(t *testing.T) {
 	} {
 		if got := Date(tc.deadline); got != tc.want {
 			t.Errorf("Date(%s) = %q, want %q", tc.deadline, got, tc.want)
+		}
+	}
+}
+
+// TestLockInstantMatchesWhatChageActuallyStores anchors this package's model to
+// the tool it models. LockInstant restates Date's own assumption — that chage
+// reads the date as UTC — so every test built on it agrees with Date by
+// construction and none of them can notice if chage disagrees. This one asks
+// chage, against a throwaway root, and compares the stored sp_expire with the
+// day count LockInstant predicts.
+//
+// Measured while writing it: shadow-utils on this host stores the same value
+// under TZ=UTC, TZ=Pacific/Kiritimati (UTC+14) and TZ=Pacific/Honolulu (UTC-10),
+// so the UTC model holds here. The point of the test is that a shadow which
+// parsed the date locally would now be caught instead of agreeing with a model
+// that assumed it away.
+func TestLockInstantMatchesWhatChageActuallyStores(t *testing.T) {
+	if _, err := exec.LookPath("chage"); err != nil {
+		t.Skip("chage is not installed")
+	}
+	const date = "2026-09-08"
+	want, err := LockInstant(date)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDays := want.Unix() / 86400
+
+	for _, tz := range []string{"UTC", "Pacific/Kiritimati", "Pacific/Honolulu"} {
+		t.Run(tz, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			files := map[string]string{
+				"passwd":  "tu:x:4242:4242::/home/tu:/bin/sh\n",
+				"shadow":  "tu:!:19000:0:99999:7:::\n",
+				"group":   "tu:x:4242:\n",
+				"gshadow": "tu:!::\n",
+			}
+			for name, body := range files {
+				if err := os.WriteFile(filepath.Join(root, "etc", name), []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command("chage", "--root", root, "-E", date, "tu")
+			cmd.Env = append(os.Environ(), "TZ="+tz)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Skipf("chage --root is unusable here: %v: %s", err, out)
+			}
+			shadow, err := os.ReadFile(filepath.Join(root, "etc", "shadow"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			fields := strings.Split(strings.TrimSpace(string(shadow)), ":")
+			if len(fields) < 8 {
+				t.Fatalf("unexpected shadow shape %q", shadow)
+			}
+			got, err := strconv.ParseInt(fields[7], 10, 64)
+			if err != nil {
+				t.Fatalf("sp_expire %q is not a day count: %v", fields[7], err)
+			}
+			if got != wantDays {
+				t.Fatalf("chage stored sp_expire=%d for %s under TZ=%s; LockInstant predicts %d. "+
+					"This package's UTC model does not match the shadow on this host.", got, date, tz, wantDays)
+			}
+		})
+	}
+}
+
+// The Expires field is the one value a third party acts on, and a zone
+// abbreviation is not unique: a server on Asia/Shanghai prints "CST", which a
+// reader in Chicago reads as US Central — a 14-hour error in the account's
+// lifetime, in the unsafe direction.
+func TestDisplayIsUnambiguousAboutTheInstantTheTimerFiresOn(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	deadline := time.Date(2026, 7, 8, 12, 0, 0, 0, shanghai)
+
+	got := Display(deadline)
+	if got != "2026-07-08 04:00:00 UTC" {
+		t.Fatalf("Display() = %q, want the UTC instant the scheduler fires on", got)
+	}
+	for _, ambiguous := range []string{"CST", "MST", "EST", "IST"} {
+		if strings.Contains(got, ambiguous) {
+			t.Fatalf("Display() = %q, want no zone abbreviation", got)
+		}
+	}
+
+	// The operator still gets the server's own reading, with a numeric offset.
+	if local := DisplayServerLocal(deadline); local != "2026-07-08 12:00:00 +0800" {
+		t.Fatalf("DisplayServerLocal() = %q, want the local time with a numeric offset", local)
+	}
+
+	// A UTC server would otherwise print the same instant twice.
+	if local := DisplayServerLocal(deadline.UTC()); local != "" {
+		t.Fatalf("DisplayServerLocal() on a UTC server = %q, want nothing to append", local)
+	}
+
+	// Display must agree with what the scheduler and the chage backstop use.
+	if !strings.HasPrefix(Date(deadline), "2026-07-09") {
+		t.Fatalf("Date() = %q, want the UTC-anchored backstop day after the deadline", Date(deadline))
+	}
+}
+
+func TestParseDisplayAbsoluteDeadline(t *testing.T) {
+	want := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{"2026-09-26 12:00:00 UTC", "2026-09-26 20:00:00 +0800", "2026-09-26T12:00:00Z"} {
+		got, err := ParseDisplay(value)
+		if err != nil || !got.Equal(want) {
+			t.Errorf("ParseDisplay(%q) = %v, %v", value, got, err)
+		}
+	}
+	for _, value := range []string{"2026-09-26 12:00:00 CST", "2026-09-26 12:00:00", "none", "", "2026-02-30 12:00:00 UTC"} {
+		if _, err := ParseDisplay(value); err == nil {
+			t.Errorf("accepted unverifiable deadline %q", value)
 		}
 	}
 }

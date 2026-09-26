@@ -410,3 +410,103 @@ func TestMissingDepsReportsGroupdelAsBaseDependency(t *testing.T) {
 		t.Fatalf("MissingDeps(false, false) = %v, want [groupdel]", missing)
 	}
 }
+
+// TestSSHDListenPortsReadsEveryListener pins the rule that makes listenaddress
+// authoritative over the reported port. OpenSSH's ListenAddress with an explicit
+// port creates a listener without adding to options->ports, so `sshd -T` prints
+// "port 22" for a host listening only on 2222 — verified against OpenSSH 9.2:
+//
+//	ListenAddress 0.0.0.0:2222  ->  port 22 / listenaddress 0.0.0.0:2222
+//	Port 2222                   ->  port 2222 / listenaddress 0.0.0.0:2222
+//	(defaults)                  ->  port 22 / listenaddress 0.0.0.0:22
+//
+// This covers the decision function. Its use inside sshPortFromSshdT is a few
+// lines that cannot be exercised here because SSHDEffective shells out to sshd.
+func TestSSHDListenPortsReadsEveryListener(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		config    string
+		wantOK    bool
+		wantPorts []int
+	}{
+		{
+			name:      "listener disagrees with the reported port",
+			config:    "port 22\nlistenaddress 0.0.0.0:2222\n",
+			wantOK:    true,
+			wantPorts: []int{2222},
+		},
+		{
+			name:      "defaults agree",
+			config:    "port 22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\n",
+			wantOK:    true,
+			wantPorts: []int{22},
+		},
+		{
+			name:      "several distinct listeners stay ambiguous",
+			config:    "port 22\nlistenaddress 0.0.0.0:2222\nlistenaddress 127.0.0.1:2200\n",
+			wantOK:    true,
+			wantPorts: []int{2200, 2222},
+		},
+		{name: "no listenaddress at all", config: "port 2222\n", wantOK: false},
+		{
+			name:   "an unreadable listener must not narrow the set",
+			config: "port 22\nlistenaddress 0.0.0.0:2222\nlistenaddress not-an-address\n",
+			wantOK: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ports, ok := sshdListenPorts(ParseSSHD(tc.config))
+			if ok != tc.wantOK {
+				t.Fatalf("sshdListenPorts ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if len(ports) != len(tc.wantPorts) {
+				t.Fatalf("ports = %v, want %v", ports, tc.wantPorts)
+			}
+			for _, want := range tc.wantPorts {
+				if _, found := ports[want]; !found {
+					t.Fatalf("ports = %v, want it to contain %d", ports, want)
+				}
+			}
+		})
+	}
+}
+
+// OpenSSH treats a leading '=' as the keyword/value separator, so "=Port 2244" is
+// a Port directive and "=Include ..." is an Include. The Match scanner already
+// fails closed on this shape; the static port fallback used to drop the line as
+// if it were blank, leaving the parse silently incomplete.
+func TestSSHPortFromConfigFailsClosedOnLeadingEqualsDirectives(t *testing.T) {
+	for _, tc := range []struct{ name, config string }{
+		{"port", "=Port 2244\n"},
+		{"include", "Port 22\n=Include /etc/ssh/sshd_config.d/*.conf\n"},
+		{"after a normal directive", "Port 22\n=PermitRootLogin no\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sshd_config")
+			if err := os.WriteFile(path, []byte(tc.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			port, ok, err := sshPortFromConfig(path)
+			if err == nil {
+				t.Fatalf("sshPortFromConfig = %d, %v, nil; want a refusal rather than a silently incomplete parse", port, ok)
+			}
+			if !strings.Contains(err.Error(), "cannot parse") {
+				t.Fatalf("error = %v, want the unparseable-directive refusal", err)
+			}
+		})
+	}
+
+	t.Run("an ordinary config still parses", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd_config")
+		if err := os.WriteFile(path, []byte("# comment\n\nPort 2244\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		port, ok, err := sshPortFromConfig(path)
+		if err != nil || !ok || port != 2244 {
+			t.Fatalf("sshPortFromConfig = %d, %v, %v; want 2244, true, nil", port, ok, err)
+		}
+	})
+}

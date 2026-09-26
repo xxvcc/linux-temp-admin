@@ -133,8 +133,8 @@ MCowBQYDK2VwAyEAmCRx+wyfgvdhQ8idBF+KkxGA+Myifa1ShrsgAGFOrxw=
 # LTA_RELEASE_KEYS_END
 
 case "$(uname -m)" in
-  x86_64) arch=amd64 ;;
-  aarch64 | arm64) arch=arm64 ;;
+  x86_64) arch=amd64; elf_machine=62 ;;
+  aarch64 | arm64) arch=arm64; elf_machine=183 ;;
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 asset="linux-temp-admin-linux-${arch}"
@@ -667,6 +667,30 @@ parse_mirror_manifest() {
   ' "$1"
 }
 
+# elf_machine_matches reads EI_CLASS, EI_DATA and e_machine straight out of the
+# downloaded bytes and compares them with the architecture this host reported.
+#
+# The detached signature covers raw bytes only: it carries no asset name and no
+# architecture, and the release-version witness is byte-identical in the amd64 and
+# arm64 builds of one release. SHA256SUMS, the only artifact binding a name to a
+# digest, is unsigned. So a mirror that serves the other architecture's genuinely
+# signed binary under this architecture's asset name passes every check above.
+# The bytes themselves still say which machine they are for.
+elf_machine_matches() {
+  elf_want=$2
+  od -An -N 20 -v -t u1 "$1" | awk -v want="$elf_want" '
+    { for (i = 1; i <= NF; i++) b[++n] = $i }
+    END {
+      if (n < 20) exit 1
+      # \x7f E L F, EI_CLASS 2 (64-bit), EI_DATA 1 (little endian)
+      if (b[1] != 127 || b[2] != 69 || b[3] != 76 || b[4] != 70) exit 1
+      if (b[5] != 2 || b[6] != 1) exit 1
+      # e_machine is a little-endian uint16 at offset 18
+      if (b[19] + b[20] * 256 != want) exit 1
+    }
+  '
+}
+
 canonical_text_file() {
   od -An -v -t u1 "$1" | awk '
     {
@@ -895,6 +919,9 @@ stage=$(mktemp "${dest_dir}/.linux-temp-admin.XXXXXX")
 if [ ! -f "$stage" ] || [ -L "$stage" ]; then
   fail "could not create a safe staging file"
 fi
+if ! elf_machine_matches "$tmp/bin" "$elf_machine"; then
+  fail "the downloaded binary is not a 64-bit little-endian Linux ELF for $arch; refusing to install another architecture's release"
+fi
 cp -- "$tmp/bin" "$stage"
 chown 0:0 -- "$stage"
 chmod 0755 -- "$stage"
@@ -904,7 +931,10 @@ chmod 0755 -- "$stage"
 # candidate prints forever; timeout kills a hanging candidate and its children.
 if ! (
   ulimit -f 1 || exit 1
-  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err"
+  # stdin is still the pipe carrying the rest of this script when the documented
+  # `curl ... | sh` path is used, and the candidate is an untrusted binary at this
+  # point. Hand it /dev/null so it cannot consume or observe the installer text.
+  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err" < /dev/null
 ); then
   fail "downloaded binary failed its pre-install version probe"
 fi
@@ -930,7 +960,7 @@ if [ "$DEST" = "$MANAGED_DEST" ]; then
   # Delegating the managed-path commit to it serializes reinstall with every
   # other mutation and reactivates a deliberately uninstalled host. An unsafe
   # marker is rejected before the candidate changes the stable command.
-  if ! timeout -k 1 30 "$stage" --lang en install --force >/dev/null 2>&1; then
+  if ! timeout -k 1 30 "$stage" --lang en install --force >/dev/null 2>&1 < /dev/null; then
     fail "signed candidate could not complete the managed install/reactivation"
   fi
   rm -f -- "$stage" || fail "could not remove the verified staging file"

@@ -32,11 +32,15 @@ type Store struct {
 	Sequence string
 	Now      func() time.Time
 
-	// lostRegistryHighest is nonzero when Init found no registry data file while
-	// the identity sequence already recorded allocations. It is process-local
-	// state for doctor, not persisted: the condition is only observable at the
-	// moment Init recreates the file.
-	lostRegistryHighest int
+	// lostRegistryHighest is the sequence high-water mark Init saw when it found no
+	// registry data file beside a sequence that records prior use. It is
+	// process-local state for doctor, not persisted: the condition is only
+	// observable at the moment Init recreates the file. lostRegistryObserved
+	// carries the finding on its own, because a registry migrated from the
+	// nine-column v2 format seeds the sequence with highest 0 and is still proof
+	// of prior use through its isolation deadline.
+	lostRegistryHighest  int
+	lostRegistryObserved bool
 }
 
 // Default returns a Store using the configured registry paths.
@@ -115,8 +119,9 @@ func (s *Store) Init() error {
 		// this tool owns it. Init cannot fail closed here without taking doctor and
 		// uninstall down with it, which would turn a recoverable state into an
 		// unrecoverable one, so it records the fact for doctor to report instead.
-		if seq, seqErr := s.requireIdentitySequence(); seqErr == nil && seq.highest > 0 {
+		if seq, seqErr := s.requireIdentitySequence(); seqErr == nil && sequenceRecordsPriorUse(seq) {
 			s.lostRegistryHighest = seq.highest
+			s.lostRegistryObserved = true
 		}
 		if err := s.ensureIdentitySequence(0, true, time.Time{}); err != nil {
 			return err
@@ -544,6 +549,7 @@ func (s *Store) BeginQuarantine(user string, uid int, generation string, deadlin
 			if !current.IdentityBound || (current.UID != 0 && current.UID != uid) || current.Generation != generation {
 				return fmt.Errorf("registry identity changed before quarantine")
 			}
+			promotesUID := current.UID == 0 && uid > 0
 			current.UID = uid
 			current.DeletionStarted = true
 			current.QuarantineUntil = deadlineText
@@ -555,6 +561,16 @@ func (s *Store) BeginQuarantine(user string, uid int, generation string, deadlin
 				return fmt.Errorf("invalid quarantine transition: %w", err)
 			}
 			out[i] = current
+			if promotesUID && !isLegacyHeader(snapshot.header) {
+				// Same order as BeginDeletion's UID-only branch: burn the number
+				// before publishing the witness that records it. Without this the
+				// commit's own coverage check rejects the transition this call just
+				// made, and every retry fails identically — the account becomes
+				// permanently undeletable by the tool that created it.
+				if err := s.ensureIdentitySequence(uid, false, time.Time{}); err != nil {
+					return err
+				}
+			}
 			return s.commitMutation(snapshot, out)
 		}
 		return fmt.Errorf("registry identity disappeared before quarantine")
@@ -830,6 +846,13 @@ func (s *Store) completelyAbsent() (bool, error) {
 	return true, nil
 }
 
+// LostRegistryHighest reports ONLY the high-water mark Init observed, and is not
+// sufficient to detect loss on its own: a registry migrated from the nine-column
+// v2 format records highest 0, so this returns 0 for a host that did lose its
+// rows. Use InspectRegistryLoss, which is also the only form that answers in a
+// process that never called Init. This accessor remains for the tests that assert
+// what Init observed.
+//
 // LostRegistryHighest reports the identity-sequence high-water mark that was
 // present when Init had to recreate a missing registry data file, or zero when
 // the registry was intact or genuinely fresh. A nonzero value means rows were
@@ -840,4 +863,49 @@ func (s *Store) LostRegistryHighest() int {
 		return 0
 	}
 	return s.lostRegistryHighest
+}
+
+// InspectRegistryLoss reports the same condition as LostRegistryHighest without
+// depending on this process having called Init. A standalone `doctor` never calls
+// Init, so the process-local flag is always clear there and the operator was told
+// nothing about a registry whose rows are gone. This probe reads only: it never
+// creates the directory, the lock, or the data file.
+//
+// It answers only while the data file is still absent. Once Init has recreated
+// it, an empty v5 registry beside a used sequence is indistinguishable from a
+// host whose accounts were all legitimately revoked, so the in-process flag
+// remains the authority for that window.
+func (s *Store) InspectRegistryLoss() (highest int, lost bool, err error) {
+	if s == nil {
+		return 0, false, fmt.Errorf("nil registry store")
+	}
+	if s.lostRegistryObserved {
+		return s.lostRegistryHighest, true, nil
+	}
+	if err := s.validateLayout(); err != nil {
+		return 0, false, err
+	}
+	if _, statErr := os.Lstat(s.File); statErr == nil {
+		return 0, false, nil
+	} else if !os.IsNotExist(statErr) {
+		return 0, false, statErr
+	}
+	seq, seqErr := s.requireIdentitySequence()
+	if seqErr != nil {
+		// No sequence beside a missing registry is a fresh or uninstalled host, not
+		// a loss. Every other sequence fault is CheckIntegrity's to report.
+		return 0, false, nil
+	}
+	if !sequenceRecordsPriorUse(seq) {
+		return 0, false, nil
+	}
+	return seq.highest, true, nil
+}
+
+// sequenceRecordsPriorUse reports whether a sequence proves this tool already
+// allocated identities on this host. A genuinely fresh sequence is written with
+// highest 0 and "safe-after none"; a legacy migration stamps a real deadline even
+// when the old rows carried no UID column to seed the high-water mark from.
+func sequenceRecordsPriorUse(seq identitySequence) bool {
+	return seq.highest > 0 || !seq.safeAfter.IsZero()
 }

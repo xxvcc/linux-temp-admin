@@ -368,3 +368,67 @@ func TestV4SchemaStopsOlderWriters(t *testing.T) {
 		t.Fatal("v4 parser accepted a v5 row and could silently discard identity quarantine state")
 	}
 }
+
+// These four guards are each the only thing standing between a malformed row and
+// a registry that reads as authoritative. None of them had a test: inverting any
+// one left the whole registry suite green.
+func TestRecordValidationPinsIdentityAndQuarantineInvariants(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	base := func() Record {
+		return Record{User: "xxvcc-a1", Port: 22, UID: 1500, Generation: generation, IdentityBound: true}
+	}
+	reject := func(t *testing.T, r Record, want string) {
+		t.Helper()
+		if _, _, err := ParseLine(r.TSV()); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("ParseLine(%q) error = %v, want %q", r.TSV(), err, want)
+		}
+	}
+
+	t.Run("a completed identity-bound row must carry a real non-root UID", func(t *testing.T) {
+		r := base()
+		r.UID = 0
+		reject(t, r, "completed identity-bound record has no valid uid")
+		// A negative UID is refused earlier, by the field parser itself.
+		r.UID = -1
+		reject(t, r, "invalid uid")
+		// A pending row is the one shape allowed to record UID 0: the account does
+		// not exist yet, so there is no UID to bind to.
+		pending := base()
+		pending.UID, pending.Pending = 0, true
+		if _, ok, err := ParseLine(pending.TSV()); err != nil || !ok {
+			t.Fatalf("pending row with UID 0 = ok:%v err:%v, want accepted", ok, err)
+		}
+	})
+
+	t.Run("the quarantine deadline must be UTC", func(t *testing.T) {
+		r := base()
+		r.DeletionStarted = true
+		r.QuarantineUnit = "linux-temp-admin-v2-quarantine-xxvcc-a1"
+		r.QuarantineUntil = "2026-08-01T12:02:00Z"
+		if _, ok, err := ParseLine(r.TSV()); err != nil || !ok {
+			t.Fatalf("UTC quarantine deadline = ok:%v err:%v, want accepted", ok, err)
+		}
+		// The same instant written with an offset must not parse: the finalizer and
+		// every comparison against it assume a UTC wall clock.
+		for _, offset := range []string{"2026-08-01T20:02:00+08:00", "2026-08-01T04:02:00-08:00"} {
+			r.QuarantineUntil = offset
+			reject(t, r, "invalid quarantine deadline")
+		}
+	})
+
+	t.Run("quarantine requires an identity-bound deletion row with a finalizer", func(t *testing.T) {
+		r := base()
+		r.QuarantineUntil = "2026-08-01T12:02:00Z"
+		r.QuarantineUnit = "linux-temp-admin-v2-quarantine-xxvcc-a1"
+		reject(t, r, "quarantine requires an identity-bound deletion row")
+
+		r.DeletionStarted, r.QuarantineUnit = true, ""
+		reject(t, r, "quarantine has no scheduled finalizer")
+	})
+
+	t.Run("a uid-only deletion row must not carry a generation", func(t *testing.T) {
+		r := base()
+		r.IdentityBound, r.DeletionStarted = false, true
+		reject(t, r, "uid-only deletion-started record carries a generation")
+	})
+}

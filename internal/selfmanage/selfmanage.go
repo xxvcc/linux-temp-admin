@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"github.com/xxvcc/linux-temp-admin/internal/version"
+	"golang.org/x/sys/unix"
 )
 
 // Manager performs install/uninstall/upgrade. Fields are injectable for tests.
@@ -48,6 +51,10 @@ type Manager struct {
 	WriteRootFile func(string, []byte, os.FileMode) error
 	// Lstat is a target-inspection fault-injection hook. Production uses os.Lstat.
 	Lstat func(string) (os.FileInfo, error)
+	// RequireHostMachine gates a candidate on being an ELF built for this host's
+	// architecture. Production leaves it nil and uses requireHostMachine; it is a
+	// field only so tests can present non-ELF fixture bytes.
+	RequireHostMachine func([]byte) error
 
 	// allowPrivateDial gates whether the dialer may connect to a private/reserved
 	// IP. It is true only for the initial, operator-supplied URL of the current
@@ -348,6 +355,18 @@ func (m *Manager) FetchReleaseManifest(manifestURL, expectedRoot string) (Releas
 	if !canonicalPublishedAt(manifest.PublishedAt) {
 		return ReleaseManifest{}, fmt.Errorf("published_at is not canonical UTC RFC3339")
 	}
+	// published_at was validated for shape and then used only to rebuild the
+	// canonical bytes, so it constrained nothing about WHICH release the mirror
+	// names. A future timestamp is the one reading that is wrong on its face
+	// rather than merely old: no release can be published after now, so it means a
+	// skewed or fabricated index. Staleness itself stays a judgement this code
+	// cannot make without a trusted clock reference; the version lower bound in
+	// the caller is what covers a rolled-back index.
+	if published, parseErr := time.Parse(time.RFC3339, manifest.PublishedAt); parseErr == nil {
+		if published.After(time.Now().UTC().Add(publishedAtSkewAllowance)) {
+			return ReleaseManifest{}, fmt.Errorf("published_at %s is in the future", manifest.PublishedAt)
+		}
+	}
 	canonical, err := json.Marshal(struct {
 		Version     string `json:"version"`
 		Tag         string `json:"tag"`
@@ -363,6 +382,10 @@ func (m *Manager) FetchReleaseManifest(manifestURL, expectedRoot string) (Releas
 	}
 	return manifest, nil
 }
+
+// publishedAtSkewAllowance tolerates ordinary clock disagreement between the
+// mirror and this host without accepting a timestamp that is meaningfully ahead.
+const publishedAtSkewAllowance = 24 * time.Hour
 
 func canonicalPublishedAt(value string) bool {
 	if len(value) < 20 || len(value) > 30 || value[4] != '-' || value[7] != '-' ||
@@ -584,6 +607,16 @@ func (m *Manager) prepareVerifiedCandidate(bin, sig []byte, expectedVersion stri
 	}
 	if !verified {
 		return nil, fmt.Errorf("signature verification failed; refusing to install")
+	}
+	// The signature covers raw bytes only: it carries no asset name and no
+	// architecture, and the release-version witness is byte-identical across the
+	// amd64 and arm64 builds of the same release. SHA256SUMS, the only artifact
+	// that binds a name to a digest, is unsigned. So a party controlling what the
+	// mirror serves can hand this host the OTHER architecture's genuinely signed
+	// binary under this architecture's asset name and every check above passes.
+	// The bytes themselves still say which machine they are for; require that.
+	if err := m.machineCheck()(bin); err != nil {
+		return nil, err
 	}
 	signedVersion, err := releaseVersionWitness(bin)
 	if err != nil {
@@ -945,12 +978,31 @@ func (m *Manager) probeVersion(bin []byte) (string, error) {
 	if err := fsutil.RootSafeDir(dir); err != nil {
 		return "", fmt.Errorf("install dir unsafe: %w", err)
 	}
+	// RootSafeDir and CreateTemp resolve dir separately, and this is the one
+	// privileged write+exec in the tree that works by name rather than through a
+	// pinned directory fd. Restructuring it to openat/fexecve is a larger change
+	// than this warrants, but the gap it leaves — dir being replaced between the
+	// safety verdict and the write — is closed by binding the two resolutions to
+	// the same inode.
+	var before unix.Stat_t
+	if err := unix.Lstat(dir, &before); err != nil {
+		return "", fmt.Errorf("pin install dir: %w", err)
+	}
 	f, err := os.CreateTemp(dir, ".lta-upgrade-*")
 	if err != nil {
 		return "", err
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
+	var after unix.Stat_t
+	if err := unix.Lstat(dir, &after); err != nil {
+		_ = f.Close()
+		return "", fmt.Errorf("recheck install dir: %w", err)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino {
+		_ = f.Close()
+		return "", fmt.Errorf("install dir %s was replaced while staging the version probe", dir)
+	}
 	if _, err := io.Copy(f, bytes.NewReader(bin)); err != nil {
 		_ = f.Close()
 		return "", err
@@ -1110,4 +1162,54 @@ func checkDialAddr(address string, allowPrivate bool) error {
 
 func isPublicIP(ip net.IP) bool {
 	return validate.PublicIP(ip)
+}
+
+// machineCheck returns the architecture gate, defaulting to requireHostMachine.
+// RequireHostMachine is a field so a test can present a non-ELF fixture; nothing
+// in production sets it, and leaving it nil keeps the strict check.
+func (m *Manager) machineCheck() func([]byte) error {
+	if m != nil && m.RequireHostMachine != nil {
+		return m.RequireHostMachine
+	}
+	return requireHostMachine
+}
+
+// hostELFMachine is the ELF machine this build must run on. An architecture that
+// is not listed cannot be checked, and the official upgrade path already refuses
+// to select an asset for one.
+func hostELFMachine() (elf.Machine, bool) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return elf.EM_X86_64, true
+	case "arm64":
+		return elf.EM_AARCH64, true
+	}
+	return 0, false
+}
+
+// requireHostMachine refuses a candidate that is not a 64-bit little-endian Linux
+// ELF executable for this host's architecture. It is deliberately a check on the
+// downloaded bytes rather than on the name they arrived under: the name is the
+// part an attacker controls.
+func requireHostMachine(bin []byte) error {
+	want, known := hostELFMachine()
+	if !known {
+		return nil
+	}
+	f, err := elf.NewFile(bytes.NewReader(bin))
+	if err != nil {
+		return fmt.Errorf("candidate is not a readable ELF executable: %w", err)
+	}
+	defer f.Close()
+	if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB {
+		return fmt.Errorf("candidate ELF class/encoding %s/%s is not the 64-bit little-endian build this host runs", f.Class, f.Data)
+	}
+	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
+		return fmt.Errorf("candidate ELF type %s is not an executable", f.Type)
+	}
+	if f.Machine != want {
+		return fmt.Errorf("candidate is built for %s but this host runs %s (%s); refusing to install another architecture's release",
+			f.Machine, want, runtime.GOARCH)
+	}
+	return nil
 }

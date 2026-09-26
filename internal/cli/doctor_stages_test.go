@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -69,4 +70,57 @@ func TestDoctorOrphanStageReportsSafeConfiguredSudoersDirectory(t *testing.T) {
 	if got := out.String(); !strings.Contains(got, sudoersDir+" looks safe") {
 		t.Fatalf("safe sudoers diagnostic did not report configured directory %q: %q", sudoersDir, got)
 	}
+}
+
+// doctor runs in its own process and never calls Registry.Init, so a lost
+// registry has to be observed from the host rather than from a flag only invite
+// and revoke can set. What matters is the sentence the operator reads.
+func TestDoctorReportsALostRegistryDataFileItNeverInitialized(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("root-owned identity-sequence metadata requires root")
+	}
+	newHost := func(t *testing.T, sequence string) (*App, *bytes.Buffer) {
+		t.Helper()
+		a, _, errb := newTestApp(t, "")
+		if sequence != "" {
+			if err := os.WriteFile(filepath.Join(a.Registry.Dir, "identity-sequence"), []byte(sequence), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return a, errb
+	}
+
+	t.Run("sequence records prior allocations while the data file is gone", func(t *testing.T) {
+		a, errb := newHost(t, "# linux-temp-admin identity sequence v1\nhighest\t1500\nsafe-after\tnone\n")
+		_, result := a.doctorRegistryIdentity()
+		got := errb.String()
+		if !strings.Contains(got, "the registry data file was missing") || !strings.Contains(got, "1500") {
+			t.Fatalf("doctor output = %q, want the lost-registry warning naming the high-water mark", got)
+		}
+		if !strings.Contains(got, "Restore the registry from trusted backup") {
+			t.Fatalf("doctor output = %q, want the operator told what to do", got)
+		}
+		if result.status() == 0 {
+			t.Fatal("doctor exited 0 on a host whose registry rows are gone")
+		}
+	})
+
+	t.Run("a migrated v2 sequence proves prior use through its deadline alone", func(t *testing.T) {
+		a, errb := newHost(t, "# linux-temp-admin identity sequence v1\nhighest\t0\nsafe-after\t2026-08-01T12:01:05Z\n")
+		_, result := a.doctorRegistryIdentity()
+		if got := errb.String(); !strings.Contains(got, "the registry data file was missing") {
+			t.Fatalf("doctor output = %q, want the warning for a migrated-v2 host too", got)
+		}
+		if result.status() == 0 {
+			t.Fatal("doctor exited 0 on a migrated host whose registry rows are gone")
+		}
+	})
+
+	t.Run("a fresh install says nothing about a lost registry", func(t *testing.T) {
+		a, errb := newHost(t, "# linux-temp-admin identity sequence v1\nhighest\t0\nsafe-after\tnone\n")
+		a.doctorRegistryIdentity()
+		if got := errb.String(); strings.Contains(got, "the registry data file was missing") {
+			t.Fatalf("doctor output = %q, want no lost-registry warning on a fresh install", got)
+		}
+	})
 }

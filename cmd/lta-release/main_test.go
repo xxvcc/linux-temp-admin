@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -232,4 +233,100 @@ func TestAtomicWriteSignatureSyncsDirectoryAndReportsCommittedFailure(t *testing
 	if len(entries) != 1 || entries[0].Name() != filepath.Base(dest) {
 		t.Fatalf("signature write left temporary files: %v", entries)
 	}
+}
+
+// `lta-release verify` is the only tool a signer has to check a release artifact
+// before it is published, and its reject path ends in os.Exit — so it can only be
+// covered by running the built command. Nothing did: mutating the loop to accept
+// every signature left the whole suite green.
+func TestVerifyCommandAcceptsOnlyAGenuineSignature(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "lta-release")
+	// -buildvcs=false: stamping reads the git metadata, which fails whenever the
+	// checkout is not readable by the user running the tests. The binary under
+	// test does not depend on the stamp.
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", tool, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build lta-release: %v\n%s", err, out)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	write := func(name string, content []byte) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	keyring := write("keyring", []byte(hex.EncodeToString(pub)+"\n"))
+	artifact := []byte("release bytes\n")
+	binPath := write("artifact.bin", artifact)
+
+	run := func(t *testing.T, keyring, file, sig string) (int, string) {
+		t.Helper()
+		cmd := exec.Command(tool, "verify", keyring, file, sig)
+		out, err := cmd.CombinedOutput()
+		code := 0
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			code = exit.ExitCode()
+		} else if err != nil {
+			t.Fatalf("run verify: %v", err)
+		}
+		return code, string(out)
+	}
+
+	t.Run("a genuine signature verifies", func(t *testing.T) {
+		sig := write("good.sig", ed25519.Sign(priv, artifact))
+		code, out := run(t, keyring, binPath, sig)
+		if code != 0 || !strings.Contains(out, "ok:") {
+			t.Fatalf("verify of a genuine signature: exit=%d out=%q", code, out)
+		}
+	})
+
+	t.Run("a signature from another key is rejected", func(t *testing.T) {
+		sig := write("wrong-key.sig", ed25519.Sign(otherPriv, artifact))
+		code, out := run(t, keyring, binPath, sig)
+		if code == 0 {
+			t.Fatalf("verify accepted a signature made by a key outside the keyring: %q", out)
+		}
+		if !strings.Contains(out, "SIGNATURE INVALID") {
+			t.Fatalf("output = %q, want the rejection named", out)
+		}
+	})
+
+	t.Run("a tampered artifact is rejected", func(t *testing.T) {
+		sig := write("good2.sig", ed25519.Sign(priv, artifact))
+		tampered := write("tampered.bin", []byte("release bytez\n"))
+		code, out := run(t, keyring, tampered, sig)
+		if code == 0 || !strings.Contains(out, "SIGNATURE INVALID") {
+			t.Fatalf("verify accepted a tampered artifact: exit=%d out=%q", code, out)
+		}
+	})
+
+	t.Run("a truncated signature is rejected before verification", func(t *testing.T) {
+		full := ed25519.Sign(priv, artifact)
+		sig := write("short.sig", full[:len(full)-1])
+		code, out := run(t, keyring, binPath, sig)
+		if code == 0 || !strings.Contains(out, "invalid signature length") {
+			t.Fatalf("verify accepted a truncated signature: exit=%d out=%q", code, out)
+		}
+	})
+
+	t.Run("an empty signature is rejected", func(t *testing.T) {
+		sig := write("empty.sig", nil)
+		code, out := run(t, keyring, binPath, sig)
+		if code == 0 {
+			t.Fatalf("verify accepted an empty signature: %q", out)
+		}
+	})
 }

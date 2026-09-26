@@ -15,6 +15,7 @@ import (
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
+	"github.com/xxvcc/linux-temp-admin/internal/version"
 	"golang.org/x/sys/unix"
 )
 
@@ -96,9 +97,22 @@ func (a *App) installLocked(force bool) int {
 	}
 	if a.Lifecycle != nil && wasUninstalled {
 		if err := a.Lifecycle.ClearUninstalled(); err != nil {
-			a.errorf("%s: %v", a.P.M("命令已安装，但无法清除卸载状态标记", "the command is installed, but the uninstall-state marker could not be cleared"), err)
-			a.audit("install", "", "fail", "installed but uninstall marker cleanup failed: "+err.Error(), nil)
-			return 1
+			// Mirror of the MarkUninstalled branch in teardown: RemoveFile syncs the
+			// parent only AFTER the unlink committed, so a *fsutil.DurabilityError
+			// means the marker is already gone and the gate is already open.
+			// Reporting that as "could not be cleared" and exiting 1 told the operator
+			// the tool was still disabled while it was not — and a retry then skips
+			// this branch entirely, because wasUninstalled is false the second time.
+			var committed *fsutil.DurabilityError
+			if errors.As(err, &committed) {
+				a.warnf("%s: %v", a.P.M("卸载状态标记已清除但持久性未确认；命令已可用，安装继续",
+					"the uninstall-state marker is cleared but its durability is unconfirmed; the command is usable and the install continues"), err)
+				a.audit("install", "", "warn", "uninstall marker cleared with unconfirmed durability: "+err.Error(), nil)
+			} else {
+				a.errorf("%s: %v", a.P.M("命令已安装，但无法清除卸载状态标记", "the command is installed, but the uninstall-state marker could not be cleared"), err)
+				a.audit("install", "", "fail", "installed but uninstall marker cleanup failed: "+err.Error(), nil)
+				return 1
+			}
 		}
 	}
 	if !installed {
@@ -205,7 +219,7 @@ func (a *App) upgradeResult(args []string) commandResult {
 	if customURL {
 		candidate, err = a.Selfmanage.PrepareUpgrade(binURL, sigURL)
 	} else {
-		candidate, err = a.prepareOfficialUpgrade()
+		candidate, err = a.prepareOfficialUpgrade(force)
 	}
 	if err != nil {
 		a.errorf("%s: %v", a.P.M("升级失败", "upgrade failed"), err)
@@ -220,7 +234,7 @@ func (a *App) upgradeResult(args []string) commandResult {
 	return result
 }
 
-func (a *App) prepareOfficialUpgrade() (*selfmanage.UpgradeCandidate, error) {
+func (a *App) prepareOfficialUpgrade(force bool) (*selfmanage.UpgradeCandidate, error) {
 	asset := config.BinaryAssetPrefix + runtime.GOARCH
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		return nil, fmt.Errorf("official releases do not support architecture %s", runtime.GOARCH)
@@ -236,6 +250,28 @@ func (a *App) prepareOfficialUpgrade() (*selfmanage.UpgradeCandidate, error) {
 			"official mirror index transfer failed; falling back to GitHub."))
 		return a.Selfmanage.PrepareReleaseUpgrade(
 			config.GitHubLatestReleaseBaseURL, asset, "")
+	}
+	// The mirror's manifest is the sole version selector on this path, and nothing
+	// downstream distinguishes "you already have the newest" from "the mirror is
+	// offering something older than what you run". Both surfaced as a silent
+	// already-up-to-date exit, which is the wrong report for a stale, rolled-back
+	// or hostile index — the one case an operator would want to see. Say it, and
+	// leave a record: the upgrade itself still declines, as it did before.
+	if installed, verErr := a.Selfmanage.InstalledVersion(); verErr == nil && version.Greater(installed, manifest.Version) {
+		// Report the outcome this run will actually have. Saying "nothing was
+		// upgraded" and auditing a skip before the decision meant a --force
+		// downgrade proceeded anyway and was reported as an upgrade in the same run.
+		if force {
+			a.warnf("%s", a.P.M(
+				"官方镜像索引提供的版本 "+manifest.Version+" 低于当前安装的 "+installed+"；--force 将执行降级 "+installed+" → "+manifest.Version+"。索引可能陈旧、被回滚或被篡改，请先核实。",
+				"the official mirror index offers "+manifest.Version+", which is older than the installed "+installed+"; --force will downgrade "+installed+" -> "+manifest.Version+". The index may be stale, rolled back or tampered with; verify it first."))
+			a.audit("upgrade", "", "warn", "forced downgrade from "+installed+" to mirror manifest "+manifest.Version, nil)
+		} else {
+			a.warnf("%s", a.P.M(
+				"官方镜像索引提供的版本 "+manifest.Version+" 低于当前安装的 "+installed+"；未升级。索引可能陈旧、被回滚或被篡改，请核实后再重试。",
+				"the official mirror index offers "+manifest.Version+", which is older than the installed "+installed+"; nothing was upgraded. The index may be stale, rolled back or tampered with; verify it before retrying."))
+			a.audit("upgrade", "", "skip", "mirror manifest offered "+manifest.Version+" below installed "+installed, nil)
+		}
 	}
 	candidate, err := a.Selfmanage.PrepareMirrorReleaseUpgrade(manifest.BaseURL, asset, manifest.Version)
 	if err == nil {

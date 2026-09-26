@@ -775,3 +775,82 @@ func TestBracketAllowUsersIsNotAFalseVerify(t *testing.T) {
 		t.Errorf("expected the whitelist to block; blockers=%v", rep.Blockers)
 	}
 }
+
+// TestConnectionScopedMatchFailsClosedOnAnEmptyKeyword pins a line sshd honours
+// but this parser cannot model. sshd treats a leading '=' as the keyword/value
+// separator, so "=Match Address 203.0.113.0/24" applies — verified against
+// OpenSSH 9.2, where that line plus "PubkeyAuthentication no" yields
+// pubkeyauthentication no for a matching connection and yes without it.
+// parseSSHDDirective reports an empty keyword for such a line; skipping it as
+// whitespace hid the Match and let an invite claim a verified login sshd denies.
+func TestConnectionScopedMatchFailsClosedOnAnEmptyKeyword(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "sshd_config")
+	dropins := filepath.Join(dir, "sshd_config.d")
+	if err := os.MkdirAll(dropins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldDropins := sshdConfigPath, sshdConfigDropInDir
+	sshdConfigPath, sshdConfigDropInDir = main, dropins
+	t.Cleanup(func() { sshdConfigPath, sshdConfigDropInDir = oldConfig, oldDropins })
+
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "leading equals hides a Match", content: "PubkeyAuthentication yes\n=Match Address 203.0.113.0/24\nPubkeyAuthentication no\n", want: true},
+		{name: "quoted empty first token", content: "PubkeyAuthentication yes\n\"\" Match Address 203.0.113.0/24\n", want: true},
+		{name: "genuinely blank lines still scan clean", content: "PubkeyAuthentication yes\n\n   \n# comment\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(main, []byte(tc.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := HasConnectionScopedMatch(); got != tc.want {
+				t.Fatalf("HasConnectionScopedMatch = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// sshd expands %h and %u, and this tool always writes
+// /home/<user>/.ssh/authorized_keys. An absolute entry that resolves to exactly
+// that file needs no sshd drop-in; treating it as a central key store either
+// refused a working invite or wrote an exception on a host that needed none.
+func TestAuthorizedKeysFileTokensAreExpandedBeforeBlocking(t *testing.T) {
+	const user = "xxvcc-a1"
+	for _, tc := range []struct {
+		name    string
+		entries []string
+		want    bool
+	}{
+		{"home-relative", []string{".ssh/authorized_keys"}, true},
+		{"%h token", []string{"%h/.ssh/authorized_keys"}, true},
+		{"absolute with %u", []string{"/home/%u/.ssh/authorized_keys"}, true},
+		{"absolute literal", []string{"/home/xxvcc-a1/.ssh/authorized_keys"}, true},
+		{"absolute with %h", []string{"%h/.ssh/authorized_keys", "none"}, true},
+		{"second entry matches", []string{"/etc/ssh/authorized_keys/%u", "/home/%u/.ssh/authorized_keys"}, true},
+
+		{"central store", []string{"/etc/ssh/authorized_keys/%u"}, false},
+		{"disabled", []string{"none"}, false},
+		{"another user's file", []string{"/home/someoneelse/.ssh/authorized_keys"}, false},
+		{"different filename", []string{"/home/%u/.ssh/authorized_keys2"}, false},
+		{"unknown token is not guessed", []string{"/home/%U/.ssh/authorized_keys"}, false},
+		{"trailing percent", []string{"/home/%u/.ssh/authorized_keys%"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := readsDefaultAuthorizedKeys(tc.entries, user); got != tc.want {
+				t.Fatalf("readsDefaultAuthorizedKeys(%q) = %v, want %v", tc.entries, got, tc.want)
+			}
+		})
+	}
+
+	// Before a username exists, only the home-relative spellings can be judged.
+	if readsDefaultAuthorizedKeys([]string{"/home/%u/.ssh/authorized_keys"}, "") {
+		t.Fatal("an absolute %u entry must not be accepted before a username is known")
+	}
+	if !readsDefaultAuthorizedKeys([]string{"%h/.ssh/authorized_keys"}, "") {
+		t.Fatal("the home-relative spelling must still be accepted before a username is known")
+	}
+}

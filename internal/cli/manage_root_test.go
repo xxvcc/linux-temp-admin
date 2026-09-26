@@ -34,6 +34,7 @@ func (fakeSys) ScheduleAt(string, time.Time) (string, error) { return "", nil }
 func (fakeSys) RemoveAtJobsFor(string) error                 { return nil }
 func (fakeSys) AtrmJob(string) error                         { return nil }
 func (fakeSys) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
+func (fakeSys) AtDaemonRunning() (bool, error)               { return true, nil }
 
 type failedCreateRunner struct{}
 
@@ -121,7 +122,7 @@ func (r *inviteTimingRunner) Run(name string, args ...string) error {
 			return fmt.Errorf("unexpected chage arguments: %v", args)
 		}
 		*r.events = append(*r.events, "expiry:"+args[1])
-		if args[1] != "1970-01-01" && (r.activationMutation != nil || r.activationErr != nil) {
+		if args[1] != "1970-01-02" && (r.activationMutation != nil || r.activationErr != nil) {
 			if r.activationMutation != nil {
 				r.activationMutation(&r.account)
 			}
@@ -196,7 +197,7 @@ func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
 	a.Users = &user.Manager{
 		Runner:                    failedCreateRunner{},
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 		ValidateManagedMailRoots:  func() error { return wantErr },
 		PrepareManagedHome: func(string) error {
 			t.Fatal("managed Home preflight ran after mail-root preflight failed")
@@ -260,7 +261,7 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 		PrepareManagedHome:        func(string) error { return nil },
 		CreateManagedHome:         func(user.Passwd) error { return nil },
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 	}
 	a.LookupUser = a.Users.LookupUser
 	a.IdentityAllocationRange = func() (int, int, error) { return 4242, 4242, nil }
@@ -294,10 +295,10 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 	if clockCalls != 1 {
 		t.Fatalf("invite transaction read its creation clock %d times, want once", clockCalls)
 	}
-	if got, want := rec.Created, createdAt.Format("2006-01-02 15:04:05 MST"); got != want {
+	if got, want := rec.Created, expiry.Display(createdAt); got != want {
 		t.Fatalf("recorded creation = %q, want %q", got, want)
 	}
-	if got, want := rec.Expires, expiry.DisplayLocal(expiry.Deadline(createdAt, 1)); got != want {
+	if got, want := rec.Expires, expiry.Display(expiry.Deadline(createdAt, 1)); got != want {
 		t.Fatalf("recorded deadline = %q, want %q", got, want)
 	}
 	if !strings.Contains(errb.String(), "account artifact cleanup is unconfirmed") {
@@ -414,7 +415,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 		}
 		return generation, nil
 	}
-	a.RandPassword = func(int) (string, error) { return "password-for-timing-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-timing-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
@@ -427,16 +428,16 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	if runner.recordErr != nil || !runner.recordFound {
 		t.Fatalf("registry row at credential: found=%v err=%v", runner.recordFound, runner.recordErr)
 	}
-	if got, want := strings.Join(runner.eventsBeforeCredential, ","), "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate"; got != want {
+	if got, want := strings.Join(runner.eventsBeforeCredential, ","), "mail,expiry:1970-01-02,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate"; got != want {
 		t.Fatalf("events before credential = %q, want %q", got, want)
 	}
 	if mailCalls < 2 {
 		t.Fatalf("mail cleanup calls before/during rollback = %d, want at least create and post-drain sweeps", mailCalls)
 	}
-	if got, want := runner.recordAtCredential.Created, t1.Format("2006-01-02 15:04:05 MST"); got != want {
+	if got, want := runner.recordAtCredential.Created, expiry.Display(t1); got != want {
 		t.Fatalf("creation time at credential = %q, want %q", got, want)
 	}
-	if got, want := runner.recordAtCredential.Expires, expiry.DisplayLocal(expiry.Deadline(t1, 1)); got != want {
+	if got, want := runner.recordAtCredential.Expires, expiry.Display(expiry.Deadline(t1, 1)); got != want {
 		t.Fatalf("expiry at credential = %q, want %q", got, want)
 	}
 	if runner.recordAtCredential.Pending {
@@ -503,7 +504,7 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				NameInUse:                 func(string) (bool, error) { return false, nil },
 				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
 				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
@@ -534,7 +535,7 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				}
 				return generation, nil
 			}
-			a.RandPassword = func(int) (string, error) { return "password-for-migration-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-migration-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
@@ -621,14 +622,14 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 	a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 	a.RandHex = func(int) (string, error) { return generation, nil }
-	a.RandPassword = func(int) (string, error) { return "password-for-permanent-test", nil }
+	a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-permanent-test"), nil }
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
 	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}, false); rc != 0 {
 		t.Fatalf("permanent runInvite rc = %d: %s", rc, errb.String())
 	}
-	want := "mail,expiry:1970-01-01,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
+	want := "mail,expiry:1970-01-02,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
 	if got := strings.Join(events, ","); got != want {
 		t.Fatalf("permanent invite events = %q, want %q", got, want)
 	}
@@ -737,7 +738,7 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 				NameInUse:                 func(string) (bool, error) { return false, nil },
 				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
 				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
@@ -762,7 +763,7 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 			a.TerminateProcesses = func(int) error { events = append(events, "kill"); return nil }
 			a.DrainScheduledJobs = func() error { events = append(events, "drain"); return nil }
 			a.RandHex = func(int) (string, error) { return "fedcba9876543210fedcba9876543210", nil }
-			a.RandPassword = func(int) (string, error) { return "password-for-activation-test", nil }
+			a.RandPassword = func(int) ([]byte, error) { return []byte("password-for-activation-test"), nil }
 			a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
@@ -828,7 +829,7 @@ func newManageApp(t *testing.T, in string, users ...string) (*App, *bytes.Buffer
 		NameInUse:                 func(string) (bool, error) { return false, nil },
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 		InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 	}
 	// The store's dir has to be root-owned for its symlink-safety checks to pass;
 	// t.TempDir() belongs to whoever runs the suite.

@@ -98,9 +98,12 @@ type HostOperations struct {
 
 // RuntimeHooks contains process-local facilities that tests make deterministic.
 type RuntimeHooks struct {
-	Now           func() time.Time
-	RandHex       func(nBytes int) (string, error)
-	RandPassword  func(nChars int) (string, error)
+	Now     func() time.Time
+	RandHex func(nBytes int) (string, error)
+	// RandPassword yields the secret as bytes so the caller can clear it. A Go
+	// string cannot be zeroed, and this is the one credential the key path already
+	// takes that care with.
+	RandPassword  func(nChars int) ([]byte, error)
 	StdoutIsTTY   func() bool
 	StdinIsTTY    func() bool
 	TerminalWidth func() int
@@ -134,6 +137,11 @@ type App struct {
 	RuntimeHooks
 
 	InstallPath string
+	// stableCommandReplaced records that this process overwrote the shared stable
+	// command at InstallPath. Nothing can restore the previous bytes, so a failed
+	// invite cannot roll it back — but the operator must be told it happened
+	// rather than be left believing the run left no trace.
+	stableCommandReplaced bool
 	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
 	// they are fields for the same reason InstallPath is: a test that ran the
 	// teardown against the constants would delete the real ones. CI runs the
@@ -283,20 +291,23 @@ const passwordLen = 24
 // randPassword returns a uniformly random password. Rejection sampling keeps the
 // distribution flat: taking a raw byte modulo 62 would quietly favour the first
 // few letters of the alphabet.
-func randPassword(nChars int) (string, error) {
+func randPassword(nChars int) ([]byte, error) {
 	out := make([]byte, 0, nChars)
 	buf := make([]byte, 1)
 	const limit = 256 - (256 % len(passwordAlphabet)) // 248: the unbiased range
 	for len(out) < nChars {
 		if _, err := rand.Read(buf); err != nil {
-			return "", err
+			clear(out)
+			return nil, err
 		}
 		if int(buf[0]) >= limit {
 			continue
 		}
 		out = append(out, passwordAlphabet[int(buf[0])%len(passwordAlphabet)])
 	}
-	return string(out), nil
+	// Returned as bytes on purpose: string(out) would mint an immutable copy that
+	// nothing can ever zero, and every later hop would copy it again.
+	return out, nil
 }
 
 // EnvLang overrides the language for one run without changing what is
@@ -396,12 +407,34 @@ func askLang(rest []string) (lang i18n.Lang, ok, prompted bool) {
 	return lang, ok, true
 }
 
+// isUnattendedYesFlag reports whether arg is any spelling of the --yes boolean
+// that Go's flag package accepts. The package treats one and two leading dashes
+// identically and allows any unambiguous prefix of nothing — it matches the
+// registered name exactly — but both "-yes" and "--y" reach the same flag here
+// because the mutating subcommands register "yes" and "y" as separate booleans.
+// Listing only some spellings let an unattended run stop on the first-run
+// language prompt.
+func isUnattendedYesFlag(arg string) bool {
+	name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+	if name == arg {
+		return false // not a flag at all
+	}
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	return name == "yes" || name == "y"
+}
+
 func shouldAskLang(rest []string, stdinTTY, stderrTTY, stdoutTTY bool) bool {
 	if !stdinTTY || !stderrTTY {
 		return false
 	}
 	for _, arg := range rest {
-		if arg == "--yes" || arg == "-y" { // an unattended run must not be stopped by a question
+		// An unattended run must not be stopped by a question. Go's flag package
+		// accepts --yes=true, -y=1 and so on for the boolean flags every mutating
+		// subcommand registers, so an exact token match let those forms reach the
+		// first-run language prompt and abort the run.
+		if isUnattendedYesFlag(arg) {
 			return false
 		}
 	}

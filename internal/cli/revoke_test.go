@@ -43,6 +43,7 @@ func (s revokeTestScheduleSystem) RemoveAtJobsFor(string) error {
 }
 func (revokeTestScheduleSystem) AtrmJob(string) error              { return nil }
 func (revokeTestScheduleSystem) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
+func (revokeTestScheduleSystem) AtDaemonRunning() (bool, error)    { return true, nil }
 
 func (r *orderedTeardownRunner) Run(name string, _ ...string) error {
 	*r.events = append(*r.events, name)
@@ -91,7 +92,7 @@ func newOrderedTeardownApp(t *testing.T, pw user.Passwd, failClearCall int, clea
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         appendArtifact("mail"),
 			RemoveManagedHome:         appendArtifact("home"),
 		},
@@ -1358,7 +1359,7 @@ func TestTeardownContinuesAcrossConcurrentUserWritablePasswdChanges(t *testing.T
 			LookupUser:                lookup,
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         func(user.Passwd) error { events = append(events, "mail"); return nil },
 			RemoveManagedHome:         func(user.Passwd) error { events = append(events, "home"); return nil },
 		},
@@ -1602,7 +1603,7 @@ func TestRevokeRetriesPostDeletionMailAndKeepsOrdinaryAbsentRowsNarrow(t *testin
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         removeMail,
 		}
 		a.Scheduler = &schedule.Scheduler{
@@ -1873,7 +1874,7 @@ func TestCompactRetainsWholeRegistryWhenAbsentAccountDatabaseIsUnclean(t *testin
 			name:      "subordinate ID remains",
 			wantError: "injected subordinate ID residue",
 			configure: func(m *user.Manager, blocked string) {
-				m.CheckSubordinateIDsAbsent = func(name string) error {
+				m.CheckSubordinateIDsAbsent = func(name string, _ int) error {
 					if name == blocked {
 						return errors.New("injected subordinate ID residue")
 					}
@@ -1935,7 +1936,7 @@ func TestCompactRetainsWholeRegistryWhenAbsentAccountDatabaseIsUnclean(t *testin
 					return false, nil
 				},
 				InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			}
 			tc.configure(a.Users, blocked.User)
 
@@ -1975,7 +1976,7 @@ func TestCompactRemovesCleanAbsentAccountDatabaseRow(t *testing.T) {
 			}
 			return false, nil
 		},
-		CheckSubordinateIDsAbsent: func(name string) error {
+		CheckSubordinateIDsAbsent: func(name string, _ int) error {
 			subIDChecks++
 			if name != rec.User {
 				t.Fatalf("subordinate-ID inspection = %q, want %q", name, rec.User)
@@ -2174,5 +2175,68 @@ func TestQuarantineRegateBindsToTheCapturedIdentity(t *testing.T) {
 				t.Fatalf("refusal did not name the identity change:\n%s", errb.String())
 			}
 		})
+	}
+}
+
+// systemctlSched reports a systemd host so beginIdentityQuarantine gets past its
+// availability gate; everything else comes from the existing fake.
+type systemctlSched struct{ failingScheduleSystem }
+
+func (systemctlSched) HasSystemctl() bool { return true }
+
+// TestQuarantineHandoffDoesNotClaimADisabledAccount pins the distinction the
+// operator message depends on. beginIdentityQuarantine disables the login as its
+// very first step, so that failure reaches the same branch that otherwise
+// reports "the account is disabled and retained" — the one claim this path must
+// never make while the door may still be open.
+func TestQuarantineHandoffDoesNotClaimADisabledAccount(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	pw := user.Passwd{
+		Name: "xxvcc-quar2", UID: 1001, GID: 1001,
+		GECOS: config.ManagedGenerationGECOSPrefix + generation,
+		Home:  "/home/xxvcc-quar2", Shell: "/bin/sh",
+	}
+	a, _, _ := newTestApp(t, "")
+	a.Users = &user.Manager{Runner: &revokeRunner{failOn: "chage"}}
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	a.EnsureScheduledCommand = func() error { return nil }
+	a.Scheduler = &schedule.Scheduler{Sys: systemctlSched{}}
+
+	started, err := a.beginIdentityQuarantine(registry.Record{
+		User: pw.Name, UID: pw.UID, Generation: generation, IdentityBound: true, Port: 22,
+	}, pw)
+	if started {
+		t.Fatal("quarantine reported started while the login disable failed")
+	}
+	if !errors.Is(err, errQuarantineLoginStillOpen) {
+		t.Fatalf("beginIdentityQuarantine error = %v, want it to mark the login as still open", err)
+	}
+}
+
+// TestDeleteAndFinalizeRefusesACorruptQuarantineDeadline pins the parse error
+// that used to be discarded. The zero time it left behind is before every real
+// clock reading, so an unparseable deadline silently selected the quarantined
+// teardown — the one that skips the synchronous drain.
+func TestDeleteAndFinalizeRefusesACorruptQuarantineDeadline(t *testing.T) {
+	a, _, errb := newTestApp(t, "")
+	a.Users = &user.Manager{Runner: &revokeRunner{}}
+	pw := user.Passwd{Name: "xxvcc-quar3", UID: 1001, GID: 1001, Home: "/home/xxvcc-quar3", Shell: "/bin/sh"}
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+	tx := &revokeTransaction{
+		app: a, username: pw.Name, registered: true, pw: pw,
+		// The parse is on the synchronous-finalization branch; the asynchronous one
+		// selects the quarantined teardown without reading the deadline at all.
+		opts: revokeOptions{synchronousFinalization: true},
+		rec: registry.Record{
+			User: pw.Name, UID: pw.UID, Port: 22, DeletionStarted: true, IdentityBound: true,
+			Generation: "0123456789abcdef0123456789abcdef", QuarantineUntil: "not-a-timestamp",
+		},
+	}
+	res := tx.deleteAndFinalize()
+	if !res.done || res.status != 1 {
+		t.Fatalf("deleteAndFinalize = done:%v status:%d, want a refusal\nstderr:\n%s", res.done, res.status, errb.String())
+	}
+	if !strings.Contains(errb.String(), "corrupt") {
+		t.Fatalf("refusal did not name the corrupt deadline:\n%s", errb.String())
 	}
 }

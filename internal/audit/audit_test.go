@@ -603,3 +603,49 @@ func TestRealActor(t *testing.T) {
 		t.Errorf("actor without SUDO_USER = %q, want root", a)
 	}
 }
+
+// TestLoginUIDReadsTheKernelShapes pins the one identity in an audit record that
+// the invoking environment cannot simply assert. Actor comes from SUDO_USER,
+// which a root-equivalent caller chooses; loginuid is set once per login session
+// by PAM. The unset sentinel means "no login session" and must not be recorded
+// as a uid.
+func TestLoginUIDReadsTheKernelShapes(t *testing.T) {
+	dir := t.TempDir()
+	old := loginUIDPath
+	t.Cleanup(func() { loginUIDPath = old })
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    *uint64
+	}{
+		{name: "a real login session", content: "1000\n", want: func() *uint64 { v := uint64(1000); return &v }()},
+		{name: "root login", content: "0\n", want: func() *uint64 { v := uint64(0); return &v }()},
+		{name: "uid above signed 32-bit range", content: "2147483648\n", want: func() *uint64 { v := uint64(2147483648); return &v }()},
+		{name: "largest actual uid", content: "4294967294\n", want: func() *uint64 { v := uint64(4294967294); return &v }()},
+		{name: "out of kernel uid range", content: "4294967296\n", want: nil},
+		{name: "unset sentinel is not a uid", content: "4294967295\n", want: nil},
+		{name: "unreadable value", content: "not-a-number\n", want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, "loginuid")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loginUIDPath = path
+			got := loginUID()
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("loginUID = %d, want nil for %q", *got, tc.content)
+			case tc.want != nil && got == nil:
+				t.Fatalf("loginUID = nil, want %d for %q", *tc.want, tc.content)
+			case tc.want != nil && *got != *tc.want:
+				t.Fatalf("loginUID = %d, want %d", *got, *tc.want)
+			}
+		})
+	}
+	// An absent file is the ordinary case on a kernel without audit support.
+	loginUIDPath = filepath.Join(dir, "absent")
+	if got := loginUID(); got != nil {
+		t.Fatalf("loginUID = %d for an absent file, want nil", *got)
+	}
+}

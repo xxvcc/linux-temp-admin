@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import tempfile
 import unittest
 from unittest import mock
@@ -245,18 +247,140 @@ class StagingBudgetTests(unittest.TestCase):
                 mirror_receiver.MAX_STAGING_ENTRIES,
             ) = original
 
+    def test_termination_signals_reap_transfer_before_unlock(self) -> None:
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=signum):
+                stage = self.temporary / f"signal-{signum}"
+                stage.mkdir()
+                pidfile = stage / "writer.pid"
+                fake_rrsync = stage / "rrsync"
+                fake_rrsync.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import os, signal, sys\n"
+                    "from pathlib import Path\n"
+                    "Path(sys.argv[-1], 'writer.pid').write_text(str(os.getpid()))\n"
+                    "while True: signal.pause()\n",
+                    encoding="ascii",
+                )
+                fake_rrsync.chmod(0o755)
+                lock = stage / ".deploy.lock"
+                cleanup_ready = stage / "cleanup-ready"
+                cleanup_proceed = stage / "cleanup-proceed"
+                child = os.fork()
+                if child == 0:
+                    try:
+                        mirror_receiver.RRSYNC = fake_rrsync
+                        original_kill = mirror_receiver.kill_transfer
+
+                        def paused_kill(process) -> None:
+                            cleanup_ready.touch()
+                            deadline = time.monotonic() + 5
+                            while not cleanup_proceed.exists():
+                                if time.monotonic() > deadline:
+                                    raise RuntimeError("test cleanup handshake timed out")
+                                time.sleep(0.01)
+                            original_kill(process)
+
+                        def locked_receive() -> int:
+                            descriptor = mirror_receiver.open_lock(
+                                lock, owner=os.getuid(), nonblocking=True
+                            )
+                            try:
+                                mirror_receiver.run_rrsync(stage, "accepted-test-command")
+                            finally:
+                                os.close(descriptor)
+                            return 0
+
+                        mirror_receiver.kill_transfer = paused_kill
+                        mirror_receiver.receive = locked_receive
+                        mirror_receiver.main()
+                    except mirror_receiver.ReceiverError as exc:
+                        os._exit(73 if signal.Signals(signum).name in str(exc) else 74)
+                    except BaseException:
+                        os._exit(75)
+                    os._exit(76)
+                writer = None
+                reaped = False
+                try:
+                    self.wait_for_file(pidfile)
+                    writer = int(pidfile.read_text(encoding="ascii"))
+                    os.kill(child, signum)
+                    self.wait_for_file(cleanup_ready)
+                    # Repeated, different termination signals cannot break the
+                    # in-progress shutdown and release its deployment lock.
+                    os.kill(child, signal.SIGHUP)
+                    os.kill(child, signal.SIGTERM)
+                    with self.assertRaisesRegex(
+                        mirror_receiver.ReceiverError, "deployment is already active"
+                    ):
+                        mirror_receiver.open_lock(lock, owner=os.getuid(), nonblocking=True)
+                    cleanup_proceed.touch()
+                    deadline = time.monotonic() + 5
+                    while True:
+                        waited, status = os.waitpid(child, os.WNOHANG)
+                        if waited == child:
+                            reaped = True
+                            break
+                        self.assertLess(time.monotonic(), deadline, "receiver did not stop")
+                        time.sleep(0.01)
+                    self.assertTrue(os.WIFEXITED(status))
+                    self.assertEqual(os.WEXITSTATUS(status), 73)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(writer, 0)
+                    descriptor = mirror_receiver.open_lock(lock, owner=os.getuid(), nonblocking=True)
+                    os.close(descriptor)
+                finally:
+                    if writer is not None:
+                        try:
+                            os.killpg(writer, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    if not reaped:
+                        os.kill(child, signal.SIGKILL)
+                        os.waitpid(child, 0)
+
+    def wait_for_file(self, path: Path) -> None:
+        deadline = time.monotonic() + 5
+        while not path.exists() or path.name == "writer.pid" and not path.stat().st_size:
+            self.assertLess(time.monotonic(), deadline, f"timed out waiting for {path}")
+            time.sleep(0.01)
+
+    def test_signal_during_spawn_cannot_orphan_unassigned_child(self) -> None:
+        stage = self.temporary / "spawn-signal"
+        stage.mkdir()
+        fake_rrsync = stage / "rrsync"
+        fake_rrsync.write_text("#!/bin/sh\nexec sleep 30\n", encoding="ascii")
+        fake_rrsync.chmod(0o755)
+        original_popen = mirror_receiver.subprocess.Popen
+        processes = []
+
+        def signal_after_spawn(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return process
+
+        with mock.patch.object(mirror_receiver, "RRSYNC", fake_rrsync), mock.patch.object(
+            mirror_receiver.subprocess, "Popen", side_effect=signal_after_spawn
+        ), mirror_receiver.controlled_termination():
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "SIGTERM"):
+                mirror_receiver.run_rrsync(stage, "accepted-test-command")
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(processes[0].pid, 0)
+
     def test_nonreceiver_monitor_failure_kills_transfer_and_preserves_error(self) -> None:
         process = mock.Mock()
         process.returncode = None
         process.pid = 12345
-        process.wait.side_effect = mirror_receiver.subprocess.TimeoutExpired(
-            cmd="rrsync", timeout=0.01
-        )
         primary = RuntimeError("monitor failed unexpectedly")
         stage = self.temporary / "monitor-failure-stage"
         stage.mkdir()
         with mock.patch.object(
             mirror_receiver.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            mirror_receiver, "observe_transfer", return_value=None
         ), mock.patch.object(
             mirror_receiver, "require_staging_budget", side_effect=primary
         ), mock.patch.object(mirror_receiver, "kill_transfer") as kill:
@@ -268,15 +392,14 @@ class StagingBudgetTests(unittest.TestCase):
     def test_transfer_kill_failure_preserves_the_monitor_error(self) -> None:
         process = mock.Mock()
         process.returncode = None
-        process.wait.side_effect = mirror_receiver.subprocess.TimeoutExpired(
-            cmd="rrsync", timeout=0.01
-        )
         primary = RuntimeError("monitor failed unexpectedly")
         cleanup = OSError("could not reap transfer group")
         stage = self.temporary / "kill-failure-stage"
         stage.mkdir()
         with mock.patch.object(
             mirror_receiver.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            mirror_receiver, "observe_transfer", return_value=None
         ), mock.patch.object(
             mirror_receiver, "require_staging_budget", side_effect=primary
         ), mock.patch.object(
@@ -286,6 +409,67 @@ class StagingBudgetTests(unittest.TestCase):
                 mirror_receiver.run_rrsync(stage, "accepted-test-command")
         self.assertIs(caught.exception, primary)
         self.assertIs(caught.exception.__cause__, cleanup)
+
+    def test_exited_transfer_leader_stays_waitable_until_group_cleanup(self) -> None:
+        for status in (0, 7):
+            with self.subTest(status=status):
+                stage = self.temporary / f"waitable-{status}"
+                stage.mkdir()
+                fake_rrsync = stage / "rrsync"
+                marker = stage / "survived"
+                fake_rrsync.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import os, sys, time\n"
+                    "from pathlib import Path\n"
+                    "child = os.fork()\n"
+                    "if child == 0:\n"
+                    "    time.sleep(0.4)\n"
+                    "    Path(sys.argv[-1], 'survived').write_text('writer survived')\n"
+                    "    os._exit(0)\n"
+                    f"os._exit({status})\n",
+                    encoding="ascii",
+                )
+                fake_rrsync.chmod(0o755)
+                original_killpg = os.killpg
+                killed = []
+
+                def require_waitable_before_kill(pid, signum):
+                    # A real waitid proves ownership still exists at the signal.
+                    # With the former Popen.wait loop this raises ECHILD: its
+                    # numeric PGID could already name an unrelated new session.
+                    observed = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                    self.assertIsNotNone(observed)
+                    self.assertEqual(observed.si_status, status)
+                    killed.append(pid)
+                    return original_killpg(pid, signum)
+
+                with mock.patch.object(mirror_receiver, "RRSYNC", fake_rrsync), mock.patch.object(
+                    mirror_receiver.os, "killpg", side_effect=require_waitable_before_kill
+                ):
+                    if status:
+                        with self.assertRaisesRegex(mirror_receiver.ReceiverError, "status 7"):
+                            mirror_receiver.run_rrsync(stage, "accepted-test-command")
+                    else:
+                        mirror_receiver.run_rrsync(stage, "accepted-test-command")
+                self.assertEqual(len(killed), 1)
+                time.sleep(0.5)
+                self.assertFalse(marker.exists(), "a descendant wrote after group cleanup")
+                with self.assertRaises(ChildProcessError):
+                    os.waitid(os.P_PID, killed[0], os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+    def test_cleanup_never_signals_a_reaped_or_unowned_group(self) -> None:
+        process = mirror_receiver.subprocess.Popen(["/bin/sh", "-c", "exit 0"], start_new_session=True)
+        process.wait()
+        with mock.patch.object(mirror_receiver.os, "killpg") as kill:
+            mirror_receiver.kill_transfer(process)
+        kill.assert_not_called()
+
+        unowned = mock.Mock(pid=process.pid, returncode=None)
+        with mock.patch.object(mirror_receiver.os, "killpg") as kill:
+            with self.assertRaisesRegex(mirror_receiver.ReceiverError, "lost ownership"):
+                mirror_receiver.kill_transfer(unowned)
+        kill.assert_not_called()
+        unowned.wait.assert_not_called()
 
     def test_nonblocking_deployment_lock_serializes_staging(self) -> None:
         lock = self.temporary / ".deploy.lock"

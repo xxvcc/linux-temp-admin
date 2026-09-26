@@ -701,3 +701,59 @@ func TestMatchBlockRefusesInvalidUsername(t *testing.T) {
 		}
 	}
 }
+
+// The post-grant rollback used to blame a missing Include for every surviving
+// blocker, sending the operator to check a line that was already there. It must
+// name the blocker that actually survived — under the directive spelling this
+// host's sshd uses, since OpenSSH renamed it in 8.5.
+func TestDescribeSurvivingBlockersNamesTheRealBlocker(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		report        sysinfo.LoginReport
+		want, notWant string
+	}{
+		{
+			name: "a Match block that wins the directive",
+			report: sysinfo.LoginReport{
+				Blockers: []sysinfo.Blocker{sysinfo.BlockPubkeyDisabled},
+				Detail:   map[sysinfo.Blocker]string{sysinfo.BlockPubkeyDisabled: "no"},
+			},
+			// The Blocker name already embeds its value; it must not be printed twice.
+			want:    "PubkeyAuthentication no",
+			notWant: "PubkeyAuthentication no (no)",
+		},
+		{
+			name: "the algorithm directive under this host's spelling",
+			report: sysinfo.LoginReport{
+				Blockers:      []sysinfo.Blocker{sysinfo.BlockKeyAlgorithm},
+				Detail:        map[sysinfo.Blocker]string{sysinfo.BlockKeyAlgorithm: "rsa-sha2-512"},
+				AlgoDirective: "PubkeyAcceptedKeyTypes",
+			},
+			want:    "PubkeyAcceptedKeyTypes (rsa-sha2-512)",
+			notWant: "PubkeyAcceptedAlgorithms",
+		},
+		{
+			name: "no AlgoDirective reported falls back to the modern spelling",
+			report: sysinfo.LoginReport{
+				Blockers: []sysinfo.Blocker{sysinfo.BlockKeyAlgorithm},
+				Detail:   map[sysinfo.Blocker]string{sysinfo.BlockKeyAlgorithm: "rsa-sha2-512"},
+			},
+			want: "PubkeyAcceptedAlgorithms (rsa-sha2-512)",
+		},
+		{
+			name:   "nothing named at all still says something",
+			report: sysinfo.LoginReport{},
+			want:   "an unnamed blocker",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := describeSurvivingBlockers(tc.report)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("describeSurvivingBlockers = %q, want it to contain %q", got, tc.want)
+			}
+			if tc.notWant != "" && strings.Contains(got, tc.notWant) {
+				t.Fatalf("describeSurvivingBlockers = %q, want it not to contain %q", got, tc.notWant)
+			}
+		})
+	}
+}

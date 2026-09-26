@@ -1395,3 +1395,72 @@ func TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse(t *testing.T) 
 		t.Fatalf("Lookup after the loss: found=%v err=%v, want the row to be gone", found, err)
 	}
 }
+
+// TestCheckIntegrityLeavesALegacyRegistryToInit pins the rule the package's own
+// doc comment states: a legacy registry may legitimately predate the sequence,
+// and the sequence becomes mandatory only once a v5 header is visible. The check
+// demanded coverage as soon as a sequence file merely existed beside a legacy
+// header — a state Init fixes silently on its migration path, and one that
+// neither recover-identity-sequence nor RepairMissingIdentitySequence will
+// touch, because the error is not ErrIdentitySequenceMissing and the registry is
+// not v5. The operator was told to restore from backup for a host that was fine.
+func TestCheckIntegrityLeavesALegacyRegistryToInit(t *testing.T) {
+	s := newStore(t)
+	reserveThrough(t, s, 1200)
+
+	// A v4 registry restored from backup beside the sequence this install already
+	// created, carrying a row above the sequence's high-water mark.
+	legacy := "# linux-temp-admin registry v4\n" + "xxvcc-legacy1\t2026-01-01 00:00:00 UTC\tnever\tno\t203.0.113.5\t22\tSHA256:x\tno\t\t1500\t\tno\tno\tno\n"
+	if err := os.WriteFile(s.File, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckIntegrity(); err != nil {
+		t.Fatalf("CheckIntegrity on a legacy registry with a present sequence = %v, want nil", err)
+	}
+}
+
+// A pending row records UID 0 until the account exists, so quarantining one
+// promotes the row to the UID useradd actually assigned. When that UID is above
+// the sequence's high-water mark — the ordinary state on a host migrated from a
+// legacy registry, whose seed only saw the completed rows — the commit's own
+// coverage check rejected the transition the call had just made. Every retry
+// failed identically, so an account the security model promises is manually
+// recoverable could never be deleted by this tool again.
+func TestBeginQuarantinePromotesThePendingUIDThroughTheIdentitySequence(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	deadline := time.Date(2026, 8, 1, 12, 2, 0, 0, time.UTC)
+	s := newStore(t)
+
+	// The sequence knows only the completed row's 1001; the pending account got 1002.
+	reserveThrough(t, s, 1001)
+	if err := s.Record(registry.Record{
+		User: "xxvcc-pending1", Port: 22, UID: 0, Generation: generation,
+		IdentityBound: true, Pending: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	unit := "linux-temp-admin-v2-quarantine-xxvcc-pending1"
+	if err := s.BeginQuarantine("xxvcc-pending1", 1002, generation, deadline, unit); err != nil {
+		t.Fatalf("BeginQuarantine on a pending row above the sequence: %v", err)
+	}
+
+	got, found, err := s.Lookup("xxvcc-pending1")
+	if err != nil || !found || !got.DeletionStarted || got.UID != 1002 || got.QuarantineUnit != unit {
+		t.Fatalf("quarantine transition = found=%v rec=%+v err=%v", found, got, err)
+	}
+
+	// The promoted UID must also be burned, or the next invite could hand 1002 out
+	// again while this quarantined identity is still being torn down.
+	sequence, err := os.ReadFile(filepath.Join(s.Dir, "identity-sequence"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sequence), "highest\t1002\n") {
+		t.Fatalf("identity sequence = %q, want the promoted UID 1002 burned", sequence)
+	}
+
+	if err := s.BeginQuarantine("xxvcc-pending1", 1002, generation, deadline, unit); err != nil {
+		t.Fatalf("idempotent BeginQuarantine after promotion: %v", err)
+	}
+}

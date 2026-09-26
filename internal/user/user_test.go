@@ -699,7 +699,7 @@ func (f *fakeRunner) Look(name string) bool { return f.available[name] }
 func stubAbsentAccountDatabaseChecks(m *Manager) *Manager {
 	m.InspectPrivateGroupState = func(string, int, bool) (bool, error) { return false, nil }
 	m.InspectSameNameGroupState = func(string) (bool, error) { return false, nil }
-	m.CheckSubordinateIDsAbsent = func(string) error { return nil }
+	m.CheckSubordinateIDsAbsent = func(string, int) error { return nil }
 	return m
 }
 
@@ -735,7 +735,7 @@ func TestAccountMutationsRejectInvalidUsernameBeforeRunningHelpers(t *testing.T)
 		{name: "mark managed", run: func(m *Manager) error { return m.MarkManaged("bad:user", testGeneration) }},
 		{name: "disable key password", run: func(m *Manager) error { return m.DisablePasswordForKeyLogin("bad:user") }},
 		{name: "lock password", run: func(m *Manager) error { return m.LockPassword("bad:user") }},
-		{name: "set password", run: func(m *Manager) error { return m.SetPassword("bad:user", "secret") }},
+		{name: "set password", run: func(m *Manager) error { return m.SetPassword("bad:user", []byte("secret")) }},
 		{name: "set expiry", run: func(m *Manager) error { return m.SetExpiry("bad:user", "2026-07-09") }},
 		{name: "clear expiry", run: func(m *Manager) error { return m.ClearExpiry("bad:user") }},
 		{name: "delete", run: func(m *Manager) error { return m.DeleteExpected("bad:user", Passwd{}, noOpBeforeDelete) }},
@@ -766,7 +766,7 @@ func TestAccountMutationsRejectReservedUsernameBeforeRunningHelpers(t *testing.T
 		{name: "mark managed", run: func(m *Manager) error { return m.MarkManaged("nobody", testGeneration) }},
 		{name: "disable key password", run: func(m *Manager) error { return m.DisablePasswordForKeyLogin("nobody") }},
 		{name: "lock password", run: func(m *Manager) error { return m.LockPassword("nobody") }},
-		{name: "set password", run: func(m *Manager) error { return m.SetPassword("nobody", "secret") }},
+		{name: "set password", run: func(m *Manager) error { return m.SetPassword("nobody", []byte("secret")) }},
 		{name: "set expiry", run: func(m *Manager) error { return m.SetExpiry("nobody", "2026-07-09") }},
 		{name: "clear expiry", run: func(m *Manager) error { return m.ClearExpiry("nobody") }},
 		{name: "disable login", run: func(m *Manager) error { return m.DisableLogin("nobody") }},
@@ -1818,48 +1818,120 @@ func TestValidateCreatedHomeRequiresNonRootOwnedRealDirectory(t *testing.T) {
 	}
 }
 
-// TestProcessSnapshotAttributesInstabilityByOwner pins the rule that keeps an
-// unrelated account's process churn from denying every invite and revoke: a
-// vanishing entry owned by another unprivileged account cannot host or fork a
-// target-UID thread, so it must not invalidate the snapshot, while a root-owned
-// one still must.
-func TestProcessSnapshotAttributesInstabilityByOwner(t *testing.T) {
-	if os.Getuid() != 0 {
-		t.Skip("attribution test needs root to set a foreign directory owner")
-	}
+// Directory ownership cannot prove that a vanished group did not retain the
+// target in another UID column or in a worker thread's credentials.
+func TestProcessSnapshotRequiresCredentialsRegardlessOfDirectoryOwner(t *testing.T) {
 	const target = 1111
-	const foreignUID = 65534
 	for _, tc := range []struct {
-		name       string
-		owner      int
-		wantStable bool
+		name  string
+		owner int
 	}{
-		{name: "third-party owner does not destabilise", owner: foreignUID, wantStable: true},
-		{name: "root owner still destabilises", owner: 0, wantStable: false},
-		{name: "target owner still destabilises", owner: target, wantStable: false},
+		{name: "current owner", owner: os.Geteuid()},
+		{name: "third-party owner", owner: 65534},
+		{name: "root owner", owner: 0},
+		{name: "target owner", owner: target},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if os.Geteuid() != 0 && tc.owner != os.Geteuid() {
+				t.Skip("foreign fixture ownership requires root in a disposable test environment")
+			}
 			setProcRoot(t, nil)
-			// A process directory with no numeric task entries is exactly the shape
-			// processGroupHasUID reports as unstable.
 			pidDir := filepath.Join(procRoot, "4242")
 			if err := os.MkdirAll(filepath.Join(pidDir, "task"), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Chown(pidDir, tc.owner, tc.owner); err != nil {
-				t.Fatal(err)
+			if tc.owner != os.Geteuid() {
+				if err := os.Chown(pidDir, tc.owner, tc.owner); err != nil {
+					t.Fatal(err)
+				}
 			}
 			pids, stable, err := processSnapshotForUID(target)
-			if err != nil {
-				t.Fatalf("processSnapshotForUID: %v", err)
-			}
-			if len(pids) != 0 {
-				t.Fatalf("pids = %v, want none", pids)
-			}
-			if stable != tc.wantStable {
-				t.Fatalf("stable = %v, want %v for owner %d", stable, tc.wantStable, tc.owner)
+			if err != nil || len(pids) != 0 || stable {
+				t.Fatalf("processSnapshotForUID = %v, %v, %v; owner %d cannot justify a stable empty scan", pids, stable, err, tc.owner)
 			}
 		})
+	}
+}
+
+func TestProcessesForUIDDoesNotLoseMixedUIDForkLineage(t *testing.T) {
+	const target = 1111
+	for _, sustained := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sustained=%v", sustained), func(t *testing.T) {
+			// Match Linux's dumpable mixed-UID shape: real UID is the target,
+			// while the directory owner is its unrelated effective UID.
+			owner := os.Geteuid()
+			if owner == 0 {
+				owner = 65534
+			}
+			status := fmt.Sprintf("State:\tS (sleeping)\nUid:\t%d\t%d\t%d\t%d\n", target, owner, owner, owner)
+			setProcRoot(t, nil)
+			writeMixed := func(pid int) {
+				writeProcProcess(t, pid, status)
+				if owner != os.Geteuid() {
+					if err := os.Chown(filepath.Join(procRoot, strconv.Itoa(pid)), owner, owner); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			writeMixed(77)
+			oldReadDir := readProcDirectory
+			t.Cleanup(func() { readProcDirectory = oldReadDir })
+			vanished := 0
+			readProcDirectory = func(path string) ([]os.DirEntry, error) {
+				entries, err := oldReadDir(path)
+				if err != nil || filepath.Base(path) != "task" || (!sustained && vanished > 0) {
+					return entries, err
+				}
+				// Fork after the root listing and vanish after the task listing,
+				// leaving the child absent from this scan's directory snapshot.
+				pidDir := filepath.Dir(path)
+				pid, err := strconv.Atoi(filepath.Base(pidDir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeMixed(pid + 1)
+				if err := os.RemoveAll(pidDir); err != nil {
+					t.Fatal(err)
+				}
+				vanished++
+				return entries, nil
+			}
+			pids, err := processesForUID(target)
+			if sustained {
+				if err == nil || !strings.Contains(err.Error(), "no consecutive stable empty process snapshots") || vanished != processScanAttempts {
+					t.Fatalf("processesForUID = %v, %v, vanished=%d; want bounded fail-closed scan", pids, err, vanished)
+				}
+			} else if err != nil || !reflect.DeepEqual(pids, []int{78}) {
+				t.Fatalf("processesForUID = %v, %v; want mixed-UID child 78", pids, err)
+			}
+			if _, err := os.Stat(filepath.Join(procRoot, strconv.Itoa(77+vanished))); err != nil {
+				t.Fatalf("test must retain its live mixed-UID descendant: %v", err)
+			}
+		})
+	}
+}
+
+func TestProcessesForUIDAllowsTransientUnrelatedChurnToSettle(t *testing.T) {
+	setProcRoot(t, map[int]string{77: "State:\tS (sleeping)\nUid:\t9999\t9999\t9999\t9999\n"})
+	oldReadDir, oldSleep := readProcDirectory, processScanSleep
+	t.Cleanup(func() { readProcDirectory, processScanSleep = oldReadDir, oldSleep })
+	reads, waits := 0, 0
+	readProcDirectory = func(path string) ([]os.DirEntry, error) {
+		entries, err := oldReadDir(path)
+		if err == nil && path == procRoot {
+			reads++
+			if reads == 1 {
+				if err := os.RemoveAll(filepath.Join(procRoot, "77")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return entries, err
+	}
+	processScanSleep = func(time.Duration) { waits++ }
+	pids, err := processesForUID(1111)
+	if err != nil || len(pids) != 0 || reads != 3 || waits != 2 {
+		t.Fatalf("processesForUID = %v, %v, reads=%d waits=%d; want retry then two stable empty scans", pids, err, reads, waits)
 	}
 }
 
@@ -3412,7 +3484,7 @@ func TestDisableLoginExpiresBeforeLocking(t *testing.T) {
 	if len(f.calls) != 2 {
 		t.Fatalf("DisableLogin calls = %v, want chage then usermod", f.calls)
 	}
-	if !reflect.DeepEqual(f.calls[0], []string{"chage", "-E", "1970-01-01", "xxvcc-u"}) {
+	if !reflect.DeepEqual(f.calls[0], []string{"chage", "-E", "1970-01-02", "xxvcc-u"}) {
 		t.Errorf("first call = %v, want the account expired to a past date", f.calls[0])
 	}
 	if !reflect.DeepEqual(f.calls[1], []string{"usermod", "-L", "xxvcc-u"}) {
@@ -3449,5 +3521,122 @@ func TestTerminateProcessesNeverSignalsRootOrAll(t *testing.T) {
 		if len(opened) != 0 {
 			t.Fatalf("reserved uid must open no pidfds, opened %v", opened)
 		}
+	}
+}
+
+// TestExpiredDateStoresANonZeroExpiry pins expiredDate away from the one value
+// shadow(5) singles out as unusable: "The value 0 should not be used as it is
+// interpreted as either an account with no expiration, or as an expiration on
+// Jan 1, 1970." shadow's isexpired() takes the first reading and requires
+// sp_expire > 0, and DisableLogin leans on that expiry as the gate that stops a
+// public-key login, which the password lock does not.
+func TestExpiredDateStoresANonZeroExpiry(t *testing.T) {
+	parsed, err := time.Parse("2006-01-02", expiredDate)
+	if err != nil {
+		t.Fatalf("expiredDate %q is not a chage date: %v", expiredDate, err)
+	}
+	// chage stores days since the epoch; this is the value that lands in the
+	// eighth /etc/shadow field.
+	days := int(parsed.UTC().Sub(time.Unix(0, 0).UTC()).Hours() / 24)
+	if days < 1 {
+		t.Fatalf("expiredDate %q stores sp_expire=%d, which shadow may read as no expiration at all", expiredDate, days)
+	}
+	if !parsed.Before(time.Now()) {
+		t.Fatalf("expiredDate %q is not safely in the past", expiredDate)
+	}
+}
+
+// glibc's nss_files skips blank lines, '#' comments and the '+'/'-' NIS
+// compatibility entries, and shadow's tools accept databases containing them.
+// These two scans run before anything else in an invite, so treating such a line
+// as "malformed" made a single comment in /etc/group stop every invite on the
+// host — and blamed a database the system reads perfectly.
+func TestIdentityScansSkipWhatTheSystemSkipsButStillFailClosedOnRealDamage(t *testing.T) {
+	const goodPasswd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1500::/home/alice:/bin/sh\n"
+	const goodGroup = "root:x:0:\nalice:x:1500:\n"
+
+	t.Run("allocation range tolerates comment and NIS lines", func(t *testing.T) {
+		for _, tc := range []struct{ name, passwd, group string }{
+			{"comment in group", goodPasswd, "# admin comment\n" + goodGroup},
+			{"NIS compat in group", goodPasswd, goodGroup + "+:::\n"},
+			{"comment in passwd", "# local comment\n" + goodPasswd, goodGroup},
+			{"NIS compat in passwd", goodPasswd + "+::::::\n", goodGroup},
+			{"NIS exclusion in passwd", goodPasswd + "-bob::::::\n", goodGroup},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				setIdentityDatabases(t, tc.passwd, tc.group, "UID_MIN 1000\nUID_MAX 60000\n")
+				minimum, _, err := IdentityAllocationRange()
+				if err != nil {
+					t.Fatalf("IdentityAllocationRange() = %v, want the scan to skip the line the system skips", err)
+				}
+				if minimum != 1501 {
+					t.Fatalf("minimum = %d, want 1501 (the skipped line must not change the high-water mark)", minimum)
+				}
+			})
+		}
+	})
+
+	t.Run("a genuinely malformed record still fails closed", func(t *testing.T) {
+		setIdentityDatabases(t, goodPasswd, "broken:x:not-a-gid:\n", "UID_MIN 1000\n")
+		if _, _, err := IdentityAllocationRange(); err == nil || !strings.Contains(err.Error(), "malformed group GID") {
+			t.Fatalf("IdentityAllocationRange error = %v, want the malformed record still rejected", err)
+		}
+	})
+
+	t.Run("marker inventory tolerates the same lines", func(t *testing.T) {
+		setIdentityDatabases(t, "# local comment\n"+goodPasswd+"+::::::\n", goodGroup, "UID_MIN 1000\n")
+		names, err := LifecycleMarkerAccounts()
+		if err != nil {
+			t.Fatalf("LifecycleMarkerAccounts() = %v, want the comment skipped (it blocks uninstall and doctor)", err)
+		}
+		if len(names) != 0 {
+			t.Fatalf("LifecycleMarkerAccounts() = %v, want no marked accounts", names)
+		}
+	})
+
+	t.Run("marker inventory still fails closed on a malformed record", func(t *testing.T) {
+		setIdentityDatabases(t, goodPasswd+"truncated:x:1600\n", goodGroup, "UID_MIN 1000\n")
+		if _, err := LifecycleMarkerAccounts(); err == nil {
+			t.Fatal("LifecycleMarkerAccounts() accepted a truncated passwd record")
+		}
+	})
+}
+
+func TestIdentityScansAcceptASCIINonRecordWhitespace(t *testing.T) {
+	const passwd = "root:x:0:0:root:/root:/bin/sh\nalice:x:1500:1500::/home/alice:/bin/sh\n"
+	const group = "root:x:0:\nalice:x:1500:\n"
+	for _, noise := range []string{
+		" \t# indented comment\n",
+		" \t\n",
+		"\r\n",
+		"\v\f\r\t # ASCII whitespace comment\n",
+		"\v\f\r\t \n",
+	} {
+		t.Run(strconv.Quote(noise), func(t *testing.T) {
+			setIdentityDatabases(t, noise+passwd, noise+group, "UID_MIN 1000\nUID_MAX 60000\n")
+			minimum, _, err := IdentityAllocationRange()
+			if err != nil || minimum != 1501 {
+				t.Fatalf("IdentityAllocationRange = %d, %v; want 1501 with system-valid non-record lines", minimum, err)
+			}
+			if names, err := LifecycleMarkerAccounts(); err != nil || len(names) != 0 {
+				t.Fatalf("LifecycleMarkerAccounts = %v, %v; want an empty inventory", names, err)
+			}
+		})
+	}
+	for _, damaged := range []string{
+		" \ttruncated:x:1600\n",
+		"\u00a0# not an ASCII comment\n",
+		"\u2003\n",
+		"broken:x: 1600 :1600::/home/broken:/bin/sh\n",
+	} {
+		t.Run("damage/"+strconv.Quote(damaged), func(t *testing.T) {
+			setIdentityDatabases(t, passwd+damaged, group, "UID_MIN 1000\nUID_MAX 60000\n")
+			if _, _, err := IdentityAllocationRange(); err == nil {
+				t.Fatalf("IdentityAllocationRange accepted damaged passwd line %q", damaged)
+			}
+			if _, err := LifecycleMarkerAccounts(); err == nil {
+				t.Fatalf("LifecycleMarkerAccounts accepted damaged passwd line %q", damaged)
+			}
+		})
 	}
 }
