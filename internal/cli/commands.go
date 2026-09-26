@@ -143,7 +143,7 @@ func (a *App) status(args []string) int {
 // mechanically derived from the username, and would double the table's width to
 // tell the reader something they already know; `status --user <name>` still
 // prints it for the one account being examined.
-func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
+func (a *App) usersTable(rows [][]string, numbered bool) *table.Table {
 	headers := []string{
 		a.P.M("用户", "USER"),
 		a.P.M("状态", "STATE"),
@@ -157,8 +157,7 @@ func (a *App) usersTable(recs []registry.Record, numbered bool) *table.Table {
 		headers = append([]string{"#"}, headers...)
 	}
 	t := table.New(headers...)
-	for i, r := range recs {
-		cells := a.userCells(r)
+	for i, cells := range rows {
 		if numbered {
 			cells = append([]string{strconv.Itoa(i + 1)}, cells...)
 		}
@@ -211,7 +210,13 @@ func (a *App) userCells(r registry.Record) []string {
 // usersView keeps the comparison table on ordinary terminals and switches to a
 // vertical record view when the table would be wider than the actual terminal.
 func (a *App) usersView(recs []registry.Record, numbered bool) string {
-	full := a.usersTable(recs, numbered).String()
+	// Use one observation per account for this render. A later refresh or a
+	// mutating command must obtain its own current account state.
+	rows := make([][]string, len(recs))
+	for i, rec := range recs {
+		rows[i] = a.userCells(rec)
+	}
+	full := a.usersTable(rows, numbered).String()
 	width := 0
 	if a.TerminalWidth != nil {
 		width = a.TerminalWidth()
@@ -229,8 +234,7 @@ func (a *App) usersView(recs []registry.Record, numbered bool) string {
 		a.P.M("端口", "port"),
 	}
 	var out strings.Builder
-	for i, rec := range recs {
-		cells := a.userCells(rec)
+	for i, cells := range rows {
 		prefix := "- "
 		if numbered {
 			prefix = fmt.Sprintf("%d) ", i+1)
@@ -929,15 +933,19 @@ func (a *App) doctorBaseEnvironment() doctorResult {
 	} else {
 		a.success(a.P.M("pidfd 进程撤销能力可用。", "pidfd process revocation is available."))
 	}
+	var presentDeps []string
 	for _, d := range sysinfo.RequiredDeps(true, true) {
 		if d.Present {
-			a.success(a.P.M("依赖存在：", "dependency found: ") + d.Label)
+			presentDeps = append(presentDeps, d.Label)
 		} else {
 			a.warnf("%s%s", a.P.M("缺少依赖：", "missing dependency: "), d.Label)
 			if doctorDependencyIsFatal(d.Label) {
 				result.fail()
 			}
 		}
+	}
+	if len(presentDeps) > 0 {
+		a.success(a.P.M("依赖检查通过：", "dependencies found: ") + strings.Join(presentDeps, ", "))
 	}
 	a.info(a.P.M("包管理器：", "package manager: ") + orNone(sysinfo.PackageManager()))
 	a.info(a.P.M("init 系统：", "init system: ") + sysinfo.InitSystem())
@@ -1154,6 +1162,7 @@ func (a *App) doctorSudoersDirectory() string {
 
 func (a *App) doctorOrphanedArtifacts() doctorResult {
 	var result doctorResult
+	needsCompact := false
 	// An sshd exception that outlived its account is a standing loosening of the
 	// host's policy, and it re-arms the moment the username is reused.
 	if a.SSHD != nil {
@@ -1165,8 +1174,7 @@ func (a *App) doctorOrphanedArtifacts() doctorResult {
 				a.warnf("%s%s", a.P.M("孤儿 sshd 例外（账号不存在或身份无法验证）：",
 					"orphaned sshd exception (the account is absent or its identity is unverified): "), a.SSHD.FilePath(u))
 			}
-			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
-				"remove them with `linux-temp-admin cleanup-expired --compact`."))
+			needsCompact = true
 			result.fail()
 		}
 	}
@@ -1188,8 +1196,7 @@ func (a *App) doctorOrphanedArtifacts() doctorResult {
 				a.warnf("%s%s", a.P.M("孤儿 sudo 授权（账号不存在或身份无法验证，NOPASSWD:ALL 仍在）：",
 					"orphaned sudo grant (the account is absent or its identity is unverified; NOPASSWD:ALL is still on disk): "), a.Sudoers.FilePath(u))
 			}
-			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
-				"remove them with `linux-temp-admin cleanup-expired --compact`."))
+			needsCompact = true
 			result.fail()
 		}
 	}
@@ -1204,10 +1211,13 @@ func (a *App) doctorOrphanedArtifacts() doctorResult {
 				a.warnf("%s%s", a.P.M("孤儿自动删除任务（账号不存在或身份无法验证）：",
 					"orphaned auto-delete task (the account is absent or its identity is unverified): "), u)
 			}
-			a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
-				"remove them with `linux-temp-admin cleanup-expired --compact`."))
+			needsCompact = true
 			result.fail()
 		}
+	}
+	if needsCompact {
+		a.warnf("%s", a.P.M("请用 `linux-temp-admin cleanup-expired --compact` 清理。",
+			"remove them with `linux-temp-admin cleanup-expired --compact`."))
 	}
 	return result
 }

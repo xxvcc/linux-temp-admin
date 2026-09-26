@@ -59,6 +59,8 @@ The quick start already creates the first invite. Later invites can be created w
 
 The interactive flow shows the account, host, port, expiry, sudo state, and login verdict, followed by a command that saves the one-time private key. Only the public key is stored on the server.
 
+The terminal asks for the lifetime once: press Enter for the default 24 hours or enter another number of hours. A permanent account requires an explicit `never`. The complete summary is shown for confirmation before creation.
+
 Send the complete bundle through trusted private chat. After saving the key, the collaborator builds the SSH command from the bundle's Host, Port, and User fields, for example:
 
 ```bash

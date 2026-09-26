@@ -924,22 +924,7 @@ func (a *App) teardownLocalAccountWith(
 	if err := stillMatches(username, expected); err != nil {
 		return revokeDeleteAccount, err
 	}
-	// Persist recovery authority before controlled mail/Home cleanup begins. The
-	// account can disappear out of band at any later syscall boundary; without this
-	// witness, a failed post-disappearance mail fsync could be mistaken on retry for
-	// an ordinary stale row and discarded without completing the narrow cleanup.
-	if persistDeletion == nil {
-		return revokeDeleteAccount, fmt.Errorf("deletion recovery persistence is not configured")
-	}
-	if err := persistDeletion(); err != nil {
-		return revokeDeleteAccount, fmt.Errorf("persist deletion-started recovery state: %w", err)
-	}
-	if err := deleteExpected(username, expected, func() error {
-		return a.finalScheduledAccountCheckWith(username, expected, stillMatches)
-	}); err != nil {
-		return revokeDeleteAccount, err
-	}
-	return revokeAccountRemoved, nil
+	return a.persistAndDeleteAccount(username, expected, persistDeletion, stillMatches, deleteExpected)
 }
 
 func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, persistDeletion func() error, removePrivateGroup bool) (revokeAccountStage, error) {
@@ -952,18 +937,35 @@ func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, 
 	if err := a.quiesceScheduledAccountImmediateForRevoke(username, expected); err != nil {
 		return revokeQuiesceAccount, err
 	}
+	deleteExpected := a.Users.DeleteExpected
+	if removePrivateGroup {
+		deleteExpected = a.Users.DeleteExpectedSequential
+	}
+	return a.persistAndDeleteAccount(username, expected, persistDeletion, a.revokeAccountStillMatches, deleteExpected)
+}
+
+// persistAndDeleteAccount is the shared final step after the caller's chosen
+// quiescence checks. The callbacks preserve the identity policy used by revoke
+// or an in-flight invite rollback, including the last check inside deletion.
+func (a *App) persistAndDeleteAccount(
+	username string,
+	expected user.Passwd,
+	persistDeletion func() error,
+	stillMatches func(string, user.Passwd) error,
+	deleteExpected func(string, user.Passwd, func() error) error,
+) (revokeAccountStage, error) {
+	// Persist recovery authority before controlled mail/Home cleanup begins. The
+	// account can disappear out of band at any later syscall boundary; without this
+	// witness, a failed post-disappearance mail fsync could be mistaken on retry for
+	// an ordinary stale row and discarded without completing the narrow cleanup.
 	if persistDeletion == nil {
 		return revokeDeleteAccount, fmt.Errorf("deletion recovery persistence is not configured")
 	}
 	if err := persistDeletion(); err != nil {
 		return revokeDeleteAccount, fmt.Errorf("persist deletion-started recovery state: %w", err)
 	}
-	deleteExpected := a.Users.DeleteExpected
-	if removePrivateGroup {
-		deleteExpected = a.Users.DeleteExpectedSequential
-	}
 	if err := deleteExpected(username, expected, func() error {
-		return a.finalScheduledAccountCheck(username, expected)
+		return a.finalScheduledAccountCheckWith(username, expected, stillMatches)
 	}); err != nil {
 		return revokeDeleteAccount, err
 	}
@@ -1243,14 +1245,10 @@ func (a *App) quiesceScheduledAccountImmediateWith(username string, expected use
 	return errors.Join(errs...)
 }
 
-// finalScheduledAccountCheck runs after controlled Home/mail cleanup and just
+// finalScheduledAccountCheckWith runs after controlled Home/mail cleanup and just
 // before userdel. The earlier drain already waited out daemon-side cached work;
 // this last pass terminates processes first, then closes jobs raced in during
 // filesystem cleanup without imposing a second polling-cycle delay.
-func (a *App) finalScheduledAccountCheck(username string, expected user.Passwd) error {
-	return a.finalScheduledAccountCheckWith(username, expected, a.revokeAccountStillMatches)
-}
-
 func (a *App) finalScheduledAccountCheckWith(username string, expected user.Passwd, stillMatches func(string, user.Passwd) error) error {
 	if err := stillMatches(username, expected); err != nil {
 		return err

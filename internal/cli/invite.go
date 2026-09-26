@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -28,210 +27,32 @@ func (a *App) invite(args []string) int {
 	if !a.requireRoot() {
 		return 1
 	}
-	fs := flag.NewFlagSet("invite", flag.ContinueOnError)
-	fs.SetOutput(a.Err)
-	prefix := fs.String("prefix", config.DefaultPrefix, "")
-	userFlag := fs.String("user", "", "")
-	hostFlag := fs.String("host", "", "")
-	portFlag := fs.Int("port", 0, "")
-	hoursFlag := fs.Int("hours", config.DefaultExpireHours, "")
-	confirmSudo := fs.String("confirm-sudo", "", "")
-	var fSudo, fNoSudo, fNopasswd, fAuto, fNoAuto, fYes, fAllowNonTTY, fInstallDeps, fNoInstallDeps bool
-	var fFixSSHD, fNoFixSSHD, fPasswordLogin bool
-	fs.BoolVar(&fSudo, "sudo", false, "")
-	fs.BoolVar(&fNoSudo, "no-sudo", false, "")
-	fs.BoolVar(&fNopasswd, "nopasswd-sudo", false, "") // deprecated alias of --sudo
-	fs.BoolVar(&fAuto, "auto-revoke", false, "")
-	fs.BoolVar(&fNoAuto, "no-auto-revoke", false, "")
-	fs.BoolVar(&fYes, "yes", false, "")
-	fs.BoolVar(&fYes, "y", false, "")
-	fs.BoolVar(&fAllowNonTTY, "allow-non-tty-private-key-output", false, "")
-	fs.BoolVar(&fInstallDeps, "install-deps", false, "")
-	fs.BoolVar(&fNoInstallDeps, "no-install-deps", false, "")
-	fs.BoolVar(&fFixSSHD, "fix-sshd", false, "")
-	fs.BoolVar(&fNoFixSSHD, "no-fix-sshd", false, "")
-	fs.BoolVar(&fPasswordLogin, "password-login", false, "")
-	if err := fs.Parse(args); err != nil {
+	opts, ok := a.parseInviteOptions(args)
+	if !ok {
 		return 1
 	}
-	if fs.NArg() > 0 {
-		a.errorf("%s %v", a.P.M("未知参数：", "unexpected arguments:"), fs.Args())
-		return 1
-	}
-	if (fSudo || fNopasswd) && fNoSudo {
-		a.errorf("%s", a.P.M("--sudo/--nopasswd-sudo 与 --no-sudo 互斥",
-			"--sudo/--nopasswd-sudo and --no-sudo are mutually exclusive"))
-		return 1
-	}
-	if fAuto && fNoAuto {
-		a.errorf("%s", a.P.M("--auto-revoke 与 --no-auto-revoke 互斥",
-			"--auto-revoke and --no-auto-revoke are mutually exclusive"))
-		return 1
-	}
-	if fInstallDeps && fNoInstallDeps {
-		a.errorf("%s", a.P.M("--install-deps 与 --no-install-deps 互斥",
-			"--install-deps and --no-install-deps are mutually exclusive"))
-		return 1
-	}
-	if fFixSSHD && fNoFixSSHD {
-		a.errorf("%s", a.P.M("--fix-sshd 与 --no-fix-sshd 互斥", "--fix-sshd and --no-fix-sshd are mutually exclusive"))
-		return 1
-	}
-	if fNopasswd {
-		fSudo = true
-	}
-	if fPasswordLogin && fFixSSHD {
-		a.errorf("%s", a.P.M("--password-login 与 --fix-sshd 互斥：密码登录的前提正是不改动 sshd",
-			"--password-login and --fix-sshd are mutually exclusive: password login exists precisely to leave sshd alone"))
-		return 1
-	}
-	portSet, hoursSet := false, false
-	fs.Visit(func(fl *flag.Flag) {
-		switch fl.Name {
-		case "port":
-			portSet = true
-		case "hours":
-			hoursSet = true
-		}
-	})
-
-	hours := *hoursFlag
-	if !validate.Hours(hours) {
-		a.errorf("%s", a.P.M(fmt.Sprintf("--hours 必须在 1..%d 之间", config.MaxExpireHours),
-			fmt.Sprintf("--hours must be between 1 and %d", config.MaxExpireHours)))
-		return 1
-	}
-	if !validate.Prefix(*prefix) {
-		a.errorf("%s", a.P.M("用户名前缀不合法："+*prefix, "invalid username prefix: "+*prefix))
-		return 1
-	}
-	username := *userFlag
-	generatedUsername := username == ""
-	if username == "" {
-		// Only the generation path uses the prefix. A prefix in the reserved
-		// "systemd-" namespace would generate usernames the revoke path refuses to
-		// delete (user.IsReservedName), so reject it here before generating. An
-		// explicit --user does not use the prefix and is validated on its own below.
-		if user.IsReservedName(*prefix + "-") {
-			a.errorf("%s", a.P.M("用户名前缀落入受保护命名空间（如 systemd-），会创建无法撤销的账号："+*prefix,
-				"username prefix is in a reserved namespace (e.g. systemd-) and would create an unrevocable account: "+*prefix))
-			return 1
-		}
-		// Fill the username's remaining Linux-compatible length with entropy. Even
-		// the longest accepted prefix retains the historical 40-bit minimum, while
-		// the default prefix receives 104 bits.
-		suffixBytes := (31 - len(*prefix)) / 2
-		for attempt := 0; attempt < 20; attempt++ {
-			h, err := a.RandHex(suffixBytes)
-			if err != nil {
-				a.errorf("rand: %v", err)
-				return 1
-			}
-			cand := *prefix + "-" + h
-			// Dependency planning happens later and may need to install `id`. Use the
-			// local database while choosing a candidate, then perform the authoritative
-			// local+NSS check inside the lifecycle lock immediately before creation.
-			exists, lookupErr := user.Exists(cand)
-			if lookupErr != nil {
-				a.errorf("%s: %v", a.P.M("读取账号数据库失败", "reading account database failed"), lookupErr)
-				return 1
-			}
-			if !exists {
-				username = cand
-				break
-			}
-		}
-		if username == "" {
-			a.errorf("%s", a.P.M("随机用户名多次冲突，请指定 --user", "random username collided repeatedly; specify --user"))
-			return 1
-		}
-	}
-	if !validate.Username(username) {
-		a.errorf("%s", a.P.M("用户名不合法："+username, "invalid username: "+username))
-		return 1
-	}
-	// Refuse a reserved/system name (root, daemon, systemd-*, ...): the revoke path
-	// protects these, so creating one would leave an account the tool can never
-	// delete — manually or via the auto-revoke timer. This is the authoritative
-	// gate; it also covers an explicit --user that bypasses the prefix path above.
-	if user.IsReservedName(username) {
-		a.errorf("%s", a.P.M("用户名落入受保护/系统命名空间，拒绝创建（撤销将无法删除）："+username,
-			"username is a reserved/system name and cannot be created (revoke would refuse to delete it): "+username))
+	username, generatedUsername, ok := a.resolveInviteUsername(opts.username, opts.prefix)
+	if !ok {
 		return 1
 	}
 
-	grantSudo := triState(fSudo, fNoSudo)
-	autoRev := triState(fAuto, fNoAuto)
+	grantSudo := opts.sudo
 
-	// Refuse a non-TTY stdout up front — before any prompt or host probe — so a
-	// piped run fails immediately rather than after the operator answers.
-	if !a.StdoutIsTTY() && !fAllowNonTTY {
-		a.errorf("%s", a.P.M("stdout 非 TTY，拒绝输出一次性私钥/密码（可加 --allow-non-tty-private-key-output）",
-			"stdout is not a TTY; refusing to print the one-time private key or password (add --allow-non-tty-private-key-output)"))
+	if !a.checkInvitePreconditions(opts, username, generatedUsername) {
 		return 1
 	}
 
-	// Everything the operator typed is validated here, before anything is probed,
-	// asked, or disclosed: a bad value on the command line is a usage error, and a
-	// malformed command must never get as far as a question. Only the values that
-	// have to be *discovered* (a Host that must be prompted for or detected, a port
-	// read from sshd) are settled later, after the login check has had its say.
-	if *hostFlag != "" && !validate.Host(*hostFlag) {
-		a.errorf("%s", a.P.M("Host 不合法："+*hostFlag, "invalid host: "+*hostFlag))
-		return 1
-	}
-	if portSet && !validate.Port(*portFlag) {
-		a.errorf("%s", a.P.M(fmt.Sprintf("SSH 端口不合法：%d", *portFlag), fmt.Sprintf("invalid SSH port: %d", *portFlag)))
-		return 1
-	}
-	if fYes && *hostFlag == "" {
-		a.errorf("%s", a.P.M("--yes 模式请显式传入 --host", "--yes mode requires an explicit --host"))
-		return 1
-	}
-	if grantSudo == "yes" && fYes && generatedUsername {
-		// The confirmation names the account being granted root. With a generated
-		// name there is nothing to name yet: the old message interpolated this
-		// run's throwaway name, and the next run generated a different one, so an
-		// automated caller could never satisfy it.
-		a.errorf("%s", a.P.M(
-			"通过 --sudo --yes 授权必须显式指定 --user <名称> 并传入同名的 --confirm-sudo <名称>：随机生成的用户名无法事先确认",
-			"granting sudo via --sudo --yes requires an explicit --user NAME together with a matching --confirm-sudo NAME; a generated username cannot be confirmed in advance"))
-		return 1
-	}
-	if grantSudo == "yes" && fYes && *confirmSudo != username {
-		a.errorf("%s", a.P.M("通过 --sudo --yes 授权需同时传入 --confirm-sudo "+username,
-			"granting sudo via --sudo --yes also requires --confirm-sudo "+username))
-		return 1
-	}
-	if err := user.CheckPidfd(); err != nil {
-		a.errorf("%s: %v", a.P.M("当前内核或进程沙箱不支持安全的进程撤销，拒绝创建无法可靠清理的账号",
-			"the kernel or process sandbox does not support safe process revocation; refusing to create an account that cannot be reliably removed"), err)
-		return 1
-	}
-
-	// Settle how the invitee will log in FIRST. planLogin only reads (`sshd -T`)
-	// and decides — it changes nothing — and it is the one question that can make
-	// every other one moot: on a host whose sshd refuses this account outright, the
-	// operator hears so immediately, having been asked nothing.
-	//
-	// That ordering is load-bearing, not cosmetic. Resolving the Host can involve
-	// asking an external echo service for this server's public IP, and this tool's
-	// own rule is that a root-run tool must not phone home unasked. Doing it for an
-	// invite that is about to be refused would be exactly that: a pointless
-	// disclosure of the server's address, plus two questions (sudo, auto-delete)
-	// whose answers were never going to be used.
-	//
-	// It also lets the confirmation below state the login method and its price in
-	// one summary, rather than springing a second question after the operator has
-	// already typed YES.
-	plan, ok := a.planLogin(username, fPasswordLogin, triState(fFixSSHD, fNoFixSSHD), fYes)
+	// Check login before resolving Host: discovery may contact an external IP
+	// service. Rejected invites must not cause that disclosure or needless prompts.
+	// The final summary includes any SSH change before the operator confirms.
+	plan, ok := a.planLogin(username, opts.passwordLogin, opts.fixSSHD, opts.yes)
 	if !ok {
 		return 1
 	}
 
 	// A Host that was not given has to be detected or asked for; whatever comes back
 	// is untrusted input and is validated like any other.
-	host := *hostFlag
+	host := opts.host
 	if host == "" {
 		host = a.detectOrPromptHost()
 		if !validate.Host(host) {
@@ -240,8 +61,8 @@ func (a *App) invite(args []string) int {
 		}
 	}
 
-	port := *portFlag
-	if !portSet {
+	port := opts.port
+	if !opts.portSet {
 		var err error
 		port, err = a.detectSSHPort()
 		if err != nil {
@@ -261,63 +82,35 @@ func (a *App) invite(args []string) int {
 		// "Sudo: yes" and can be declined, and `--no-sudo` makes a plain account. A
 		// non-interactive run (--yes) is left as a plain account unless --sudo is
 		// passed explicitly, which keeps the --confirm-sudo gate and scripts intact.
-		if fYes {
+		if opts.yes {
 			grantSudo = "no"
 		} else {
 			grantSudo = "yes"
 		}
 	}
-	if autoRev == "ask" {
-		if fYes {
-			autoRev = "yes"
-		} else {
-			answer, answered := a.promptYesNo(a.P.M("是否到期后自动删除该用户？[Y/n]: ", "Auto-delete this user on expiry? [Y/n]: "), true)
-			if !answered {
-				return 1
-			}
-			if answer {
-				autoRev = "yes"
-			} else {
-				autoRev = "no"
-			}
-		}
-	}
-
-	// The lifetime only means something when the account will auto-delete; without
-	// it the account is permanent (no expiry, no deletion), so there is nothing to
-	// ask. A menu-driven operator never touches --hours, so offer it here when
-	// auto-delete is on and it was not set on the command line. The TTY gate
-	// matters: promptHours re-asks on invalid input, and an unbounded non-TTY stdin
-	// stream (e.g. `yes n | lta invite`) never reaches EOF, so without it the root
-	// tool would spin forever on the pipe.
-	if autoRev == "yes" && !hoursSet && !fYes && a.StdinIsTTY() {
-		hours = a.promptHours(hours)
-	}
-	// --hours with --no-auto-revoke asks for a lifetime the permanent account will
-	// not have; say so rather than silently ignoring the flag.
-	if autoRev == "no" && hoursSet {
-		a.warnf("%s", a.P.M("未选择自动删除，账号将永久有效，--hours 被忽略。",
-			"auto-delete is off, so the account is permanent and --hours is ignored."))
+	hours, wantAuto, ok := a.resolveInviteLifetime(opts.autoRevoke, opts.hours, opts.hoursSet, opts.yes)
+	if !ok {
+		return 1
 	}
 
 	// Work out what would have to be installed BEFORE the summary, so the summary
 	// can name it and the YES can be its consent. This only decides — the install
 	// itself is a host change and waits until after the confirmation.
-	depPkgs, ok := a.planDeps(grantSudo == "yes", plan.password, fInstallDeps, fNoInstallDeps, fYes)
+	depPkgs, ok := a.planDeps(grantSudo == "yes", plan.password, opts.installDeps, opts.noInstallDeps, opts.yes)
 	if !ok {
 		return 1
 	}
 
-	if !fYes {
+	if !opts.yes {
 		// A permanent account (auto-delete off) has no lifetime, so the summary shows
 		// its expiry as "permanent" instead of an hours figure that would not apply.
 		lifetime := fmt.Sprintf(a.P.M("有效期=%d小时", "expires-in=%dh"), hours)
-		if autoRev != "yes" {
+		if !wantAuto {
 			lifetime = a.P.M("永久", "permanent")
 		}
 		a.printf("\n%s\n  user=%s host=%s port=%d %s sudo=%s auto-delete=%s\n  login=%s\n",
 			a.P.M("即将创建一次性临时账号：", "About to create a one-time temporary account:"),
-			username, host, port, lifetime, a.choiceDisplay(grantSudo), a.choiceDisplay(autoRev), a.loginSummary(plan, username))
+			username, host, port, lifetime, a.choiceDisplay(grantSudo), a.choiceDisplay(ynStr(wantAuto)), a.loginSummary(plan, username))
 		if len(depPkgs) > 0 {
 			a.printf("  %s%s", a.P.M("确认后将安装依赖：", "dependencies to install on confirm: "), strings.Join(depPkgs, " "))
 		}
@@ -336,7 +129,7 @@ func (a *App) invite(args []string) int {
 	}
 	return a.withAccountExclusiveLock(username, func() int {
 		return a.withLifecycleLock(func() int {
-			return a.runInviteWithIdentityPolicy(username, host, port, hours, grantSudo == "yes", autoRev == "yes", plan, generatedUsername)
+			return a.runInviteWithIdentityPolicy(username, host, port, hours, grantSudo == "yes", wantAuto, plan, generatedUsername)
 		})
 	})
 }
@@ -352,24 +145,56 @@ func (a *App) choiceDisplay(value string) string {
 	}
 }
 
-// promptHours asks for the account lifetime, offering current as the default a
-// blank line accepts. It loops until the input is valid or blank. Callers must
-// gate it on a.StdinIsTTY(): a closed stdin reads empty and settles on the
-// default, but an unbounded non-TTY stream of invalid lines never blanks and
-// would spin here forever, so it is only ever reached on a real terminal.
-func (a *App) promptHours(current int) int {
-	msg := fmt.Sprintf(a.P.M("有效期（小时，1-%d）[%d]: ", "Lifetime in hours (1-%d) [%d]: "),
-		config.MaxExpireHours, current)
-	for {
-		ans := a.prompt(msg)
-		if ans == "" {
-			return current
+// resolveInviteLifetime combines the default terminal flow into one question.
+// Explicit flags and piped input keep their existing auto-delete choice rules.
+func (a *App) resolveInviteLifetime(autoRev string, hours int, hoursSet, yes bool) (int, bool, bool) {
+	wantAuto := autoRev != "no"
+	if !yes && !hoursSet && wantAuto && a.StdinIsTTY() {
+		return a.promptLifetime(hours, autoRev == "ask")
+	}
+	if autoRev == "ask" && !yes {
+		var ok bool
+		wantAuto, ok = a.promptYesNo(a.P.M("是否到期后自动删除该用户？[Y/n]: ", "Auto-delete this user on expiry? [Y/n]: "), true)
+		if !ok {
+			return hours, false, false
 		}
-		if n, err := strconv.Atoi(ans); err == nil && validate.Hours(n) {
-			return n
+	}
+	if !wantAuto && hoursSet {
+		a.warnf("%s", a.P.M("未选择自动删除，账号将永久有效，--hours 被忽略。",
+			"auto-delete is off, so the account is permanent and --hours is ignored."))
+	}
+	return hours, wantAuto, true
+}
+
+// promptLifetime accepts permanence only through an explicit keyword. A typo
+// never disables expiry; EOF cancels and invalid piped input cannot loop.
+func (a *App) promptLifetime(current int, allowPermanent bool) (int, bool, bool) {
+	msg := fmt.Sprintf(a.P.M("有效期（小时，1-%d）[%d]: ", "Lifetime in hours (1-%d) [%d]: "), config.MaxExpireHours, current)
+	if allowPermanent {
+		msg = fmt.Sprintf(a.P.M("有效期（小时，1-%d；永久请输入 never）[%d]: ",
+			"Lifetime in hours (1-%d; never for a permanent account) [%d]: "), config.MaxExpireHours, current)
+	}
+	for {
+		fmt.Fprint(a.Err, msg)
+		answer, ok := a.readLine()
+		if !ok {
+			a.warnf("%s", a.P.M("输入已结束，已取消", "input ended; cancelled"))
+			return current, false, false
+		}
+		if answer == "" {
+			return current, true, true
+		}
+		if allowPermanent && strings.EqualFold(answer, "never") {
+			return current, false, true
+		}
+		if hours, err := strconv.Atoi(answer); err == nil && validate.Hours(hours) {
+			return hours, true, true
 		}
 		a.warnf("%s", a.P.M(fmt.Sprintf("请输入 1-%d 之间的整数", config.MaxExpireHours),
 			fmt.Sprintf("enter an integer between 1 and %d", config.MaxExpireHours)))
+		if !a.StdinIsTTY() {
+			return current, false, false
+		}
 	}
 }
 

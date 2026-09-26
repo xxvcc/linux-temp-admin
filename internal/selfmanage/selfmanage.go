@@ -37,7 +37,7 @@ import (
 type Manager struct {
 	InstallPath string
 	// PublicKey is the legacy single-key injection point. PublicKeys is the
-	// rotation-capable keyring; Upgrade accepts a signature made by either. New
+	// rotation-capable keyring; candidate verification accepts signatures from either. New
 	// populates both so existing callers that inspect PublicKey keep working.
 	PublicKey      ed25519.PublicKey
 	PublicKeys     []ed25519.PublicKey
@@ -171,8 +171,7 @@ func New(installPath string, maxBytes int64) *Manager {
 
 // Install atomically writes srcBytes to InstallPath as a root-owned 0755 binary.
 // It reports whether it actually wrote: a byte-identical target is left alone and
-// returns (false, nil), mirroring Upgrade's ("", nil) for "nothing to do". If the
-// target differs and force is false, it refuses.
+// returns (false, nil). If the target differs and force is false, it refuses.
 func (m *Manager) Install(srcBytes []byte, force bool) (installed bool, err error) {
 	if err := ensureInstallDir(filepath.Dir(m.InstallPath)); err != nil {
 		return false, err
@@ -632,52 +631,72 @@ func (m *Manager) prepareVerifiedCandidate(bin, sig []byte, expectedVersion stri
 	}, nil
 }
 
+// UpgradeResult records the installed state observed at commit time and whether
+// the command was visibly replaced. Replaced remains true if directory syncing
+// fails after replacement, so an interactive caller can retire its old process.
+type UpgradeResult struct {
+	// PreviousVersion is empty when no command was installed, or "unknown" when
+	// an existing command could not be identified.
+	PreviousVersion string
+	// Version is the resulting version after replacement or a successful no-op.
+	// It remains empty when an error prevented a visible replacement.
+	Version  string
+	Replaced bool
+}
+
 // ApplyUpgrade re-reads the installed command at commit time, applies the
 // downgrade policy to that current state, and atomically installs candidate.
-// It returns ("", nil) if the installed command is already the same version or
-// newer. If replacement is visible but not known durable, the version is returned
-// alongside the durability error so the CLI can report the partial outcome.
-func (m *Manager) ApplyUpgrade(candidate *UpgradeCandidate, force bool) (string, error) {
+// A same/newer installed command produces a successful result with Replaced
+// false. A visible but not known durable replacement returns both its result
+// and the durability error; failure alone does not mean nothing changed.
+func (m *Manager) ApplyUpgrade(candidate *UpgradeCandidate, force bool) (UpgradeResult, error) {
+	var result UpgradeResult
 	if candidate == nil || len(candidate.bin) == 0 ||
 		(candidate.signedVersion != "" && !validate.ReleaseVersion(candidate.signedVersion)) ||
 		(candidate.expected != "" && !validate.ReleaseVersion(candidate.expected)) {
-		return "", fmt.Errorf("invalid prepared upgrade candidate")
+		return result, fmt.Errorf("invalid prepared upgrade candidate")
 	}
-	installedVersion := ""
 	if current, err := m.InstalledVersion(); err == nil {
-		installedVersion = current
-	} else if !errors.Is(err, ErrNotInstalled) && !force {
-		return "", fmt.Errorf("read installed version: %w", err)
+		result.PreviousVersion = current
+	} else if !errors.Is(err, ErrNotInstalled) {
+		result.PreviousVersion = "unknown"
+		if !force {
+			return result, fmt.Errorf("read installed version: %w", err)
+		}
 	}
 	if !force {
 		if candidate.signedVersion == "" {
-			return "", fmt.Errorf("signed candidate has no static release-version witness; use --force only after independently confirming the historical binary")
+			return result, fmt.Errorf("signed candidate has no static release-version witness; use --force only after independently confirming the historical binary")
 		}
-		if installedVersion != "" && !version.Greater(candidate.signedVersion, installedVersion) {
-			return "", nil // already up to date or newer; candidate was not executed
+		if result.PreviousVersion != "" && !version.Greater(candidate.signedVersion, result.PreviousVersion) {
+			result.Version = result.PreviousVersion
+			return result, nil // same/newer install; candidate was not executed
 		}
 	}
 	probedVersion, err := m.probeVersion(candidate.bin)
 	if err != nil {
-		return "", fmt.Errorf("read downloaded version: %w", err)
+		return result, fmt.Errorf("read downloaded version: %w", err)
 	}
 	if candidate.signedVersion != "" && probedVersion != candidate.signedVersion {
-		return "", fmt.Errorf("candidate version %q does not match signed release-version witness %q", probedVersion, candidate.signedVersion)
+		return result, fmt.Errorf("candidate version %q does not match signed release-version witness %q", probedVersion, candidate.signedVersion)
 	}
 	if candidate.expected != "" && probedVersion != candidate.expected {
-		return "", fmt.Errorf("signed candidate version %q does not match selected release %q", probedVersion, candidate.expected)
+		return result, fmt.Errorf("signed candidate version %q does not match selected release %q", probedVersion, candidate.expected)
 	}
-	installed, err := m.Install(candidate.bin, true)
+	result.Replaced, err = m.Install(candidate.bin, true)
+	if result.Replaced {
+		result.Version = probedVersion
+	}
 	if err != nil {
-		if installed {
-			return probedVersion, fmt.Errorf("installed command was replaced but durability is unknown: %w", err)
+		if result.Replaced {
+			return result, fmt.Errorf("installed command was replaced but durability is unknown: %w", err)
 		}
-		return "", err
+		return result, err
 	}
-	if !installed {
-		return "", nil
-	}
-	return probedVersion, nil
+	// Install also returns false for identical, already-safe bytes. This is a
+	// known no-op, not an unverified or failed installation.
+	result.Version = probedVersion
+	return result, nil
 }
 
 var releaseVersionWitnessPrefix = []byte{
@@ -711,17 +730,6 @@ func releaseVersionWitness(bin []byte) (string, error) {
 		search = search[index+1:]
 	}
 	return versionValue, nil
-}
-
-// Upgrade is the one-shot API retained for callers that already provide their
-// own serialization. CLI code uses PrepareUpgrade and ApplyUpgrade separately so
-// network retries never hold the global lifecycle lock.
-func (m *Manager) Upgrade(binaryURL, sigURL string, force bool) (string, error) {
-	candidate, err := m.PrepareUpgrade(binaryURL, sigURL)
-	if err != nil {
-		return "", err
-	}
-	return m.ApplyUpgrade(candidate, force)
 }
 
 func (m *Manager) verificationKeys() []ed25519.PublicKey {

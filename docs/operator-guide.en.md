@@ -33,9 +33,11 @@ The interactive flow:
 1. chooses a username, using a random suffix by default;
 2. detects or asks for the invite host and SSH port;
 3. grants sudo by default, with an option for a regular account;
-4. asks whether to auto-delete and then asks the lifetime only when enabled;
+4. uses one terminal prompt for the lifetime: Enter keeps 24 hours, and an explicit `never` selects a permanent account;
 5. shows the complete summary for confirmation;
 6. creates the account and grants, creates a task when automatic revocation is enabled, and only then prints the invite credential.
+
+Explicit lifetime and automatic-removal flags keep their existing rules: `--auto-revoke` cannot be changed to permanent at the prompt, and `--no-auto-revoke` skips the lifetime question. Piped input retains the existing y/n automatic-removal choice; `--yes` never prompts. Invalid terminal input is retried, and end-of-input cancels. The final confirmation clearly identifies permanent accounts.
 
 Before creating anything, the tool checks whether the planned credential is compatible with the effective sshd configuration. An unresolved blocker reported by the check refuses creation, and incomplete knowledge is reported as `UNVERIFIED`. "Verified against the effective sshd config" means only that this configuration check completed without a known blocker or unevaluated rule; it is not end-to-end proof of the network, firewall, PAM, SELinux, or running sshd state. Test the invite through the intended connection path before delivery.
 

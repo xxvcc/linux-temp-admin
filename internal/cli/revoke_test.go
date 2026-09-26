@@ -2111,7 +2111,7 @@ func TestFinalScheduledAccountCheckClearsWorkQueuedBeforeTerminationCompletes(t 
 		},
 	}
 
-	if err := a.finalScheduledAccountCheck(pw.Name, pw); err != nil {
+	if err := a.finalScheduledAccountCheckWith(pw.Name, pw, a.revokeAccountStillMatches); err != nil {
 		t.Fatal(err)
 	}
 	if queued {
