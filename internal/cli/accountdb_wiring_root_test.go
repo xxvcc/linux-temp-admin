@@ -90,7 +90,7 @@ func TestInviteReconcilesPartialUseraddAccountDatabaseState(t *testing.T) {
 				NameInUse:                 func(string) (bool, error) { return false, nil },
 				InspectPrivateGroupState:  func(_ string, gid int, _ bool) (bool, error) { return runner.groupPresent && gid == reservedID, nil },
 				InspectSameNameGroupState: func(string) (bool, error) { return runner.groupPresent, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 				ValidateManagedMailRoots:  func() error { return nil },
 				PrepareManagedHome:        func(string) error { return nil },
 				RemoveManagedMail:         func(user.Passwd) error { return nil },

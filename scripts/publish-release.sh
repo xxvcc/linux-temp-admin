@@ -168,8 +168,8 @@ require_safe_source_repo() {
   done
 }
 
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size unit
+file_limit_blocks() {
+  local max=$1 unit
   # Bash uses 1024-byte `ulimit -f` blocks normally but 512-byte blocks in POSIX
   # or sh mode. Assuming 1024 halved the effective cap wherever the unit is 512,
   # rejecting files that are within the limit. Probe the inherited kernel value in
@@ -184,7 +184,12 @@ bounded_copy() {
     512 | 1024) ;;
     *) echo "unsupported shell file-size limit unit: $unit" >&2; return 1 ;;
   esac
-  blocks=$(( (max + unit - 1) / unit ))
+  printf '%s\n' "$(( (max + unit - 1) / unit ))"
+}
+
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks="$(file_limit_blocks "$max")" || return 1
   if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
     cp --reflink=never --sparse=never -- "$source" "$destination" ); then
     echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2
@@ -745,7 +750,7 @@ download_draft_asset() {
     || { echo "invalid or oversized advertised draft asset: $name" >&2; return 1; }
   [[ "$api_url" == "https://api.github.com/repos/${REPO}/releases/assets/"* ]] \
     || { echo "unexpected GitHub asset API URL for $name" >&2; return 1; }
-  blocks=$(( (max + 1023) / 1024 ))
+  blocks="$(file_limit_blocks "$max")" || return 1
   ( ulimit -f "$blocks" || exit 1; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$out" ) \
     || { echo "bounded draft download failed: $name" >&2; return 1; }
   actual_size="$(wc -c < "$out")"
@@ -930,9 +935,8 @@ require_remote_asset_digests
 
 public_fetch() {
   local url=$1 out=$2 max=$3 attempt blocks fetch_url
-  # Bash expresses RLIMIT_FSIZE in 1024-byte units. Exact byte checks below
-  # handle the final partial block and remain authoritative.
-  blocks=$(( (max + 1023) / 1024 ))
+  # Probe the shell unit; exact byte checks also enforce the final partial block.
+  blocks="$(file_limit_blocks "$max")" || return 1
   for attempt in 1 2 3 4 5 6; do
     rm -f -- "$out"
     fetch_url="$url"

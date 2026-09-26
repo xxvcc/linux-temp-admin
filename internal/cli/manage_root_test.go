@@ -34,6 +34,7 @@ func (fakeSys) ScheduleAt(string, time.Time) (string, error) { return "", nil }
 func (fakeSys) RemoveAtJobsFor(string) error                 { return nil }
 func (fakeSys) AtrmJob(string) error                         { return nil }
 func (fakeSys) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
+func (fakeSys) AtDaemonRunning() (bool, error)               { return true, nil }
 
 type failedCreateRunner struct{}
 
@@ -196,7 +197,7 @@ func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
 	a.Users = &user.Manager{
 		Runner:                    failedCreateRunner{},
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 		ValidateManagedMailRoots:  func() error { return wantErr },
 		PrepareManagedHome: func(string) error {
 			t.Fatal("managed Home preflight ran after mail-root preflight failed")
@@ -260,7 +261,7 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 		PrepareManagedHome:        func(string) error { return nil },
 		CreateManagedHome:         func(user.Passwd) error { return nil },
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 	}
 	a.LookupUser = a.Users.LookupUser
 	a.IdentityAllocationRange = func() (int, int, error) { return 4242, 4242, nil }
@@ -294,10 +295,10 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 	if clockCalls != 1 {
 		t.Fatalf("invite transaction read its creation clock %d times, want once", clockCalls)
 	}
-	if got, want := rec.Created, createdAt.Format("2006-01-02 15:04:05 MST"); got != want {
+	if got, want := rec.Created, expiry.Display(createdAt); got != want {
 		t.Fatalf("recorded creation = %q, want %q", got, want)
 	}
-	if got, want := rec.Expires, expiry.DisplayLocal(expiry.Deadline(createdAt, 1)); got != want {
+	if got, want := rec.Expires, expiry.Display(expiry.Deadline(createdAt, 1)); got != want {
 		t.Fatalf("recorded deadline = %q, want %q", got, want)
 	}
 	if !strings.Contains(errb.String(), "account artifact cleanup is unconfirmed") {
@@ -433,10 +434,10 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	if mailCalls < 2 {
 		t.Fatalf("mail cleanup calls before/during rollback = %d, want at least create and post-drain sweeps", mailCalls)
 	}
-	if got, want := runner.recordAtCredential.Created, t1.Format("2006-01-02 15:04:05 MST"); got != want {
+	if got, want := runner.recordAtCredential.Created, expiry.Display(t1); got != want {
 		t.Fatalf("creation time at credential = %q, want %q", got, want)
 	}
-	if got, want := runner.recordAtCredential.Expires, expiry.DisplayLocal(expiry.Deadline(t1, 1)); got != want {
+	if got, want := runner.recordAtCredential.Expires, expiry.Display(expiry.Deadline(t1, 1)); got != want {
 		t.Fatalf("expiry at credential = %q, want %q", got, want)
 	}
 	if runner.recordAtCredential.Pending {
@@ -503,7 +504,7 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				NameInUse:                 func(string) (bool, error) { return false, nil },
 				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
 				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
@@ -737,7 +738,7 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 				NameInUse:                 func(string) (bool, error) { return false, nil },
 				InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return runner.present, nil },
 				InspectSameNameGroupState: func(string) (bool, error) { return runner.present, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 				PrepareManagedHome:        func(string) error { return nil },
 				CreateManagedHome: func(user.Passwd) error {
 					events = append(events, "home")
@@ -828,7 +829,7 @@ func newManageApp(t *testing.T, in string, users ...string) (*App, *bytes.Buffer
 		NameInUse:                 func(string) (bool, error) { return false, nil },
 		InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 		InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-		CheckSubordinateIDsAbsent: func(string) error { return nil },
+		CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 	}
 	// The store's dir has to be root-owned for its symlink-safety checks to pass;
 	// t.TempDir() belongs to whoever runs the suite.

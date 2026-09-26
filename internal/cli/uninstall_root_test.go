@@ -957,6 +957,7 @@ func TestDoctorReportsAutoDeleteAccountsWithNoTaskLeft(t *testing.T) {
 			t.Fatal(err)
 		}
 		rec.AutoRevoke = true
+		rec.Expires = "2099-07-08 12:00:00 UTC"
 		rec.AutoUnit = unit
 		if err := a.Registry.Record(rec); err != nil {
 			t.Fatal(err)

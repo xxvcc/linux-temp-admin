@@ -39,7 +39,7 @@ func rootDir(t *testing.T) string {
 
 func TestInstallIdempotentAndForce(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin")}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin")}
 	installed, err := m.Install([]byte("v1"), false)
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestInstallIdempotentAndForce(t *testing.T) {
 func TestInstallFailsClosedOnTargetInspectionError(t *testing.T) {
 	dir := rootDir(t)
 	wrote := false
-	m := &Manager{
+	m := &Manager{RequireHostMachine: allowAnyMachine,
 		InstallPath: filepath.Join(dir, "linux-temp-admin"),
 		Lstat:       func(string) (os.FileInfo, error) { return nil, fs.ErrPermission },
 		WriteRootFile: func(string, []byte, os.FileMode) error {
@@ -114,7 +114,7 @@ func TestInstallRequiresForceForExistingSpecialFile(t *testing.T) {
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := &Manager{InstallPath: path}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: path}
 	if _, err := m.Install([]byte("candidate"), false); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("Install error = %v, want special-file refusal", err)
 	}
@@ -134,7 +134,7 @@ func TestInstallCreatesMissingRootSafeParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	installDir := filepath.Join(localDir, "sbin")
-	m := &Manager{InstallPath: filepath.Join(installDir, "linux-temp-admin")}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(installDir, "linux-temp-admin")}
 
 	installed, err := m.Install([]byte("candidate"), false)
 	if err != nil || !installed {
@@ -159,7 +159,7 @@ func TestInstallCreatesMissingRootSafeParent(t *testing.T) {
 func TestInstallRepairsUnsafeMetadataOnIdenticalFile(t *testing.T) {
 	dir := rootDir(t)
 	path := filepath.Join(dir, "linux-temp-admin")
-	m := &Manager{InstallPath: path}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: path}
 	if _, err := m.Install([]byte("same"), false); err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestInstallRepairsUnsafeMetadataOnIdenticalFile(t *testing.T) {
 
 func TestInstallReportsVisibleReplacementOnDurabilityFailure(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin")}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin")}
 	m.WriteRootFile = func(path string, content []byte, mode os.FileMode) error {
 		if err := fsutil.WriteRootFile(path, content, mode); err != nil {
 			return err
@@ -264,7 +264,7 @@ func TestPrepareReleaseUpgradeVerifiesCompleteSet(t *testing.T) {
 	bin := newBinary("2.8.0")
 	sig := ed25519.Sign(priv, bin)
 	srv := releaseSetServer(t, asset, bin, sig, "")
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	candidate, err := m.PrepareReleaseUpgrade(srv.URL+"/v2.8.0", asset, "2.8.0")
 	if err != nil || candidate.Version() != "2.8.0" {
 		t.Fatalf("PrepareReleaseUpgrade: version=%q err=%v", candidate.Version(), err)
@@ -302,7 +302,7 @@ func TestPrepareReleaseUpgradeClassifiesFallbackBoundary(t *testing.T) {
 				sig = append(sig, '\n')
 			}
 			srv := releaseSetServer(t, asset, bin, sig, tc.missing)
-			m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20, RetryDelay: 0}
+			m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20, RetryDelay: 0}
 			_, err := m.PrepareReleaseUpgrade(srv.URL+"/v2.8.0", asset, "2.8.0")
 			if err == nil || IsTransportFailure(err) != tc.wantTransport {
 				t.Fatalf("err=%v transport=%v, want transport=%v", err, IsTransportFailure(err), tc.wantTransport)
@@ -318,7 +318,7 @@ func TestUpgradeVerifiesSignatureAndInstalls(t *testing.T) {
 	sig := ed25519.Sign(priv, bin)
 	srv := signedServer(t, bin, sig)
 
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false)
 	if err != nil {
 		t.Fatalf("Upgrade: %v", err)
@@ -336,7 +336,7 @@ func TestPreparedUpgradeRechecksInstalledVersionAtCommit(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	candidateBytes := newBinary("2.0.0")
 	srv := signedServer(t, candidateBytes, ed25519.Sign(priv, candidateBytes))
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	if wrote, err := m.Install(newBinary("1.0.0"), false); err != nil || !wrote {
 		t.Fatalf("seed old install: wrote=%v err=%v", wrote, err)
 	}
@@ -364,7 +364,7 @@ func TestPreparedUpgradeRejectsDowngradeBeforeExecutingCandidate(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	evidence := filepath.Join(dir, "candidate-executed")
 	candidateBytes := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.0.0}\nprintf executed > '" + evidence + "'\nprintf '2.0.0\\n'\n")
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
 	if wrote, err := m.Install(newBinary("3.0.0"), false); err != nil || !wrote {
 		t.Fatalf("seed newer install: wrote=%v err=%v", wrote, err)
 	}
@@ -389,7 +389,7 @@ func TestHistoricalSignedUpgradeRequiresForceBeforeProbe(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	evidence := filepath.Join(dir, "historical-candidate-executed")
 	candidateBytes := []byte("#!/bin/sh\nprintf executed > '" + evidence + "'\nprintf '2.0.0\\n'\n")
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
 
 	candidate, err := m.prepareVerifiedCandidate(
 		candidateBytes, ed25519.Sign(priv, candidateBytes), "2.0.0")
@@ -419,7 +419,7 @@ func TestForcedHistoricalCandidateStillMustMatchSelectedRelease(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	evidence := filepath.Join(dir, "mismatched-candidate-executed")
 	candidateBytes := []byte("#!/bin/sh\nprintf executed > '" + evidence + "'\nprintf '2.0.1\\n'\n")
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, MaxBytes: 1 << 20}
 	candidate, err := m.prepareVerifiedCandidate(
 		candidateBytes, ed25519.Sign(priv, candidateBytes), "2.0.0")
 	if err != nil {
@@ -446,7 +446,7 @@ func TestUpgradeRejectsBadSignature(t *testing.T) {
 	badSig := ed25519.Sign(wrongPriv, bin)
 	srv := signedServer(t, bin, badSig)
 
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	if _, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false); err == nil {
 		t.Fatal("Upgrade must reject a bad signature")
 	}
@@ -462,7 +462,7 @@ func TestUpgradeSkipsWhenNotNewer(t *testing.T) {
 	sig := ed25519.Sign(priv, bin)
 	srv := signedServer(t, bin, sig)
 
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	if installed, err := m.Install(bin, false); err != nil || !installed {
 		t.Fatalf("seed installed version: installed=%v err=%v", installed, err)
 	}
@@ -493,7 +493,7 @@ func TestUpgradeUsesInstalledCommandAsVersionBaseline(t *testing.T) {
 			pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 			candidate := newBinary(tc.candidate)
 			srv := signedServer(t, candidate, ed25519.Sign(priv, candidate))
-			m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+			m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 			if wrote, err := m.Install(newBinary(tc.installed), false); err != nil || !wrote {
 				t.Fatalf("seed installed command: wrote=%v err=%v", wrote, err)
 			}
@@ -521,7 +521,7 @@ func TestUpgradeReturnsCandidateWithDurabilityFailure(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	bin := newBinary("2.0.1")
 	srv := signedServer(t, bin, ed25519.Sign(priv, bin))
-	m := &Manager{InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
 	m.WriteRootFile = func(path string, content []byte, mode os.FileMode) error {
 		if err := fsutil.WriteRootFile(path, content, mode); err != nil {
 			return err
@@ -542,7 +542,7 @@ func TestUpgradeAcceptsAnyKeyInKeyring(t *testing.T) {
 	second, secondPriv, _ := ed25519.GenerateKey(rand.Reader)
 	bin := newBinary("2.0.1")
 	srv := signedServer(t, bin, ed25519.Sign(secondPriv, bin))
-	m := &Manager{
+	m := &Manager{RequireHostMachine: allowAnyMachine,
 		InstallPath: filepath.Join(dir, "linux-temp-admin"),
 		PublicKeys:  []ed25519.PublicKey{first, second},
 		Client:      srv.Client(),
@@ -555,7 +555,7 @@ func TestUpgradeAcceptsAnyKeyInKeyring(t *testing.T) {
 
 func TestProbeVersionIsBounded(t *testing.T) {
 	dir := rootDir(t)
-	m := &Manager{
+	m := &Manager{RequireHostMachine: allowAnyMachine,
 		InstallPath:    filepath.Join(dir, "linux-temp-admin"),
 		ProbeTimeout:   100 * time.Millisecond,
 		ProbeMaxOutput: 32,
@@ -576,4 +576,50 @@ func statT(t *testing.T, path string) *syscall.Stat_t {
 		t.Fatal(err)
 	}
 	return fi.Sys().(*syscall.Stat_t)
+}
+
+// allowAnyMachine lets the shell-script candidate fixtures through the ELF
+// architecture gate. The gate itself is covered by
+// TestCandidateForAnotherArchitectureIsRefused.
+func allowAnyMachine([]byte) error { return nil }
+
+// docs/security-model.md requires the probe output to match BOTH the signed
+// witness and the selected release. The "selected release" half is covered by
+// TestForcedHistoricalCandidateStillMustMatchSelectedRelease; this pins the
+// other half, which no fixture could previously produce because newBinary makes
+// the static witness and the runtime output agree by construction.
+func TestCandidateWhoseProbeDisagreesWithItsSignedWitnessIsRefused(t *testing.T) {
+	dir := rootDir(t)
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	// Signed witness says 2.0.1; running it reports 2.0.9 — the build-metadata
+	// inconsistency buildinfo.VersionMetadataConsistent exists to catch.
+	candidateBytes := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.0.1}\n[ \"$1\" = version ] && echo 2.0.9\nexit 0\n")
+	m := &Manager{
+		RequireHostMachine: allowAnyMachine,
+		InstallPath:        filepath.Join(dir, "linux-temp-admin"),
+		PublicKey:          pub, MaxBytes: 1 << 20,
+	}
+	// expectedVersion "" is the `--url` shape: with no selected release to compare
+	// against, the signed-witness equality is the ONLY thing that can refuse this
+	// candidate. Preparing with "2.0.1" would let the selected-release check fire
+	// on the same fixture and mask the removal of the witness check.
+	candidate, err := m.prepareVerifiedCandidate(candidateBytes, ed25519.Sign(priv, candidateBytes), "")
+	if err != nil {
+		t.Fatalf("prepare candidate: %v", err)
+	}
+	if candidate.expected != "" {
+		t.Fatalf("premise: candidate.expected = %q, want empty so only the witness check applies", candidate.expected)
+	}
+
+	got, err := m.ApplyUpgrade(candidate, false)
+	if err == nil {
+		t.Fatalf("ApplyUpgrade = %q, nil; a candidate that reports a different version than it is signed for must be refused", got)
+	}
+	if !strings.Contains(err.Error(), "does not match signed release-version witness") {
+		t.Fatalf("error = %v, want the signed-witness mismatch refusal", err)
+	}
+	if _, err := os.Lstat(m.InstallPath); !os.IsNotExist(err) {
+		t.Fatalf("the inconsistent candidate was installed anyway: %v", err)
+	}
 }

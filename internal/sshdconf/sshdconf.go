@@ -243,7 +243,12 @@ func (m *Manager) Grant(user string, groups []string, report sysinfo.LoginReport
 		// Whether such an unevaluable rule downgrades the invite to UNVERIFIED is the
 		// caller's decision, taken from the same report; it is not this check's job.
 		if rep := sysinfo.CheckKeyLogin(cfg, user, groups); !rep.OK() {
-			return rollback(fmt.Errorf("the sshd drop-in is not present in the effective config (is `Include %s/*.conf` present in /etc/ssh/sshd_config?)", m.Dir), false)
+			// Name the blocker that actually survived. A missing Include is only one
+			// possible cause: a Match block in a drop-in that sorts before this one
+			// wins the directive, and blaming the Include sent the operator to check a
+			// line that was already there.
+			return rollback(fmt.Errorf("the sshd exception did not take effect: %s still applies; either `Include %s/*.conf` is absent from /etc/ssh/sshd_config, or another Match block sets the same directive first",
+				describeSurvivingBlockers(rep), m.Dir), false)
 		}
 		switch err := m.Reload(); {
 		case err == nil:
@@ -865,4 +870,35 @@ func sshdProcessStartTime(pid int) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("process start time overflows kernel boot time")
 	}
 	return time.Unix(bootSeconds+seconds, nanos), nil
+}
+
+// describeSurvivingBlockers renders the blockers that are still in force, with
+// the effective value each one came from when the probe reported it.
+func describeSurvivingBlockers(rep sysinfo.LoginReport) string {
+	parts := make([]string, 0, len(rep.Blockers))
+	for _, b := range rep.Blockers {
+		name := b.String()
+		if b == sysinfo.BlockKeyAlgorithm && rep.AlgoDirective != "" {
+			// Name the directive under the spelling this host's sshd used: it was
+			// renamed in 8.5, and printing the other one sends the operator to grep
+			// for a line that is not in their config — the exact failure this
+			// message was rewritten to stop. invite.go:696 does the same.
+			name = rep.AlgoDirective
+		}
+		detail := rep.Detail[b]
+		// These two Blocker names already embed their value ("PubkeyAuthentication
+		// no"), so appending Detail would print it twice.
+		if b == sysinfo.BlockPubkeyDisabled || b == sysinfo.BlockPasswordDisabled {
+			detail = ""
+		}
+		if detail != "" {
+			parts = append(parts, name+" ("+detail+")")
+			continue
+		}
+		parts = append(parts, name)
+	}
+	if len(parts) == 0 {
+		return "an unnamed blocker"
+	}
+	return strings.Join(parts, "; ")
 }

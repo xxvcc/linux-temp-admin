@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/expiry"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -32,7 +33,11 @@ func (a *App) revoke(args []string) int {
 	}
 	opts.manualInvocation = true
 	if opts.username == "" {
-		opts.username = a.selectUser()
+		picked, ok := a.selectUser()
+		if !ok {
+			return 1
+		}
+		opts.username = picked
 	}
 	if !validate.Username(opts.username) {
 		a.errorf("%s", a.P.M("用户名不合法，拒绝删除："+opts.username, "invalid username; refusing deletion: "+opts.username))
@@ -309,7 +314,7 @@ func (tx *revokeTransaction) cleanupAbsentAccount() int {
 			// It may be released only after proving that no same-name group or
 			// subordinate-ID assignment remains. In particular, a crash-left pending
 			// row is retained when such residue needs manual inspection.
-			reconcileErr = a.Users.VerifyAccountDatabaseAfterExternalDeletion(rec.User, rec.UID, rec.SequentialID)
+			reconcileErr = a.Users.VerifyAccountDatabaseAfterExternalDeletion(rec.User, rec.UID, rec.UID, rec.SequentialID)
 		}
 	}
 	cleanupErr := errors.Join(
@@ -495,7 +500,7 @@ func (tx *revokeTransaction) stripGrantsAndCheckProtection() revokePhaseResult {
 			a.warnf("%s", a.P.M("自动删除任务保留；systemd 任务会按策略重试，at 和旧的一次性任务需人工核查。",
 				"the auto-delete task is retained; systemd jobs retry by policy, while at and legacy one-shot jobs require manual inspection."))
 		}
-		a.audit("account.delete", username, "fail", "protected target; grants stripped", nil)
+		a.audit("account.delete", username, "fail", protectedRevokeAuditDetail(grantErr), nil)
 		return finishRevoke(1)
 	}
 	return continueRevoke()
@@ -531,7 +536,7 @@ func (tx *revokeTransaction) honorExistingQuarantine() revokePhaseResult {
 				a.errorf("%s: %v", a.P.M("隔离期内的账号身份已改变，无法确认关闭的是同一个账号", "the quarantined account's identity changed; cannot confirm the gates were closed on the same account"), err)
 				return finishRevoke(1)
 			}
-			a.info(a.P.M("账号访问已撤销，用户名和 UID 隔离保留至：", "account access is revoked; name and UID remain quarantined until: ") + deadline.Local().Format("2006-01-02 15:04:05 MST"))
+			a.info(a.P.M("账号访问已撤销，用户名和 UID 隔离保留至：", "account access is revoked; name and UID remain quarantined until: ") + expiry.Display(deadline))
 			return finishRevoke(0)
 		}
 		if a.Now().Before(deadline) {
@@ -670,6 +675,11 @@ func (tx *revokeTransaction) deleteAndFinalize() revokePhaseResult {
 	}
 	stage, teardownErr := teardown(username, pw, persistDeletion, rec.SequentialID)
 	switch stage {
+	case revokeIdentityUnstable:
+		a.errorf("%s: %v", a.P.M("该账号的身份已与本次撤销授权的对象不符；本次拆除在禁用或删除任何东西之前就停下了，账号、登记和自动删除任务均保留。注意本次运行的更早步骤可能已经禁用登录并终止了该 UID 的进程，请立即人工核查账号当前状态",
+			"the account no longer matches the identity this revocation was authorized for; this teardown stopped before disabling or deleting anything, and the account, registry record, and auto-delete task were all retained. Earlier steps in this run may already have disabled the login and terminated its processes, so verify the account's current state immediately"), teardownErr)
+		a.audit("account.delete", username, "fail", "identity changed before teardown: "+teardownErr.Error(), nil)
+		return finishRevoke(1)
 	case revokeDisableLogin:
 		a.errorf("%s: %v", a.P.M("无法完整禁用登录；保留账号、登记和自动删除任务，未终止进程或删除账号，请立即人工处理",
 			"could not fully disable the login; the account, registry record, and auto-delete task were retained, and no processes were terminated or account deleted; inspect immediately"), teardownErr)
@@ -825,8 +835,8 @@ func (a *App) beginIdentityQuarantine(rec registry.Record, expected user.Passwd)
 	// and exits without releasing the identity.
 	cleanupErr := a.Scheduler.CancelAuto(rec.User, rec.AutoUnit)
 	a.success(a.P.M(
-		"访问已撤销；账号身份隔离至 "+deadline.Local().Format("2006-01-02 15:04:05 MST")+"，届时自动完成删除。",
-		"access revoked; account identity is quarantined until "+deadline.Local().Format("2006-01-02 15:04:05 MST")+" and will then be deleted automatically."))
+		"访问已撤销；账号身份隔离至 "+expiry.Display(deadline)+"，届时自动完成删除。",
+		"access revoked; account identity is quarantined until "+expiry.Display(deadline)+" and will then be deleted automatically."))
 	return true, errors.Join(handoffErr, cleanupErr)
 }
 
@@ -852,11 +862,34 @@ func (a *App) verifyCommittedQuarantine(rec registry.Record, uid int, deadline t
 type revokeAccountStage uint8
 
 const (
-	revokeDisableLogin revokeAccountStage = iota
+	// revokeIdentityUnstable is the pre-teardown check: the account no longer
+	// matches the identity this revoke was authorized for, and nothing has been
+	// attempted yet. It is a separate stage because reporting it as a failed
+	// disable told the operator a step had been tried and had failed.
+	revokeIdentityUnstable revokeAccountStage = iota
+	revokeDisableLogin
 	revokeQuiesceAccount
 	revokeDeleteAccount
 	revokeAccountRemoved
 )
+
+// String names the stage. The diagnostic used to print the raw iota value, so
+// inserting a stage silently changed what every previously-logged number meant.
+func (s revokeAccountStage) String() string {
+	switch s {
+	case revokeIdentityUnstable:
+		return "identity-unstable"
+	case revokeDisableLogin:
+		return "disable-login"
+	case revokeQuiesceAccount:
+		return "quiesce-account"
+	case revokeDeleteAccount:
+		return "delete-account"
+	case revokeAccountRemoved:
+		return "account-removed"
+	}
+	return fmt.Sprintf("stage(%d)", uint8(s))
+}
 
 // teardownLocalAccount preserves the ordering that makes UID reuse safe. A
 // stage is returned with the error so revoke can explain precisely which recovery
@@ -877,7 +910,7 @@ func (a *App) teardownLocalAccountWith(
 	deleteExpected func(string, user.Passwd, func() error) error,
 ) (revokeAccountStage, error) {
 	if err := stillMatches(username, expected); err != nil {
-		return revokeDisableLogin, err
+		return revokeIdentityUnstable, err
 	}
 	if err := a.Users.DisableLogin(username); err != nil {
 		return revokeDisableLogin, err
@@ -911,7 +944,7 @@ func (a *App) teardownLocalAccountWith(
 
 func (a *App) teardownQuarantinedAccount(username string, expected user.Passwd, persistDeletion func() error, removePrivateGroup bool) (revokeAccountStage, error) {
 	if err := a.revokeAccountStillMatches(username, expected); err != nil {
-		return revokeDisableLogin, err
+		return revokeIdentityUnstable, err
 	}
 	if err := a.Users.DisableLogin(username); err != nil {
 		return revokeDisableLogin, err
@@ -1076,7 +1109,7 @@ func (a *App) reconcileDeletionStarted(rec registry.Record) error {
 	}
 	return errors.Join(
 		a.Users.ReconcileManagedMailAfterDeletion(rec.User, rec.UID),
-		a.Users.ReconcileAccountDatabaseAfterDeletion(rec.User, rec.UID, rec.SequentialID),
+		a.Users.ReconcileAccountDatabaseAfterDeletion(rec.User, rec.UID, rec.UID, rec.SequentialID),
 	)
 }
 
@@ -1331,10 +1364,19 @@ func (a *App) removeSSHDException(username string) error {
 // only way to name it here is to type it. (manageUsers takes the opposite branch
 // on an empty list, but for a reason that does not apply here: it is reached from
 // the menu, where a prompt nobody can answer would eat the next menu choice.)
-func (a *App) selectUser() string {
+func (a *App) selectUser() (string, bool) {
 	recs, err := a.Registry.List()
 	if err != nil {
 		a.warnf("%v", err)
+		// An unreadable registry is not an empty one. Saying "no registered
+		// temporary users" here states a fact about registration that this read
+		// could not establish, on the one command whose next step is deletion, and
+		// points the operator at --force for an account that may well be
+		// registered. status, manageUsers and cleanupExpired all bail instead.
+		a.errorf("%s", a.P.M(
+			"登记表读取失败，无法列出已登记账号；在修复登记表之前不要按未登记账号处理。",
+			"the registry could not be read, so no account list is available; do not treat any account as unregistered until the registry is repaired."))
+		return "", false
 	}
 	if len(recs) == 0 {
 		a.warnf("%s", a.P.M("没有已登记的临时用户；如需删除未登记账号，请输入完整用户名（配合 --force）。",
@@ -1348,7 +1390,17 @@ func (a *App) selectUser() string {
 	}
 	choice := strings.TrimSpace(a.prompt(a.P.M("请输入编号或用户名: ", "enter a number or a username: ")))
 	if n, err := strconv.Atoi(choice); err == nil && n >= 1 && n <= len(recs) {
-		return recs[n-1].User
+		return recs[n-1].User, true
 	}
-	return choice
+	return choice, true
+}
+
+// protectedRevokeAuditDetail states what actually happened to the grants. It used
+// to always claim they were stripped, so an incident reviewer reading the audit
+// log concluded the NOPASSWD drop-in was gone while it was still granting root.
+func protectedRevokeAuditDetail(grantErr error) string {
+	if grantErr != nil {
+		return "protected target; grants NOT fully stripped: " + grantErr.Error()
+	}
+	return "protected target; grants stripped"
 }

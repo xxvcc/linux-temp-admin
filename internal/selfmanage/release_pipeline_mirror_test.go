@@ -658,23 +658,23 @@ func TestGeneratedReleaseSafetyPrimitivesAreCurrentAndSelfContained(t *testing.T
 	allFunctions := []string{
 		"local_with_timeout", "require_trusted_tmp", "require_safe_directory_path",
 		"require_regular_file_path", "require_safe_file_path", "require_real_directory_path",
-		"require_safe_source_repo", "require_safe_new_output_path", "bounded_copy", "sync_output_directory",
+		"require_safe_source_repo", "require_safe_new_output_path", "file_limit_blocks", "bounded_copy", "sync_output_directory",
 	}
 	expected := map[string]map[string]bool{
 		"../../scripts/prepare-release.sh": {
 			"local_with_timeout": true, "require_trusted_tmp": true, "require_safe_directory_path": true,
 			"require_safe_source_repo": true, "require_safe_new_output_path": true,
-			"bounded_copy": true, "sync_output_directory": true,
+			"file_limit_blocks": true, "bounded_copy": true, "sync_output_directory": true,
 		},
 		"../../scripts/offline-sign-release.sh": {
 			"local_with_timeout": true, "require_trusted_tmp": true, "require_safe_directory_path": true,
 			"require_regular_file_path": true, "require_safe_file_path": true, "require_real_directory_path": true,
-			"require_safe_new_output_path": true, "bounded_copy": true, "sync_output_directory": true,
+			"require_safe_new_output_path": true, "file_limit_blocks": true, "bounded_copy": true, "sync_output_directory": true,
 		},
 		"../../scripts/publish-release.sh": {
 			"local_with_timeout": true, "require_trusted_tmp": true, "require_safe_directory_path": true,
 			"require_regular_file_path": true, "require_safe_file_path": true, "require_real_directory_path": true,
-			"require_safe_source_repo": true, "bounded_copy": true,
+			"require_safe_source_repo": true, "file_limit_blocks": true, "bounded_copy": true,
 		},
 	}
 	for path, wanted := range expected {
@@ -697,7 +697,7 @@ func TestGeneratedReleaseSafetyPrimitivesAreCurrentAndSelfContained(t *testing.T
 
 func TestGeneratedBoundedCopyStopsWhenFileLimitCannotBeSet(t *testing.T) {
 	template := readReleaseFile(t, "../../scripts/release-safety-primitives.inc")
-	start := strings.Index(template, "bounded_copy() {")
+	start := strings.Index(template, "file_limit_blocks() {")
 	if start < 0 {
 		t.Fatal("bounded_copy template function was not found")
 	}

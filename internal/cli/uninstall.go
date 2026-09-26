@@ -609,6 +609,10 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 	// ignored foreign marker is left alone, so demanding --remove-users for it
 	// would name a deletion that is not going to happen.
 	pending := 0
+	// Split for the message only: the gate stays on the witness count (see
+	// below), but the refusal used to assert that this many ACCOUNTS exist,
+	// which is false for a stale v1 row, an orphaned drop-in or a leftover timer.
+	liveAccounts := 0
 	for _, acc := range plan.accounts {
 		// Deliberately counts witnesses, not just live accounts. An audit finding
 		// read this as demanding a mass-deletion flag for deletions that will not
@@ -621,6 +625,9 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 		// happens to hold.
 		if !plan.ignores(opts, acc) {
 			pending++
+			if acc.exists {
+				liveAccounts++
+			}
 		}
 	}
 	if pending > 0 && !opts.removeUsers {
@@ -632,8 +639,8 @@ func (a *App) authorizeUninstall(plan teardownPlan, opts uninstallOptions) bool 
 		// count is the compensation, not an equal.
 		if opts.yes || !a.StdinIsTTY() {
 			a.errorf("%s", a.P.M(
-				fmt.Sprintf("非交互模式不会删除账号。这台机器上有 %d 个由本工具管理的账号，卸载必须先删除它们；确认请加 --remove-users。", pending),
-				fmt.Sprintf("a non-interactive run will not delete accounts. This host has %d managed by this tool, and the uninstall must remove them first; pass --remove-users to say so.", pending)))
+				fmt.Sprintf("非交互模式不会删除账号或清理账号相关状态。这台机器上有 %d 项由本工具管理的账号状态，其中 %d 个是仍然存在的账号，其余为登记行、sudo 授权或自动删除任务等残留；卸载必须先清除它们，确认请加 --remove-users。", pending, liveAccounts),
+				fmt.Sprintf("a non-interactive run will not delete accounts or clear account state. This host has %d item(s) of account state managed by this tool, of which %d are live accounts and the rest are leftover registry rows, sudo grants or auto-delete tasks; the uninstall must clear them first, so pass --remove-users to say so.", pending, liveAccounts)))
 			a.warnf("%s", a.P.M("（不能只卸载命令、留下受管账号：这会让工具失去撤销这些账号、清理授权和执行已有自动删除任务的能力。）",
 				"(uninstalling the command while keeping managed accounts is not an option: it removes the ability to revoke those accounts, clean their grants, and run any auto-delete tasks already scheduled.)"))
 			return false
@@ -800,6 +807,18 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 		a.audit("uninstall", "", "fail", "residual: "+strings.Join(residual.names(), " ")+"; failed revokes: "+strings.Join(failedRevokes, " "), nil)
 		return 1
 	}
+	// The re-inventory exists to catch state that changed since the plan was
+	// approved, and an install path that became unremovable in that window is
+	// exactly such a change. Computing the blocker and discarding it left the
+	// half-uninstalled end state the pre-flight check exists to prevent.
+	if residual.binaryBlocker != "" {
+		a.errorf("%s：%s（%s）", a.P.M("拒绝卸载：无法移除已安装的命令", "refusing to uninstall: the installed command cannot be removed"),
+			residual.binaryPath, residual.binaryBlocker)
+		a.warnf("%s", a.P.M("先处理该路径（或用 --force 明确接受），再重试——否则卸载会删光账号与状态却卡在最后一步。",
+			"resolve that path (or pass --force to accept it explicitly) and retry — otherwise the uninstall would remove every account and all state, then stop at the last step."))
+		a.audit("uninstall", "", "fail", "install path became unremovable after the plan: "+residual.binaryBlocker, nil)
+		return 1
+	}
 
 	// Releases before the persistent-timer cleanup fix could leave an inert
 	// stamp after both the account and its unit files were gone. There is no
@@ -817,10 +836,21 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 
 	if a.Lifecycle != nil {
 		if err := a.Lifecycle.MarkUninstalled(); err != nil {
-			a.errorf("%s: %v", a.P.M("无法写入卸载状态标记；状态与命令均已保留，以阻止排队中的旧进程重新启用工具",
-				"cannot record the uninstall-state marker; state and command were kept so a queued older process cannot re-enable the tool"), err)
-			a.audit("uninstall", "", "fail", "uninstall marker write failed: "+err.Error(), nil)
-			return 1
+			// The marker is written by rename and only then synced, so a durability
+			// failure means it is already visible and already blocking every later
+			// mutation. Reporting that as "not recorded" told the operator the gate
+			// was not armed while it silently was.
+			var committed *fsutil.DurabilityError
+			if errors.As(err, &committed) {
+				a.warnf("%s: %v", a.P.M("卸载状态标记已写入但持久性未确认；它已在生效，卸载继续",
+					"the uninstall-state marker is recorded but its durability is unconfirmed; it is already in force, and the uninstall continues"), err)
+				a.audit("uninstall", "", "warn", "uninstall marker committed with unconfirmed durability: "+err.Error(), nil)
+			} else {
+				a.errorf("%s: %v", a.P.M("无法写入卸载状态标记；状态与命令均已保留，以阻止排队中的旧进程重新启用工具",
+					"cannot record the uninstall-state marker; state and command were kept so a queued older process cannot re-enable the tool"), err)
+				a.audit("uninstall", "", "fail", "uninstall marker write failed: "+err.Error(), nil)
+				return 1
+			}
 		}
 	}
 	if err := a.removeStateDir(force); err != nil {
@@ -859,6 +889,18 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 		a.audit("uninstall", "", "ok", a.InstallPath, map[string]string{"accounts": fmt.Sprint(len(plan.accounts)), "purged": "no"})
 	}
 
+	// The accounts --ignore-foreign-markers deliberately left behind are still
+	// live. The warning that named them printed before the YES prompt and has
+	// scrolled away by now, so this line is the operator's last word on the host
+	// — it must not say they are gone.
+	if left := residual.ignoredForeignMarkers(opts); len(left) > 0 {
+		a.success(a.P.M(
+			fmt.Sprintf("已卸载：授权、自动删除任务、状态与命令均已移除。以下 %d 个仅由 passwd 标记指认的账号按 --ignore-foreign-markers 保留，未被删除，请人工处理：%s",
+				len(left), strings.Join(left, ", ")),
+			fmt.Sprintf("uninstalled: the grants, the auto-delete tasks, the state and the command are gone. %d account(s) named only by a passwd marker were left in place by --ignore-foreign-markers and must be dealt with by hand: %s",
+				len(left), strings.Join(left, ", "))))
+		return 0
+	}
 	a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
 		"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
 	return 0

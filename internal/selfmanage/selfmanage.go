@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +51,10 @@ type Manager struct {
 	WriteRootFile func(string, []byte, os.FileMode) error
 	// Lstat is a target-inspection fault-injection hook. Production uses os.Lstat.
 	Lstat func(string) (os.FileInfo, error)
+	// RequireHostMachine gates a candidate on being an ELF built for this host's
+	// architecture. Production leaves it nil and uses requireHostMachine; it is a
+	// field only so tests can present non-ELF fixture bytes.
+	RequireHostMachine func([]byte) error
 
 	// allowPrivateDial gates whether the dialer may connect to a private/reserved
 	// IP. It is true only for the initial, operator-supplied URL of the current
@@ -602,6 +608,16 @@ func (m *Manager) prepareVerifiedCandidate(bin, sig []byte, expectedVersion stri
 	if !verified {
 		return nil, fmt.Errorf("signature verification failed; refusing to install")
 	}
+	// The signature covers raw bytes only: it carries no asset name and no
+	// architecture, and the release-version witness is byte-identical across the
+	// amd64 and arm64 builds of the same release. SHA256SUMS, the only artifact
+	// that binds a name to a digest, is unsigned. So a party controlling what the
+	// mirror serves can hand this host the OTHER architecture's genuinely signed
+	// binary under this architecture's asset name and every check above passes.
+	// The bytes themselves still say which machine they are for; require that.
+	if err := m.machineCheck()(bin); err != nil {
+		return nil, err
+	}
 	signedVersion, err := releaseVersionWitness(bin)
 	if err != nil {
 		return nil, fmt.Errorf("read signed release version: %w", err)
@@ -1146,4 +1162,54 @@ func checkDialAddr(address string, allowPrivate bool) error {
 
 func isPublicIP(ip net.IP) bool {
 	return validate.PublicIP(ip)
+}
+
+// machineCheck returns the architecture gate, defaulting to requireHostMachine.
+// RequireHostMachine is a field so a test can present a non-ELF fixture; nothing
+// in production sets it, and leaving it nil keeps the strict check.
+func (m *Manager) machineCheck() func([]byte) error {
+	if m != nil && m.RequireHostMachine != nil {
+		return m.RequireHostMachine
+	}
+	return requireHostMachine
+}
+
+// hostELFMachine is the ELF machine this build must run on. An architecture that
+// is not listed cannot be checked, and the official upgrade path already refuses
+// to select an asset for one.
+func hostELFMachine() (elf.Machine, bool) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return elf.EM_X86_64, true
+	case "arm64":
+		return elf.EM_AARCH64, true
+	}
+	return 0, false
+}
+
+// requireHostMachine refuses a candidate that is not a 64-bit little-endian Linux
+// ELF executable for this host's architecture. It is deliberately a check on the
+// downloaded bytes rather than on the name they arrived under: the name is the
+// part an attacker controls.
+func requireHostMachine(bin []byte) error {
+	want, known := hostELFMachine()
+	if !known {
+		return nil
+	}
+	f, err := elf.NewFile(bytes.NewReader(bin))
+	if err != nil {
+		return fmt.Errorf("candidate is not a readable ELF executable: %w", err)
+	}
+	defer f.Close()
+	if f.Class != elf.ELFCLASS64 || f.Data != elf.ELFDATA2LSB {
+		return fmt.Errorf("candidate ELF class/encoding %s/%s is not the 64-bit little-endian build this host runs", f.Class, f.Data)
+	}
+	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
+		return fmt.Errorf("candidate ELF type %s is not an executable", f.Type)
+	}
+	if f.Machine != want {
+		return fmt.Errorf("candidate is built for %s but this host runs %s (%s); refusing to install another architecture's release",
+			f.Machine, want, runtime.GOARCH)
+	}
+	return nil
 }

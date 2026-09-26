@@ -105,7 +105,7 @@ func cronAtDaemonPresent(procRoot string) (bool, error) {
 			commPath := filepath.Join(procRoot, entry, "comm")
 			nameBody, nameErr := readProcEntry(commPath, 64)
 			if nameErr != nil {
-				if errors.Is(nameErr, os.ErrNotExist) {
+				if procEntryVanished(nameErr) {
 					continue
 				}
 				return false, fmt.Errorf("read process name %s: %w", commPath, nameErr)
@@ -120,7 +120,7 @@ func cronAtDaemonPresent(procRoot string) (bool, error) {
 			statusPath := filepath.Join(procRoot, entry, "status")
 			rootProcess, statusErr := processRunsAsRoot(statusPath)
 			if statusErr != nil {
-				if errors.Is(statusErr, os.ErrNotExist) {
+				if procEntryVanished(statusErr) {
 					continue
 				}
 				return false, fmt.Errorf("verify process credentials %s: %w", statusPath, statusErr)
@@ -131,7 +131,7 @@ func cronAtDaemonPresent(procRoot string) (bool, error) {
 
 			executable, executableErr := drainExecutableInfo(procRoot, entry)
 			if executableErr != nil {
-				if errors.Is(executableErr, os.ErrNotExist) {
+				if procEntryVanished(executableErr) {
 					continue
 				}
 				return false, fmt.Errorf("verify process executable %s: %w", filepath.Join(procRoot, entry, "exe"), executableErr)
@@ -555,4 +555,14 @@ func ownedSpoolArtifacts(directories []string, uid uint32) ([]string, error) {
 		}
 	}
 	return artifacts, nil
+}
+
+// procEntryVanished reports whether err means the process disappeared between
+// listing /proc and reading the entry. The kernel answers ENOENT for a pid
+// directory that is already gone and ESRCH for one being torn down while the open
+// is in flight; both are the same fact. Treating only ENOENT as "it vanished"
+// turned an unrelated short-lived process exiting at the wrong moment into a
+// failed daemon scan.
+func procEntryVanished(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH)
 }

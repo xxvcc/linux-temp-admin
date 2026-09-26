@@ -813,3 +813,44 @@ func TestConnectionScopedMatchFailsClosedOnAnEmptyKeyword(t *testing.T) {
 		})
 	}
 }
+
+// sshd expands %h and %u, and this tool always writes
+// /home/<user>/.ssh/authorized_keys. An absolute entry that resolves to exactly
+// that file needs no sshd drop-in; treating it as a central key store either
+// refused a working invite or wrote an exception on a host that needed none.
+func TestAuthorizedKeysFileTokensAreExpandedBeforeBlocking(t *testing.T) {
+	const user = "xxvcc-a1"
+	for _, tc := range []struct {
+		name    string
+		entries []string
+		want    bool
+	}{
+		{"home-relative", []string{".ssh/authorized_keys"}, true},
+		{"%h token", []string{"%h/.ssh/authorized_keys"}, true},
+		{"absolute with %u", []string{"/home/%u/.ssh/authorized_keys"}, true},
+		{"absolute literal", []string{"/home/xxvcc-a1/.ssh/authorized_keys"}, true},
+		{"absolute with %h", []string{"%h/.ssh/authorized_keys", "none"}, true},
+		{"second entry matches", []string{"/etc/ssh/authorized_keys/%u", "/home/%u/.ssh/authorized_keys"}, true},
+
+		{"central store", []string{"/etc/ssh/authorized_keys/%u"}, false},
+		{"disabled", []string{"none"}, false},
+		{"another user's file", []string{"/home/someoneelse/.ssh/authorized_keys"}, false},
+		{"different filename", []string{"/home/%u/.ssh/authorized_keys2"}, false},
+		{"unknown token is not guessed", []string{"/home/%U/.ssh/authorized_keys"}, false},
+		{"trailing percent", []string{"/home/%u/.ssh/authorized_keys%"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := readsDefaultAuthorizedKeys(tc.entries, user); got != tc.want {
+				t.Fatalf("readsDefaultAuthorizedKeys(%q) = %v, want %v", tc.entries, got, tc.want)
+			}
+		})
+	}
+
+	// Before a username exists, only the home-relative spellings can be judged.
+	if readsDefaultAuthorizedKeys([]string{"/home/%u/.ssh/authorized_keys"}, "") {
+		t.Fatal("an absolute %u entry must not be accepted before a username is known")
+	}
+	if !readsDefaultAuthorizedKeys([]string{"%h/.ssh/authorized_keys"}, "") {
+		t.Fatal("the home-relative spelling must still be accepted before a username is known")
+	}
+}

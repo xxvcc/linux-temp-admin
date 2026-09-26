@@ -301,6 +301,14 @@ func sshPortFromConfig(path string) (int, bool, error) {
 		if !complete {
 			return 0, false, fmt.Errorf("sshd config %s contains a directive the static port fallback cannot parse", path)
 		}
+		if keyword == "" && len(args) != 0 {
+			// sshd treats a leading '=' as the keyword/value separator and honours the
+			// directive after it, so "=Port 2244" IS a Port line. The Match/Include
+			// scanner in sshd.go fails closed on exactly this shape; skipping it here
+			// dropped the directive silently and defeated the hasInclude completeness
+			// guard with an "=Include" line.
+			return 0, false, fmt.Errorf("sshd config %s contains a directive the static port fallback cannot parse", path)
+		}
 		if keyword == "" {
 			continue
 		}
@@ -309,6 +317,20 @@ func sshPortFromConfig(path string) (int, bool, error) {
 				return 0, false, fmt.Errorf("sshd config %s contains Include without a value", path)
 			}
 			hasInclude = true
+			continue
+		}
+		if strings.EqualFold(keyword, "listenaddress") {
+			// sshd also takes its port from a ListenAddress that carries one, so a
+			// config that sets the port only that way has a port this scan cannot
+			// see. Silently returning "no port configured" for such a host is the
+			// same silent-drop shape the leading-'=' guard above rejects, so refuse
+			// rather than answer from an incomplete read.
+			if len(args) != 1 {
+				return 0, false, fmt.Errorf("sshd config %s contains ListenAddress without exactly one value", path)
+			}
+			if _, portText, splitErr := net.SplitHostPort(args[0]); splitErr == nil && portText != "" {
+				return 0, false, fmt.Errorf("sshd config %s sets the port through ListenAddress, which the static port fallback cannot resolve", path)
+			}
 			continue
 		}
 		if !strings.EqualFold(keyword, "port") {

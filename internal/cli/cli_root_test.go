@@ -225,10 +225,11 @@ func TestUpgradeDownloadDoesNotHoldLifecycleLock(t *testing.T) {
 	a.InstallPath = installPath
 	a.Lifecycle = lifecycle.New(lockPath)
 	a.Selfmanage = &selfmanage.Manager{
-		InstallPath: installPath,
-		PublicKey:   pub,
-		Client:      srv.Client(),
-		MaxBytes:    config.MaxUpgradeBytes,
+		InstallPath:        installPath,
+		RequireHostMachine: cliAllowAnyMachine,
+		PublicKey:          pub,
+		Client:             srv.Client(),
+		MaxBytes:           config.MaxUpgradeBytes,
 	}
 	done := make(chan commandResult, 1)
 	go func() { done <- a.upgradeResult([]string{"--url", srv.URL + "/bin", "--yes"}) }()
@@ -316,10 +317,11 @@ func TestOfficialUpgradeMirrorFallbackBoundary(t *testing.T) {
 			dir := rootOwnedDir(t)
 			requests := make(map[string]int)
 			m := &selfmanage.Manager{
-				InstallPath: filepath.Join(dir, "linux-temp-admin"),
-				PublicKey:   pub,
-				MaxBytes:    config.MaxUpgradeBytes,
-				RetryDelay:  0,
+				InstallPath:        filepath.Join(dir, "linux-temp-admin"),
+				RequireHostMachine: cliAllowAnyMachine,
+				PublicKey:          pub,
+				MaxBytes:           config.MaxUpgradeBytes,
+				RetryDelay:         0,
 			}
 			m.Client = &http.Client{Transport: cliRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 				mirrorBin := tc.mirrorBin
@@ -356,7 +358,7 @@ func TestOfficialUpgradeMirrorFallbackBoundary(t *testing.T) {
 			})}
 			a, _, _ := newTestApp(t, "")
 			a.Selfmanage = m
-			candidate, gotErr := a.prepareOfficialUpgrade()
+			candidate, gotErr := a.prepareOfficialUpgrade(false)
 			if (gotErr != nil) != tc.wantErr {
 				t.Fatalf("candidate=%v err=%v, wantErr=%v", candidate, gotErr, tc.wantErr)
 			}
@@ -465,3 +467,7 @@ func TestLanguagePreferencesCannotRecreateStateAfterUninstall(t *testing.T) {
 		t.Fatalf("menu language switch recreated uninstalled state: %v", err)
 	}
 }
+
+// cliAllowAnyMachine lets the shell-script upgrade fixtures past the ELF
+// architecture gate. The gate itself is covered in internal/selfmanage.
+func cliAllowAnyMachine([]byte) error { return nil }

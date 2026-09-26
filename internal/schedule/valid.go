@@ -25,8 +25,9 @@ var (
 
 // ValidSchedule reports whether recordedUnit still names this exact account
 // generation's queued revoke task. Invalid or stale artifacts return false;
-// failures that prevent a reliable inventory return an error.
-func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit string) (bool, error) {
+// failures that prevent a reliable inventory return an error. The trigger must
+// match the recorded deadline, allowing only upward rounding to its next minute.
+func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit string, deadline time.Time) (bool, error) {
 	if !validate.Username(user) || !validate.AccountID(uid) || !validate.Generation(generation) {
 		return false, nil
 	}
@@ -47,6 +48,8 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 			return false, fmt.Errorf("inventory at jobs: %w", err)
 		}
 		found := false
+		var queued time.Time
+		var body string
 		for _, job := range jobs {
 			if job.ID != id {
 				continue
@@ -55,8 +58,32 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 				return false, nil
 			}
 			found = true
+			queued = job.ScheduledAt
+			body = job.Body
 		}
-		return found, nil
+		if !found {
+			return false, nil
+		}
+		// Presence in the queue is not validity. The systemd branch below rejects a
+		// trigger that has already passed; the at branch must reject the same shape,
+		// or a deadline that went by while atd was stopped reads as healthy forever.
+		if !scheduleDeadlineMatches(queued, deadline) || !queued.After(s.nowFunc()()) {
+			return false, nil
+		}
+		// A job queued before the working directory was pinned still carries the
+		// submitting operator's CWD in its own `cd` prologue, and exits there
+		// without reaching revoke once that directory is gone. It is in the queue
+		// but it is not a schedule.
+		if !atBodyRunsFromAPinnedDirectory(body) {
+			return false, nil
+		}
+		// A queue nobody drains is not a schedule. This probe never starts atd:
+		// reporting on a host must not change it.
+		running, err := s.Sys.AtDaemonRunning()
+		if err != nil {
+			return false, fmt.Errorf("confirm atd is running: %w", err)
+		}
+		return running, nil
 	}
 
 	unit := s.UnitName(user)
@@ -83,14 +110,25 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 	if err != nil {
 		return false, nil
 	}
-	now := time.Now
-	if s.Now != nil {
-		now = s.Now
-	}
-	if !trigger.After(now().UTC()) {
+	now := s.nowFunc()
+	if !scheduleDeadlineMatches(trigger, deadline) || !trigger.After(now().UTC()) {
 		return false, nil
 	}
 	return s.systemdTimerExecutable(unit + ".timer")
+}
+
+// scheduleDeadlineMatches accepts exact deadlines and the single upward minute
+// rounding used by at. It never treats a missing timestamp or a whole extra
+// minute as healthy; older non-minute registry timestamps remain inspectable.
+func scheduleDeadlineMatches(trigger, deadline time.Time) bool {
+	if trigger.IsZero() || deadline.IsZero() {
+		return false
+	}
+	rounded := deadline.Truncate(time.Minute)
+	if !deadline.Equal(rounded) {
+		rounded = rounded.Add(time.Minute)
+	}
+	return trigger.Equal(deadline) || trigger.Equal(rounded)
 }
 
 // ValidQuarantine reports whether recordedUnit is the exact persistent systemd
@@ -231,4 +269,12 @@ func readScheduleFile(path string) ([]byte, bool, error) {
 
 func validScheduleMetadata(stat *unix.Stat_t) bool {
 	return stat.Mode&unix.S_IFMT == unix.S_IFREG && stat.Uid == 0 && stat.Gid == 0 && stat.Mode&0o7777 == 0o644
+}
+
+// nowFunc returns the Scheduler's time source, defaulting to time.Now.
+func (s *Scheduler) nowFunc() func() time.Time {
+	if s != nil && s.Now != nil {
+		return s.Now
+	}
+	return time.Now
 }

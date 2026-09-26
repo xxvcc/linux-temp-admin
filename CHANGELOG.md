@@ -2,7 +2,29 @@
 
 All notable changes to this project are documented here.
 
-## v2.10.7 - 2026-09-07
+## v2.10.7 - 2026-09-26
+
+- Close the remaining audit findings: clean up helper process groups before
+  reaping their leader on errors or inherited-pipe timeouts; retain orphan
+  auto-revoke retries until sshd removal has a confirmed reload.
+- Require persistent atd enablement as well as a running daemon before accepting
+  an at fallback. Distinguish a positively absent systemd manager from a broken
+  manager so non-systemd hosts can use their native init backend.
+- Create delivered private-key files with umask 077 and no-clobber semantics;
+  refuse existing files and links before writing any credential.
+- Keep the mirror deployment lock until signal-triggered transfer cleanup has
+  killed and reaped its writer. Apply the correct shell file-limit units to every
+  release download and source archive, including POSIX Bash environments.
+- Require complete process credentials before accepting an empty UID scan;
+  a /proc directory owner cannot exclude mixed-UID processes. Accept ASCII blank
+  lines and indented comments in account databases without relaxing real records.
+- Make doctor verify the queued revoke deadline against the registry, including
+  minute rounding. Legacy ambiguous timezone abbreviations now report an
+  unverifiable deadline instead of silently passing that check.
+- Preserve the full unsigned kernel login UID in audit records on every Go
+  architecture, avoiding an int conversion that could wrap on 32-bit builds.
+- Upgrade golang.org/x/crypto to v0.56.0 and update the security-model
+  descriptions to the current expiry date, v5 registry and reserved UID/GID flow.
 
 - Skip the lines the system's own readers skip when parsing group, gshadow and
   the subordinate-ID databases. glibc ignores blank and `#` lines and both glibc

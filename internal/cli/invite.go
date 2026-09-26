@@ -188,6 +188,16 @@ func (a *App) invite(args []string) int {
 		a.errorf("%s", a.P.M("--yes 模式请显式传入 --host", "--yes mode requires an explicit --host"))
 		return 1
 	}
+	if grantSudo == "yes" && fYes && generatedUsername {
+		// The confirmation names the account being granted root. With a generated
+		// name there is nothing to name yet: the old message interpolated this
+		// run's throwaway name, and the next run generated a different one, so an
+		// automated caller could never satisfy it.
+		a.errorf("%s", a.P.M(
+			"通过 --sudo --yes 授权必须显式指定 --user <名称> 并传入同名的 --confirm-sudo <名称>：随机生成的用户名无法事先确认",
+			"granting sudo via --sudo --yes requires an explicit --user NAME together with a matching --confirm-sudo NAME; a generated username cannot be confirmed in advance"))
+		return 1
+	}
 	if grantSudo == "yes" && fYes && *confirmSudo != username {
 		a.errorf("%s", a.P.M("通过 --sudo --yes 授权需同时传入 --confirm-sudo "+username,
 			"granting sudo via --sudo --yes also requires --confirm-sudo "+username))
@@ -933,22 +943,23 @@ type inviteTransaction struct {
 	kp *sshkey.KeyPair
 	// password is the issued login secret for a --password-login invite, kept as
 	// bytes so rollback and the printer can clear it; a Go string could not be.
-	password         []byte
-	generation       string
-	fingerprint      string
-	permanent        bool
-	createdAt        time.Time
-	revokeDeadline   time.Time
-	expiresDisplay   string
-	rec              registry.Record
-	registered       bool
-	pw               user.Passwd
-	rollbackIdentity user.Passwd
-	groups           []string
-	sshdDropIn       string
-	sudoGranted      bool
-	autoUnit         string
-	autoScheduled    bool
+	password           []byte
+	generation         string
+	fingerprint        string
+	permanent          bool
+	createdAt          time.Time
+	revokeDeadline     time.Time
+	expiresDisplay     string
+	expiresServerLocal string
+	rec                registry.Record
+	registered         bool
+	pw                 user.Passwd
+	rollbackIdentity   user.Passwd
+	groups             []string
+	sshdDropIn         string
+	sudoGranted        bool
+	autoUnit           string
+	autoScheduled      bool
 
 	identityIsolationReady  bool
 	sudoRemovalConfirmed    bool
@@ -980,6 +991,14 @@ func newInviteTransaction(a *App, username, host string, port, hours int, wantSu
 // available for the deferred-job cleanup policy.
 func (a *App) runInviteWithIdentityPolicy(username, host string, port, hours int, wantSudo, wantAuto bool, plan loginPlan, generatedUsername bool) int {
 	tx := newInviteTransaction(a, username, host, port, hours, wantSudo, wantAuto, plan, generatedUsername)
+	// printInvite zeroes the credentials it renders, but nothing reached it on a
+	// failure path. The interactive menu keeps one long-lived root process, so a
+	// rolled-back invite left the unencrypted private key and the plaintext
+	// password live in the heap for the rest of the session — through later
+	// privileged actions and into any core dump, ptrace, swap or hibernation
+	// image. clear() on an already-zeroed slice is harmless, so this is safe
+	// alongside printInvite's own deferred clears.
+	defer tx.clearSecrets()
 	if !tx.preflightAndGenerateCredentials() {
 		return 1
 	}
@@ -1045,11 +1064,12 @@ func (tx *inviteTransaction) preflightAndGenerateCredentials() bool {
 	tx.expiresDisplay = a.P.M("永久（不会过期，也不会自动删除）", "never (does not expire or auto-delete)")
 	if !tx.permanent {
 		tx.revokeDeadline = expiry.Deadline(tx.createdAt, tx.hours)
-		tx.expiresDisplay = expiry.DisplayLocal(tx.revokeDeadline)
+		tx.expiresDisplay = expiry.Display(tx.revokeDeadline)
+		tx.expiresServerLocal = expiry.DisplayServerLocal(tx.revokeDeadline)
 	}
 	tx.rec = registry.Record{
 		User:          tx.username,
-		Created:       tx.createdAt.Format("2006-01-02 15:04:05 MST"),
+		Created:       expiry.Display(tx.createdAt),
 		Expires:       tx.expiresDisplay,
 		Sudo:          tx.wantSudo,
 		Host:          tx.host,
@@ -1079,8 +1099,28 @@ func (tx *inviteTransaction) confirmSSHDRemoved() error {
 	return err
 }
 
+// clearSecrets zeroes every credential this transaction generated. It is
+// idempotent: printInvite clears the same backing arrays on the success path.
+func (tx *inviteTransaction) clearSecrets() {
+	if tx == nil {
+		return
+	}
+	if tx.kp != nil {
+		clear(tx.kp.PrivatePEM)
+	}
+	clear(tx.password)
+}
+
 func (tx *inviteTransaction) rollback() error {
 	tx.a.warnf("%s", tx.a.P.M("创建失败，正在回滚："+tx.username, "creation failed; rolling back: "+tx.username))
+	if tx.a.stableCommandReplaced {
+		// Not a cleanup step: the replaced bytes are gone. It belongs in the
+		// rollback report because "the invite was rolled back" otherwise reads as
+		// "the host is unchanged", and the root binary is not unchanged.
+		tx.a.warnf("%s", tx.a.P.M(
+			"注意：本次运行已替换 "+tx.a.InstallPath+" 上的稳定命令，回滚不会还原它。",
+			"note: this run already replaced the stable command at "+tx.a.InstallPath+"; the rollback does not restore it."))
+	}
 	var rollbackErrs []error
 	for i := len(tx.cleanups) - 1; i >= 0; i-- {
 		if err := tx.cleanups[i](); err != nil {
@@ -1396,10 +1436,11 @@ func (tx *inviteTransaction) drainAndFinalizeIdentity() bool {
 	// otherwise that safety wait would shorten a nominal one-hour invite. Persist
 	// the adjusted display and absolute target while the account is still pending.
 	tx.createdAt = a.Now()
-	tx.rec.Created = tx.createdAt.Format("2006-01-02 15:04:05 MST")
+	tx.rec.Created = expiry.Display(tx.createdAt)
 	if !tx.permanent {
 		tx.revokeDeadline = expiry.Deadline(tx.createdAt, tx.hours)
-		tx.expiresDisplay = expiry.DisplayLocal(tx.revokeDeadline)
+		tx.expiresDisplay = expiry.Display(tx.revokeDeadline)
+		tx.expiresServerLocal = expiry.DisplayServerLocal(tx.revokeDeadline)
 		tx.rec.Expires = tx.expiresDisplay
 	}
 	if err := a.Registry.Record(tx.rec); err != nil {
@@ -1599,7 +1640,7 @@ func (tx *inviteTransaction) scheduleActivateAndReport() int {
 	if err := a.printInvite(inviteBundle{
 		user: tx.username, host: tx.host, port: tx.port, hours: tx.hours,
 		sudo: tx.sudoGranted, auto: tx.autoScheduled, autoUnit: tx.autoUnit,
-		permanent: tx.permanent, expires: tx.expiresDisplay,
+		permanent: tx.permanent, expires: tx.expiresDisplay, expiresServerLocal: tx.expiresServerLocal,
 		registered: tx.registered, kp: tx.kp, password: tx.password,
 		sshdDropIn: tx.sshdDropIn, verified: tx.plan.verified, unverified: tx.plan.unverified,
 	}); err != nil {
@@ -1698,7 +1739,7 @@ func (a *App) rollbackInviteAccount(username string, rec registry.Record, expect
 		return a.persistDeletionStarted(rec, true, expected)
 	}, stillMatches, deleteExpected)
 	if err != nil {
-		return fmt.Errorf("fail-closed account teardown stopped at stage %d: %w", stage, err)
+		return fmt.Errorf("fail-closed account teardown stopped at stage %s: %w", stage, err)
 	}
 	return nil
 }
@@ -1722,13 +1763,16 @@ type inviteBundle struct {
 	sudo, auto  bool
 	permanent   bool
 	expires     string
-	autoUnit    string
-	registered  bool
-	kp          *sshkey.KeyPair // nil for a password invite
-	password    []byte          // nil for a key invite
-	sshdDropIn  string          // empty when sshd was not touched
-	verified    bool            // the effective-config check completed without a blocker or unknown
-	unverified  string          // why it could not be confirmed; set exactly when verified is false
+	// expiresServerLocal is the same instant in the server's zone, shown only
+	// when the server is not already on UTC.
+	expiresServerLocal string
+	autoUnit           string
+	registered         bool
+	kp                 *sshkey.KeyPair // nil for a password invite
+	password           []byte          // nil for a key invite
+	sshdDropIn         string          // empty when sshd was not touched
+	verified           bool            // the effective-config check completed without a blocker or unknown
+	unverified         string          // why it could not be confirmed; set exactly when verified is false
 }
 
 func loginKind(p loginPlan) string {
@@ -1805,7 +1849,7 @@ func (a *App) printInvite(b inviteBundle) error {
 Host: %s
 Port: %d
 User: %s
-Expires: %s
+Expires: %s%s
 Sudo: %s
 Login: %s
 Password login: %s
@@ -1813,7 +1857,7 @@ Auto revoke: %s
 Auto revoke unit: %s
 Sshd exception: %s
 `,
-		b.host, b.port, b.user, b.expires, yesno(b.sudo),
+		b.host, b.port, b.user, b.expires, b.serverLocalSuffix(), yesno(b.sudo),
 		b.loginLine(), passwordLine, yesno(b.auto), orNone(b.autoUnit), orNone(b.sshdDropIn))
 
 	// The credential only. The SSH login command that used to sit here was dropped:
@@ -1825,11 +1869,15 @@ Sshd exception: %s
 	} else {
 		fmt.Fprintf(&out, `
 %s
+(
+umask 077
+set -C
+[ ! -e './%s.key' ] && [ ! -L './%s.key' ] || exit 1
 cat > './%s.key' <<'EOF_KEY'
 %sEOF_KEY
-chmod 600 './%s.key'
+)
 `,
-			a.P.M("保存私钥命令:", "Save private key command:"), b.user, b.kp.PrivatePEM, b.user)
+			a.P.M("保存私钥命令:", "Save private key command:"), b.user, b.user, b.user, b.kp.PrivatePEM)
 	}
 
 	if b.sshdDropIn != "" {
@@ -1904,10 +1952,21 @@ func (a *App) ensureStableInstalled() error {
 	}
 	force := false
 	installed, versionErr := a.Selfmanage.InstalledVersion()
+	// A readable version means a command is already at InstallPath; only then can
+	// a write displace something.
+	hadInstalledBinary := versionErr == nil
 	if versionErr == nil {
 		if strings.HasSuffix(buildinfo.Version, "-dev") {
 			// A development build is not ordered against releases. Install these exact
 			// bytes so its scheduled cleanup always runs the code creating the account.
+			//
+			// Say so. This replaces the signed release at a shared root path that every
+			// other account's auto-revoke timer already points at, and it used to happen
+			// with no line on screen and no audit record.
+			a.warnf("%s", fmt.Sprintf(a.P.M(
+				"当前运行的是开发构建 %s，将用它覆盖已安装的 %s（路径 %s）：该路径上的稳定命令由其他账号的自动撤销任务共用。",
+				"this is development build %s and it will replace the installed %s at %s: that stable command is shared by every other account's auto-revoke task."),
+				buildinfo.Version, installed, a.InstallPath))
 			force = true
 		} else if !version.Greater(buildinfo.Version, installed) {
 			return nil
@@ -1924,8 +1983,25 @@ func (a *App) ensureStableInstalled() error {
 	if err != nil {
 		return err
 	}
-	if _, err = a.Selfmanage.Install(bin, force); err != nil {
+	replaced, err := a.Selfmanage.Install(bin, force)
+	if err != nil {
 		return err
+	}
+	if replaced {
+		// installLocked records every other path that writes this file; a silent
+		// write here left no trace that the root binary had changed.
+		//
+		// Install reports true for three different things: a first-ever install, a
+		// metadata-normalising rewrite of identical bytes, and a genuine content
+		// replacement. Only the last one displaced a command other accounts' timers
+		// already point at, so only that one may claim a replacement or put a
+		// not-restored note in the rollback report.
+		if hadInstalledBinary {
+			a.audit("install", "", "ok", fmt.Sprintf("stable command replaced with %s while preparing an account action", buildinfo.Version), nil)
+			a.stableCommandReplaced = true
+		} else {
+			a.audit("install", "", "ok", fmt.Sprintf("stable command installed at %s while preparing an account action", buildinfo.Version), nil)
+		}
 	}
 	installed, err = a.Selfmanage.InstalledVersion()
 	if err != nil {
@@ -1989,4 +2065,15 @@ func (a *App) promptHost(detected string) string {
 		return h
 	}
 	return detected
+}
+
+// serverLocalSuffix appends the server's own rendering of the deadline after the
+// authoritative UTC one. The recipient acts on Expires, so the UTC instant leads;
+// the operator reading the same bundle still gets the local time, with a numeric
+// offset rather than a zone abbreviation two regions can both claim.
+func (b inviteBundle) serverLocalSuffix() string {
+	if b.permanent || b.expiresServerLocal == "" {
+		return ""
+	}
+	return " (server local " + b.expiresServerLocal + ")"
 }

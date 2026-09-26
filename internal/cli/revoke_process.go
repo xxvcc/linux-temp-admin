@@ -49,7 +49,11 @@ func runningLegacyRevokeProcess(procRoot, installPath, username string) (bool, e
 			pidDir := filepath.Join(procRoot, entry)
 			cmdline, cmdErr := readProcFile(filepath.Join(pidDir, "cmdline"), procCmdlineMaxBytes)
 			if cmdErr != nil {
-				if errors.Is(cmdErr, os.ErrNotExist) {
+				// A process that exits between the directory read and this open reports
+				// ESRCH, not ENOENT. Treating only ENOENT as "it vanished" aborted the
+				// whole scan whenever any unrelated short-lived process happened to exit,
+				// which on the invite path rolled back a half-created account.
+				if procEntryVanished(cmdErr) {
 					continue
 				}
 				if !errors.Is(cmdErr, errProcFileTooLarge) {
@@ -67,7 +71,7 @@ func runningLegacyRevokeProcess(procRoot, installPath, username string) (bool, e
 			}
 			status, statusErr := readProcFile(filepath.Join(pidDir, "status"), procStatusMaxBytes)
 			if statusErr != nil {
-				if errors.Is(statusErr, os.ErrNotExist) {
+				if procEntryVanished(statusErr) {
 					continue
 				}
 				return false, fmt.Errorf("read process %s credentials: %w", entry, statusErr)
@@ -176,4 +180,13 @@ func effectiveUID(status []byte) (uint32, error) {
 		return 0, fmt.Errorf("missing Uid field")
 	}
 	return euid, nil
+}
+
+// procEntryVanished reports whether err means the process disappeared between
+// listing /proc and reading the entry. The kernel answers ENOENT for a pid
+// directory that is already gone and ESRCH for one being torn down while the
+// open is in flight; both are the same fact, and internal/user already treats
+// them as one.
+func procEntryVanished(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH)
 }

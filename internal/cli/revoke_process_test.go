@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestEffectiveUIDAcceptsFullLinuxUIDRange(t *testing.T) {
@@ -110,5 +112,31 @@ func TestRunningLegacyRevokeProcessRecognizesOversizedMatchingShellPrefix(t *tes
 	found, err := runningLegacyRevokeProcess(root, testInstallPath, "xxvcc-a1")
 	if err != nil || !found {
 		t.Fatalf("runningLegacyRevokeProcess = (%v, %v), want (true, nil)", found, err)
+	}
+}
+
+// /proc entries disappear under any busy host. The kernel reports ENOENT for a
+// pid directory that is already gone and ESRCH for one being torn down mid-open;
+// only the first was treated as "it vanished", so one unrelated short-lived
+// process exiting at the wrong moment aborted the scan — and on the invite path
+// that rolled back a half-created account.
+func TestProcEntryVanishedCoversBothKernelAnswers(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"already gone", os.ErrNotExist, true},
+		{"torn down mid-open", unix.ESRCH, true},
+		{"wrapped ESRCH", fmt.Errorf("read process 4242 command line: %w", unix.ESRCH), true},
+		{"wrapped ENOENT", fmt.Errorf("open: %w", os.ErrNotExist), true},
+		{"permission denied is a real failure", os.ErrPermission, false},
+		{"oversized file is a real failure", errProcFileTooLarge, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := procEntryVanished(tc.err); got != tc.want {
+				t.Fatalf("procEntryVanished(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }

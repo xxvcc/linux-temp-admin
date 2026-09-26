@@ -40,12 +40,22 @@ type System interface {
 	// can inventory root-created jobs whose registry row has been lost. Missing
 	// inventory commands or an unparseable owner header are errors.
 	AtJobs() ([]AtJob, error)
+	// AtDaemonRunning reports whether atd is currently able to dispatch queued
+	// jobs. Unlike the submission path it never starts or enables anything: a
+	// validity check must observe the host, not change it. It returns false with
+	// no error only when a probe positively answered "not running"; when no probe
+	// could answer at all it returns an error so callers fail closed instead of
+	// reporting a queue nobody will drain as healthy.
+	AtDaemonRunning() (bool, error)
 }
 
 type AtJob struct {
 	ID       string
 	Body     string
 	OwnerUID uint32
+	// ScheduledAt is the queued run time atq reported, or the zero time when atq
+	// did not print one in a shape this tool parses.
+	ScheduledAt time.Time
 }
 
 // Scheduler writes units / queues jobs. Paths and time source are fields for tests.
@@ -395,6 +405,13 @@ func (s *Scheduler) disableAndConfirmTimerStopped(timerUnit string) error {
 
 func (s *Scheduler) scheduleAt(user string, uid int, generation string, deadline time.Time) (string, error) {
 	if !s.Sys.HasAt() {
+		// Name only what this branch actually observed. Schedule() reaches the at
+		// fallback both when systemctl is absent and when it is present but failed,
+		// and reporting the first case in the second sent operators to look for a
+		// missing tool that was installed and had just been used.
+		if s.Sys.HasSystemctl() {
+			return "", fmt.Errorf("at is not available for the fallback task")
+		}
 		return "", fmt.Errorf("no systemctl or at available")
 	}
 	if !deadline.After(s.now()) {
@@ -494,7 +511,7 @@ func (s *Scheduler) Cancel(user, recordedUnit string) error {
 				}
 			}
 			if hasUnitEvidence {
-				errs = append(errs, fmt.Errorf("systemctl is unavailable; cannot confirm %s.timer is stopped, preserving its unit files and registry evidence", unit))
+				errs = append(errs, fmt.Errorf("systemctl is unavailable or no systemd manager is running; cannot confirm %s.timer is stopped, preserving its unit files and registry evidence", unit))
 				continue
 			}
 		}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/buildinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/expiry"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/prefs"
@@ -725,6 +727,19 @@ func (a *App) compact() int {
 
 func (a *App) compactLocked() int {
 	rc := 0
+	// A grant this sweep could not enumerate or could not remove must keep its
+	// auto-revoke task: cancelling the task is what leaves an orphaned NOPASSWD
+	// drop-in with nothing left to remove it.
+	grantSweepIncomplete := false
+	grantStillPresent := map[string]bool{}
+	// For sudoers, disappearance of the file removes the grant. SSH exceptions
+	// additionally require a confirmed daemon reload; a failed Remove must keep
+	// its retry task even when the drop-in was already unlinked.
+	pinIfStillOnDisk := func(user, path string) {
+		if _, err := os.Lstat(path); err == nil || !os.IsNotExist(err) {
+			grantStillPresent[user] = true
+		}
+	}
 	// Sweep the live grants BEFORE the registry rows: compacting drops the rows
 	// that name these accounts, and a grant nobody can name any more is a grant
 	// nobody will ever find.
@@ -733,6 +748,7 @@ func (a *App) compactLocked() int {
 		if err != nil {
 			a.warnf("%v", err)
 			rc = 1
+			grantSweepIncomplete = true
 		}
 		for _, u := range orphans {
 			if err := a.SSHD.Remove(u); err != nil {
@@ -741,6 +757,7 @@ func (a *App) compactLocked() int {
 				// that does not assert the removal failed.
 				a.warnf("%s: %v", a.P.M("清理孤儿 sshd 例外时", "while cleaning up the orphaned sshd exception"), err)
 				rc = 1
+				grantStillPresent[u] = true
 				continue
 			}
 			a.info(a.P.M("已移除孤儿 sshd 例外："+a.SSHD.FilePath(u),
@@ -755,6 +772,7 @@ func (a *App) compactLocked() int {
 		if err != nil {
 			a.warnf("%v", err)
 			rc = 1
+			grantSweepIncomplete = true
 		}
 		for _, u := range orphans {
 			// Announce the removal only once it happened: this used to print "removed"
@@ -764,6 +782,7 @@ func (a *App) compactLocked() int {
 				a.errorf("%s: %v", a.P.M("无法移除孤儿 sudo 授权（该文件仍会在用户名被复用时立即生效，请手动删除）",
 					"could not remove an orphaned sudo grant (it re-arms the instant its username is reused; delete it by hand)"), err)
 				rc = 1
+				pinIfStillOnDisk(u, a.Sudoers.FilePath(u))
 				continue
 			}
 			a.info(a.P.M("已移除孤儿 sudo 授权："+a.Sudoers.FilePath(u),
@@ -783,6 +802,15 @@ func (a *App) compactLocked() int {
 			rc = 1
 		}
 		for _, u := range orphans {
+			if grantSweepIncomplete || grantStillPresent[u] {
+				// Keep the task. It is the only remaining mechanism that would strip a
+				// grant this run could not confirm gone.
+				a.warnf("%s%s", a.P.M(
+					"保留自动删除任务，因为本次未能确认该账号的授权已清除：",
+					"keeping the auto-delete task because this run could not confirm the account's grants were removed: "), u)
+				rc = 1
+				continue
+			}
 			if err := a.Scheduler.Cancel(u, ""); err != nil {
 				a.warnf("%s: %v", a.P.M("无法移除孤儿自动删除任务", "could not remove orphaned auto-delete task"), err)
 				rc = 1
@@ -808,7 +836,7 @@ func (a *App) compactLocked() int {
 		if a.Users == nil {
 			return false, fmt.Errorf("verify absent account database for %s: user manager is unavailable", rec.User)
 		}
-		if err := a.Users.VerifyAccountDatabaseAfterExternalDeletion(rec.User, rec.UID, rec.SequentialID); err != nil {
+		if err := a.Users.VerifyAccountDatabaseAfterExternalDeletion(rec.User, rec.UID, rec.UID, rec.SequentialID); err != nil {
 			return false, fmt.Errorf("verify absent account database for %s: %w", rec.User, err)
 		}
 		return false, nil
@@ -984,13 +1012,19 @@ func (a *App) doctorRegistryIdentity() (doctorRegistryState, doctorResult) {
 	}
 	state.records = records
 	state.readable = true
-	if highest := a.Registry.LostRegistryHighest(); highest > 0 {
-		// CheckIntegrity cannot see this: by the time it runs, Init has already
-		// recreated the data file, and an empty registry trivially satisfies every
-		// sequence invariant. Only Init observes the absence, so it records it.
+	// CheckIntegrity cannot see this: once Init has recreated the data file, an
+	// empty registry trivially satisfies every sequence invariant. doctor runs in
+	// its own process and never calls Init, so it asks the store to observe the
+	// absence directly rather than reading a flag only invite and revoke can set.
+	lostHighest, registryLost, lostErr := a.Registry.InspectRegistryLoss()
+	if lostErr != nil {
+		a.warnf("%s: %v", a.P.M("无法判断登记表数据文件是否丢失", "cannot determine whether the registry data file was lost"), lostErr)
+		result.fail()
+	}
+	if registryLost {
 		a.warnf("%s", a.P.M(
-			fmt.Sprintf("登记表数据文件缺失但身份序列已记录到 %d：这不是全新安装，本工具此前创建的账号已失去证明其归属的登记行。撤销和孤儿清扫都依赖该证据。请从可信备份恢复登记表，不要以当前这份空表继续运作。", highest),
-			fmt.Sprintf("the registry data file was missing while the identity sequence already recorded %d: this is not a fresh install, and every account this tool created before now has lost the row that proves it owns them. Revoke and the orphan sweeps rely on that evidence. Restore the registry from trusted backup rather than continuing on the empty one it had to recreate.", highest)))
+			fmt.Sprintf("登记表数据文件缺失但身份序列已记录先前的分配（最高 %d）：这不是全新安装，本工具此前创建的账号已失去证明其归属的登记行。撤销和孤儿清扫都依赖该证据。请从可信备份恢复登记表，不要以当前这份空表继续运作。", lostHighest),
+			fmt.Sprintf("the registry data file was missing while the identity sequence already recorded prior allocations (highest %d): this is not a fresh install, and every account this tool created before now has lost the row that proves it owns them. Revoke and the orphan sweeps rely on that evidence. Restore the registry from trusted backup rather than continuing on the empty one it had to recreate.", lostHighest)))
 		result.fail()
 	}
 	if integrityErr := a.Registry.CheckIntegrity(); integrityErr != nil {
@@ -1215,7 +1249,13 @@ func (a *App) doctorScheduleValidity(state doctorRegistryState) doctorResult {
 		if !r.AutoRevoke || !exists {
 			continue
 		}
-		valid, err := a.Scheduler.ValidSchedule(r.User, r.UID, r.Generation, r.AutoUnit)
+		deadline, parseErr := expiry.ParseDisplay(r.Expires)
+		if parseErr != nil {
+			a.warnf("%s %s: %v", a.P.M("无法验证自动删除到期时间：", "cannot verify auto-delete deadline:"), r.User, parseErr)
+			result.fail()
+			continue
+		}
+		valid, err := a.Scheduler.ValidSchedule(r.User, r.UID, r.Generation, r.AutoUnit, deadline)
 		if err != nil {
 			a.warnf("%s %s: %v", a.P.M("无法验证自动删除任务：", "cannot verify auto-delete task:"), r.User, err)
 			result.fail()
@@ -1227,8 +1267,8 @@ func (a *App) doctorScheduleValidity(state doctorRegistryState) doctorResult {
 	}
 	if len(strandedAuto) > 0 {
 		for _, u := range strandedAuto {
-			a.warnf("%s%s", a.P.M("账号设置了自动删除但已无可验证的对应任务（任务必须匹配 UID、世代、记录的 unit 和正文；chage 仅提供按天粒度的较晚兜底锁定）：",
-				"account set to auto-delete but has no valid task left to do it (the UID, generation, recorded unit, and body must all match; chage only provides a later, day-granularity lockout backstop): "), u)
+			a.warnf("%s%s", a.P.M("账号设置了自动删除但已无可验证的对应任务（任务必须匹配 UID、世代、记录的 unit、到期时间和正文；chage 仅提供按天粒度的较晚兜底锁定）：",
+				"account set to auto-delete but has no valid task left to do it (the UID, generation, recorded unit, deadline, and body must all match; chage only provides a later, day-granularity lockout backstop): "), u)
 		}
 		a.warnf("%s", a.P.M("到期后请用 `linux-temp-admin revoke --user <名>` 手动删除。",
 			"remove them with `linux-temp-admin revoke --user <name>` once expired."))

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
 )
 
@@ -697,7 +698,7 @@ func CheckKeyLogin(c *SSHDConfig, user string, groups []string) LoginReport {
 	if !yes(c.First("pubkeyauthentication")) {
 		r.block(BlockPubkeyDisabled, c.First("pubkeyauthentication"))
 	}
-	if akf := c.Values("authorizedkeysfile"); len(akf) > 0 && !readsDefaultAuthorizedKeys(akf) {
+	if akf := c.Values("authorizedkeysfile"); len(akf) > 0 && !readsDefaultAuthorizedKeys(akf, user) {
 		r.block(BlockAuthorizedKeysFile, strings.Join(akf, " "))
 	}
 	if m := c.Values("authenticationmethods"); !methodsSatisfiedBy(m, "publickey") {
@@ -797,13 +798,73 @@ func pubkeyAlgorithms(c *SSHDConfig) (algs []string, directive string) {
 // readsDefaultAuthorizedKeys reports whether any AuthorizedKeysFile entry names
 // the per-user file this tool writes. "none" and central paths like
 // /etc/ssh/authorized_keys/%u do not.
-func readsDefaultAuthorizedKeys(entries []string) bool {
+//
+// sshd expands %h to the account's home and %u to its login name, and this tool
+// always writes /home/<user>/.ssh/authorized_keys. An absolute entry that expands
+// to exactly that file therefore needs no drop-in: comparing two literal
+// spellings only made `/home/%u/.ssh/authorized_keys` look like a central store,
+// which either refused a working invite or wrote an sshd exception on a host that
+// needed none.
+//
+// user may be empty before a name is chosen; %u then stays unexpanded and only
+// the home-relative spellings match, which is the old, conservative behaviour.
+func readsDefaultAuthorizedKeys(entries []string, user string) bool {
 	for _, e := range entries {
 		if e == ".ssh/authorized_keys" || e == "%h/.ssh/authorized_keys" {
 			return true
 		}
+		// Both sides return "" when they cannot answer (no username yet, an
+		// unresolvable token), and "" must never compare equal to "".
+		if managed := managedAuthorizedKeysPath(user); managed != "" && expandAuthorizedKeysPath(e, user) == managed {
+			return true
+		}
 	}
 	return false
+}
+
+// managedAuthorizedKeysPath is the file this tool writes for user, or "" when no
+// managed path can be named. The home comes from validate.ManagedHomePath, the
+// single spelling every managed-home check derives from, so this equality
+// cannot drift away from the one the account creation and cleanup paths use.
+func managedAuthorizedKeysPath(user string) string {
+	home := validate.ManagedHomePath(user)
+	if home == "" {
+		return ""
+	}
+	return home + "/.ssh/authorized_keys"
+}
+
+// expandAuthorizedKeysPath applies the two AuthorizedKeysFile tokens whose values
+// this tool knows: %h (the managed home) and %u (the login name). It returns ""
+// for a relative entry, which sshd resolves against the home directory and which
+// the literal cases above already cover, and for any entry carrying a token this
+// function cannot resolve — guessing there would be the unsafe direction.
+func expandAuthorizedKeysPath(entry, user string) string {
+	if entry == "" || !strings.HasPrefix(entry, "/") || !validate.Username(user) {
+		return ""
+	}
+	var out strings.Builder
+	for i := 0; i < len(entry); i++ {
+		if entry[i] != '%' {
+			out.WriteByte(entry[i])
+			continue
+		}
+		if i+1 >= len(entry) {
+			return ""
+		}
+		i++
+		switch entry[i] {
+		case 'h':
+			out.WriteString(validate.ManagedHomePath(user))
+		case 'u':
+			out.WriteString(user)
+		case '%':
+			out.WriteByte('%')
+		default:
+			return "" // an unknown token: do not guess what it expands to
+		}
+	}
+	return out.String()
 }
 
 // methodsSatisfiedBy reports whether an AuthenticationMethods setting can be

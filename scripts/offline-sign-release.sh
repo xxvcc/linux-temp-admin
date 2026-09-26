@@ -120,8 +120,8 @@ require_safe_new_output_path() {
   require_safe_directory_path "$parent" "$label parent" 1
 }
 
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size unit
+file_limit_blocks() {
+  local max=$1 unit
   # Bash uses 1024-byte `ulimit -f` blocks normally but 512-byte blocks in POSIX
   # or sh mode. Assuming 1024 halved the effective cap wherever the unit is 512,
   # rejecting files that are within the limit. Probe the inherited kernel value in
@@ -136,7 +136,12 @@ bounded_copy() {
     512 | 1024) ;;
     *) echo "unsupported shell file-size limit unit: $unit" >&2; return 1 ;;
   esac
-  blocks=$(( (max + unit - 1) / unit ))
+  printf '%s\n' "$(( (max + unit - 1) / unit ))"
+}
+
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks="$(file_limit_blocks "$max")" || return 1
   if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
     cp --reflink=never --sparse=never -- "$source" "$destination" ); then
     echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2

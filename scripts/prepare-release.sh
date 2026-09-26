@@ -32,7 +32,7 @@ export PATH LC_ALL GIT_NO_REPLACE_OBJECTS GIT_NO_LAZY_FETCH GIT_TERMINAL_PROMPT 
   GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_ASKPASS SSH_ASKPASS \
   GIT_PAGER GIT_OPTIONAL_LOCKS OPENSSL_CONF GH_HOST GH_PROMPT_DISABLED GH_PAGER
 unset OPENSSL_CONF_INCLUDE OPENSSL_MODULES OPENSSL_ENGINES
-unset GPG_TTY
+unset GPG_TTY GNUPGHOME
 unset GOROOT GOEXPERIMENT GOFIPS140 GO111MODULE GOCACHE GOMODCACHE GOPATH GOTMPDIR
 unset GOPROXY GOSUMDB GONOSUMDB GOPRIVATE GONOPROXY GOINSECURE GOVCS GOAUTH GOTELEMETRY
 hash -r
@@ -127,8 +127,8 @@ require_safe_new_output_path() {
   require_safe_directory_path "$parent" "$label parent" 1
 }
 
-bounded_copy() {
-  local source=$1 destination=$2 max=$3 blocks size unit
+file_limit_blocks() {
+  local max=$1 unit
   # Bash uses 1024-byte `ulimit -f` blocks normally but 512-byte blocks in POSIX
   # or sh mode. Assuming 1024 halved the effective cap wherever the unit is 512,
   # rejecting files that are within the limit. Probe the inherited kernel value in
@@ -143,7 +143,12 @@ bounded_copy() {
     512 | 1024) ;;
     *) echo "unsupported shell file-size limit unit: $unit" >&2; return 1 ;;
   esac
-  blocks=$(( (max + unit - 1) / unit ))
+  printf '%s\n' "$(( (max + unit - 1) / unit ))"
+}
+
+bounded_copy() {
+  local source=$1 destination=$2 max=$3 blocks size
+  blocks="$(file_limit_blocks "$max")" || return 1
   if ! ( ulimit -f "$blocks" || exit 1; local_with_timeout \
     cp --reflink=never --sparse=never -- "$source" "$destination" ); then
     echo "file exceeds its bounded-copy limit or could not be copied: $source" >&2
@@ -359,7 +364,7 @@ download_draft_asset() {
     || { echo "invalid or oversized advertised draft asset: $name" >&2; return 1; }
   [[ "$api_url" == "https://api.github.com/repos/${REPO}/releases/assets/"* ]] \
     || { echo "unexpected GitHub asset API URL for $name" >&2; return 1; }
-  blocks=$(( (max + 1023) / 1024 ))
+  blocks="$(file_limit_blocks "$max")" || return 1
   ( ulimit -f "$blocks" || exit 1; gh_with_timeout api -H 'Accept: application/octet-stream' "$api_url" > "$work/ci/$name" ) \
     || { echo "bounded draft download failed: $name" >&2; return 1; }
   actual_size="$(wc -c < "$work/ci/$name")"
@@ -384,7 +389,7 @@ done
 echo ">> [prepare 3/6] export committed source only (no candidate scripts executed)"
 mkdir "$work/source"
 source_archive="$work/source.tar"
-source_blocks=$(( (MAX_SOURCE_ARCHIVE_BYTES + 1023) / 1024 ))
+source_blocks="$(file_limit_blocks "$MAX_SOURCE_ARCHIVE_BYTES")" || exit 1
 ( ulimit -f "$source_blocks" || exit 1; git_with_timeout -C "$SOURCE_DIR" archive --format=tar "$tag_commit" > "$source_archive" ) \
   || { echo "tag source archive is oversized or could not be exported" >&2; exit 1; }
 [[ -s "$source_archive" && "$(wc -c < "$source_archive")" -le "$MAX_SOURCE_ARCHIVE_BYTES" ]] \

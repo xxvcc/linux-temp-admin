@@ -36,6 +36,7 @@ TRANSFER_TIMEOUT_SECONDS = 300
 # holding the deployment lock.
 INSTALLER_SCAN_TIMEOUT_SECONDS = 120
 STAGING_SCAN_INTERVAL_SECONDS = 0.1
+TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_RELEASE_VERSION_BYTES = 128
@@ -100,6 +101,39 @@ class ReceiverError(RuntimeError):
 
 def fail(message: str) -> None:
     raise ReceiverError(message)
+
+
+@contextmanager
+def controlled_termination() -> Iterator[None]:
+    # Raising once unwinds through transfer and staging cleanup. Repeated signals
+    # must not interrupt that cleanup and release the deployment lock early.
+    terminating = False
+
+    def terminate(signum: int, _frame: object) -> None:
+        nonlocal terminating
+        if not terminating:
+            terminating = True
+            fail(f"receiver interrupted by {signal.Signals(signum).name}")
+
+    previous = {signum: signal.getsignal(signum) for signum in TERMINATION_SIGNALS}
+    try:
+        for signum in TERMINATION_SIGNALS:
+            signal.signal(signum, terminate)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@contextmanager
+def blocked_termination() -> Iterator[set[signal.Signals]]:
+    # Defer Python's asynchronous handler while acquiring ownership of a child
+    # or killing/reaping it. A pending signal is delivered after the safe point.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+    try:
+        yield previous
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 @contextmanager
@@ -790,12 +824,30 @@ def require_project_budget(
         )
 
 
+def observe_transfer(process: subprocess.Popen[bytes]) -> os.waitid_result | None:
+    # WNOWAIT keeps the leader's PID reserved until kill_transfer has retired
+    # its process group. Popen.wait/poll would reap it and allow that numeric
+    # PID/PGID to name an unrelated later session before killpg runs.
+    return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
 def kill_transfer(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+    with blocked_termination():
+        if process.returncode is not None:
+            # Idempotent cleanup after wait: the old numeric PGID is no longer
+            # ours to signal, even if a different group now has the same number.
+            return
+        # Prove the child is still ours before signaling the numeric group. No
+        # other code reaps this child; the receiver is deliberately single-threaded.
+        try:
+            observe_transfer(process)
+        except ChildProcessError:
+            fail("lost ownership of the transfer child; refusing to signal a reused process group")
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 def run_rrsync(stage: Path, original_command: str) -> None:
@@ -808,41 +860,47 @@ def run_rrsync(stage: Path, original_command: str) -> None:
         "SSH_ORIGINAL_COMMAND": original_command,
         "USER": str(os.getuid()),
     }
-    process = subprocess.Popen(
-        # -munge is what confines symlinks the sender may transfer: the mandated
-        # option profile enables --links, so without it a link can name a path
-        # outside the staging directory and later resolve there.
-        [str(RRSYNC), "-munge", "-wo", "-no-del", str(stage)],
-        env=environment,
-        preexec_fn=limit_receiver,
-        start_new_session=True,
-    )
+    process: subprocess.Popen[bytes] | None = None
     try:
+        with blocked_termination() as previous_mask:
+            def prepare_child() -> None:
+                limit_receiver()
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+            process = subprocess.Popen(
+                # -munge confines sender symlinks to staging; the accepted option
+                # profile includes --links, so they would otherwise escape it.
+                [str(RRSYNC), "-munge", "-wo", "-no-del", str(stage)],
+                env=environment,
+                preexec_fn=prepare_child,
+                start_new_session=True,
+            )
         deadline = time.monotonic() + TRANSFER_TIMEOUT_SECONDS
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 fail("rsync transfer exceeded its time limit")
-            try:
-                status = process.wait(
-                    timeout=min(STAGING_SCAN_INTERVAL_SECONDS, remaining)
-                )
+            observed = observe_transfer(process)
+            if observed is not None:
+                status = observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status
                 break
-            except subprocess.TimeoutExpired:
-                # Count every current and residual transfer tree, not only this
-                # session. The deployment lock is included; its fixed metadata
-                # is negligible and including it avoids a pathname exception.
-                require_staging_budget(stage.parent)
+            time.sleep(min(STAGING_SCAN_INTERVAL_SECONDS, remaining))
+            # Count every current and residual transfer tree, not only this
+            # session. The deployment lock is included; its fixed metadata
+            # is negligible and including it avoids a pathname exception.
+            require_staging_budget(stage.parent)
+        # Transfers never intentionally daemonize. Retire all remaining writers
+        # while the leader is still unreaped, before validating staged files.
+        kill_transfer(process)
         if status != 0:
             fail(f"rrsync rejected or failed the transfer with status {status}")
         # Close the race between the final periodic scan and process exit before any
         # release validation or publication begins.
         require_staging_budget(stage.parent)
     except BaseException as operation_error:
-        # No catchable receiver exit may leave a writer outside the deployment
-        # lock. The separate session lets one signal terminate rrsync and every
-        # rsync descendant before the lock can be released.
-        if process.returncode is None:
+        # Even an exited group leader can leave a writer. Kill the group and reap
+        # the direct child before the deployment lock may be released.
+        if process is not None:
             try:
                 kill_transfer(process)
             except BaseException as cleanup_error:
@@ -897,7 +955,7 @@ def open_lock(path: Path, *, owner: int, nonblocking: bool = False) -> int:
     return descriptor
 
 
-def main() -> int:
+def receive() -> int:
     owner = os.getuid()
     if owner == 0:
         fail("mirror receiver must not run as root")
@@ -942,6 +1000,11 @@ def main() -> int:
     finally:
         os.close(lock_descriptor)
     return 0
+
+
+def main() -> int:
+    with controlled_termination():
+        return receive()
 
 
 if __name__ == "__main__":

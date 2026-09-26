@@ -18,14 +18,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"golang.org/x/sys/unix"
-	"strconv"
-	"strings"
 )
 
 const (
@@ -53,7 +53,7 @@ type record struct {
 	// environment supplies and a root-equivalent caller can therefore choose;
 	// loginuid is set once per login session by PAM and is the value to reconcile
 	// against when an actor name is in question.
-	LoginUID *int              `json:"loginuid,omitempty"`
+	LoginUID *uint64           `json:"loginuid,omitempty"`
 	Action   string            `json:"action"`
 	Target   string            `json:"target,omitempty"`
 	Result   string            `json:"result"`
@@ -99,7 +99,7 @@ func realActor() (string, int) {
 // this codebase makes its other /proc and /etc readers testable.
 var loginUIDPath = "/proc/self/loginuid"
 
-func loginUID() *int {
+func loginUID() *uint64 {
 	raw, err := os.ReadFile(loginUIDPath)
 	if err != nil {
 		return nil
@@ -108,8 +108,7 @@ func loginUID() *int {
 	if err != nil || value == uint64(^uint32(0)) {
 		return nil
 	}
-	id := int(value)
-	return &id
+	return &value
 }
 
 // Log appends one event. It is best-effort from the caller's perspective (it

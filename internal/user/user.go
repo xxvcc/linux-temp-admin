@@ -186,7 +186,11 @@ func InspectIdentityAllocation() (IdentityAllocationSnapshot, error) {
 		return IdentityAllocationSnapshot{}, fmt.Errorf("read passwd database for identity allocation: %w", err)
 	}
 	for i, line := range strings.Split(string(passwd), "\n") {
-		if line == "" {
+		// Skip exactly what glibc's nss_files skips. Refusing a comment or a NIS
+		// compatibility entry here hard-failed every invite on a host that carries
+		// one, and told the operator the database was malformed when the system
+		// itself reads it fine. Genuinely malformed records still fail closed.
+		if skipNonEntryLine(line) {
 			continue
 		}
 		pw, err := parsePasswdEntry(line)
@@ -204,7 +208,7 @@ func InspectIdentityAllocation() (IdentityAllocationSnapshot, error) {
 		return IdentityAllocationSnapshot{}, fmt.Errorf("read group database for identity allocation: %w", err)
 	}
 	for i, line := range strings.Split(string(groups), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		parts := strings.Split(line, ":")
@@ -314,7 +318,7 @@ func LifecycleMarkerAccounts() ([]string, error) {
 	seen := make(map[string]bool)
 	var names []string
 	for i, line := range strings.Split(string(data), "\n") {
-		if line == "" {
+		if skipNonEntryLine(line) {
 			continue
 		}
 		pw, err := parsePasswdEntry(line)
@@ -771,7 +775,7 @@ type Manager struct {
 	NameInUse                 func(string) (bool, error)
 	InspectPrivateGroupState  func(string, int, bool) (bool, error)
 	InspectSameNameGroupState func(string) (bool, error)
-	CheckSubordinateIDsAbsent func(string) error
+	CheckSubordinateIDsAbsent func(string, int) error
 	ValidateManagedMailRoots  func() error
 	PrepareManagedHome        func(string) error
 	CreateManagedHome         func(Passwd) error
@@ -1299,7 +1303,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 				return fmt.Errorf("account %s reappeared during artifact cleanup sweep %d", name, sweep)
 			}
 		}
-		return m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
+		return m.ReconcileAccountDatabaseAfterDeletion(name, expected.UID, expected.GID, removePrivateGroup)
 	}
 	type helper struct {
 		name string
@@ -1358,7 +1362,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if !absent {
 				return fmt.Errorf("account %s reappeared during final managed mail cleanup", name)
 			}
-			return m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
+			return m.ReconcileAccountDatabaseAfterDeletion(name, expected.UID, expected.GID, removePrivateGroup)
 		}
 		if removePrivateGroup {
 			// The artifact cleanup and final job drain above can be long. Repeat the
@@ -1382,7 +1386,7 @@ func (m *Manager) delete(name string, expected *Passwd, beforeDelete func() erro
 			if finalStateErr == nil && !stillAbsent {
 				finalStateErr = fmt.Errorf("account %s reappeared during final managed mail cleanup", name)
 			}
-			accountDBErr := m.ReconcileAccountDatabaseAfterDeletion(name, expected.GID, removePrivateGroup)
+			accountDBErr := m.ReconcileAccountDatabaseAfterDeletion(name, expected.UID, expected.GID, removePrivateGroup)
 			if runErr != nil {
 				return errors.Join(errors.Join(attemptErrs...),
 					fmt.Errorf("%s removed the account but reported incomplete cleanup: %w", helper.name, runErr),
@@ -2217,13 +2221,17 @@ func processesForUID(uid int) ([]int, error) {
 		if !stable {
 			stableEmpty = 0
 			disturbed++
-			continue
+		} else {
+			stableEmpty++
+			if stableEmpty == processEmptyConfirmations {
+				return nil, nil
+			}
 		}
-		stableEmpty++
-		if stableEmpty == processEmptyConfirmations {
-			return nil, nil
+		// Give short-lived background activity time to settle without exhausting
+		// every retry in one burst. Sustained unclassified churn fails closed.
+		if attempt+1 < processScanAttempts {
+			processScanSleep(processScanRetryDelay)
 		}
-		processScanSleep(processScanRetryDelay)
 	}
 	// Name the cause. Every attempt reporting a disturbance means the snapshot kept
 	// racing process activity this scan could not rule out, which is host state
@@ -2234,63 +2242,32 @@ func processesForUID(uid int) ([]int, error) {
 		procRoot, processScanAttempts, disturbed)
 }
 
-// procEntry is one numeric /proc entry with the directory owner captured in the
-// snapshot's fast first pass. known is false when the entry was already gone.
-type procEntry struct {
-	tgid  int
-	owner int
-	known bool
-}
-
 func processSnapshotForUID(uid int) ([]int, bool, error) {
 	entries, err := readProcDirectory(procRoot)
 	if err != nil {
 		return nil, false, fmt.Errorf("scan %s: %w", procRoot, err)
 	}
-	// First pass: one cheap stat per entry, taken while the listing is still fresh,
-	// records who owns each process directory. /proc/<pid> carries the process's
-	// real UID, and moving a thread to another UID needs privilege this threat
-	// model does not grant an unprivileged local user. An entry owned by some other
-	// unprivileged account therefore cannot host a thread carrying the target UID,
-	// and neither can anything it forks, so its disappearance says nothing about
-	// whether the target UID is absent.
-	//
-	// This matters because the old snapshot let ANY vanishing entry invalidate the
-	// whole scan. Ordinary background churn on a busy host — let alone a deliberate
-	// fork loop from any local account — then denied every invite and every account
-	// deletion, since processesForUID needs two consecutive stable empty snapshots.
-	//
-	// Root and the target UID stay conservative: root can move a thread to the
-	// target UID, and the target's own processes are exactly what is being looked
-	// for. An entry that vanished before it could be attributed also stays
-	// conservative. Residual, deliberately accepted: a multi-threaded process whose
-	// leader has dropped to another UID while a worker thread still holds root
-	// would be attributed to the leader's UID.
-	procEntries := make([]procEntry, 0, len(entries))
+	// /proc directory ownership reflects effective credentials (or root for a
+	// non-dumpable process), not every real/effective/saved/filesystem UID of every
+	// thread. A foreign-owned group may therefore still carry the target UID. Read
+	// credentials directly, without a separate stat pass that both adds a race
+	// window and cannot establish that a disappearing group was unrelated.
+	var pids []int
+	stable := true
 	for _, entry := range entries {
 		tgid, convErr := strconv.Atoi(entry.Name())
 		if convErr != nil {
 			continue
 		}
-		var st unix.Stat_t
-		if statErr := unix.Fstatat(unix.AT_FDCWD, filepath.Join(procRoot, entry.Name()), &st, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
-			procEntries = append(procEntries, procEntry{tgid: tgid, owner: int(st.Uid), known: true})
-			continue
-		}
-		procEntries = append(procEntries, procEntry{tgid: tgid})
-	}
-	var pids []int
-	stable := true
-	for _, entry := range procEntries {
-		matched, groupStable, err := processGroupHasUID(entry.tgid, uid)
+		matched, groupStable, err := processGroupHasUID(tgid, uid)
 		if err != nil {
-			return nil, false, fmt.Errorf("read thread credentials for process %d: %w", entry.tgid, err)
+			return nil, false, fmt.Errorf("read thread credentials for process %d: %w", tgid, err)
 		}
-		if !groupStable && (!entry.known || entry.owner == 0 || entry.owner == uid) {
+		if !groupStable {
 			stable = false
 		}
 		if matched {
-			pids = append(pids, entry.tgid)
+			pids = append(pids, tgid)
 		}
 	}
 	sort.Ints(pids)

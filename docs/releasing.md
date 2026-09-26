@@ -917,10 +917,13 @@ been revalidated:
   directory before creating a stage, throughout transfer, after transfer, and
   after cleanup. It refuses new work when residual `transfer-*` state exhausts
   that budget and reports cleanup failure instead of silently accumulating it.
-  On every catchable receiver failure it terminates and reaps the complete
-  transfer process group before releasing the deployment lock, and reports a
-  failure in that cleanup without hiding the primary error. An uncatchable
-  receiver death can still leave a detached writer, and directory scans cannot
+  Receiver failures, including SIGTERM, SIGHUP, and SIGINT, terminate the
+  complete transfer process group and reap its direct child before releasing the
+  deployment lock. Signals are deferred while child ownership is established and
+  during kill/reap; repeated termination signals cannot interrupt shutdown. Even
+  a successful transfer leader exit retires surviving descendants before
+  publication. Cleanup failures are reported without hiding the primary error. An
+  uncatchable receiver death can still leave a detached writer, and directory scans cannot
   account for a file that has already been unlinked but remains open; use a
   dedicated quota or filesystem when the host requires a kernel-enforced hard
   bound against either residual case.

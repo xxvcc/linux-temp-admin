@@ -47,6 +47,8 @@ func (failingScheduleSystem) HasAt() bool                                  { ret
 func (failingScheduleSystem) ScheduleAt(string, time.Time) (string, error) { return "", nil }
 func (failingScheduleSystem) RemoveAtJobsFor(string) error                 { return nil }
 func (failingScheduleSystem) AtrmJob(string) error                         { return nil }
+func (failingScheduleSystem) AtDaemonRunning() (bool, error)               { return true, nil }
+
 func (failingScheduleSystem) AtJobs() ([]schedule.AtJob, error) {
 	return nil, errors.New("at queue unreadable")
 }

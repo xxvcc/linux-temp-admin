@@ -137,6 +137,11 @@ type App struct {
 	RuntimeHooks
 
 	InstallPath string
+	// stableCommandReplaced records that this process overwrote the shared stable
+	// command at InstallPath. Nothing can restore the previous bytes, so a failed
+	// invite cannot roll it back — but the operator must be told it happened
+	// rather than be left believing the run left no trace.
+	stableCommandReplaced bool
 	// StateDir and AuditLogDir are the paths an uninstall removes RECURSIVELY, so
 	// they are fields for the same reason InstallPath is: a test that ran the
 	// teardown against the constants would delete the real ones. CI runs the
@@ -402,6 +407,24 @@ func askLang(rest []string) (lang i18n.Lang, ok, prompted bool) {
 	return lang, ok, true
 }
 
+// isUnattendedYesFlag reports whether arg is any spelling of the --yes boolean
+// that Go's flag package accepts. The package treats one and two leading dashes
+// identically and allows any unambiguous prefix of nothing — it matches the
+// registered name exactly — but both "-yes" and "--y" reach the same flag here
+// because the mutating subcommands register "yes" and "y" as separate booleans.
+// Listing only some spellings let an unattended run stop on the first-run
+// language prompt.
+func isUnattendedYesFlag(arg string) bool {
+	name := strings.TrimPrefix(strings.TrimPrefix(arg, "-"), "-")
+	if name == arg {
+		return false // not a flag at all
+	}
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	return name == "yes" || name == "y"
+}
+
 func shouldAskLang(rest []string, stdinTTY, stderrTTY, stdoutTTY bool) bool {
 	if !stdinTTY || !stderrTTY {
 		return false
@@ -411,8 +434,7 @@ func shouldAskLang(rest []string, stdinTTY, stderrTTY, stdoutTTY bool) bool {
 		// accepts --yes=true, -y=1 and so on for the boolean flags every mutating
 		// subcommand registers, so an exact token match let those forms reach the
 		// first-run language prompt and abort the run.
-		if arg == "--yes" || arg == "-y" ||
-			strings.HasPrefix(arg, "--yes=") || strings.HasPrefix(arg, "-yes=") || strings.HasPrefix(arg, "-y=") {
+		if isUnattendedYesFlag(arg) {
 			return false
 		}
 	}

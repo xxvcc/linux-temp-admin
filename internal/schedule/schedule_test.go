@@ -28,6 +28,8 @@ type fakeSystem struct {
 	atJobsErr    error
 	loadedErr    error
 	systemctlErr func(args ...string) error
+	atdStopped   bool
+	atdProbeErr  error
 }
 
 func (f *fakeSystem) HasSystemctl() bool { return f.hasSystemctl }
@@ -53,6 +55,15 @@ func (f *fakeSystem) RemoveAtJobsFor(command string) error {
 }
 func (f *fakeSystem) AtrmJob(id string) error  { f.atrmd = append(f.atrmd, id); return f.atrmErr }
 func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
+
+// atdStopped/atdProbeErr default to a running daemon so existing cases keep their
+// meaning; the at-validity tests set them explicitly.
+func (f *fakeSystem) AtDaemonRunning() (bool, error) {
+	if f.atdProbeErr != nil {
+		return false, f.atdProbeErr
+	}
+	return !f.atdStopped, nil
+}
 func (f *fakeSystem) loadedSystemdUnits() ([]string, error) {
 	return f.loadedUnits, f.loadedErr
 }
@@ -960,5 +971,35 @@ func TestCancelRemovesLegacyUnitsToo(t *testing.T) {
 	}
 	if !disabled {
 		t.Errorf("the v1 timer was never disabled; systemctl calls: %v", sys.calls)
+	}
+}
+
+// The at-fallback failure used to report "no systemctl or at available" on a host
+// where systemctl was present and had just been used, sending the operator to
+// look for a tool that was installed.
+func TestAtFallbackFailureNamesOnlyWhatThisHostIsMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		hasSystemctl  bool
+		want, notWant string
+	}{
+		{"systemd host whose unit write failed", true, "at is not available", "no systemctl"},
+		{"host with neither backend", false, "no systemctl or at available", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sys := &fakeSystem{hasSystemctl: tc.hasSystemctl, hasAt: false}
+			s := newScheduler(t.TempDir(), sys)
+
+			_, err := s.scheduleAt("xxvcc-a1", 1001, testGeneration, deadlineAfter(s, 24))
+			if err == nil {
+				t.Fatal("scheduleAt succeeded with no at backend")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want it to name %q", err, tc.want)
+			}
+			if tc.notWant != "" && strings.Contains(err.Error(), tc.notWant) {
+				t.Fatalf("error = %v, want it not to blame %q on a host that has it", err, tc.notWant)
+			}
+		})
 	}
 }

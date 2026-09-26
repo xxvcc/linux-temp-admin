@@ -56,7 +56,19 @@ func AccountID(id int) bool { return id > 0 && KernelID(id) }
 // a cleaned or symlink-resolved equivalent would weaken the pathname binding
 // used before recursive cleanup.
 func ManagedHome(user, home string) bool {
-	return Username(user) && home == "/home/"+user
+	return Username(user) && home == ManagedHomePath(user)
+}
+
+// ManagedHomePath is the one spelling of the dedicated home this tool assigns.
+// Everything that compares against that path derives it from here, so the
+// copies cannot drift: a second spelling that disagrees would let one check
+// accept a path another refuses. It returns "" for a name this tool could never
+// have created, so no caller can build a path for one.
+func ManagedHomePath(user string) string {
+	if !Username(user) {
+		return ""
+	}
+	return "/home/" + user
 }
 
 // Prefix reports whether s is a valid username prefix.

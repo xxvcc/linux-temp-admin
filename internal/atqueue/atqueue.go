@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // MaxJobs bounds a complete queue inventory before callers inspect each job.
@@ -39,11 +40,38 @@ func ValidJobID(id string) bool {
 	return true
 }
 
+// Entry is one atq inventory line. ScheduledAt is the queued run time when atq
+// printed one in the C-locale shape this tool pins; it stays zero for the
+// implementations that print something else, because an unparsed column must not
+// be mistaken for "no deadline".
+type Entry struct {
+	ID          string
+	ScheduledAt time.Time
+}
+
 // ParseInventory treats every non-empty atq line as inventory evidence. It
 // fails closed rather than returning a partial inventory when any line is
 // malformed, an ID is duplicated, or the queue exceeds MaxJobs.
 func ParseInventory(out []byte, maxTokenBytes int) ([]string, error) {
-	var ids []string
+	entries, err := ParseInventoryEntries(out, maxTokenBytes)
+	if err != nil {
+		return nil, err
+	}
+	if entries == nil {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
+	return ids, nil
+}
+
+// ParseInventoryEntries is ParseInventory plus each job's queued run time, which
+// callers need to tell a pending job from one whose deadline has already passed
+// while atd was not running.
+func ParseInventoryEntries(out []byte, maxTokenBytes int) ([]Entry, error) {
+	var ids []Entry
 	seen := make(map[string]bool)
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	scanner.Buffer(make([]byte, 1024), maxTokenBytes)
@@ -63,7 +91,7 @@ func ParseInventory(out []byte, maxTokenBytes int) ([]string, error) {
 			return nil, fmt.Errorf("parse atq line %d: duplicate job id %s", lineNo, id)
 		}
 		seen[id] = true
-		ids = append(ids, id)
+		ids = append(ids, Entry{ID: id, ScheduledAt: parseQueuedTime(fields)})
 		if len(ids) > MaxJobs {
 			// Name what the operator can act on: the count spans every account's
 			// jobs, so the blocker is usually not the account being cleaned up.
@@ -74,6 +102,25 @@ func ParseInventory(out []byte, maxTokenBytes int) ([]string, error) {
 		return nil, fmt.Errorf("parse atq: %w", err)
 	}
 	return ids, nil
+}
+
+// parseQueuedTime reads the five-field date atq prints under the pinned C locale
+// ("Fri Jul 24 00:00:00 2026"). It returns the zero time for any other shape:
+// guessing a deadline is worse than admitting the queue did not state one.
+//
+// The instant is read as UTC, which is correct ONLY because the caller runs atq
+// with TZ=UTC. Parsing in time.Local would read the child's output in this
+// process's own zone — two different zones on any host whose $TZ differs from
+// /etc/localtime, since helpers inherit no TZ.
+func parseQueuedTime(fields []string) time.Time {
+	if len(fields) < 6 {
+		return time.Time{}
+	}
+	when, err := time.ParseInLocation("Mon Jan 2 15:04:05 2006", strings.Join(fields[1:6], " "), time.UTC)
+	if err != nil {
+		return time.Time{}
+	}
+	return when
 }
 
 // ParseOwner returns the UID from the first atrun-shaped owner header. The GID

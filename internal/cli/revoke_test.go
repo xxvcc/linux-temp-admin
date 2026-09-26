@@ -43,6 +43,7 @@ func (s revokeTestScheduleSystem) RemoveAtJobsFor(string) error {
 }
 func (revokeTestScheduleSystem) AtrmJob(string) error              { return nil }
 func (revokeTestScheduleSystem) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
+func (revokeTestScheduleSystem) AtDaemonRunning() (bool, error)    { return true, nil }
 
 func (r *orderedTeardownRunner) Run(name string, _ ...string) error {
 	*r.events = append(*r.events, name)
@@ -91,7 +92,7 @@ func newOrderedTeardownApp(t *testing.T, pw user.Passwd, failClearCall int, clea
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         appendArtifact("mail"),
 			RemoveManagedHome:         appendArtifact("home"),
 		},
@@ -1358,7 +1359,7 @@ func TestTeardownContinuesAcrossConcurrentUserWritablePasswdChanges(t *testing.T
 			LookupUser:                lookup,
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         func(user.Passwd) error { events = append(events, "mail"); return nil },
 			RemoveManagedHome:         func(user.Passwd) error { events = append(events, "home"); return nil },
 		},
@@ -1602,7 +1603,7 @@ func TestRevokeRetriesPostDeletionMailAndKeepsOrdinaryAbsentRowsNarrow(t *testin
 			NameInUse:                 func(string) (bool, error) { return false, nil },
 			InspectPrivateGroupState:  func(string, int, bool) (bool, error) { return false, nil },
 			InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-			CheckSubordinateIDsAbsent: func(string) error { return nil },
+			CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			RemoveManagedMail:         removeMail,
 		}
 		a.Scheduler = &schedule.Scheduler{
@@ -1873,7 +1874,7 @@ func TestCompactRetainsWholeRegistryWhenAbsentAccountDatabaseIsUnclean(t *testin
 			name:      "subordinate ID remains",
 			wantError: "injected subordinate ID residue",
 			configure: func(m *user.Manager, blocked string) {
-				m.CheckSubordinateIDsAbsent = func(name string) error {
+				m.CheckSubordinateIDsAbsent = func(name string, _ int) error {
 					if name == blocked {
 						return errors.New("injected subordinate ID residue")
 					}
@@ -1935,7 +1936,7 @@ func TestCompactRetainsWholeRegistryWhenAbsentAccountDatabaseIsUnclean(t *testin
 					return false, nil
 				},
 				InspectSameNameGroupState: func(string) (bool, error) { return false, nil },
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			}
 			tc.configure(a.Users, blocked.User)
 
@@ -1975,7 +1976,7 @@ func TestCompactRemovesCleanAbsentAccountDatabaseRow(t *testing.T) {
 			}
 			return false, nil
 		},
-		CheckSubordinateIDsAbsent: func(name string) error {
+		CheckSubordinateIDsAbsent: func(name string, _ int) error {
 			subIDChecks++
 			if name != rec.User {
 				t.Fatalf("subordinate-ID inspection = %q, want %q", name, rec.User)

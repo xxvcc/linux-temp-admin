@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/xxvcc/linux-temp-admin/internal/config"
+	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
+	"github.com/xxvcc/linux-temp-admin/internal/lifecycle"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/selfmanage"
 	"github.com/xxvcc/linux-temp-admin/internal/user"
@@ -443,5 +445,198 @@ func TestQuarantinedAccountRemainsAuthorizedForSynchronousUninstallCleanup(t *te
 	}
 	if !liveTeardownAccountAuthorized(acc) {
 		t.Fatal("a valid quarantined account could not be synchronously finalized by uninstall")
+	}
+}
+
+// uninstallHost builds the same shape as TestUninstallIgnoreForeignMarkersCompletesTeardown:
+// a self-contained root, state dir, registry and install path, with no managed
+// accounts unless the caller adds one.
+func uninstallHost(t *testing.T) (*App, *strings.Builder, *strings.Builder) {
+	t.Helper()
+	if os.Getuid() != 0 {
+		t.Skip("the teardown reads and writes root-owned state")
+	}
+	a, _, _ := newTestApp(t, "")
+	var outb, errb strings.Builder
+	a.Out = &outb
+	a.Err = &errb
+	root := t.TempDir()
+	a.StateDir = filepath.Join(root, "state")
+	a.AuditLogDir = filepath.Join(root, "audit")
+	registryDir := filepath.Join(a.StateDir, "v2")
+	if err := os.MkdirAll(registryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.Registry = &registry.Store{
+		Dir:  registryDir,
+		File: filepath.Join(registryDir, "registry.tsv"),
+		Lock: filepath.Join(registryDir, "registry.lock"),
+	}
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.InstallPath = filepath.Join(binDir, "linux-temp-admin")
+	if err := os.WriteFile(a.InstallPath, []byte("installed"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a.Selfmanage = selfmanage.New(a.InstallPath, 0)
+	return a, &outb, &errb
+}
+
+// The install path is probed during the inventory precisely so a path that cannot
+// be removed is discovered BEFORE anything is destroyed. The post-revoke
+// re-inventory recomputed that blocker and threw it away, which is the one window
+// where the discovery still matters: state changed after the plan was approved.
+func TestUninstallRefusesWhenTheInstallPathBecomesUnremovableAfterThePlan(t *testing.T) {
+	a, _, errb := uninstallHost(t)
+
+	// Approve a plan against a removable file, then make the path unremovable in
+	// the window the re-inventory exists to cover.
+	plan := a.teardownPlan(false, false)
+	if plan.binaryBlocker != "" {
+		t.Fatalf("premise: the plan already blocks (%q)", plan.binaryBlocker)
+	}
+	if err := os.Remove(a.InstallPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(a.InstallPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := uninstallOptions{yes: true, removeUsers: true}
+	if rc := a.teardown(a.teardownPlan(false, false), opts); rc == 0 {
+		t.Fatalf("teardown returned 0 though the command cannot be removed; stderr=%q", errb.String())
+	}
+	if got := errb.String(); !strings.Contains(got, "refusing to uninstall") {
+		t.Fatalf("stderr = %q, want the refusal naming the install path", got)
+	}
+	if _, err := os.Lstat(a.StateDir); err != nil {
+		t.Fatalf("the state directory was removed despite the refusal: %v", err)
+	}
+}
+
+// The marker is written by rename and synced afterwards, so a durability failure
+// means it is already on disk and already blocking every later mutation.
+// Reporting that as "not recorded" told the operator the gate was not armed.
+func TestUninstallContinuesWhenTheMarkerIsCommittedButUnsynced(t *testing.T) {
+	a, _, errb := uninstallHost(t)
+	a.Lifecycle = markerLock(t, &fsutil.DurabilityError{Operation: "uninstall marker directory", Err: os.ErrInvalid})
+
+	opts := uninstallOptions{yes: true, removeUsers: true}
+	rc := a.teardown(a.teardownPlan(false, false), opts)
+
+	if rc != 0 {
+		t.Fatalf("teardown = %d, want the uninstall to continue past a committed-but-unsynced marker; stderr=%q", rc, errb.String())
+	}
+	if got := errb.String(); !strings.Contains(got, "durability is unconfirmed") {
+		t.Fatalf("stderr = %q, want the operator told the marker IS recorded", got)
+	}
+	if _, err := os.Lstat(a.StateDir); !os.IsNotExist(err) {
+		t.Fatalf("the state directory survived a continuing uninstall: %v", err)
+	}
+}
+
+// A marker that genuinely could not be written still stops the uninstall.
+func TestUninstallStopsWhenTheMarkerCannotBeRecordedAtAll(t *testing.T) {
+	a, _, errb := uninstallHost(t)
+	a.Lifecycle = markerLock(t, os.ErrPermission)
+
+	opts := uninstallOptions{yes: true, removeUsers: true}
+	if rc := a.teardown(a.teardownPlan(false, false), opts); rc == 0 {
+		t.Fatalf("teardown = 0 though the marker was never recorded; stderr=%q", errb.String())
+	}
+	if _, err := os.Lstat(a.StateDir); err != nil {
+		t.Fatalf("state was removed although the gate was never armed: %v", err)
+	}
+}
+
+// The non-interactive refusal used to call every witness an account. A stale
+// registry row with no passwd entry behind it is leftover state, not an account.
+func TestNonInteractiveRefusalSeparatesLiveAccountsFromLeftoverState(t *testing.T) {
+	const generation = "0123456789abcdef0123456789abcdef"
+	a, _, errb := uninstallHost(t)
+	if err := a.Registry.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.Registry.ReserveIdentity(1600, 1600); err != nil {
+		t.Fatal(err)
+	}
+	// One row whose account really exists, and one whose account is long gone.
+	// The gate counts both witnesses; the message must not call both accounts.
+	for _, rec := range []registry.Record{
+		{User: "xxvcc-live1", Port: 22, UID: 1500, Generation: generation, IdentityBound: true},
+		{User: "xxvcc-stale1", Port: 22, UID: 1501, Generation: generation, IdentityBound: true},
+	} {
+		if err := a.Registry.Record(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.LookupUser = func(name string) (user.Passwd, bool, error) {
+		if name != "xxvcc-live1" {
+			return user.Passwd{}, false, nil
+		}
+		return user.Passwd{
+			Name: name, UID: 1500, GID: 1500,
+			GECOS: config.ManagedGenerationGECOSPrefix + generation + ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
+			Home:  "/home/" + name, Shell: "/bin/sh",
+		}, true, nil
+	}
+
+	plan := a.teardownPlan(false, false)
+	if a.authorizeUninstall(plan, uninstallOptions{yes: true}) {
+		t.Fatal("a non-interactive run authorized itself without --remove-users")
+	}
+
+	got := errb.String()
+	if !strings.Contains(got, "2 item(s) of account state") {
+		t.Fatalf("stderr = %q, want both witnesses counted as account state", got)
+	}
+	if !strings.Contains(got, "1 are live accounts") {
+		t.Fatalf("stderr = %q, want exactly one of them reported as a live account", got)
+	}
+	if !strings.Contains(got, "leftover registry rows") {
+		t.Fatalf("stderr = %q, want the remainder named as leftover state", got)
+	}
+}
+
+// markerLock returns a real lifecycle lock whose marker write fails with err, so
+// the two marker branches can be driven without a filesystem that misbehaves on
+// demand.
+func markerLock(t *testing.T, err error) *lifecycle.Lock {
+	t.Helper()
+	l := lifecycle.New(filepath.Join(t.TempDir(), "lifecycle.lock"))
+	l.WriteRootFile = func(string, []byte, os.FileMode, int, int) error { return err }
+	return l
+}
+
+// --ignore-foreign-markers deliberately leaves live accounts in place, and the
+// warning that named them printed before the YES prompt and has scrolled away by
+// the end. The closing line is the operator's last word on the host, so it must
+// not say the accounts are gone.
+func TestUninstallClosingLineNamesTheAccountsItDeliberatelyLeft(t *testing.T) {
+	const name = "someone-else"
+	a, outb, errb := uninstallHost(t)
+	pw := user.Passwd{
+		Name: name, UID: 4242, GID: 4242, GECOS: config.ManagedGECOS,
+		Home: "/home/" + name, Shell: "/bin/sh",
+	}
+	a.ListMarkerAccounts = func() ([]string, error) { return []string{name}, nil }
+	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
+
+	opts := uninstallOptions{yes: true, force: true, ignoreForeignMarkers: true}
+	if rc := a.teardown(a.teardownPlan(false, true), opts); rc != 0 {
+		t.Fatalf("teardown = %d, want a completed teardown; stderr=%q", rc, errb.String())
+	}
+
+	out := outb.String()
+	if !strings.Contains(out, name) {
+		t.Fatalf("closing output = %q, want the deliberately-kept account named", out)
+	}
+	if !strings.Contains(out, "left in place by --ignore-foreign-markers") {
+		t.Fatalf("closing output = %q, want it to say the account was left in place", out)
+	}
+	if strings.Contains(out, "the temporary accounts, their grants") {
+		t.Fatalf("closing output = %q, want no claim that every account is gone", out)
 	}
 }

@@ -616,10 +616,13 @@ func TestLoginUIDReadsTheKernelShapes(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		content string
-		want    *int
+		want    *uint64
 	}{
-		{name: "a real login session", content: "1000\n", want: func() *int { v := 1000; return &v }()},
-		{name: "root login", content: "0\n", want: func() *int { v := 0; return &v }()},
+		{name: "a real login session", content: "1000\n", want: func() *uint64 { v := uint64(1000); return &v }()},
+		{name: "root login", content: "0\n", want: func() *uint64 { v := uint64(0); return &v }()},
+		{name: "uid above signed 32-bit range", content: "2147483648\n", want: func() *uint64 { v := uint64(2147483648); return &v }()},
+		{name: "largest actual uid", content: "4294967294\n", want: func() *uint64 { v := uint64(4294967294); return &v }()},
+		{name: "out of kernel uid range", content: "4294967296\n", want: nil},
 		{name: "unset sentinel is not a uid", content: "4294967295\n", want: nil},
 		{name: "unreadable value", content: "not-a-number\n", want: nil},
 	} {

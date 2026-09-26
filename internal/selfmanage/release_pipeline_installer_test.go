@@ -487,7 +487,7 @@ func InstallerPinnedReleaseEndToEnd(t *testing.T) {
 	if err := os.WriteFile(tombstone, []byte("uninstalled-v1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	candidate := []byte(fmt.Sprintf(`#!/bin/sh
+	candidate := elfWrappedScript(t, fmt.Sprintf(`
 case "$1" in
   version)
     awk '$1 == "Max" && $2 == "core" && $3 == "file" && $4 == "size" { print $5, $6 }' /proc/self/limits > "$LTA_CORE_EVIDENCE"
@@ -699,7 +699,7 @@ func InstallerOfficialMirrorFallbackBoundary(t *testing.T) {
 	}
 
 	asset := "linux-temp-admin-linux-" + runtime.GOARCH
-	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ] && printf '2.8.0\\n'\n")
+	candidate := elfWrappedScript(t, "[ \"$1\" = version ] && printf '2.8.0\\n'\n")
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -1415,4 +1415,53 @@ fi
 	t.Run("chunked overflow", func(t *testing.T) {
 		run(t, "/overflow", 1)
 	})
+}
+
+// elfWrappedScript compiles script into a real ELF executable for this host.
+//
+// The installer now reads EI_CLASS/EI_DATA/e_machine out of the downloaded bytes
+// before installing them, because the release signature covers raw bytes and
+// binds neither the asset name nor the architecture. A shell-script fixture is
+// correctly refused by that gate, so these tests wrap the same script in a
+// genuine binary: the behaviour under test is unchanged, and the bytes are the
+// shape a real release has.
+func elfWrappedScript(t *testing.T, script string) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	program := `package main
+
+import (
+	"os"
+	"os/exec"
+)
+
+const script = ` + strconv.Quote(script) + `
+
+func main() {
+	args := append([]string{"-c", script, os.Args[0]}, os.Args[1:]...)
+	cmd := exec.Command("/bin/sh", args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			os.Exit(exit.ExitCode())
+		}
+		os.Exit(1)
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "candidate")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, src)
+	build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	if combined, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build ELF-wrapped candidate: %v\n%s", err, combined)
+	}
+	bin, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bin
 }

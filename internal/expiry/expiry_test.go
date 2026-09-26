@@ -184,3 +184,55 @@ func TestLockInstantMatchesWhatChageActuallyStores(t *testing.T) {
 		})
 	}
 }
+
+// The Expires field is the one value a third party acts on, and a zone
+// abbreviation is not unique: a server on Asia/Shanghai prints "CST", which a
+// reader in Chicago reads as US Central — a 14-hour error in the account's
+// lifetime, in the unsafe direction.
+func TestDisplayIsUnambiguousAboutTheInstantTheTimerFiresOn(t *testing.T) {
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("tzdata unavailable: %v", err)
+	}
+	deadline := time.Date(2026, 7, 8, 12, 0, 0, 0, shanghai)
+
+	got := Display(deadline)
+	if got != "2026-07-08 04:00:00 UTC" {
+		t.Fatalf("Display() = %q, want the UTC instant the scheduler fires on", got)
+	}
+	for _, ambiguous := range []string{"CST", "MST", "EST", "IST"} {
+		if strings.Contains(got, ambiguous) {
+			t.Fatalf("Display() = %q, want no zone abbreviation", got)
+		}
+	}
+
+	// The operator still gets the server's own reading, with a numeric offset.
+	if local := DisplayServerLocal(deadline); local != "2026-07-08 12:00:00 +0800" {
+		t.Fatalf("DisplayServerLocal() = %q, want the local time with a numeric offset", local)
+	}
+
+	// A UTC server would otherwise print the same instant twice.
+	if local := DisplayServerLocal(deadline.UTC()); local != "" {
+		t.Fatalf("DisplayServerLocal() on a UTC server = %q, want nothing to append", local)
+	}
+
+	// Display must agree with what the scheduler and the chage backstop use.
+	if !strings.HasPrefix(Date(deadline), "2026-07-09") {
+		t.Fatalf("Date() = %q, want the UTC-anchored backstop day after the deadline", Date(deadline))
+	}
+}
+
+func TestParseDisplayAbsoluteDeadline(t *testing.T) {
+	want := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	for _, value := range []string{"2026-09-26 12:00:00 UTC", "2026-09-26 20:00:00 +0800", "2026-09-26T12:00:00Z"} {
+		got, err := ParseDisplay(value)
+		if err != nil || !got.Equal(want) {
+			t.Errorf("ParseDisplay(%q) = %v, %v", value, got, err)
+		}
+	}
+	for _, value := range []string{"2026-09-26 12:00:00 CST", "2026-09-26 12:00:00", "none", "", "2026-02-30 12:00:00 UTC"} {
+		if _, err := ParseDisplay(value); err == nil {
+			t.Errorf("accepted unverifiable deadline %q", value)
+		}
+	}
+}

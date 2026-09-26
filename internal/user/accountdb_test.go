@@ -234,7 +234,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 				}
 			}
 		}
-		if err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true); err != nil {
+		if err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true); err != nil {
 			t.Fatal(err)
 		}
 		want := [][]string{{"groupdel", "--", accountDBTestName}}
@@ -252,7 +252,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 			_ = os.WriteFile(groupPath, nil, 0o600)
 			_ = os.WriteFile(gshadowPath, nil, 0o600)
 		}
-		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true)
+		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true)
 		if !errors.Is(err, errForced) || !strings.Contains(err.Error(), "reported incomplete cleanup") {
 			t.Fatalf("reconcile error = %v, want retained helper failure", err)
 		}
@@ -263,7 +263,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 		contents.passwd = ""
 		setAccountDBContents(t, contents)
 		f := &fakeRunner{available: map[string]bool{"groupdel": true}}
-		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true)
+		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true)
 		if err == nil || !strings.Contains(err.Error(), "reported success but private group") {
 			t.Fatalf("reconcile error = %v, want retained private-group residue", err)
 		}
@@ -289,7 +289,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true)
+		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true)
 		if err == nil || !strings.Contains(err.Error(), "has GID 2002, want 2001") {
 			t.Fatalf("reconcile error = %v, want replacement-group refusal", err)
 		}
@@ -301,7 +301,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 		contents.group = accountDBTestName + ":x:3456:\n"
 		setAccountDBContents(t, contents)
 		f := &fakeRunner{available: map[string]bool{"groupdel": true}}
-		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, 0, false)
+		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, 0, 0, false)
 		if err == nil || !strings.Contains(err.Error(), "does not prove its GID") {
 			t.Fatalf("legacy reconcile error = %v, want manual group recovery", err)
 		}
@@ -313,7 +313,7 @@ func TestReconcileAccountDatabaseRemovesOnlyProvenPrivateGroup(t *testing.T) {
 	t.Run("subordinate IDs keep recovery open", func(t *testing.T) {
 		setAccountDBContents(t, accountDBContents{subuid: accountDBTestName + ":100000:65536\n"})
 		f := &fakeRunner{available: map[string]bool{"groupdel": true}}
-		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true)
+		err := absentAccountManager(f).ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true)
 		if err == nil || !strings.Contains(err.Error(), "subuid assignment remains") {
 			t.Fatalf("subuid reconcile error = %v", err)
 		}
@@ -350,9 +350,9 @@ func TestReconcileAccountDatabaseRejectsAccountReappearanceAroundGroupdel(t *tes
 				InspectPrivateGroupState: func(string, int, bool) (bool, error) {
 					return !run, nil
 				},
-				CheckSubordinateIDsAbsent: func(string) error { return nil },
+				CheckSubordinateIDsAbsent: func(string, int) error { return nil },
 			}
-			err := m.ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, true)
+			err := m.ReconcileAccountDatabaseAfterDeletion(accountDBTestName, accountDBTestID, accountDBTestID, true)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("reconcile error = %v, want %q", err, tc.want)
 			}
@@ -531,14 +531,14 @@ func TestSubordinateIDsAbsentMatchesTheNumericOwnerForm(t *testing.T) {
 func TestPrivateGroupRemovalRefusesSystemRangeGIDs(t *testing.T) {
 	m := &Manager{}
 	for _, gid := range []int{1, 99, 999} {
-		err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", gid, true)
+		err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", gid, gid, true)
 		if err == nil || !strings.Contains(err.Error(), "out-of-range GID") {
 			t.Errorf("ReconcileAccountDatabaseAfterDeletion(gid=%d) = %v, want an out-of-range refusal", gid, err)
 		}
 	}
 	// Without the removal request the GID is not an authorization and is not
 	// bounded here, so the call must get past this check.
-	if err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", 99, false); err != nil &&
+	if err := m.ReconcileAccountDatabaseAfterDeletion("xxvcc-db1", 99, 99, false); err != nil &&
 		strings.Contains(err.Error(), "out-of-range GID") {
 		t.Errorf("a non-removing reconcile was refused on its GID: %v", err)
 	}
@@ -553,8 +553,9 @@ func TestAccountDBParsersSkipWhatTheSystemSkips(t *testing.T) {
 	const name = accountDBTestName
 	// Exactly the shapes the system readers skip, in every database these parsers
 	// read. Each would otherwise trip the "not exactly N fields" rule.
-	noise := "# a local comment\n+::::::\n-badguy\n\n"
+	noise := "# a local comment\n \t# indented comment\n \t\n\r\n\v\f# ASCII whitespace\n+::::::\n-badguy\n\n"
 	live := accountDBLiveContents()
+	live.passwd = noise + live.passwd
 	live.group = noise + live.group
 	live.gshadow = noise + live.gshadow
 	live.subuid = noise
@@ -576,4 +577,104 @@ func TestAccountDBParsersSkipWhatTheSystemSkips(t *testing.T) {
 	rejected("gshadow inspection", gshadowErr)
 	_, sameNameErr := inspectSameNameGroup(name)
 	rejected("same-name group inspection", sameNameErr)
+}
+
+// subuid(5)/subgid(5) key their first field on the login name or the UID, never
+// on a GID. An account whose UID differs from its primary GID — every account
+// created before this tool used `useradd -U`, and any host with
+// USERGROUPS_ENAB=no — must still have its subordinate ranges scanned by UID, or
+// revoke drops the registry row that was the only pointer left to the residue.
+func TestSubordinateIDScanUsesTheUIDNotThePrimaryGID(t *testing.T) {
+	const uid, gid = 1001, 100
+
+	t.Run("reconcile after this tool's own deletion", func(t *testing.T) {
+		var got []int
+		m := absentAccountManager(&fakeRunner{})
+		m.InspectPrivateGroupState = func(string, int, bool) (bool, error) { return false, nil }
+		m.InspectSameNameGroupState = func(string) (bool, error) { return false, nil }
+		m.CheckSubordinateIDsAbsent = func(_ string, owner int) error {
+			got = append(got, owner)
+			return nil
+		}
+		if err := m.ReconcileAccountDatabaseAfterDeletion(accountDBTestName, uid, gid, false); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != uid {
+			t.Fatalf("subordinate scan saw owner %v, want exactly [%d]; scanning the GID reports numeric-form residue as clean", got, uid)
+		}
+	})
+
+	t.Run("verify after an external deletion", func(t *testing.T) {
+		var got []int
+		m := absentAccountManager(&fakeRunner{})
+		m.InspectPrivateGroupState = func(string, int, bool) (bool, error) { return false, nil }
+		m.InspectSameNameGroupState = func(string) (bool, error) { return false, nil }
+		m.CheckSubordinateIDsAbsent = func(_ string, owner int) error {
+			got = append(got, owner)
+			return nil
+		}
+		if err := m.VerifyAccountDatabaseAfterExternalDeletion(accountDBTestName, uid, gid, false); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0] != uid {
+			t.Fatalf("subordinate scan saw owner %v, want exactly [%d]", got, uid)
+		}
+	})
+
+	t.Run("numeric-form residue for the UID is reported, not swallowed", func(t *testing.T) {
+		f := &fakeRunner{}
+		m := absentAccountManager(f)
+		m.InspectPrivateGroupState = func(string, int, bool) (bool, error) { return false, nil }
+		m.InspectSameNameGroupState = func(string) (bool, error) { return false, nil }
+		m.CheckSubordinateIDsAbsent = func(_ string, owner int) error {
+			if owner == uid {
+				return errors.New("subordinate ID residue for 1001")
+			}
+			return nil
+		}
+		err := m.ReconcileAccountDatabaseAfterDeletion(accountDBTestName, uid, gid, false)
+		if err == nil || !strings.Contains(err.Error(), "subordinate ID residue") {
+			t.Fatalf("ReconcileAccountDatabaseAfterDeletion = %v, want the residue reported", err)
+		}
+	})
+}
+
+// Only classification of non-record lines may discard ASCII whitespace. Real
+// records, malformed lines and non-ASCII lookalikes must still reach the strict
+// parser; otherwise account or subordinate-ID residue could disappear from view.
+func TestAccountDBNonRecordWhitespaceDoesNotHideDamage(t *testing.T) {
+	for _, line := range []string{
+		" \tbroken",
+		"\u00a0# not an ASCII comment",
+		"\u2003",
+		"other:x: 3001 :",
+	} {
+		t.Run(line, func(t *testing.T) {
+			setAccountDBContents(t, accountDBContents{group: line + "\n"})
+			if _, err := inspectSameNameGroup(accountDBTestName); err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("inspectSameNameGroup accepted damaged record %q: %v", line, err)
+			}
+		})
+	}
+	for _, line := range []string{" \tbroken", "\u00a0# not an ASCII comment", "\u2003"} {
+		t.Run("gshadow/"+line, func(t *testing.T) {
+			setAccountDBContents(t, accountDBContents{gshadow: line + "\n"})
+			if _, _, err := inspectPrivateGShadow(accountDBTestName); err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("inspectPrivateGShadow accepted damaged record %q: %v", line, err)
+			}
+		})
+	}
+	for _, line := range []string{
+		" \tbroken",
+		"\u00a0# not an ASCII comment",
+		"\u2003",
+		"other: 100000 :65536",
+	} {
+		t.Run("subids/"+line, func(t *testing.T) {
+			setAccountDBContents(t, accountDBContents{subuid: line + "\n", subgid: line + "\n"})
+			if err := ensureSubordinateIDsAbsent(accountDBTestName, accountDBTestID); err == nil || !strings.Contains(err.Error(), "malformed") {
+				t.Fatalf("ensureSubordinateIDsAbsent accepted damaged record %q: %v", line, err)
+			}
+		})
+	}
 }

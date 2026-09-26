@@ -473,3 +473,40 @@ func TestSSHDListenPortsReadsEveryListener(t *testing.T) {
 		})
 	}
 }
+
+// OpenSSH treats a leading '=' as the keyword/value separator, so "=Port 2244" is
+// a Port directive and "=Include ..." is an Include. The Match scanner already
+// fails closed on this shape; the static port fallback used to drop the line as
+// if it were blank, leaving the parse silently incomplete.
+func TestSSHPortFromConfigFailsClosedOnLeadingEqualsDirectives(t *testing.T) {
+	for _, tc := range []struct{ name, config string }{
+		{"port", "=Port 2244\n"},
+		{"include", "Port 22\n=Include /etc/ssh/sshd_config.d/*.conf\n"},
+		{"after a normal directive", "Port 22\n=PermitRootLogin no\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sshd_config")
+			if err := os.WriteFile(path, []byte(tc.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			port, ok, err := sshPortFromConfig(path)
+			if err == nil {
+				t.Fatalf("sshPortFromConfig = %d, %v, nil; want a refusal rather than a silently incomplete parse", port, ok)
+			}
+			if !strings.Contains(err.Error(), "cannot parse") {
+				t.Fatalf("error = %v, want the unparseable-directive refusal", err)
+			}
+		})
+	}
+
+	t.Run("an ordinary config still parses", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sshd_config")
+		if err := os.WriteFile(path, []byte("# comment\n\nPort 2244\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		port, ok, err := sshPortFromConfig(path)
+		if err != nil || !ok || port != 2244 {
+			t.Fatalf("sshPortFromConfig = %d, %v, %v; want 2244, true, nil", port, ok, err)
+		}
+	})
+}

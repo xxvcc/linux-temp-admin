@@ -63,7 +63,12 @@ func (m *Manager) preflightPrivateGroupRemoval(expected Passwd) error {
 // and verifies that shadow's userdel did not leave subordinate-ID assignments.
 // A deletion-recovery row may authorize the group only when its SequentialID bit
 // proves that the recorded UID was also the private GID.
-func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, removePrivateGroup bool) error {
+//
+// uid and gid are separate because subuid(5)/subgid(5) key their owner field on
+// the login name or the UID and never on a GID, while the private-group proof
+// needs the GID. Passing one value for both reported numeric-form subordinate
+// residue as clean on every account whose UID and GID differ.
+func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, uid, gid int, removePrivateGroup bool) error {
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
@@ -81,7 +86,7 @@ func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, re
 		return fmt.Errorf("account %s exists; refusing account-database reconciliation", name)
 	}
 	groupErr := m.reconcilePrivateGroupAfterDeletion(name, gid, removePrivateGroup)
-	subIDErr := m.ensureSubordinateIDsAbsent(name, gid)
+	subIDErr := m.ensureSubordinateIDsAbsent(name, uid)
 	absent, stateErr := m.deletionState(name, nil, nil)
 	if stateErr != nil {
 		stateErr = fmt.Errorf("verify account absence after account-database reconciliation: %w", stateErr)
@@ -96,7 +101,7 @@ func (m *Manager) ReconcileAccountDatabaseAfterDeletion(name string, gid int, re
 // registry row can identify. It never invokes groupdel: without a durable
 // deletion-started witness, an exact-looking group is still not deletion
 // authority and must be handled by an operator.
-func (m *Manager) VerifyAccountDatabaseAfterExternalDeletion(name string, gid int, sequentialID bool) error {
+func (m *Manager) VerifyAccountDatabaseAfterExternalDeletion(name string, uid, gid int, sequentialID bool) error {
 	if err := validateMutationName(name); err != nil {
 		return err
 	}
@@ -124,7 +129,7 @@ func (m *Manager) VerifyAccountDatabaseAfterExternalDeletion(name string, gid in
 			groupErr = fmt.Errorf("same-name group %s remains after external account deletion, but the registry does not prove its GID; remove it manually, then retry", name)
 		}
 	}
-	subIDErr := m.ensureSubordinateIDsAbsent(name, gid)
+	subIDErr := m.ensureSubordinateIDsAbsent(name, uid)
 	absent, stateErr := m.deletionState(name, nil, nil)
 	if stateErr != nil {
 		stateErr = fmt.Errorf("verify account absence after account-database inspection: %w", stateErr)
@@ -202,7 +207,7 @@ func (m *Manager) inspectSameNameGroup(name string) (bool, error) {
 
 func (m *Manager) ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 	if m.CheckSubordinateIDsAbsent != nil {
-		return m.CheckSubordinateIDsAbsent(name)
+		return m.CheckSubordinateIDsAbsent(name, numericOwner)
 	}
 	return ensureSubordinateIDsAbsent(name, numericOwner)
 }
@@ -424,10 +429,19 @@ func ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 // malformed record hard-failed every sequential invite on a host that carries
 // one, for lines that define no group and no subordinate range.
 func skipNonEntryLine(line string) bool {
-	if line == "" {
+	// glibc's internal_getent advances past leading blanks BEFORE it tests for an
+	// empty line or a '#' comment, and tolerates the CR of a CRLF file. Testing
+	// byte 0 of the raw line left every indented comment and whitespace-only line
+	// routed into the strict parser, which is the same hard failure this skip
+	// exists to prevent.
+	// Normalize only this classification view. Real records are still passed to
+	// their strict parsers unchanged, and Unicode whitespace is not libc's ASCII
+	// whitespace in these account database formats.
+	trimmed := strings.TrimLeft(line, " \t\r\v\f")
+	if trimmed == "" {
 		return true
 	}
-	switch line[0] {
+	switch trimmed[0] {
 	case '#', '+', '-':
 		return true
 	}
