@@ -22,6 +22,8 @@ import (
 // System abstracts the external schedulers so orchestration is testable.
 type System interface {
 	HasSystemctl() bool
+	// Systemctl("is-enabled", unit) succeeds only for persistent "enabled";
+	// other calls retain the external command's ordinary exit semantics.
 	Systemctl(args ...string) error
 	// HasAt reports any installed at-backend footprint. A completely absent
 	// backend is not an inventory error; a partial backend is and must fail closed.

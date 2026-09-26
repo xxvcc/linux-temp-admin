@@ -1,4 +1,4 @@
-package selfmanage
+package releasecheck
 
 import (
 	"bytes"

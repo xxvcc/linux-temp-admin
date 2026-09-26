@@ -172,11 +172,11 @@ func mustUserLookup(t *testing.T, name string) (user.Passwd, bool) {
 
 func mustUserManaged(t *testing.T, name string) bool {
 	t.Helper()
-	managed, err := user.IsManaged(name)
+	pw, found, err := user.Lookup(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return managed
+	return found && user.IsManagedEntry(pw)
 }
 
 func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
@@ -215,7 +215,7 @@ func TestRunInviteReleasesIntentWhenCreatePreflightFails(t *testing.T) {
 		return "abcdef0123", nil
 	}
 
-	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}, false); rc != 1 {
+	if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: true, login: loginPlan{verified: true}, generatedUsername: false}); rc != 1 {
 		t.Fatalf("runInvite rc=%d, want preflight failure", rc)
 	}
 	if found, err := a.Registry.Contains(username); err != nil || found {
@@ -282,7 +282,7 @@ func TestRunInviteRetainsPendingRegistryWhenCreateHelperReportsFailure(t *testin
 		return "abcdef0123", nil
 	}
 
-	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}, false); rc != 1 {
+	if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: true, login: loginPlan{verified: true}, generatedUsername: false}); rc != 1 {
 		t.Fatalf("runInvite rc=%d, want helper failure", rc)
 	}
 	rec, found, err := a.Registry.Lookup(username)
@@ -419,7 +419,7 @@ func TestRunInviteClearsStaleJobsBeforeCredentialAndRebasesLifetime(t *testing.T
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
-	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{password: true, verified: true}, false); rc != 1 {
+	if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: true, login: loginPlan{password: true, verified: true}, generatedUsername: false}); rc != 1 {
 		t.Fatalf("runInvite rc = %d, want injected credential failure", rc)
 	}
 	if !strings.Contains(errb.String(), stopErr.Error()) {
@@ -540,9 +540,8 @@ func TestGeneratedInviteHonorsLegacyMigrationIsolationWindow(t *testing.T) {
 				return sysinfo.ParseSSHD("passwordauthentication yes\n"), nil
 			}
 
-			if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false,
-				loginPlan{password: true, verified: true}, true); rc != 1 {
-				t.Fatalf("runInviteWithIdentityPolicy rc=%d, want injected Home failure", rc)
+			if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: false, login: loginPlan{password: true, verified: true}, generatedUsername: true}); rc != 1 {
+				t.Fatalf("runInvite rc=%d, want injected Home failure", rc)
 			}
 			joinedEvents := strings.Join(events, ",")
 			drainAt, homeAt := strings.Index(joinedEvents, "drain"), strings.Index(joinedEvents, "home")
@@ -626,7 +625,7 @@ func TestRunPermanentInviteClearsSafetyExpiry(t *testing.T) {
 	sshdConfig := sysinfo.ParseSSHD("passwordauthentication yes\n")
 	a.SSHDConfig = func(string) (*sysinfo.SSHDConfig, error) { return sshdConfig, nil }
 
-	if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, false, loginPlan{password: true, verified: true}, false); rc != 0 {
+	if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: false, login: loginPlan{password: true, verified: true}, generatedUsername: false}); rc != 0 {
 		t.Fatalf("permanent runInvite rc = %d: %s", rc, errb.String())
 	}
 	want := "mail,expiry:1970-01-02,password-lock,kill,clear,drain,kill,clear,mail,home,home-validate,credential,expiry:-1"
@@ -773,9 +772,8 @@ func TestRunInviteRollbackUsesStableIdentityOnceActivationMayStart(t *testing.T)
 				outputWriter = &inviteBundleFailWriter{onBundle: func() { mutateIdentity(&runner.account) }, err: tc.outputErr}
 				a.Out = outputWriter
 			}
-			if rc := a.runInviteWithIdentityPolicy(tc.username, "192.0.2.1", 22, 1, false, tc.wantAuto,
-				loginPlan{password: true, verified: true}, false); rc != 1 {
-				t.Fatalf("runInviteWithIdentityPolicy rc=%d, want injected failure", rc)
+			if rc := a.runInvite(invitePlan{username: tc.username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: tc.wantAuto, login: loginPlan{password: true, verified: true}, generatedUsername: false}); rc != 1 {
+				t.Fatalf("runInvite rc=%d, want injected failure", rc)
 			}
 			wantErr := tc.activationErr
 			if wantErr == nil {
@@ -1039,7 +1037,7 @@ func TestManageUsersDisplayedNumberIsTheOneThatActs(t *testing.T) {
 // uid, returning that uid. The confirmation gate is only reachable when the
 // account exists — revoke returns from its "user is gone, clean up" branch first
 // otherwise — so a fake row cannot reach it, which is exactly why the gate went
-// untested. The uid must be the real one or IsProtectedRevokeTarget refuses the
+// untested. The uid must be the real one or IsProtectedRevokeEntry refuses the
 // account as UID-tampered before the confirmation gets to be what is under test.
 func newRealAccount(t *testing.T, a *App, name string) int {
 	t.Helper()
@@ -1219,9 +1217,8 @@ func TestManageUsersMissingRowIsSweptWithoutAPrompt(t *testing.T) {
 // A contradicting UID is by definition one the tool never issued, so that sweep
 // would have been pointed at whatever the account's UID now collides with.
 //
-// It also pins that the refusal is not silent: UIDTampered's report only ever ran
-// inside the branch something else had already refused, so on the one path where
-// it was the whole story it never spoke.
+// The identity mismatch must also produce a diagnostic, even when it is the
+// only reason to refuse the operation.
 func TestRevokeRefusesAndReportsAUIDTamperedAccount(t *testing.T) {
 	const name = "ltatamper1"
 	a, _, errb := newManageApp(t, "")

@@ -595,8 +595,8 @@ func TestStoreRecordUpsertRemove(t *testing.T) {
 	if recs[0].Host != "h2" {
 		t.Errorf("upsert did not update: host=%q", recs[0].Host)
 	}
-	if u, _ := s.UnitFor("xxvcc-a1"); u != "u" {
-		t.Errorf("UnitFor = %q, want u", u)
+	if rec, found, err := s.Lookup("xxvcc-a1"); err != nil || !found || rec.AutoUnit != "u" {
+		t.Errorf("Lookup auto-revoke unit = %q found=%v err=%v, want u", rec.AutoUnit, found, err)
 	}
 	if err := s.Remove("xxvcc-a1"); err != nil {
 		t.Fatal(err)
@@ -1369,8 +1369,8 @@ func TestBeginDeletionUIDOnlyAdvanceRejectsInvalidSequenceState(t *testing.T) {
 // sequence invariant trivially.
 func TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse(t *testing.T) {
 	s := newStore(t)
-	if got := s.LostRegistryHighest(); got != 0 {
-		t.Fatalf("a genuinely fresh store reported LostRegistryHighest = %d, want 0", got)
+	if highest, lost, err := s.InspectRegistryLoss(); err != nil || lost || highest != 0 {
+		t.Fatalf("fresh store registry loss = (%d, %v, %v), want no loss", highest, lost, err)
 	}
 	reserveThrough(t, s, 1500)
 	if err := s.Record(registry.Record{User: "xxvcc-lost1", UID: 1500, Host: "203.0.113.5", Port: 22}); err != nil {
@@ -1386,8 +1386,8 @@ func TestInitReportsARecreatedRegistryWhoseSequenceProvesPriorUse(t *testing.T) 
 	if err := reopened.Init(); err != nil {
 		t.Fatalf("Init on the surviving state directory: %v", err)
 	}
-	if got := reopened.LostRegistryHighest(); got != 1500 {
-		t.Fatalf("LostRegistryHighest = %d, want the surviving sequence high-water mark 1500", got)
+	if highest, lost, err := reopened.InspectRegistryLoss(); err != nil || !lost || highest != 1500 {
+		t.Fatalf("recreated registry loss = (%d, %v, %v), want loss with surviving high-water mark 1500", highest, lost, err)
 	}
 	// The row really is gone, which is what makes the report necessary rather than
 	// merely informative.

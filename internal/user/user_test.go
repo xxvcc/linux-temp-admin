@@ -100,11 +100,12 @@ func TestLookupAndManaged(t *testing.T) {
 	if !ok || pw.UID != 1001 || pw.Home != "/home/tmp1000" {
 		t.Fatalf("Lookup tmp1000 = %+v ok=%v", pw, ok)
 	}
-	if managed, err := IsManaged("tmp1000"); err != nil || !managed {
+	if !IsManagedEntry(pw) {
 		t.Error("tmp1000 should be managed")
 	}
-	if managed, err := IsManaged("human"); err != nil || managed {
-		t.Error("human should not be managed")
+	pw, ok, err = Lookup("human")
+	if err != nil || !ok || IsManagedEntry(pw) {
+		t.Errorf("human should exist without a managed marker: %+v ok=%v err=%v", pw, ok, err)
 	}
 	if exists, err := Exists("nope"); err != nil || exists {
 		t.Error("nonexistent user should not Exist")
@@ -446,11 +447,6 @@ func TestLookupErrorsAreNotAbsence(t *testing.T) {
 	if _, err := Exists("someone"); err == nil {
 		t.Fatal("Exists must preserve the passwd read error")
 	}
-	if _, err := IsProtectedRevokeTarget("someone", RevokeIdentity{
-		Registered: true, RecordedUID: 1001, RecordedGeneration: testGeneration, IdentityBound: true,
-	}, false); err == nil {
-		t.Fatal("revoke protection must fail closed on a passwd read error")
-	}
 }
 
 func TestIsReservedName(t *testing.T) {
@@ -472,13 +468,13 @@ func TestIsReservedName(t *testing.T) {
 	// Every reserved name must also be refused by the revoke path (defense in
 	// depth: the two sides share this predicate and must never diverge).
 	for _, n := range reserved {
-		if protected, err := IsProtectedRevokeTarget(n, RevokeIdentity{Registered: true}, false); err != nil || !protected {
+		if !IsProtectedRevokeEntry(n, Passwd{}, false, RevokeIdentity{Registered: true}, false) {
 			t.Errorf("reserved %q is not a protected revoke target", n)
 		}
 	}
 }
 
-func TestIsProtectedRevokeTarget(t *testing.T) {
+func TestIsProtectedRevokeEntryPolicy(t *testing.T) {
 	setPasswd(t, samplePasswd)
 	cases := []struct {
 		name          string
@@ -535,17 +531,18 @@ func TestIsProtectedRevokeTarget(t *testing.T) {
 		{"escalated", true, 0, testGeneration, true, false, true},
 	}
 	for _, c := range cases {
-		got, err := IsProtectedRevokeTarget(c.name, RevokeIdentity{
+		pw, exists, err := Lookup(c.name)
+		if err != nil {
+			t.Fatalf("Lookup(%q): %v", c.name, err)
+		}
+		got := IsProtectedRevokeEntry(c.name, pw, exists, RevokeIdentity{
 			Registered:         c.registered,
 			RecordedUID:        c.recordedUID,
 			RecordedGeneration: c.generation,
 			IdentityBound:      c.identityBound,
 		}, c.allowLegacy)
-		if err != nil {
-			t.Fatalf("IsProtectedRevokeTarget(%q): %v", c.name, err)
-		}
 		if got != c.want {
-			t.Errorf("IsProtectedRevokeTarget(%q, registered=%v, recordedUID=%d, generation=%q, identityBound=%v, allowLegacy=%v) = %v, want %v",
+			t.Errorf("IsProtectedRevokeEntry(%q, registered=%v, recordedUID=%d, generation=%q, identityBound=%v, allowLegacy=%v) = %v, want %v",
 				c.name, c.registered, c.recordedUID, c.generation, c.identityBound, c.allowLegacy, got, c.want)
 		}
 	}
@@ -730,8 +727,10 @@ func TestAccountMutationsRejectInvalidUsernameBeforeRunningHelpers(t *testing.T)
 		name string
 		run  func(*Manager) error
 	}{
-		{name: "create", run: func(m *Manager) error { return m.Create("bad:user", "/bin/sh", testGeneration) }},
-		{name: "create pending", run: func(m *Manager) error { return m.CreatePending("bad:user", "/bin/sh", testGeneration) }},
+		{name: "create pending", run: func(m *Manager) error {
+			_, err := m.CreatePendingIdentityWithID("bad:user", "/bin/sh", testGeneration, 2345)
+			return err
+		}},
 		{name: "mark managed", run: func(m *Manager) error { return m.MarkManaged("bad:user", testGeneration) }},
 		{name: "disable key password", run: func(m *Manager) error { return m.DisablePasswordForKeyLogin("bad:user") }},
 		{name: "lock password", run: func(m *Manager) error { return m.LockPassword("bad:user") }},
@@ -761,8 +760,14 @@ func TestAccountMutationsRejectReservedUsernameBeforeRunningHelpers(t *testing.T
 		name string
 		run  func(*Manager) error
 	}{
-		{name: "create", run: func(m *Manager) error { return m.Create("nobody", "/bin/sh", testGeneration) }},
-		{name: "create pending", run: func(m *Manager) error { return m.CreatePending("systemd-test", "/bin/sh", testGeneration) }},
+		{name: "create", run: func(m *Manager) error {
+			_, err := m.CreatePendingIdentityWithID("nobody", "/bin/sh", testGeneration, 2345)
+			return err
+		}},
+		{name: "create pending", run: func(m *Manager) error {
+			_, err := m.CreatePendingIdentityWithID("systemd-test", "/bin/sh", testGeneration, 2345)
+			return err
+		}},
 		{name: "mark managed", run: func(m *Manager) error { return m.MarkManaged("nobody", testGeneration) }},
 		{name: "disable key password", run: func(m *Manager) error { return m.DisablePasswordForKeyLogin("nobody") }},
 		{name: "lock password", run: func(m *Manager) error { return m.LockPassword("nobody") }},
@@ -841,28 +846,12 @@ exit 1`)
 	})
 }
 
-func TestCreateArgvUseradd(t *testing.T) {
-	marker := testManagedGenerationGECOS(t)
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/bash\n")
-	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "adduser": true}}
-	m := managerWithStubbedHomeChecks(f)
-	if err := m.Create("xxvcc-a1", "/bin/bash", testGeneration); err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/bash", "-c", marker,
-		"-e", expiredDate, "-p", initialLockedPasswordHash, "xxvcc-a1"}
-	if len(f.calls) != 1 || !reflect.DeepEqual(f.calls[0], want) {
-		t.Errorf("useradd argv = %v, want %v", f.calls, want)
-	}
-}
-
 func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	managedMarker := testManagedGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true, "groupdel": true}}
 	f.onRun = func(name string) {
 		if name == "usermod" {
 			if err := os.WriteFile(passwdPath, []byte("xxvcc-a1:x:2345:2345:"+managedMarker+":/home/xxvcc-a1:/bin/bash\n"), 0o644); err != nil {
@@ -871,7 +860,7 @@ func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 		}
 	}
 	m := managerWithStubbedHomeChecks(f)
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/bash", testGeneration)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -884,7 +873,7 @@ func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 	}
 	want := [][]string{
 		{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/bash", "-c", pendingMarker,
-			"-e", expiredDate, "-p", initialLockedPasswordHash, "xxvcc-a1"},
+			"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"},
 		{"usermod", "-c", managedMarker, "xxvcc-a1"},
 	}
 	if !reflect.DeepEqual(f.calls, want) {
@@ -1073,7 +1062,7 @@ func TestCreatePendingDefersHomeUntilExpectedIdentityCall(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	var order []string
 	m := &Manager{
 		Runner:             f,
@@ -1094,7 +1083,8 @@ func TestCreatePendingDefersHomeUntilExpectedIdentityCall(t *testing.T) {
 			return nil
 		},
 	}
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/bash", testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/bash", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,71 +1099,13 @@ func TestCreatePendingDefersHomeUntilExpectedIdentityCall(t *testing.T) {
 	}
 }
 
-func TestCreateStillClearsMatchingMailBeforeCreatingHome(t *testing.T) {
-	marker := testManagedGenerationGECOS(t)
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/bash\n")
-	setProcRoot(t, map[int]string{})
-	var order []string
-	m := &Manager{
-		Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
-		PrepareManagedHome: func(string) error { return nil },
-		RemoveManagedMail: func(Passwd) error {
-			order = append(order, "mail")
-			return nil
-		},
-		CreateManagedHome: func(Passwd) error {
-			order = append(order, "home")
-			return nil
-		},
-		ValidateManagedHome: func(Passwd) error {
-			order = append(order, "validate")
-			return nil
-		},
-	}
-	if err := m.Create("xxvcc-a1", "/bin/bash", testGeneration); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(order, []string{"mail", "home", "validate"}) {
-		t.Fatalf("account artifact order = %v, want mail cleanup before Home creation", order)
-	}
-}
-
-func TestCreatePendingCompatibilityStillCreatesHome(t *testing.T) {
-	pendingMarker := testPendingGenerationGECOS(t)
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/bash\n")
-	setProcRoot(t, map[int]string{})
-	var order []string
-	m := &Manager{
-		Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
-		PrepareManagedHome: func(string) error { return nil },
-		RemoveManagedMail: func(Passwd) error {
-			order = append(order, "mail")
-			return nil
-		},
-		CreateManagedHome: func(Passwd) error {
-			order = append(order, "home")
-			return nil
-		},
-		ValidateManagedHome: func(Passwd) error {
-			order = append(order, "validate")
-			return nil
-		},
-	}
-	if err := m.CreatePending("xxvcc-a1", "/bin/bash", testGeneration); err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(order, []string{"mail", "home", "validate"}) {
-		t.Fatalf("compatibility CreatePending artifact order = %v, want complete Home creation", order)
-	}
-}
-
 func TestCreateManagedHomeExpectedRefusesReplacementBeforeCreation(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
 	homeCalls := 0
 	m := &Manager{
-		Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
+		Runner:             &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}},
 		PrepareManagedHome: func(string) error { return nil },
 		RemoveManagedMail:  func(Passwd) error { return nil },
 		CreateManagedHome: func(Passwd) error {
@@ -1185,7 +1117,8 @@ func TestCreateManagedHomeExpectedRefusesReplacementBeforeCreation(t *testing.T)
 			return nil
 		},
 	}
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1141,7 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeAfterCreation(t *testing.
 	setProcRoot(t, map[int]string{})
 	var order []string
 	m := &Manager{
-		Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
+		Runner:             &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}},
 		PrepareManagedHome: func(string) error { return nil },
 		RemoveManagedMail:  func(Passwd) error { return nil },
 		CreateManagedHome: func(Passwd) error {
@@ -1220,7 +1153,8 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeAfterCreation(t *testing.
 			return nil
 		},
 	}
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1257,7 +1191,7 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeDuringValidation(t *testi
 	setProcRoot(t, map[int]string{})
 	var order []string
 	m := &Manager{
-		Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
+		Runner:             &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}},
 		PrepareManagedHome: func(string) error { return nil },
 		RemoveManagedMail:  func(Passwd) error { return nil },
 		CreateManagedHome: func(Passwd) error {
@@ -1269,7 +1203,8 @@ func TestCreateManagedHomeExpectedRefusesIdentityChangeDuringValidation(t *testi
 			return os.WriteFile(passwdPath, []byte("xxvcc-a1:x:3456:3456:replacement:/home/xxvcc-a1:/bin/sh\n"), 0o644)
 		},
 	}
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1290,7 +1225,7 @@ func TestCreateManagedHomeExpectedChecksIdentityAfterHookErrors(t *testing.T) {
 			setProcRoot(t, map[int]string{})
 			wantErr := errors.New(stage + " failed")
 			m := &Manager{
-				Runner:             &fakeRunner{available: map[string]bool{"useradd": true}},
+				Runner:             &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}},
 				PrepareManagedHome: func(string) error { return nil },
 				RemoveManagedMail:  func(Passwd) error { return nil },
 				CreateManagedHome: func(Passwd) error {
@@ -1307,7 +1242,8 @@ func TestCreateManagedHomeExpectedChecksIdentityAfterHookErrors(t *testing.T) {
 					return nil
 				},
 			}
-			pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+			stubAbsentAccountDatabaseChecks(m)
+			pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1437,9 +1373,9 @@ func TestMarkManagedExpectedRefusesReplacementBeforeUsermod(t *testing.T) {
 	pendingMarker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true, "groupdel": true}}
 	m := managerWithStubbedHomeChecks(f)
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1460,7 +1396,7 @@ func TestMarkManagedExpectedRejectsUserWritableFieldChangeAfterUsermod(t *testin
 	changedMarker := "Changed Name,,,," + config.ManagedGenerationGECOSWitnessPrefix + testGeneration
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+pendingMarker+":/home/xxvcc-a1:/bin/sh\n")
 	setProcRoot(t, map[int]string{})
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "usermod": true, "groupdel": true}}
 	f.onRun = func(name string) {
 		if name == "usermod" {
 			if err := os.WriteFile(passwdPath, []byte("xxvcc-a1:x:2345:2345:"+changedMarker+":/home/xxvcc-a1:/bin/sh\n"), 0o644); err != nil {
@@ -1469,7 +1405,7 @@ func TestMarkManagedExpectedRejectsUserWritableFieldChangeAfterUsermod(t *testin
 		}
 	}
 	m := managerWithStubbedHomeChecks(f)
-	pending, err := m.CreatePendingIdentity("xxvcc-a1", "/bin/sh", testGeneration)
+	pending, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1487,8 +1423,8 @@ func TestMarkManagedRequiresUsermod(t *testing.T) {
 func TestCreateRequiresUseradd(t *testing.T) {
 	for _, helper := range []string{"adduser", "busybox"} {
 		t.Run(helper, func(t *testing.T) {
-			f := &fakeRunner{available: map[string]bool{helper: true}}
-			err := managerWithStubbedHomeChecks(f).Create("xxvcc-a1", "/bin/sh", testGeneration)
+			f := &fakeRunner{available: map[string]bool{helper: true, "groupdel": true}}
+			_, err := managerWithStubbedHomeChecks(f).CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 			if err == nil || !strings.Contains(err.Error(), "useradd not available") {
 				t.Fatalf("Create error = %v, want useradd refusal", err)
 			}
@@ -1501,7 +1437,7 @@ func TestCreateRequiresUseradd(t *testing.T) {
 
 func TestCreateValidatesManagedMailRootsBeforeUseradd(t *testing.T) {
 	wantErr := errors.New("unsafe mail root")
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	m := managerWithStubbedHomeChecks(f)
 	m.ValidateManagedMailRoots = func() error { return wantErr }
 	m.PrepareManagedHome = func(string) error {
@@ -1509,7 +1445,7 @@ func TestCreateValidatesManagedMailRootsBeforeUseradd(t *testing.T) {
 		return nil
 	}
 
-	err := m.Create("xxvcc-a1", "/bin/sh", testGeneration)
+	_, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "before account creation") {
 		t.Fatalf("Create error = %v, want pre-useradd mail-root refusal", err)
 	}
@@ -1543,7 +1479,7 @@ func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *test
 	managedMailRoots = []string{root}
 	t.Cleanup(func() { managedMailRoots = oldRoots })
 
-	f := &fakeRunner{available: map[string]bool{"useradd": true}}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
 	f.onRun = func(name string) {
 		if name == "useradd" {
 			if err := os.Chmod(root, 0o777|os.ModeSetgid); err != nil {
@@ -1570,9 +1506,10 @@ func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *test
 			return removeManagedMail(got)
 		},
 	}
-	got, err := m.CreatePendingIdentity(expected.Name, expected.Shell, testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	got, err := m.CreatePendingIdentityWithID(expected.Name, expected.Shell, testGeneration, 2345)
 	if err == nil || !strings.Contains(err.Error(), "world-writable roots require sticky") {
-		t.Fatalf("CreatePendingIdentity error = %v, want post-useradd mode refusal", err)
+		t.Fatalf("CreatePendingIdentityWithID error = %v, want post-useradd mode refusal", err)
 	}
 	if got != expected {
 		t.Fatalf("captured rollback identity = %+v, want %+v", got, expected)
@@ -1585,63 +1522,18 @@ func TestCreateRevalidatesMailRootAfterUseraddAndReturnsCapturedIdentity(t *test
 	}
 }
 
-func TestCreateEnforcesManagedHomeChecks(t *testing.T) {
-	marker := testManagedGenerationGECOS(t)
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/sh\n")
-	setProcRoot(t, map[int]string{})
-
-	t.Run("preflight before helper", func(t *testing.T) {
-		f := &fakeRunner{available: map[string]bool{"useradd": true}}
-		wantErr := errors.New("pre-existing home")
-		m := &Manager{
-			Runner:              f,
-			PrepareManagedHome:  func(string) error { return wantErr },
-			ValidateManagedHome: func(Passwd) error { t.Fatal("post-create check ran"); return nil },
-		}
-		if err := m.Create("xxvcc-a1", "/bin/sh", testGeneration); !errors.Is(err, wantErr) {
-			t.Fatalf("Create error = %v, want %v", err, wantErr)
-		}
-		if len(f.calls) != 0 {
-			t.Fatalf("unsafe home reached useradd: %v", f.calls)
-		}
-	})
-
-	t.Run("post-create identity", func(t *testing.T) {
-		f := &fakeRunner{available: map[string]bool{"useradd": true}}
-		wantErr := errors.New("wrong home owner")
-		m := &Manager{
-			Runner:              f,
-			PrepareManagedHome:  func(string) error { return nil },
-			CreateManagedHome:   func(Passwd) error { return nil },
-			ValidateManagedHome: func(Passwd) error { return wantErr },
-		}
-		if err := m.Create("xxvcc-a1", "/bin/sh", testGeneration); !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "retained") {
-			t.Fatalf("Create error = %v, want retained-account home failure", err)
-		}
-		if len(f.calls) != 1 || f.calls[0][0] != "useradd" {
-			t.Fatalf("post-create check call order = %v", f.calls)
-		}
-	})
-
-	t.Run("create empty home before validation", func(t *testing.T) {
-		f := &fakeRunner{available: map[string]bool{"useradd": true}}
-		wantErr := errors.New("home creation failed")
-		m := &Manager{
-			Runner:             f,
-			PrepareManagedHome: func(string) error { return nil },
-			CreateManagedHome:  func(Passwd) error { return wantErr },
-			ValidateManagedHome: func(Passwd) error {
-				t.Fatal("validation ran after failed Home creation")
-				return nil
-			},
-		}
-		if err := m.Create("xxvcc-a1", "/bin/sh", testGeneration); !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "retained") {
-			t.Fatalf("Create error = %v, want retained-account Home creation failure", err)
-		}
-		if len(f.calls) != 1 || f.calls[0][0] != "useradd" {
-			t.Fatalf("Home creation failure call order = %v", f.calls)
-		}
-	})
+func TestCreateRejectsPreexistingHomeBeforeUseradd(t *testing.T) {
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "groupdel": true}}
+	wantErr := errors.New("pre-existing home")
+	m := managerWithStubbedHomeChecks(f)
+	m.PrepareManagedHome = func(string) error { return wantErr }
+	m.ValidateManagedHome = func(Passwd) error { t.Fatal("post-create check ran"); return nil }
+	if _, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345); !errors.Is(err, wantErr) {
+		t.Fatalf("Create error = %v, want %v", err, wantErr)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("unsafe home reached useradd: %v", f.calls)
+	}
 }
 
 func useTemporaryManagedHomeRoot(t *testing.T) string {
@@ -1969,30 +1861,30 @@ func writeProcTask(t *testing.T, tgid, tid int, status string) {
 }
 
 func TestCreateRejectsUIDWithResidualProcess(t *testing.T) {
-	marker := testManagedGenerationGECOS(t)
+	marker := testPendingGenerationGECOS(t)
 	setPasswd(t, "xxvcc-a1:x:2345:2345:"+marker+":/home/xxvcc-a1:/bin/sh\n")
 	// The target UID appears only in the saved-set UID column. Checking only real
 	// and effective UIDs would miss this process, which can switch back to 2345.
 	setProcRoot(t, map[int]string{77: "Name:\tleftover\nUid:\t1000\t1000\t2345\t1000\n"})
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true}}
-	err := managerWithStubbedHomeChecks(f).Create("xxvcc-a1", "/bin/sh", testGeneration)
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true, "groupdel": true}}
+	_, err := managerWithStubbedHomeChecks(f).CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err == nil || !strings.Contains(err.Error(), "UID 2345") || !strings.Contains(err.Error(), "77") {
 		t.Fatalf("Create error = %v, want residual-UID process refusal", err)
 	}
 	want := [][]string{{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/sh", "-c", marker,
-		"-e", expiredDate, "-p", initialLockedPasswordHash, "xxvcc-a1"}}
+		"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"}}
 	if !reflect.DeepEqual(f.calls, want) {
 		t.Fatalf("Create calls = %v, want the pending account retained to occupy the reused UID: %v", f.calls, want)
 	}
 }
 
 func TestCreateFailsClosedWhenProcCannotBeScanned(t *testing.T) {
-	setPasswd(t, "xxvcc-a1:x:2345:2345:"+testManagedGenerationGECOS(t)+":/home/xxvcc-a1:/bin/sh\n")
+	setPasswd(t, "xxvcc-a1:x:2345:2345:"+testPendingGenerationGECOS(t)+":/home/xxvcc-a1:/bin/sh\n")
 	old := procRoot
 	procRoot = filepath.Join(t.TempDir(), "missing")
 	t.Cleanup(func() { procRoot = old })
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true}}
-	if err := managerWithStubbedHomeChecks(f).Create("xxvcc-a1", "/bin/sh", testGeneration); err == nil || !strings.Contains(err.Error(), "scan") {
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true, "groupdel": true}}
+	if _, err := managerWithStubbedHomeChecks(f).CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345); err == nil || !strings.Contains(err.Error(), "scan") {
 		t.Fatalf("Create error = %v, want proc scan failure", err)
 	}
 	if len(f.calls) != 1 || f.calls[0][0] != "useradd" {
@@ -2006,8 +1898,8 @@ func TestCreateRollbackRefusesReplacementIdentity(t *testing.T) {
 	old := procRoot
 	procRoot = filepath.Join(t.TempDir(), "missing")
 	t.Cleanup(func() { procRoot = old })
-	replacement := Passwd{Name: "xxvcc-a1", UID: 3456, GID: 3456, GECOS: "replacement", Home: "/srv/xxvcc-a1", Shell: "/bin/bash"}
-	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true}}
+	replacement := Passwd{Name: "xxvcc-a1", UID: 2345, GID: 2345, GECOS: "replacement", Home: "/srv/xxvcc-a1", Shell: "/bin/bash"}
+	f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true, "groupdel": true}}
 	m := &Manager{
 		Runner: f,
 		LookupUser: func(string) (Passwd, bool, error) {
@@ -2016,7 +1908,8 @@ func TestCreateRollbackRefusesReplacementIdentity(t *testing.T) {
 		PrepareManagedHome:  func(string) error { return nil },
 		ValidateManagedHome: func(Passwd) error { return nil },
 	}
-	err := m.Create("xxvcc-a1", "/bin/sh", testGeneration)
+	stubAbsentAccountDatabaseChecks(m)
+	_, err := m.CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 	if err == nil || !strings.Contains(err.Error(), "identity does not match") {
 		t.Fatalf("Create error = %v, want replacement refusal", err)
 	}
@@ -2035,8 +1928,8 @@ func TestCreateDoesNotRollBackAnUnsafeOrUnreadableIdentityByName(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			setPasswd(t, tc.passwd)
-			f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true}}
-			err := managerWithStubbedHomeChecks(f).Create("xxvcc-a1", "/bin/sh", testGeneration)
+			f := &fakeRunner{available: map[string]bool{"useradd": true, "userdel": true, "groupdel": true}}
+			_, err := managerWithStubbedHomeChecks(f).CreatePendingIdentityWithID("xxvcc-a1", "/bin/sh", testGeneration, 2345)
 			if err == nil {
 				t.Fatal("Create accepted an unsafe or missing post-create identity")
 			}

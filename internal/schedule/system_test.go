@@ -168,7 +168,7 @@ func TestSystemctlTimerStateClassification(t *testing.T) {
 		body  string
 		want  bool
 	}{
-		{name: "disabled", query: "is-enabled", body: "exit 1", want: true},
+		{name: "disabled", query: "is-enabled", body: "echo disabled; exit 1", want: true},
 		{name: "inactive", query: "is-active", body: "exit 3", want: true},
 		{name: "unknown", query: "is-active", body: "exit 4", want: true},
 		{name: "query failure", query: "is-enabled", body: "echo 'Failed to connect to bus' >&2; exit 1"},
@@ -178,7 +178,11 @@ func TestSystemctlTimerStateClassification(t *testing.T) {
 			dir := t.TempDir()
 			writeCommand(t, dir, "systemctl", tt.body)
 			t.Setenv("PATH", dir)
-			err := (realSystem{}).Systemctl(tt.query, "--quiet", unit)
+			args := []string{tt.query, unit}
+			if tt.query == "is-active" {
+				args = []string{tt.query, "--quiet", unit}
+			}
+			err := (realSystem{}).Systemctl(args...)
 			if got := systemctlTimerStateNegative(err, tt.query, unit); got != tt.want {
 				t.Fatalf("systemctlTimerStateNegative(%v) = %v, want %v", err, got, tt.want)
 			}

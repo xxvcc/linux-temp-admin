@@ -36,7 +36,7 @@ func TestSudoYesWithoutAnExplicitUserNamesTheRealRequirement(t *testing.T) {
 // dump.
 func TestFailedInviteZeroesTheCredentialsItGenerated(t *testing.T) {
 	a, _, _ := newTestApp(t, "")
-	tx := newInviteTransaction(a, "xxvcc-a1", "203.0.113.5", 22, 24, false, false, loginPlan{verified: true}, false)
+	tx := newInviteTransaction(a, invitePlan{username: "xxvcc-a1", host: "203.0.113.5", port: 22, hours: 24, wantSudo: false, wantAuto: false, login: loginPlan{verified: true}, generatedUsername: false})
 
 	key := []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n")
 	tx.kp = &sshkey.KeyPair{PrivatePEM: key}
@@ -87,7 +87,7 @@ func TestEveryYesSpellingSuppressesTheFirstRunLanguagePrompt(t *testing.T) {
 }
 
 // The fix for the credential-leak finding is one line — `defer tx.clearSecrets()`
-// in runInviteWithIdentityPolicy. A test that calls clearSecrets directly guards
+// in runInvite. A test that calls clearSecrets directly guards
 // the helper, not the wiring: move, reorder or drop the defer and the leak comes
 // back with the suite green. This drives a real failing invite and inspects the
 // bytes the generator handed out.
@@ -108,8 +108,7 @@ func TestRolledBackInviteLeavesNoCredentialBytesInMemory(t *testing.T) {
 		return "abcdef0123", nil
 	}
 
-	rc := a.runInviteWithIdentityPolicy("xxvcc-a1", "203.0.113.5", 22, 24, false, false,
-		loginPlan{password: true, verified: true}, false)
+	rc := a.runInvite(invitePlan{username: "xxvcc-a1", host: "203.0.113.5", port: 22, hours: 24, wantSudo: false, wantAuto: false, login: loginPlan{password: true, verified: true}, generatedUsername: false})
 	if rc == 0 {
 		t.Fatal("the invite was expected to fail at generation")
 	}

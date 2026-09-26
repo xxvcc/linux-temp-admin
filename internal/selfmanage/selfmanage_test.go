@@ -286,7 +286,7 @@ func TestInstallerDropsImportedShellFunctions(t *testing.T) {
 }
 
 func TestUpgradeRefusedWithoutKey(t *testing.T) {
-	m := &Manager{PublicKey: nil}
+	m := &Manager{PublicKeys: nil}
 	if _, err := prepareAndApplyUpgrade(m, "https://x/bin", "https://x/sig", false); err == nil {
 		t.Error("Upgrade must refuse when no signing key is configured")
 	}
@@ -326,7 +326,7 @@ func TestPrepareVerifiedCandidateDoesNotExecuteSignedBytes(t *testing.T) {
 	}
 	evidence := filepath.Join(t.TempDir(), "candidate-executed")
 	bin := []byte("#!/bin/sh\n# LTA_RELEASE_VERSION_V1{2.9.5}\nprintf executed > '" + evidence + "'\nprintf '2.9.5\\n'\n")
-	m := &Manager{PublicKey: pub, RequireHostMachine: func([]byte) error { return nil }}
+	m := &Manager{PublicKeys: []ed25519.PublicKey{pub}, RequireHostMachine: func([]byte) error { return nil }}
 	candidate, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), "2.9.5")
 	if err != nil || candidate.Version() != "2.9.5" {
 		t.Fatalf("prepareVerifiedCandidate = version %q, err=%v", candidate.Version(), err)
@@ -1020,7 +1020,7 @@ func TestCandidateForAnotherArchitectureIsRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 		bin := elfHeader(other, 2, 1)
-		m := &Manager{PublicKey: pub}
+		m := &Manager{PublicKeys: []ed25519.PublicKey{pub}}
 		if _, err := m.prepareVerifiedCandidate(bin, ed25519.Sign(priv, bin), ""); err == nil {
 			t.Fatal("prepareVerifiedCandidate accepted a validly signed foreign-architecture binary")
 		}

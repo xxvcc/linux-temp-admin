@@ -32,8 +32,8 @@ LOCK_PATH = INCOMING_ROOT / ".deploy.lock"
 RRSYNC = Path("/usr/bin/rrsync")
 MIRROR_BASE_URL = "https://dl.ll.cd/linux-temp-admin"
 TRANSFER_TIMEOUT_SECONDS = 300
-# Bounds the published-installer scan, which hashes one file per release while
-# holding the deployment lock.
+# Cooperative budget for installer comparison and matching-release validation
+# under the deployment lock; it cannot interrupt one blocked filesystem call.
 INSTALLER_SCAN_TIMEOUT_SECONDS = 120
 STAGING_SCAN_INTERVAL_SECONDS = 0.1
 TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
@@ -99,6 +99,10 @@ class ReceiverError(RuntimeError):
     pass
 
 
+class ReceiverInterrupted(ReceiverError):
+    """A termination request must unwind publication, never skip a candidate."""
+
+
 def fail(message: str) -> None:
     raise ReceiverError(message)
 
@@ -113,7 +117,7 @@ def controlled_termination() -> Iterator[None]:
         nonlocal terminating
         if not terminating:
             terminating = True
-            fail(f"receiver interrupted by {signal.Signals(signum).name}")
+            raise ReceiverInterrupted(f"receiver interrupted by {signal.Signals(signum).name}")
 
     previous = {signum: signal.getsignal(signum) for signum in TERMINATION_SIGNALS}
     try:
@@ -287,44 +291,69 @@ def parse_request(command: str) -> tuple[str, str]:
     return request_type, normalized_destination
 
 
-def sha256_file(path: Path) -> str:
+def check_installer_scan_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        fail(
+            "scanning published installers exceeded "
+            f"{INSTALLER_SCAN_TIMEOUT_SECONDS}s under the deployment lock"
+        )
+
+
+def sha256_file(path: Path, *, deadline: float | None = None) -> str:
+    check_installer_scan_deadline(deadline)
     digest = hashlib.sha256()
     with path.open("rb", buffering=0) as handle:
-        while chunk := handle.read(1024 * 1024):
+        while True:
+            check_installer_scan_deadline(deadline)
+            chunk = handle.read(1024 * 1024)
+            check_installer_scan_deadline(deadline)
+            if not chunk:
+                break
             digest.update(chunk)
+    check_installer_scan_deadline(deadline)
     return digest.hexdigest()
 
 
-def files_equal(left: Path, right: Path) -> bool:
+def files_equal(left: Path, right: Path, *, deadline: float | None = None) -> bool:
+    check_installer_scan_deadline(deadline)
     left_info = lstat(left)
     right_info = lstat(right)
+    check_installer_scan_deadline(deadline)
     if not stat.S_ISREG(left_info.st_mode) or not stat.S_ISREG(right_info.st_mode):
         return False
     if left_info.st_size != right_info.st_size:
         return False
     with left.open("rb", buffering=0) as left_handle, right.open("rb", buffering=0) as right_handle:
         while True:
+            check_installer_scan_deadline(deadline)
             left_chunk = left_handle.read(1024 * 1024)
+            check_installer_scan_deadline(deadline)
             right_chunk = right_handle.read(1024 * 1024)
+            check_installer_scan_deadline(deadline)
             if left_chunk != right_chunk:
                 return False
             if not left_chunk:
                 return True
 
 
-def canonical_checksum_bytes(directory: Path) -> bytes:
+def canonical_checksum_bytes(directory: Path, *, deadline: float | None = None) -> bytes:
     return b"".join(
-        f"{sha256_file(directory / name)}  {name}\n".encode("ascii")
+        f"{sha256_file(directory / name, deadline=deadline)}  {name}\n".encode("ascii")
         for name in CHECKSUM_FILES
     )
 
 
-def validate_version(directory: Path, *, owner: int, published: bool = False) -> None:
+def validate_version(
+    directory: Path, *, owner: int, published: bool = False, deadline: float | None = None
+) -> None:
+    check_installer_scan_deadline(deadline)
     require_directory(directory, owner=owner, mode=0o755 if published else None)
     entries = sorted(entry.name for entry in os.scandir(directory))
+    check_installer_scan_deadline(deadline)
     if entries != sorted(EXPECTED_VERSION_FILES):
         fail(f"version directory does not contain the exact release set: {directory}")
     for name in EXPECTED_VERSION_FILES:
+        check_installer_scan_deadline(deadline)
         maximum = MAX_BINARY_BYTES if name in (
             "linux-temp-admin-linux-amd64",
             "linux-temp-admin-linux-arm64",
@@ -332,12 +361,15 @@ def validate_version(directory: Path, *, owner: int, published: bool = False) ->
         exact = 64 if name.endswith(".sig") else None
         require_regular(directory / name, owner=owner, maximum=maximum, exact=exact)
     checksum = (directory / "SHA256SUMS").read_bytes()
-    if checksum != canonical_checksum_bytes(directory):
+    check_installer_scan_deadline(deadline)
+    if checksum != canonical_checksum_bytes(directory, deadline=deadline):
         fail(f"SHA256SUMS is not canonical or does not match the release files: {directory}")
     if published:
         for name in EXPECTED_VERSION_FILES:
+            check_installer_scan_deadline(deadline)
             if stat.S_IMODE(lstat(directory / name).st_mode) != 0o644:
                 fail(f"published release file mode is not 0644: {directory / name}")
+    check_installer_scan_deadline(deadline)
 
 
 def stable_version_tuple(
@@ -591,32 +623,38 @@ def publish_version(staged: Path, destination: Path, *, owner: int) -> None:
 def matching_stable_installer_versions(
     project_root: Path, installer: Path, *, owner: int
 ) -> list[VersionKey]:
-    # This runs under the deployment lock and fully hashes the installer of every
-    # published release, so its cost grows with the archive while every other
-    # publication waits. Bound it the way every other long step here is bounded:
-    # a deadline that fails the publication instead of holding the lock forever.
+    # Compare the small installers first; only matching versions need their full
+    # release contents hashed. One cooperative deadline covers directory scans,
+    # comparisons and validation, including the final item. Checks around reads
+    # cannot interrupt a filesystem call that is already blocked.
     deadline = time.monotonic() + INSTALLER_SCAN_TIMEOUT_SECONDS
     matches: list[VersionKey] = []
     with os.scandir(project_root) as entries:
         for entry in entries:
-            if time.monotonic() > deadline:
-                raise ReceiverError(
-                    "scanning published installers exceeded "
-                    f"{INSTALLER_SCAN_TIMEOUT_SECONDS}s under the deployment lock"
-                )
+            check_installer_scan_deadline(deadline)
             if not entry.is_dir(follow_symlinks=False):
                 continue
             try:
                 version = stable_version_tuple(entry.name)
+            except ReceiverInterrupted:
+                raise
             except ReceiverError:
                 continue
             version_dir = project_root / entry.name
             try:
-                validate_version(version_dir, owner=owner, published=True)
+                require_directory(version_dir, owner=owner, mode=0o755)
+                published_installer = version_dir / "install.sh"
+                require_regular(published_installer, owner=owner, maximum=MAX_METADATA_BYTES)
+                if not files_equal(installer, published_installer, deadline=deadline):
+                    continue
+                validate_version(version_dir, owner=owner, published=True, deadline=deadline)
+            except ReceiverInterrupted:
+                raise
             except ReceiverError:
+                check_installer_scan_deadline(deadline)
                 continue
-            if files_equal(installer, version_dir / "install.sh"):
-                matches.append(version)
+            matches.append(version)
+    check_installer_scan_deadline(deadline)
     return matches
 
 

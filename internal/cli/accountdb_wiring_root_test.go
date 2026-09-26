@@ -109,7 +109,7 @@ func TestInviteReconcilesPartialUseraddAccountDatabaseState(t *testing.T) {
 				UnitPrefix:  config.AutoRevokeUnitPrefix, Now: a.Now, Sys: fakeSys{},
 			}
 
-			if rc := a.runInviteWithIdentityPolicy(username, "192.0.2.1", 22, 1, false, true, loginPlan{verified: true}, false); rc != 1 {
+			if rc := a.runInvite(invitePlan{username: username, host: "192.0.2.1", port: 22, hours: 1, wantSudo: false, wantAuto: true, login: loginPlan{verified: true}, generatedUsername: false}); rc != 1 {
 				t.Fatalf("runInvite rc = %d, want original useradd failure", rc)
 			}
 			wantCalls := [][]string{

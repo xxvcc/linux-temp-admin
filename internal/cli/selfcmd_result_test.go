@@ -78,7 +78,7 @@ func TestUpgradeMenuRetiresProcessAfterVisibleReplacement(t *testing.T) {
 			}
 			m := &selfmanage.Manager{
 				InstallPath: a.InstallPath, RequireHostMachine: cliAllowAnyMachine,
-				PublicKey: pub, MaxBytes: config.MaxUpgradeBytes,
+				PublicKeys: []ed25519.PublicKey{pub}, MaxBytes: config.MaxUpgradeBytes,
 				Client: &http.Client{Transport: cliRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 					body, ok := payloads[req.URL.String()]
 					if !ok {

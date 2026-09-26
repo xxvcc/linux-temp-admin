@@ -23,8 +23,19 @@ func TestUserLifecycle(t *testing.T) {
 
 	const generation = "0123456789abcdef0123456789abcdef"
 	m := New()
-	if err := m.Create(name, "/bin/sh", generation); err != nil {
-		t.Fatalf("Create: %v", err)
+	reservedID, _, err := IdentityAllocationRange()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := m.CreatePendingIdentityWithID(name, "/bin/sh", generation, reservedID)
+	if err != nil {
+		t.Fatalf("CreatePendingIdentityWithID: %v", err)
+	}
+	if err := m.CreateManagedHomeExpected(name, pending); err != nil {
+		t.Fatalf("CreateManagedHomeExpected: %v", err)
+	}
+	if _, err := m.MarkManagedExpected(name, generation, pending); err != nil {
+		t.Fatalf("MarkManagedExpected: %v", err)
 	}
 	exists, err := Exists(name)
 	if err != nil || !exists {
@@ -40,8 +51,7 @@ func TestUserLifecycle(t *testing.T) {
 	if !MatchesManagedGeneration(pw, generation) {
 		t.Error("created account marker does not match its generation")
 	}
-	managed, err := IsManaged(name)
-	if err != nil || !managed {
+	if !IsManagedEntry(pw) {
 		t.Error("created account should carry the managed GECOS tag")
 	}
 	if err := m.DisablePasswordForKeyLogin(name); err != nil {
@@ -50,7 +60,7 @@ func TestUserLifecycle(t *testing.T) {
 	if err := m.SetExpiry(name, "2999-01-01"); err != nil {
 		t.Errorf("SetExpiry: %v", err)
 	}
-	if err := m.DeleteExpected(name, pw, func() error { return nil }); err != nil {
+	if err := m.DeleteExpectedSequential(name, pw, func() error { return nil }); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if exists, err := Exists(name); err != nil || exists {

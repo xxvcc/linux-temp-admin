@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -961,6 +962,137 @@ class ReceiverPolicyTests(unittest.TestCase):
         )
         with self.assertRaises(mirror_receiver.ReceiverError):
             mirror_receiver.validate_version(bad, owner=self.owner)
+
+    def test_installer_scan_skips_binary_hashes_for_nonmatching_versions(self) -> None:
+        old = make_version(self.temporary / "old", installer=b"#!/bin/sh\nexit 1\n")
+        selected = make_version(self.temporary / "selected", tag="v2.9.0")
+        shutil.copytree(old, self.project / old.name)
+        shutil.copytree(selected, self.project / selected.name)
+
+        with mock.patch.object(
+            mirror_receiver, "sha256_file", wraps=mirror_receiver.sha256_file
+        ) as hash_file:
+            matches = mirror_receiver.matching_stable_installer_versions(
+                self.project, selected / "install.sh", owner=self.owner
+            )
+        self.assertEqual(matches, [mirror_receiver.stable_version_tuple(selected.name)])
+        self.assertCountEqual(
+            [call.args[0] for call in hash_file.call_args_list],
+            [self.project / selected.name / name for name in mirror_receiver.CHECKSUM_FILES],
+        )
+
+    def test_installer_scan_still_requires_a_complete_valid_matching_release(self) -> None:
+        source = make_version(self.temporary / "selected")
+        for damage in ("binary checksum", "extra file", "unsafe binary", "unsafe installer"):
+            with self.subTest(damage=damage):
+                version = self.project / source.name
+                shutil.copytree(source, version)
+                try:
+                    if damage == "binary checksum":
+                        (version / "linux-temp-admin-linux-amd64").write_bytes(b"corrupt")
+                    elif damage == "extra file":
+                        (version / "unexpected").write_bytes(b"unexpected")
+                    elif damage == "unsafe binary":
+                        (version / "linux-temp-admin-linux-amd64").chmod(0o666)
+                    else:
+                        (version / "install.sh").chmod(0o666)
+                    self.assertEqual(
+                        mirror_receiver.matching_stable_installer_versions(
+                            self.project, source / "install.sh", owner=self.owner
+                        ),
+                        [],
+                    )
+                finally:
+                    shutil.rmtree(version)
+
+    def test_installer_scan_rejects_timeout_after_last_validation(self) -> None:
+        source = make_version(self.temporary / "selected")
+        shutil.copytree(source, self.project / source.name)
+        clock = [0.0]
+        validate = mirror_receiver.validate_version
+
+        def finish_after_deadline(*args, **kwargs):
+            validate(*args, **kwargs)
+            clock[0] = mirror_receiver.INSTALLER_SCAN_TIMEOUT_SECONDS
+
+        with mock.patch.object(mirror_receiver.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(mirror_receiver, "validate_version", side_effect=finish_after_deadline), \
+             self.assertRaisesRegex(mirror_receiver.ReceiverError, "scanning published installers exceeded"):
+            mirror_receiver.matching_stable_installer_versions(
+                self.project, source / "install.sh", owner=self.owner
+            )
+
+    def test_installer_scan_shares_deadline_across_matching_versions(self) -> None:
+        source = make_version(self.temporary / "selected")
+        for tag in ("v2.8.0", "v2.9.0"):
+            shutil.copytree(source, self.project / tag)
+        clock = [0.0]
+        validated = []
+        validate = mirror_receiver.validate_version
+
+        def consume_budget(directory, **kwargs):
+            validate(directory, **kwargs)
+            validated.append(directory.name)
+            clock[0] += mirror_receiver.INSTALLER_SCAN_TIMEOUT_SECONDS / 2 + 1
+
+        with mock.patch.object(mirror_receiver.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(mirror_receiver, "validate_version", side_effect=consume_budget), \
+             self.assertRaisesRegex(mirror_receiver.ReceiverError, "scanning published installers exceeded"):
+            mirror_receiver.matching_stable_installer_versions(
+                self.project, source / "install.sh", owner=self.owner
+            )
+        self.assertCountEqual(validated, ["v2.8.0", "v2.9.0"])
+
+    def test_installer_scan_termination_does_not_publish_another_valid_candidate(self) -> None:
+        source = make_version(self.temporary / "selected")
+        for tag in ("v2.8.0", "v2.9.0"):
+            shutil.copytree(source, self.project / tag)
+        for operation in ("stable_version_tuple", "files_equal", "validate_version"):
+            original = getattr(mirror_receiver, operation)
+            for signum in mirror_receiver.TERMINATION_SIGNALS:
+                with self.subTest(operation=operation, signal=signum):
+                    calls = []
+
+                    def interrupt_first_candidate(*args, **kwargs):
+                        calls.append(args)
+                        if len(calls) == 1:
+                            signal.raise_signal(signum)
+                        return original(*args, **kwargs)
+
+                    with mock.patch.object(mirror_receiver, operation, side_effect=interrupt_first_candidate), \
+                         mirror_receiver.controlled_termination(), \
+                         self.assertRaisesRegex(mirror_receiver.ReceiverInterrupted, signal.Signals(signum).name):
+                        mirror_receiver.publish_stable(
+                            source / "install.sh", "install.sh", project_root=self.project, owner=self.owner
+                        )
+                    self.assertEqual(len(calls), 1)
+                    self.assertFalse((self.project / "install.sh").exists())
+
+    def test_installer_scan_deadline_stops_hash_and_comparison_between_reads(self) -> None:
+        fixture = self.temporary / "read-fixture"
+        fixture.write_bytes(b"fixture")
+        for operation in ("hash", "comparison"):
+            with self.subTest(operation=operation):
+                clock = [0.0]
+                read_sizes = []
+
+                class SlowReader(io.BytesIO):
+                    def read(self, size=-1):
+                        read_sizes.append(size)
+                        clock[0] += 0.6
+                        return super().read(size)
+
+                def open_slow_reader(*args, **kwargs):
+                    return SlowReader(b"x" * (3 * 1024 * 1024))
+
+                with mock.patch.object(mirror_receiver.time, "monotonic", side_effect=lambda: clock[0]), \
+                     mock.patch.object(Path, "open", side_effect=open_slow_reader), \
+                     self.assertRaisesRegex(mirror_receiver.ReceiverError, "scanning published installers exceeded"):
+                    if operation == "hash":
+                        mirror_receiver.sha256_file(fixture, deadline=1.0)
+                    else:
+                        mirror_receiver.files_equal(fixture, fixture, deadline=1.0)
+                self.assertEqual(read_sizes, [1024 * 1024, 1024 * 1024])
 
     def test_stable_files_must_bind_to_a_complete_version(self) -> None:
         staged_version = make_version(self.temporary / "version")

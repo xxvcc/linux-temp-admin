@@ -30,7 +30,9 @@ jobs:
       - name: Shell syntax
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
 
       - name: ShellCheck
         run: shellcheck -S warning scripts/*.sh

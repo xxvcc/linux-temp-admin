@@ -14,6 +14,7 @@ import (
 
 	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 )
 
@@ -64,17 +65,13 @@ func has(name string) bool { _, err := exec.LookPath(name); return err == nil }
 // non-systemd hosts commonly install it. Require both sd_booted's marker to be
 // absent and a readable non-systemd PID 1 before treating the manager as absent.
 func (realSystem) HasSystemctl() bool {
-	return has("systemctl") && !systemdDefinitelyAbsent("/run/systemd/system", "/proc/1/comm")
-}
-
-func systemdDefinitelyAbsent(bootMarker, initComm string) bool {
-	if _, err := os.Stat(bootMarker); !os.IsNotExist(err) {
+	if !has("systemctl") {
 		return false
 	}
-	comm, err := os.ReadFile(initComm)
-	name := strings.TrimSpace(string(comm))
-	return err == nil && name != "" && name != "systemd"
+	booted, err := sysinfo.SystemdBooted()
+	return booted || err != nil
 }
+
 func (realSystem) HasAt() bool {
 	return has("at") || has("atq") || has("atrm") || has("atd") || has("batch")
 }
@@ -83,14 +80,46 @@ func (realSystem) Systemctl(args ...string) error {
 	// Classification below relies on systemctl's diagnostics. Force the stable C
 	// locale instead of trying to recognize every translated error message.
 	out, err := executil.CombinedOutput("systemctl", args, schedulerCommandOptions(schedulerOutputLimit))
+	output := strings.TrimSpace(string(out))
+	// The two-argument is-enabled query is our persistent-enablement contract.
+	// systemctl itself also exits zero for enabled-runtime, static and aliases;
+	// none proves that this timer will be loaded after reboot.
+	if len(args) == 2 && args[0] == "is-enabled" {
+		if output == "enabled" && err == nil {
+			return nil
+		}
+		if systemdUnitNotPersistent(output, err) {
+			err = errSystemdUnitNotPersistent
+		} else if err == nil {
+			err = errors.New("unrecognized unit enablement state")
+		}
+	}
 	if err != nil {
 		return &systemctlError{
 			args:   append([]string(nil), args...),
 			err:    err,
-			output: strings.TrimSpace(string(out)),
+			output: output,
 		}
 	}
 	return nil
+}
+
+func systemdUnitNotPersistent(state string, err error) bool {
+	wantExit := 0
+	switch state {
+	case "enabled-runtime", "static", "indirect", "alias", "generated", "transient":
+	case "disabled", "linked", "linked-runtime", "masked", "masked-runtime", "bad":
+		wantExit = 1
+	case "not-found":
+		wantExit = 4
+	default:
+		return false
+	}
+	if err == nil {
+		return wantExit == 0
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == wantExit
 }
 
 // loadedSystemdUnits inventories the manager, not only unit files on disk.

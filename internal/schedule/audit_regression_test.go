@@ -7,37 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
-)
 
-func TestSystemdAbsenceRequiresBothBootMarkerAndInitEvidence(t *testing.T) {
-	for _, tc := range []struct {
-		name, comm     string
-		marker, absent bool
-	}{
-		{"non-systemd init", "openrc-init\n", false, true},
-		{"systemd init without marker", "systemd\n", false, false},
-		{"booted marker", "container-init\n", true, false},
-		{"unreadable init", "", false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			marker, comm := filepath.Join(dir, "system"), filepath.Join(dir, "comm")
-			if tc.marker {
-				if err := os.Mkdir(marker, 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tc.comm != "" {
-				if err := os.WriteFile(comm, []byte(tc.comm), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if got := systemdDefinitelyAbsent(marker, comm); got != tc.absent {
-				t.Fatalf("absent=%v want=%v", got, tc.absent)
-			}
-		})
-	}
-}
+	"github.com/xxvcc/linux-temp-admin/internal/sysinfo"
+)
 
 func TestEnsureAtdVerifiesBootPersistenceEvenWhenAlreadyRunning(t *testing.T) {
 	for _, backend := range []string{"systemd", "openrc", "chkconfig", "update-rc.d"} {
@@ -180,7 +152,7 @@ func TestScheduleDeadlineMinuteRounding(t *testing.T) {
 }
 
 func TestNonSystemdHostWithSystemctlAllowsEmptyCleanupAndAtInventory(t *testing.T) {
-	if !systemdDefinitelyAbsent("/run/systemd/system", "/proc/1/comm") {
+	if booted, err := sysinfo.SystemdBooted(); booted || err != nil {
 		t.Skip("requires an actual non-systemd PID 1; exercised in the ordinary test container")
 	}
 	dir := t.TempDir()

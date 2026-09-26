@@ -391,6 +391,17 @@ func TestRealGroupInspectorReadsBothDatabases(t *testing.T) {
 		{name: "group only", group: "xxvcc-g1:x:2001:\n", gshadow: "other:!::\n", wantGroup: true},
 		{name: "absent from both", group: "other:x:2002:\n", gshadow: "other:!::\n"},
 		{name: "comment and NIS lines are not entries", group: "# c\n+::::\nother:x:2002:\n", gshadow: "# c\nother:!::\n"},
+		{
+			name:      "ASCII whitespace and indented comments",
+			group:     " \t# comment\n \t\r\n\v\f# comment\nxxvcc-g1:x:2001:\n",
+			gshadow:   " \t# comment\n \t\r\n\v\f# comment\nxxvcc-g1:!::\n",
+			wantGroup: true, wantGShadow: true,
+		},
+		{
+			name:    "only ignored lines",
+			group:   " \t# comment\n \t\r\n\v\f# comment\n +::::\n -excluded\n",
+			gshadow: " \t# comment\n \t\r\n\v\f# comment\n +::::\n -excluded\n",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			groupDatabasePath = write("group", tc.group)
@@ -403,5 +414,20 @@ func TestRealGroupInspectorReadsBothDatabases(t *testing.T) {
 				t.Fatalf("artifacts = %+v, want group=%v gshadow=%v", got, tc.wantGroup, tc.wantGShadow)
 			}
 		})
+	}
+}
+
+func TestDatabaseHasNameKeepsNonCommentLinesUnchanged(t *testing.T) {
+	for _, parseGID := range []bool{true, false} {
+		for _, line := range []string{" \tbroken", "\u00a0# not an ASCII comment", "\u2003"} {
+			if found, err := databaseHasName([]byte(line+"\n"), "lta-group", parseGID); err == nil || found {
+				t.Errorf("databaseHasName(%q, parseGID=%v) = (%v, %v), want malformed entry", line, parseGID, found, err)
+			}
+		}
+		// Classification must not trim the name of a real record into a match.
+		line := " \tlta-group:x:2001:\n"
+		if found, err := databaseHasName([]byte(line), "lta-group", parseGID); err != nil || found {
+			t.Errorf("databaseHasName(%q, parseGID=%v) = (%v, %v), want no match", line, parseGID, found, err)
+		}
 	}
 }

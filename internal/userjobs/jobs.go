@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/atqueue"
@@ -220,7 +221,7 @@ func processExecutableInfo(procRoot, pid string) (executableInfo, error) {
 	if closeErr != nil {
 		return executableInfo{}, closeErr
 	}
-	stat, ok := fi.Sys().(*unix.Stat_t)
+	stat, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return executableInfo{}, fmt.Errorf("executable metadata is unavailable")
 	}

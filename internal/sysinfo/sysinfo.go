@@ -59,9 +59,16 @@ func PackageManager() string {
 
 // InitSystem returns "systemd", "openrc", "sysvinit", or "unknown".
 func InitSystem() string {
+	booted, err := SystemdBooted()
+	return initSystem(booted, err)
+}
+
+func initSystem(booted bool, err error) string {
 	switch {
-	case has("systemctl"):
+	case booted:
 		return "systemd"
+	case err != nil:
+		return "unknown"
 	case has("rc-service"):
 		return "openrc"
 	case has("service"):

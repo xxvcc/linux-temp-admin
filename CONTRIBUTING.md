@@ -40,7 +40,9 @@ system paths. Root installer tests that create temporary destinations below
 **Release/install scripts**, if you touch `scripts/`:
 
 ```bash
-bash -n scripts/*.sh
+for script in scripts/*.sh; do
+  bash -n "$script" || exit
+done
 sh -n scripts/install.sh
 python3 -B -m unittest -v scripts/mirror_receiver_test.py
 shellcheck -S warning scripts/*.sh

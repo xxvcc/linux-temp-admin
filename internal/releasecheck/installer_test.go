@@ -1,4 +1,4 @@
-package selfmanage
+package releasecheck
 
 import (
 	"bytes"
@@ -459,7 +459,7 @@ printf '%s' "$FSIZE_BLOCK_BYTES"
 }
 
 // InstallerPinnedReleaseEndToEnd exercises the disposable-host integration
-// entry point declared in release_pipeline_integration_test.go.
+// entry point declared in integration_test.go.
 func InstallerPinnedReleaseEndToEnd(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("installer end-to-end test requires root")
@@ -684,7 +684,7 @@ esac
 }
 
 // InstallerOfficialMirrorFallbackBoundary exercises the disposable-host
-// integration entry point declared in release_pipeline_integration_test.go.
+// integration entry point declared in integration_test.go.
 func InstallerOfficialMirrorFallbackBoundary(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("installer end-to-end test requires root")

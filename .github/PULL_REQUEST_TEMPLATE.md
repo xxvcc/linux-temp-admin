@@ -12,7 +12,7 @@
 
 Release/install scripts, if changed:
 
-- [ ] `bash -n scripts/*.sh`, `sh -n scripts/install.sh`, and `shellcheck -S warning scripts/*.sh`
+- [ ] `bash -n` for every `scripts/*.sh` file, `sh -n scripts/install.sh`, and `shellcheck -S warning scripts/*.sh`
 - [ ] `python3 -B -m unittest -v scripts/mirror_receiver_test.py`
 - [ ] Invalid version/tag rejection and static amd64/arm64 builds pass
 

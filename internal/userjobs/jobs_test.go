@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/xxvcc/linux-temp-admin/internal/executil"
+	"golang.org/x/sys/unix"
 )
 
 func isolateJobHelpers(t *testing.T) {
@@ -549,6 +550,31 @@ func TestWaitForDrainRecognizesDaemonAndBatchFootprints(t *testing.T) {
 				t.Fatalf("drain wait = %s, want 65s for %s footprint", slept, available)
 			}
 		})
+	}
+}
+
+func TestProcessExecutableInfoReadsLiveProcess(t *testing.T) {
+	const exePath = "/proc/self/exe"
+	target, err := os.Readlink(exePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(exePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Stat(exePath, &stat); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := processExecutableInfo("/proc", strconv.Itoa(os.Getpid()))
+	if err != nil {
+		t.Fatalf("read live process executable metadata: %v", err)
+	}
+	want := executableInfo{target: target, mode: info.Mode(), uid: stat.Uid, gid: stat.Gid}
+	if got != want {
+		t.Fatalf("processExecutableInfo = %+v, want %+v", got, want)
 	}
 }
 
