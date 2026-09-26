@@ -59,6 +59,8 @@ curl -fsSL https://dl.ll.cd/linux-temp-admin/install.sh | /usr/bin/sudo /bin/sh 
 
 交互流程会显示账号、Host、端口、有效期、sudo 状态和登录验证结果，并输出一次性的私钥保存命令。服务器只保存公钥，私钥不会落盘。
 
+终端中的有效期只需选择一次：回车使用默认 24 小时，或输入其他小时数；永久账号需明确输入 `never`。创建前会显示完整摘要并要求确认。
+
 把完整邀请包通过可信私聊发给协作者。对方保存私钥后，使用邀请头部的 Host、Port 和 User 登录，例如：
 
 ```bash

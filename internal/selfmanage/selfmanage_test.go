@@ -39,6 +39,17 @@ type failingResponseBody struct{ err error }
 func (b failingResponseBody) Read([]byte) (int, error) { return 0, b.err }
 func (failingResponseBody) Close() error               { return nil }
 
+// prepareAndApplyUpgrade exercises both production phases without retaining a
+// redundant one-shot production API. CLI callers hold their lifecycle lock only
+// for ApplyUpgrade, after preparation has finished.
+func prepareAndApplyUpgrade(m *Manager, binaryURL, sigURL string, force bool) (UpgradeResult, error) {
+	candidate, err := m.PrepareUpgrade(binaryURL, sigURL)
+	if err != nil {
+		return UpgradeResult{}, err
+	}
+	return m.ApplyUpgrade(candidate, force)
+}
+
 func TestEmbeddedPublicKeyConfigured(t *testing.T) {
 	keys := embeddedPublicKeys()
 	if len(keys) == 0 {
@@ -276,7 +287,7 @@ func TestInstallerDropsImportedShellFunctions(t *testing.T) {
 
 func TestUpgradeRefusedWithoutKey(t *testing.T) {
 	m := &Manager{PublicKey: nil}
-	if _, err := m.Upgrade("https://x/bin", "https://x/sig", false); err == nil {
+	if _, err := prepareAndApplyUpgrade(m, "https://x/bin", "https://x/sig", false); err == nil {
 		t.Error("Upgrade must refuse when no signing key is configured")
 	}
 }

@@ -2531,23 +2531,6 @@ func TestPlanLoginNoPasswordFallbackWhenPasswordsOff(t *testing.T) {
 	}
 }
 
-// TestPromptHours covers the new interactive lifetime prompt: a value is taken,
-// a blank keeps the default, and an out-of-range entry is re-asked.
-func TestPromptHours(t *testing.T) {
-	if got := mustHours(t, "48\n", 24); got != 48 {
-		t.Errorf("hours = %d, want 48", got)
-	}
-	if got := mustHours(t, "\n", 24); got != 24 {
-		t.Errorf("blank hours = %d, want the default 24", got)
-	}
-	if got := mustHours(t, "0\n99999999\n72\n", 24); got != 72 {
-		t.Errorf("hours after invalid entries = %d, want 72", got)
-	}
-	if got := mustHours(t, "", 24); got != 24 { // EOF settles on the default, never loops
-		t.Errorf("EOF hours = %d, want 24", got)
-	}
-}
-
 func TestPromptYesNoRejectsTypos(t *testing.T) {
 	a, _, errb := newTestApp(t, "never\nmaybe\nn\n")
 	a.StdinIsTTY = func() bool { return true }
@@ -2636,12 +2619,6 @@ func TestClassifyRegisteredAccountIdentityStates(t *testing.T) {
 	}
 }
 
-func mustHours(t *testing.T, in string, def int) int {
-	t.Helper()
-	a, _, _ := newTestApp(t, in)
-	return a.promptHours(def)
-}
-
 // TestPlanDepsRefusesBeforeSummaryAndInstallsAfter is a lightweight check that the
 // dependency split reports missing deps read-only. With no package manager the
 // plan must refuse (returns false), never claiming an install it cannot do.
@@ -2726,7 +2703,7 @@ func TestGeneratedInviteReachesDependencyGateWithoutID(t *testing.T) {
 }
 
 // TestInviteSkipsHoursPromptOnNonTTYStdin is the regression guard for the
-// promptHours infinite-loop. promptHours re-asks on invalid input, so on a
+// lifetime prompt infinite-loop. The lifetime prompt re-asks on invalid input, so on a
 // non-TTY stdin feeding non-numeric lines (the `yes n | lta invite` idiom, whose
 // stream never blanks) it would spin forever. The hours prompt is therefore gated
 // on StdinIsTTY. This asserts the gate directly — the lifetime question must never

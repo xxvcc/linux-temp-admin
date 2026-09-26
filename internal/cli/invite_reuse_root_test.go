@@ -1030,9 +1030,9 @@ func TestInviteInteractiveDefaultsSudoOn(t *testing.T) {
 	a, _, _, _ := inviteApp(t)
 	out := a.Out.(*bytes.Buffer)
 	a.StdinIsTTY = func() bool { return true }
-	// Interactive answers: sudo is NOT asked now; auto-delete [Y/n] -> n (so no
-	// hours prompt either); then the confirmation YES.
-	a.In = strings.NewReader("n\nYES\n")
+	// The default terminal flow asks for lifetime once. Explicitly select a
+	// permanent account, then confirm the summary that includes sudo.
+	a.In = strings.NewReader("never\nYES\n")
 	const name = "xxvcc-defsudo1"
 	integrationtest.RequireUserAbsent(t, name, true)
 	t.Cleanup(func() { integrationtest.CleanupUser(t, name, true) })

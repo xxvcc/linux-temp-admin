@@ -383,29 +383,22 @@ func detachedSignatureURL(binaryURL string) (string, error) {
 }
 
 func (a *App) upgradePreparedLocked(candidate *selfmanage.UpgradeCandidate, force bool) commandResult {
-	previous := ""
-	if v, err := a.Selfmanage.InstalledVersion(); err == nil {
-		previous = v
-	} else if !errors.Is(err, selfmanage.ErrNotInstalled) {
-		previous = "unknown"
-	}
-	newVer, err := a.Selfmanage.ApplyUpgrade(candidate, force)
+	upgrade, err := a.Selfmanage.ApplyUpgrade(candidate, force)
 	if err != nil {
-		var durability *fsutil.DurabilityError
-		if newVer != "" && errors.As(err, &durability) {
+		if upgrade.Replaced {
 			a.errorf("%s: %v", a.P.M("命令已替换，但无法确认升级已持久化", "the command was replaced, but the upgrade's durability is unknown"), err)
-			a.audit("upgrade", "", "fail", versionTransition(previous, newVer)+" visible but durability unknown: "+err.Error(), nil)
+			a.audit("upgrade", "", "fail", versionTransition(upgrade.PreviousVersion, upgrade.Version)+" visible but durability unknown: "+err.Error(), nil)
 		} else {
 			a.errorf("%s: %v", a.P.M("升级失败", "upgrade failed"), err)
 			a.audit("upgrade", "", "fail", "upgrade failed before replacement: "+err.Error(), nil)
 		}
-		return statusResult(1)
+		return commandResult{status: 1, applied: upgrade.Replaced}
 	}
-	if newVer == "" {
+	if !upgrade.Replaced {
 		return a.reportNoopUpgrade(a.Selfmanage.InstalledVersion)
 	}
-	a.audit("upgrade", "", "ok", versionTransition(previous, newVer), nil)
-	a.success(a.P.M("已升级到 "+newVer, "upgraded to "+newVer))
+	a.audit("upgrade", "", "ok", versionTransition(upgrade.PreviousVersion, upgrade.Version), nil)
+	a.success(a.P.M("已升级到 "+upgrade.Version, "upgraded to "+upgrade.Version))
 	return commandResult{applied: true}
 }
 

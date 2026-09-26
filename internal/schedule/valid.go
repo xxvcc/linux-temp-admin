@@ -90,14 +90,7 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 	if recordedUnit != unit || strings.ContainsAny(unit, "/ ") {
 		return false, nil
 	}
-	service, valid, err := readScheduleFile(filepath.Join(s.SystemdDir, unit+".service"))
-	if err != nil || !valid {
-		return false, err
-	}
-	if string(service) != s.serviceContent(user, uid, generation) {
-		return false, nil
-	}
-	timer, valid, err := readScheduleFile(filepath.Join(s.SystemdDir, unit+".timer"))
+	timer, valid, err := s.readBoundTimer(user, uid, generation, unit)
 	if err != nil || !valid {
 		return false, err
 	}
@@ -149,14 +142,7 @@ func (s *Scheduler) ValidQuarantine(user string, uid int, generation, recordedUn
 	if recordedUnit != unit || strings.ContainsAny(unit, "/ ") {
 		return false, nil
 	}
-	service, valid, err := readScheduleFile(filepath.Join(q.SystemdDir, unit+".service"))
-	if err != nil || !valid {
-		return false, err
-	}
-	if string(service) != q.serviceContent(user, uid, generation) {
-		return false, nil
-	}
-	timer, valid, err := readScheduleFile(filepath.Join(q.SystemdDir, unit+".timer"))
+	timer, valid, err := q.readBoundTimer(user, uid, generation, unit)
 	if err != nil || !valid {
 		return false, err
 	}
@@ -172,6 +158,19 @@ func (s *Scheduler) ValidQuarantine(user string, uid int, generation, recordedUn
 		return false, nil
 	}
 	return q.systemdTimerExecutable(unit + ".timer")
+}
+
+// readBoundTimer reads a timer only after its service names the exact account
+// identity. Callers keep their own calendar and legacy-format acceptance rules.
+func (s *Scheduler) readBoundTimer(user string, uid int, generation, unit string) ([]byte, bool, error) {
+	service, valid, err := readScheduleFile(filepath.Join(s.SystemdDir, unit+".service"))
+	if err != nil || !valid {
+		return nil, false, err
+	}
+	if string(service) != s.serviceContent(user, uid, generation) {
+		return nil, false, nil
+	}
+	return readScheduleFile(filepath.Join(s.SystemdDir, unit+".timer"))
 }
 
 func (s *Scheduler) systemdTimerExecutable(timer string) (bool, error) {

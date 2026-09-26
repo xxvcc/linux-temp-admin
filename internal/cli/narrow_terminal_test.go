@@ -4,9 +4,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xxvcc/linux-temp-admin/internal/config"
 	"github.com/xxvcc/linux-temp-admin/internal/i18n"
 	"github.com/xxvcc/linux-temp-admin/internal/registry"
 	"github.com/xxvcc/linux-temp-admin/internal/table"
+	"github.com/xxvcc/linux-temp-admin/internal/user"
 )
 
 func TestTakeDisplayWidthConsumesInvalidByteWithoutPanic(t *testing.T) {
@@ -72,5 +74,51 @@ func TestMenuLabelsFitFortyColumns(t *testing.T) {
 				t.Errorf("menu item %d %s label is %d columns wide, want <= 40: %q", i+1, name, width, label)
 			}
 		}
+	}
+}
+
+func TestUsersViewUsesOneObservationPerAccountAndRefreshes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		width int
+	}{{"table", 200}, {"cards", 40}} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, _ := newTestApp(t, "")
+			a.TerminalWidth = func() int { return tc.width }
+			const generation = "0123456789abcdef0123456789abcdef"
+			recs := []registry.Record{
+				{User: "lta-view-a", UID: 1001, Generation: generation, IdentityBound: true, Port: 22},
+				{User: "lta-view-b", UID: 1002, Generation: generation, IdentityBound: true, Port: 22},
+			}
+			calls := map[string]int{}
+			a.LookupUser = func(name string) (user.Passwd, bool, error) {
+				calls[name]++
+				if calls[name] > 1 {
+					return user.Passwd{}, false, nil
+				}
+				for _, rec := range recs {
+					if rec.User == name {
+						return user.Passwd{Name: name, UID: rec.UID, GID: rec.UID,
+							GECOS: ",,,," + config.ManagedGenerationGECOSWitnessPrefix + generation,
+							Home:  "/home/" + name, Shell: "/bin/sh"}, true, nil
+					}
+				}
+				t.Fatalf("unexpected lookup: %s", name)
+				return user.Passwd{}, false, nil
+			}
+			first := a.usersView(recs, true)
+			if strings.Count(first, "active") != len(recs) || strings.Contains(first, "missing") {
+				t.Fatalf("first display did not preserve its account observations:\n%s", first)
+			}
+			for _, rec := range recs {
+				if calls[rec.User] != 1 {
+					t.Fatalf("first render looked up %s %d times", rec.User, calls[rec.User])
+				}
+			}
+			second := a.usersView(recs, true)
+			if strings.Count(second, "missing") != len(recs) || strings.Contains(second, "active") {
+				t.Fatalf("refresh reused stale account observations:\n%s", second)
+			}
+		})
 	}
 }

@@ -319,12 +319,12 @@ func TestUpgradeVerifiesSignatureAndInstalls(t *testing.T) {
 	srv := signedServer(t, bin, sig)
 
 	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
-	got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false)
+	got, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false)
 	if err != nil {
 		t.Fatalf("Upgrade: %v", err)
 	}
-	if got != "2.0.1" {
-		t.Errorf("new version = %q, want 2.0.1", got)
+	if got.Version != "2.0.1" || !got.Replaced {
+		t.Errorf("new result = %+v, want visible 2.0.1 replacement", got)
 	}
 	if b, _ := os.ReadFile(m.InstallPath); string(b) != string(bin) {
 		t.Error("installed binary does not match the downloaded one")
@@ -351,8 +351,8 @@ func TestPreparedUpgradeRechecksInstalledVersionAtCommit(t *testing.T) {
 	if wrote, err := m.Install(newBinary("3.0.0"), true); err != nil || !wrote {
 		t.Fatalf("concurrent newer install: wrote=%v err=%v", wrote, err)
 	}
-	if got, err := m.ApplyUpgrade(candidate, false); err != nil || got != "" {
-		t.Fatalf("ApplyUpgrade over newer install: version=%q err=%v", got, err)
+	if got, err := m.ApplyUpgrade(candidate, false); err != nil || got != (UpgradeResult{PreviousVersion: "3.0.0", Version: "3.0.0"}) {
+		t.Fatalf("ApplyUpgrade over newer install: result=%+v err=%v", got, err)
 	}
 	if current, err := m.InstalledVersion(); err != nil || current != "3.0.0" {
 		t.Fatalf("prepared candidate downgraded newer install: version=%q err=%v", current, err)
@@ -376,8 +376,8 @@ func TestPreparedUpgradeRejectsDowngradeBeforeExecutingCandidate(t *testing.T) {
 	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
 		t.Fatalf("candidate executed during preparation: %v", err)
 	}
-	if got, err := m.ApplyUpgrade(candidate, false); err != nil || got != "" {
-		t.Fatalf("ApplyUpgrade downgrade: version=%q err=%v", got, err)
+	if got, err := m.ApplyUpgrade(candidate, false); err != nil || got.Replaced {
+		t.Fatalf("ApplyUpgrade downgrade: result=%+v err=%v", got, err)
 	}
 	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
 		t.Fatalf("candidate executed before downgrade refusal: %v", err)
@@ -396,15 +396,15 @@ func TestHistoricalSignedUpgradeRequiresForceBeforeProbe(t *testing.T) {
 	if err != nil || candidate.Version() != "" {
 		t.Fatalf("prepare historical candidate: version=%q err=%v", candidate.Version(), err)
 	}
-	if got, err := m.ApplyUpgrade(candidate, false); got != "" || err == nil ||
+	if got, err := m.ApplyUpgrade(candidate, false); got.Replaced || err == nil ||
 		!strings.Contains(err.Error(), "no static release-version witness") {
-		t.Fatalf("non-forced historical candidate: version=%q err=%v", got, err)
+		t.Fatalf("non-forced historical candidate: result=%+v err=%v", got, err)
 	}
 	if _, err := os.Lstat(evidence); !os.IsNotExist(err) {
 		t.Fatalf("historical candidate executed without --force: %v", err)
 	}
-	if got, err := m.ApplyUpgrade(candidate, true); err != nil || got != "2.0.0" {
-		t.Fatalf("forced historical candidate: version=%q err=%v", got, err)
+	if got, err := m.ApplyUpgrade(candidate, true); err != nil || got.Version != "2.0.0" || !got.Replaced {
+		t.Fatalf("forced historical candidate: result=%+v err=%v", got, err)
 	}
 	if content, err := os.ReadFile(evidence); err != nil || string(content) != "executed" {
 		t.Fatalf("forced candidate probe evidence: content=%q err=%v", content, err)
@@ -426,9 +426,9 @@ func TestForcedHistoricalCandidateStillMustMatchSelectedRelease(t *testing.T) {
 		t.Fatalf("prepare historical candidate: %v", err)
 	}
 
-	if got, err := m.ApplyUpgrade(candidate, true); got != "" || err == nil ||
+	if got, err := m.ApplyUpgrade(candidate, true); got.Replaced || err == nil ||
 		!strings.Contains(err.Error(), "does not match selected release") {
-		t.Fatalf("forced mismatched historical candidate: version=%q err=%v", got, err)
+		t.Fatalf("forced mismatched historical candidate: result=%+v err=%v", got, err)
 	}
 	if content, err := os.ReadFile(evidence); err != nil || string(content) != "executed" {
 		t.Fatalf("bounded probe evidence: content=%q err=%v", content, err)
@@ -447,7 +447,7 @@ func TestUpgradeRejectsBadSignature(t *testing.T) {
 	srv := signedServer(t, bin, badSig)
 
 	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
-	if _, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false); err == nil {
+	if _, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false); err == nil {
 		t.Fatal("Upgrade must reject a bad signature")
 	}
 	if _, err := os.Lstat(m.InstallPath); !os.IsNotExist(err) {
@@ -466,12 +466,12 @@ func TestUpgradeSkipsWhenNotNewer(t *testing.T) {
 	if installed, err := m.Install(bin, false); err != nil || !installed {
 		t.Fatalf("seed installed version: installed=%v err=%v", installed, err)
 	}
-	got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false)
+	got, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "" {
-		t.Errorf("expected no upgrade (same version), got %q", got)
+	if got.Replaced {
+		t.Errorf("expected no upgrade (same version), got %+v", got)
 	}
 	if b, err := os.ReadFile(m.InstallPath); err != nil || string(b) != string(bin) {
 		t.Errorf("same installed version changed: content=%q err=%v", b, err)
@@ -498,15 +498,18 @@ func TestUpgradeUsesInstalledCommandAsVersionBaseline(t *testing.T) {
 				t.Fatalf("seed installed command: wrote=%v err=%v", wrote, err)
 			}
 
-			got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false)
+			got, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.want == tc.candidate && got != tc.candidate {
-				t.Fatalf("Upgrade version=%q, want %q", got, tc.candidate)
+			if tc.want == tc.candidate && (got.Version != tc.candidate || !got.Replaced) {
+				t.Fatalf("Upgrade result=%+v, want %q", got, tc.candidate)
 			}
-			if tc.want == tc.installed && got != "" {
-				t.Fatalf("newer installed command was downgraded without --force: Upgrade=%q", got)
+			if tc.want == tc.installed && got.Replaced {
+				t.Fatalf("newer installed command was downgraded without --force: Upgrade=%+v", got)
+			}
+			if got.PreviousVersion != tc.installed || got.Version != tc.want {
+				t.Fatalf("Upgrade state = %+v, want previous=%q current=%q", got, tc.installed, tc.want)
 			}
 			current, err := m.InstalledVersion()
 			if err != nil || current != tc.want {
@@ -516,23 +519,56 @@ func TestUpgradeUsesInstalledCommandAsVersionBaseline(t *testing.T) {
 	}
 }
 
-func TestUpgradeReturnsCandidateWithDurabilityFailure(t *testing.T) {
-	dir := rootDir(t)
-	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	bin := newBinary("2.0.1")
-	srv := signedServer(t, bin, ed25519.Sign(priv, bin))
-	m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
-	m.WriteRootFile = func(path string, content []byte, mode os.FileMode) error {
-		if err := fsutil.WriteRootFile(path, content, mode); err != nil {
-			return err
-		}
-		return &fsutil.DurabilityError{Operation: "rename", Err: syscall.EIO}
-	}
+func TestUpgradeReportsWhetherFailedWriteReplacedCommand(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("committed=%t", committed), func(t *testing.T) {
+			dir := rootDir(t)
+			pub, priv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := newBinary("2.0.0")
+			bin := newBinary("2.0.1")
+			srv := signedServer(t, bin, ed25519.Sign(priv, bin))
+			m := &Manager{RequireHostMachine: allowAnyMachine, InstallPath: filepath.Join(dir, "linux-temp-admin"), PublicKey: pub, Client: srv.Client(), MaxBytes: 1 << 20}
+			if _, err := m.Install(old, false); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(m.InstallPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.WriteRootFile = func(path string, content []byte, mode os.FileMode) error {
+				if !committed {
+					return syscall.EIO
+				}
+				if err := fsutil.WriteRootFile(path, content, mode); err != nil {
+					return err
+				}
+				return &fsutil.DurabilityError{Operation: "rename", Err: syscall.EIO}
+			}
 
-	got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false)
-	var durability *fsutil.DurabilityError
-	if got != "2.0.1" || !errors.As(err, &durability) {
-		t.Fatalf("Upgrade = version=%q err=%v, want candidate plus DurabilityError", got, err)
+			got, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false)
+			var durability *fsutil.DurabilityError
+			if !errors.Is(err, syscall.EIO) || errors.As(err, &durability) != committed || got.Replaced != committed || got.PreviousVersion != "2.0.0" {
+				t.Fatalf("Upgrade = %+v, %v; want committed=%t and previous=2.0.0", got, err, committed)
+			}
+			wantBytes, wantVersion := old, ""
+			if committed {
+				wantBytes, wantVersion = bin, "2.0.1"
+			}
+			if got.Version != wantVersion {
+				t.Fatalf("result version=%q, want %q", got.Version, wantVersion)
+			}
+			actual, readErr := os.ReadFile(m.InstallPath)
+			if readErr != nil || !bytes.Equal(actual, wantBytes) {
+				t.Fatalf("visible command bytes match=%t, err=%v", bytes.Equal(actual, wantBytes), readErr)
+			}
+			after, statErr := os.Stat(m.InstallPath)
+			if statErr != nil || os.SameFile(before, after) == committed {
+				t.Fatalf("inode replacement does not match committed=%t: %v", committed, statErr)
+			}
+		})
 	}
 }
 
@@ -548,8 +584,8 @@ func TestUpgradeAcceptsAnyKeyInKeyring(t *testing.T) {
 		Client:      srv.Client(),
 		MaxBytes:    1 << 20,
 	}
-	if got, err := m.Upgrade(srv.URL+"/bin", srv.URL+"/sig", false); err != nil || got != "2.0.1" {
-		t.Fatalf("Upgrade with secondary key: version=%q err=%v", got, err)
+	if got, err := prepareAndApplyUpgrade(m, srv.URL+"/bin", srv.URL+"/sig", false); err != nil || got.Version != "2.0.1" || !got.Replaced {
+		t.Fatalf("Upgrade with secondary key: result=%+v err=%v", got, err)
 	}
 }
 
@@ -614,7 +650,7 @@ func TestCandidateWhoseProbeDisagreesWithItsSignedWitnessIsRefused(t *testing.T)
 
 	got, err := m.ApplyUpgrade(candidate, false)
 	if err == nil {
-		t.Fatalf("ApplyUpgrade = %q, nil; a candidate that reports a different version than it is signed for must be refused", got)
+		t.Fatalf("ApplyUpgrade = %+v, nil; a candidate that reports a different version than it is signed for must be refused", got)
 	}
 	if !strings.Contains(err.Error(), "does not match signed release-version witness") {
 		t.Fatalf("error = %v, want the signed-witness mismatch refusal", err)

@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## Unreleased
+
+- Read each account once per status display, sharing that observation between
+  table and narrow-terminal layouts while refreshing it on the next display.
+- Return explicit upgrade outcomes and exit the menu after a visible executable
+  replacement even if its directory sync fails; retain the failure exit status.
+- Combine the default terminal invite's automatic-removal and lifetime questions
+  into one prompt. Enter keeps 24 hours; `never` explicitly selects permanence.
+  Preserve existing CLI flags and piped-input behavior; EOF cancels the prompt.
+- Separate invite argument parsing and preconditions from planning and execution;
+  share timer file validation and the final controlled account-deletion steps
+  without changing backend compatibility, identity policy, or recovery rules.
+- Summarize successful dependency checks and show each shared doctor cleanup
+  suggestion once, retaining individual failure diagnostics and exit statuses.
+
 ## v2.10.7 - 2026-09-26
 
 - Close the remaining audit findings: clean up helper process groups before
