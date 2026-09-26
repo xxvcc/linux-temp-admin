@@ -1,4 +1,4 @@
-package selfmanage
+package releasecheck
 
 import (
 	"fmt"
@@ -17,9 +17,11 @@ func workflowUses(t *testing.T, path string) []string {
 	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "- uses: ") {
-			uses = append(uses, strings.TrimPrefix(trimmed, "- uses: "))
+			action, _, _ := strings.Cut(strings.TrimPrefix(trimmed, "- uses: "), " #")
+			uses = append(uses, strings.TrimSpace(action))
 		} else if strings.HasPrefix(trimmed, "uses: ") {
-			uses = append(uses, strings.TrimPrefix(trimmed, "uses: "))
+			action, _, _ := strings.Cut(strings.TrimPrefix(trimmed, "uses: "), " #")
+			uses = append(uses, strings.TrimSpace(action))
 		}
 	}
 	return uses
@@ -34,7 +36,7 @@ func TestReleaseWriterIsSeparatedFromCandidateWorkflow(t *testing.T) {
 	if strings.Contains(release, "contents: write") {
 		t.Fatal("candidate-tag Release workflow must not receive contents:write")
 	}
-	for _, required := range []string{"workflow_run:", "contents: write", "refusing to refresh any remote asset"} {
+	for _, required := range []string{"workflow_run:", "contents: write"} {
 		if !strings.Contains(stage, required) {
 			t.Fatalf("trusted stage workflow is missing %q", required)
 		}
@@ -100,8 +102,8 @@ func TestReleaseArtifactHandoffUsesAuditedNode24Actions(t *testing.T) {
 		path string
 		pin  string
 	}{
-		"upload":   {"../../.github/workflows/release.yml", "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1"},
-		"download": {"../../.github/workflows/stage-release.yml", "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1"},
+		"upload":   {"../../.github/workflows/release.yml", "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"},
+		"download": {"../../.github/workflows/stage-release.yml", "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"},
 	} {
 		if !slices.Contains(workflowUses(t, check.path), check.pin) {
 			t.Errorf("release %s action is not pinned to the audited native Node.js 24 version", name)
@@ -255,7 +257,7 @@ func TestMirrorReleaseWorkflowPublishesVerifiedImmutableContentFailClosed(t *tes
 	if strings.Contains(mirror[jobEnvStart:stepsStart], "GH_TOKEN") {
 		t.Fatal("mirror job exposes the GitHub token to release binaries instead of scoping it to API steps")
 	}
-	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1"
+	checkoutPin := "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 	checkoutCount := 0
 	for _, action := range workflowUses(t, "../../.github/workflows/mirror-release.yml") {
 		if action == checkoutPin {

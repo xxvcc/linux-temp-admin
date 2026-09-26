@@ -182,7 +182,7 @@ func TestValidScheduleRequiresEnabledAndActiveSystemdTimer(t *testing.T) {
 			name: "disabled",
 			stateErr: func(args ...string) error {
 				if args[0] == "is-enabled" {
-					return errSystemdUnitDisabled
+					return errSystemdUnitNotPersistent
 				}
 				return nil
 			},
@@ -242,7 +242,7 @@ func TestValidScheduleRequiresEnabledAndActiveSystemdTimer(t *testing.T) {
 			if len(sys.calls) != tt.wantCalls {
 				t.Fatalf("systemctl calls = %v, want %d", sys.calls, tt.wantCalls)
 			}
-			if len(sys.calls) > 0 && strings.Join(sys.calls[0], " ") != "is-enabled --quiet "+unit+".timer" {
+			if len(sys.calls) > 0 && strings.Join(sys.calls[0], " ") != "is-enabled "+unit+".timer" {
 				t.Fatalf("first systemctl call = %v", sys.calls[0])
 			}
 			if len(sys.calls) > 1 && strings.Join(sys.calls[1], " ") != "is-active --quiet "+unit+".timer" {

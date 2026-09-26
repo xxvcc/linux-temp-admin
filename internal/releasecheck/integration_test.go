@@ -1,6 +1,6 @@
 //go:build integration
 
-package selfmanage
+package releasecheck
 
 import "testing"
 

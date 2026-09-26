@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## v2.10.8 - 2026-09-26
+
+- Keep automatic cleanup scheduled until absent-account database, sudoers and
+  sshd cleanup has succeeded, so a failed step remains retryable.
+- Require persistent systemd timer enablement, and distinguish a booted systemd
+  manager from an installed systemctl when reporting the init system.
+- Exit the menu after an uninstall visibly removes the command even if a later
+  durability or audit-log cleanup step fails. Track visible implicit installs
+  before reporting their durability failure.
+- Bound the mirror installer scan through its final validation, skip hashing
+  unrelated release binaries, and propagate termination signals through scans.
+- Fix Linux executable ownership inspection and integration account-file parsing;
+  check shell syntax one file at a time in CI and contributor instructions.
+- Group invite choices in one plan; remove unused account-creation wrappers,
+  output fields, registry accessors and single-key configuration. Split CLI,
+  account lifecycle and self-management files by responsibility, and keep release
+  tooling tests in their own package without changing public commands, state
+  formats, signing-key rotation, supported backends or recovery checks.
+- Align both operator-guide languages with explicit registry compaction,
+  interactive sshd-change consent and successful quarantine handoffs.
 - Read each account once per status display, sharing that observation between
   table and narrow-terminal layouts while refreshing it on the next display.
 - Return explicit upgrade outcomes and exit the menu after a visible executable

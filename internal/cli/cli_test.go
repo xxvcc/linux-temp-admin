@@ -264,9 +264,9 @@ func TestPrintInviteFitsItsReservation(t *testing.T) {
 	}
 	// The widest render this tool produces: a real key plus every optional note.
 	if err := a.printInvite(inviteBundle{
-		user: "xxvcc-a1", host: "203.0.113.10", port: 22, hours: 24,
+		user: "xxvcc-a1", host: "203.0.113.10", port: 22,
 		sudo: true, auto: true, permanent: true, expires: "2026-09-07 12:00:00 UTC",
-		autoUnit: "linux-temp-admin-v2-revoke-xxvcc-a1.timer", registered: true,
+		autoUnit:   "linux-temp-admin-v2-revoke-xxvcc-a1.timer",
 		kp:         kp,
 		sshdDropIn: "/etc/ssh/sshd_config.d/10-linux-temp-admin-xxvcc-a1.conf",
 		unverified: "sshd Match Group cannot be evaluated until the account exists",
@@ -2390,7 +2390,7 @@ func TestUpgradeURLFileUsesIndependentSignedURLs(t *testing.T) {
 	var requested []string
 	m := &selfmanage.Manager{
 		InstallPath: filepath.Join(t.TempDir(), "linux-temp-admin"),
-		PublicKey:   make(ed25519.PublicKey, ed25519.PublicKeySize),
+		PublicKeys:  []ed25519.PublicKey{make(ed25519.PublicKey, ed25519.PublicKeySize)},
 		MaxBytes:    1 << 20,
 		RetryDelay:  time.Nanosecond,
 		Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

@@ -19,8 +19,8 @@ import (
 const maxScheduleFileSize = 64 << 10
 
 var (
-	errSystemdUnitDisabled = errors.New("systemd unit is disabled")
-	errSystemdUnitInactive = errors.New("systemd unit is inactive")
+	errSystemdUnitNotPersistent = errors.New("systemd unit is not persistently enabled")
+	errSystemdUnitInactive      = errors.New("systemd unit is inactive")
 )
 
 // ValidSchedule reports whether recordedUnit still names this exact account
@@ -177,8 +177,9 @@ func (s *Scheduler) systemdTimerExecutable(timer string) (bool, error) {
 	if s.Sys == nil {
 		return false, fmt.Errorf("query systemd timer %s: no system backend", timer)
 	}
-	for _, query := range []string{"is-enabled", "is-active"} {
-		if err := s.Sys.Systemctl(query, "--quiet", timer); err != nil {
+	for _, args := range [][]string{{"is-enabled", timer}, {"is-active", "--quiet", timer}} {
+		query := args[0]
+		if err := s.Sys.Systemctl(args...); err != nil {
 			if systemctlTimerStateNegative(err, query, timer) {
 				return false, nil
 			}
@@ -188,15 +189,13 @@ func (s *Scheduler) systemdTimerExecutable(timer string) (bool, error) {
 	return true, nil
 }
 
-// systemctlTimerStateNegative recognizes only documented, quiet state-query
-// exits. Diagnostics or unrelated failures remain errors so doctor cannot turn
-// an unqueryable timer into a merely disabled one.
+// systemctlTimerStateNegative recognizes the explicit persistent-state result
+// and documented quiet is-active exits. Unrelated failures remain errors so
+// doctor cannot turn an unqueryable timer into a merely disabled one.
 func systemctlTimerStateNegative(err error, query, timer string) bool {
 	switch query {
 	case "is-enabled":
-		if errors.Is(err, errSystemdUnitDisabled) {
-			return true
-		}
+		return errors.Is(err, errSystemdUnitNotPersistent)
 	case "is-active":
 		if errors.Is(err, errSystemdUnitInactive) {
 			return true
@@ -215,13 +214,7 @@ func systemctlTimerStateNegative(err error, query, timer string) bool {
 	if !errors.As(commandErr, &exitErr) {
 		return false
 	}
-	switch query {
-	case "is-enabled":
-		return exitErr.ExitCode() == 1
-	case "is-active":
-		return exitErr.ExitCode() == 3 || exitErr.ExitCode() == 4
-	}
-	return false
+	return exitErr.ExitCode() == 3 || exitErr.ExitCode() == 4
 }
 
 func uniqueCalendar(content []byte) (string, bool) {

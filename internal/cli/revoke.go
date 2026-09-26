@@ -319,10 +319,14 @@ func (tx *revokeTransaction) cleanupAbsentAccount() int {
 	}
 	cleanupErr := errors.Join(
 		reconcileErr,
-		a.cancelAccountSchedules(username, rec),
 		a.removeSudoGrant(username),
 		a.removeSSHDException(username),
 	)
+	// Keep retry entry points until every account artifact and name-scoped
+	// grant is confirmed gone, even when passwd no longer contains the account.
+	if cleanupErr == nil {
+		cleanupErr = a.cancelAccountSchedules(username, rec)
+	}
 	if cleanupErr != nil {
 		a.errorf("%s: %v", a.P.M(
 			"账号虽已不存在，但账号数据库、邮件、授权或任务清理尚未全部完成；保留登记供重试",

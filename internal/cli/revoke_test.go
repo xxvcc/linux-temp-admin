@@ -1630,8 +1630,13 @@ func TestRevokeRetriesPostDeletionMailAndKeepsOrdinaryAbsentRowsNarrow(t *testin
 			}
 			return nil
 		})
+		scheduleCalls := 0
+		a.Scheduler.Sys = revokeTestScheduleSystem{removeAtCalls: &scheduleCalls}
 		if rc := a.revokeOptionsLocked(revokeOptions{username: rec.User, yes: true}); rc != 1 {
 			t.Fatalf("first recovery revoke rc = %d, want retained failure", rc)
+		}
+		if scheduleCalls != 0 {
+			t.Fatalf("failed mail cleanup canceled retry task %d time(s)", scheduleCalls)
 		}
 		if present, err := a.Registry.Contains(rec.User); err != nil || !present {
 			t.Fatalf("failed mail retry lost registry witness: present=%v err=%v", present, err)
@@ -1641,6 +1646,9 @@ func TestRevokeRetriesPostDeletionMailAndKeepsOrdinaryAbsentRowsNarrow(t *testin
 		}
 		if present, err := a.Registry.Contains(rec.User); err != nil || present {
 			t.Fatalf("successful mail retry retained registry witness: present=%v err=%v", present, err)
+		}
+		if scheduleCalls != 1 {
+			t.Fatalf("completed mail cleanup canceled task %d time(s), want 1", scheduleCalls)
 		}
 		if mailCalls != 2 {
 			t.Fatalf("mail recovery calls = %d, want 2", mailCalls)

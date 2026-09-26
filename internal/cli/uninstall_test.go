@@ -505,7 +505,7 @@ func TestUninstallRefusesWhenTheInstallPathBecomesUnremovableAfterThePlan(t *tes
 	}
 
 	opts := uninstallOptions{yes: true, removeUsers: true}
-	if rc := a.teardown(a.teardownPlan(false, false), opts); rc == 0 {
+	if rc := a.teardown(a.teardownPlan(false, false), opts).status; rc == 0 {
 		t.Fatalf("teardown returned 0 though the command cannot be removed; stderr=%q", errb.String())
 	}
 	if got := errb.String(); !strings.Contains(got, "refusing to uninstall") {
@@ -524,7 +524,7 @@ func TestUninstallContinuesWhenTheMarkerIsCommittedButUnsynced(t *testing.T) {
 	a.Lifecycle = markerLock(t, &fsutil.DurabilityError{Operation: "uninstall marker directory", Err: os.ErrInvalid})
 
 	opts := uninstallOptions{yes: true, removeUsers: true}
-	rc := a.teardown(a.teardownPlan(false, false), opts)
+	rc := a.teardown(a.teardownPlan(false, false), opts).status
 
 	if rc != 0 {
 		t.Fatalf("teardown = %d, want the uninstall to continue past a committed-but-unsynced marker; stderr=%q", rc, errb.String())
@@ -543,7 +543,7 @@ func TestUninstallStopsWhenTheMarkerCannotBeRecordedAtAll(t *testing.T) {
 	a.Lifecycle = markerLock(t, os.ErrPermission)
 
 	opts := uninstallOptions{yes: true, removeUsers: true}
-	if rc := a.teardown(a.teardownPlan(false, false), opts); rc == 0 {
+	if rc := a.teardown(a.teardownPlan(false, false), opts).status; rc == 0 {
 		t.Fatalf("teardown = 0 though the marker was never recorded; stderr=%q", errb.String())
 	}
 	if _, err := os.Lstat(a.StateDir); err != nil {
@@ -625,7 +625,7 @@ func TestUninstallClosingLineNamesTheAccountsItDeliberatelyLeft(t *testing.T) {
 	a.LookupUser = func(string) (user.Passwd, bool, error) { return pw, true, nil }
 
 	opts := uninstallOptions{yes: true, force: true, ignoreForeignMarkers: true}
-	if rc := a.teardown(a.teardownPlan(false, true), opts); rc != 0 {
+	if rc := a.teardown(a.teardownPlan(false, true), opts).status; rc != 0 {
 		t.Fatalf("teardown = %d, want a completed teardown; stderr=%q", rc, errb.String())
 	}
 

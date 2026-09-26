@@ -503,9 +503,8 @@ func (a *App) uninstallResult(args []string) commandResult {
 			a.audit("uninstall", "", "fail", "inventory changed after confirmation", nil)
 			return 1
 		}
-		status := a.teardown(current, opts)
-		result = commandResult{status: status, applied: status == 0}
-		return status
+		result = a.teardown(current, opts)
+		return result.status
 	})
 	return result
 }
@@ -681,7 +680,7 @@ func sameTeardownPlan(a, b teardownPlan) bool {
 // teardown executes the plan. Order is the whole design: every step leaves the
 // host no worse than it found it, and the binary goes last because everything
 // that could still need a manager needs the manager to exist.
-func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
+func (a *App) teardown(plan teardownPlan, opts uninstallOptions) commandResult {
 	force, purgeAudit := opts.force, opts.purgeAudit
 	// Each account goes through the ordinary revoke — the same path, the same
 	// protections, the same audit trail. Nothing here reimplements deletion.
@@ -764,7 +763,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 		a.errorf("%s: %v", a.P.M("无法确认账号与授权已全部清除，卸载中止（命令与状态已保留）",
 			"cannot confirm every account and grant is gone; the uninstall stopped (command and state kept)"), residual.inventoryErr)
 		a.audit("uninstall", "", "fail", "re-inventory error: "+residual.inventoryErr.Error(), nil)
-		return 1
+		return statusResult(1)
 	}
 	// Block only on residue that carries privilege: a live account, or a leftover
 	// grant / exception / unit. A residual entry named ONLY by a registry row whose
@@ -805,7 +804,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 			"已保留已安装的命令和状态目录，卸载中止。留着一个带 sudo 的授权却删掉唯一能清理它的命令，比不卸载更糟。请先手动处理，再重试。",
 			"the installed command and the state directory were kept, and the uninstall stopped. Leaving a sudo grant behind while deleting the only thing that can clean it up is worse than not uninstalling. Deal with these by hand and retry."))
 		a.audit("uninstall", "", "fail", "residual: "+strings.Join(residual.names(), " ")+"; failed revokes: "+strings.Join(failedRevokes, " "), nil)
-		return 1
+		return statusResult(1)
 	}
 	// The re-inventory exists to catch state that changed since the plan was
 	// approved, and an install path that became unremovable in that window is
@@ -817,7 +816,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 		a.warnf("%s", a.P.M("先处理该路径（或用 --force 明确接受），再重试——否则卸载会删光账号与状态却卡在最后一步。",
 			"resolve that path (or pass --force to accept it explicitly) and retry — otherwise the uninstall would remove every account and all state, then stop at the last step."))
 		a.audit("uninstall", "", "fail", "install path became unremovable after the plan: "+residual.binaryBlocker, nil)
-		return 1
+		return statusResult(1)
 	}
 
 	// Releases before the persistent-timer cleanup fix could leave an inert
@@ -830,7 +829,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 			a.errorf("%s: %v", a.P.M("无法清除旧版 systemd 定时器时间戳，卸载中止（命令与状态已保留）",
 				"cannot remove legacy systemd timer timestamps; the uninstall stopped (command and state kept)"), err)
 			a.audit("uninstall", "", "fail", "timer timestamp cleanup failed: "+err.Error(), nil)
-			return 1
+			return statusResult(1)
 		}
 	}
 
@@ -849,7 +848,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 				a.errorf("%s: %v", a.P.M("无法写入卸载状态标记；状态与命令均已保留，以阻止排队中的旧进程重新启用工具",
 					"cannot record the uninstall-state marker; state and command were kept so a queued older process cannot re-enable the tool"), err)
 				a.audit("uninstall", "", "fail", "uninstall marker write failed: "+err.Error(), nil)
-				return 1
+				return statusResult(1)
 			}
 		}
 	}
@@ -857,7 +856,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 		a.errorf("%s: %v", a.P.M("删除状态目录失败；工具已标记为卸载并保留命令，以便修复后重试",
 			"removing the state directory failed; the tool is marked uninstalled and the command was kept so uninstall can be retried after repair"), err)
 		a.audit("uninstall", "", "fail", "state directory cleanup failed: "+err.Error(), nil)
-		return 1
+		return statusResult(1)
 	}
 	a.info(a.P.M("已删除状态目录："+a.StateDir, "removed the state directory: "+a.StateDir))
 
@@ -866,9 +865,15 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 	// actually gone, so the log never records success for a teardown that failed at
 	// its defining step.
 	if err := a.Selfmanage.Uninstall(force); err != nil {
-		a.errorf("%v", err)
-		a.audit("uninstall", "", "fail", "binary removal failed: "+err.Error(), nil)
-		return 1
+		var committed *fsutil.DurabilityError
+		removed := errors.As(err, &committed)
+		if removed {
+			a.errorf("%s: %v", a.P.M("命令已删除，但无法确认删除已持久化", "the command was removed, but its removal's durability is unknown"), err)
+		} else {
+			a.errorf("%v", err)
+		}
+		a.audit("uninstall", "", "fail", "binary removal failed: "+err.Error(), map[string]string{"removed": fmt.Sprint(removed)})
+		return commandResult{status: 1, applied: removed}
 	}
 	if purgeAudit {
 		// Record the complete outcome before purging; logging after a successful
@@ -881,7 +886,7 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 			// Keep the logger live. A failed recursive removal may be partial, and this
 			// failure is exactly the event the surviving/recreated log must retain.
 			a.audit("uninstall", "", "fail", "audit purge failed: "+err.Error(), nil)
-			return 1
+			return commandResult{status: 1, applied: true}
 		}
 		a.info(a.P.M("已删除审计日志："+a.AuditLogDir, "removed the audit log: "+a.AuditLogDir))
 		a.Audit = nil
@@ -899,11 +904,11 @@ func (a *App) teardown(plan teardownPlan, opts uninstallOptions) int {
 				len(left), strings.Join(left, ", ")),
 			fmt.Sprintf("uninstalled: the grants, the auto-delete tasks, the state and the command are gone. %d account(s) named only by a passwd marker were left in place by --ignore-foreign-markers and must be dealt with by hand: %s",
 				len(left), strings.Join(left, ", "))))
-		return 0
+		return commandResult{applied: true}
 	}
 	a.success(a.P.M("已卸载：临时账号、授权、自动删除任务、状态与命令均已移除。",
 		"uninstalled: the temporary accounts, their grants, their auto-delete tasks, the state and the command are gone."))
-	return 0
+	return commandResult{applied: true}
 }
 
 // removeStateDir deletes everything this tool kept under /var/lib, v1's files

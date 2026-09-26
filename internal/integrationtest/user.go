@@ -208,12 +208,10 @@ func databaseHasName(data []byte, name string, parseGID bool) (bool, error) {
 	seen := make(map[string]bool)
 	found := false
 	for lineNumber, line := range strings.Split(string(data), "\n") {
-		// Skip what the system's own readers skip. glibc's nss_files ignores blank
-		// and '#'-comment lines, and both glibc and shadow-utils accept the NIS
-		// compatibility entries beginning with '+' or '-'. Treating one of those as
-		// a malformed record failed this inspection outright on a host that carries
-		// one, for a line that names no group.
-		if line == "" || line[0] == '#' || line[0] == '+' || line[0] == '-' {
+		// Like libc, ignore leading ASCII whitespace when classifying blank,
+		// comment and NIS compatibility lines. Parse real records unchanged.
+		trimmed := strings.TrimLeft(line, " \t\r\v\f")
+		if trimmed == "" || trimmed[0] == '#' || trimmed[0] == '+' || trimmed[0] == '-' {
 			continue
 		}
 		parts := strings.Split(line, ":")

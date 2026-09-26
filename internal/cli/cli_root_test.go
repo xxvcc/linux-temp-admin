@@ -227,7 +227,7 @@ func TestUpgradeDownloadDoesNotHoldLifecycleLock(t *testing.T) {
 	a.Selfmanage = &selfmanage.Manager{
 		InstallPath:        installPath,
 		RequireHostMachine: cliAllowAnyMachine,
-		PublicKey:          pub,
+		PublicKeys:         []ed25519.PublicKey{pub},
 		Client:             srv.Client(),
 		MaxBytes:           config.MaxUpgradeBytes,
 	}
@@ -319,7 +319,7 @@ func TestOfficialUpgradeMirrorFallbackBoundary(t *testing.T) {
 			m := &selfmanage.Manager{
 				InstallPath:        filepath.Join(dir, "linux-temp-admin"),
 				RequireHostMachine: cliAllowAnyMachine,
-				PublicKey:          pub,
+				PublicKeys:         []ed25519.PublicKey{pub},
 				MaxBytes:           config.MaxUpgradeBytes,
 				RetryDelay:         0,
 			}

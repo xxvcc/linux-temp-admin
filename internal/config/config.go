@@ -18,7 +18,7 @@ const (
 
 	// ManagedTag marks tool-managed accounts.
 	ManagedTag = "linux-temp-admin"
-	// ManagedGECOS is the exact GECOS an invite sets; user.IsManaged requires this
+	// ManagedGECOS is the exact GECOS an invite sets; user.IsManagedEntry requires this
 	// full string for legacy accounts, not a bare ManagedTag substring.
 	ManagedGECOS = ManagedTag + " temporary admin"
 	// ManagedGenerationGECOSPrefix begins the generation-bound marker written for

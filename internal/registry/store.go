@@ -771,20 +771,6 @@ func (s *Store) Lookup(user string) (rec Record, found bool, err error) {
 	return Record{}, false, nil
 }
 
-// UnitFor returns the recorded auto-revoke unit for user (empty if none/absent).
-func (s *Store) UnitFor(user string) (string, error) {
-	recs, err := s.readAll()
-	if err != nil {
-		return "", err
-	}
-	for _, r := range recs {
-		if r.User == user {
-			return r.AutoUnit, nil
-		}
-	}
-	return "", nil
-}
-
 // Compact removes ordinary entries whose account no longer exists, deciding
 // under one held lock so a concurrent recreate cannot lose its fresh entry.
 // Deletion recovery rows are retained without calling keep: that row is the
@@ -846,35 +832,13 @@ func (s *Store) completelyAbsent() (bool, error) {
 	return true, nil
 }
 
-// LostRegistryHighest reports ONLY the high-water mark Init observed, and is not
-// sufficient to detect loss on its own: a registry migrated from the nine-column
-// v2 format records highest 0, so this returns 0 for a host that did lose its
-// rows. Use InspectRegistryLoss, which is also the only form that answers in a
-// process that never called Init. This accessor remains for the tests that assert
-// what Init observed.
+// InspectRegistryLoss reports a missing registry whose surviving identity
+// sequence proves prior use, including migrations with a zero high-water mark.
+// It reads only: it never creates the directory, lock, or data file.
 //
-// LostRegistryHighest reports the identity-sequence high-water mark that was
-// present when Init had to recreate a missing registry data file, or zero when
-// the registry was intact or genuinely fresh. A nonzero value means rows were
-// lost: every account this tool created before that point no longer has the
-// registry witness its revoke and orphan sweeps rely on.
-func (s *Store) LostRegistryHighest() int {
-	if s == nil {
-		return 0
-	}
-	return s.lostRegistryHighest
-}
-
-// InspectRegistryLoss reports the same condition as LostRegistryHighest without
-// depending on this process having called Init. A standalone `doctor` never calls
-// Init, so the process-local flag is always clear there and the operator was told
-// nothing about a registry whose rows are gone. This probe reads only: it never
-// creates the directory, the lock, or the data file.
-//
-// It answers only while the data file is still absent. Once Init has recreated
-// it, an empty v5 registry beside a used sequence is indistinguishable from a
-// host whose accounts were all legitimately revoked, so the in-process flag
-// remains the authority for that window.
+// Once Init has recreated the data file, an empty v5 registry beside a used
+// sequence is indistinguishable from a host whose accounts were legitimately
+// revoked. The loss observed by Init remains authoritative in that process.
 func (s *Store) InspectRegistryLoss() (highest int, lost bool, err error) {
 	if s == nil {
 		return 0, false, fmt.Errorf("nil registry store")

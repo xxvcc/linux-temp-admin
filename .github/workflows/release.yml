@@ -113,7 +113,9 @@ jobs:
             go test -mod=readonly -count=1 -race -p 1 -tags integration ./...
           test -z "$(gofmt -l .)"
           sh -n scripts/install.sh
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
           python3 -B -m unittest -v scripts/mirror_receiver_test.py
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update
