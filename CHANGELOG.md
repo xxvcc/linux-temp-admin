@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## v2.10.8 - 2026-09-26
+
 - Keep automatic cleanup scheduled until absent-account database, sudoers and
   sshd cleanup has succeeded, so a failed step remains retryable.
 - Require persistent systemd timer enablement, and distinguish a booted systemd
