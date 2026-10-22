@@ -371,6 +371,31 @@ supply a durable exclusive lock that records its owner and tag and has an
 explicit stale-lock recovery policy. Workflow concurrency and a workstation-local
 `flock` do not satisfy this requirement.
 
+For this repository, coordinators use the shared GitHub reference
+`refs/tags/lta-publication-lock`. Before online preparation, create a unique
+annotated tag object whose message records the release tag, exact commit,
+authenticated maintainer login, UTC acquisition time and a random operation ID.
+Atomically create the fixed reference with GitHub's `POST /repos/xxvcc/linux-temp-admin/git/refs`.
+An existing reference means the release is busy; never update or replace it.
+If the create request has an ambiguous result, read the reference and proceed
+only if it points to this operation's exact tag-object SHA. Record that SHA in
+the release evidence and recheck ownership before signing and publication.
+The lock tag does not match the `v*` release trigger and is not a version tag.
+Every workstation must use this same protocol; it coordinates participating
+publishers and does not protect against an authorized maintainer deliberately
+deleting the lock. A local lock may additionally coordinate older local tools.
+
+Retain the reference through publication, mirror synchronization and independent
+public verification. Release only the owned reference with an atomic expected-SHA
+check, using `git push --force-with-lease=refs/tags/lta-publication-lock:<recorded-tag-object-sha>
+origin :refs/tags/lta-publication-lock`. Do not use a separate GET followed by an
+unconditional REST DELETE, which could remove a successor's lock. Locks do not
+expire automatically. After an interrupted operation, first establish that its
+recorded coordinator and workflows have stopped, inspect the bound draft/public
+release and Latest state, and record the recovery decision. Resume the same
+operation or remove only its recorded tag-object SHA with the same lease check;
+elapsed time alone is never sufficient to reclaim a lock.
+
 The OpenPGP tag-signing key is separate from the offline ed25519 release key.
 Before the first release under this process, generate or import a dedicated
 maintainer OpenPGP key whose UID contains an email verified on the `xxvcc`
