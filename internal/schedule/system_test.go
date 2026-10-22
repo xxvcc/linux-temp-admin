@@ -41,29 +41,6 @@ func TestRealSystemHasAtDetectsEveryBackendFootprint(t *testing.T) {
 	})
 }
 
-func TestAtrmJobTreatsAlreadyAbsentAsSuccess(t *testing.T) {
-	dir := t.TempDir()
-	writeCommand(t, dir, "atq", "exit 0")
-	writeCommand(t, dir, "atrm", "echo should-not-run >&2; exit 1")
-	t.Setenv("PATH", dir)
-
-	if err := (realSystem{}).AtrmJob("42"); err != nil {
-		t.Fatalf("already-absent at job should be success: %v", err)
-	}
-}
-
-func TestAtrmJobReportsFailureForStillQueuedJob(t *testing.T) {
-	dir := t.TempDir()
-	writeCommand(t, dir, "atq", "printf '42\\tFri Jul 24 00:00:00 2026 a root\\n'")
-	writeCommand(t, dir, "atrm", "echo removal-failed >&2; exit 1")
-	t.Setenv("PATH", dir)
-
-	err := (realSystem{}).AtrmJob("42")
-	if err == nil || !strings.Contains(err.Error(), "removal-failed") {
-		t.Fatalf("AtrmJob error = %v, want the real removal failure", err)
-	}
-}
-
 func TestSystemctlMissingUnitErrorIsPreciselyClassified(t *testing.T) {
 	const unit = "linux-temp-admin-v2-revoke-xxvcc-a1.timer"
 	tests := []struct {
@@ -287,7 +264,7 @@ func TestAtJobQueuedFailsClosedOnMalformedInventory(t *testing.T) {
 	dir := t.TempDir()
 	writeCommand(t, dir, "atq", "printf '%s\\n' 'corrupt queue line'")
 	t.Setenv("PATH", dir)
-	if queued, err := atJobQueued("42"); err == nil || queued {
+	if queued, err := atJobQueuedContext(context.Background(), "42"); err == nil || queued {
 		t.Fatalf("atJobQueued malformed inventory = %v, %v; want false, error", queued, err)
 	}
 }

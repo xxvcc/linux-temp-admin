@@ -126,7 +126,10 @@ type sshdConfigIdentity struct {
 }
 
 type sshdIncludeScan struct {
-	paths      map[string]bool
+	// An opened inode is false while being scanned and true after a complete
+	// scan. Revisiting an active inode is a recursive Include, not proof that
+	// its contents were checked. Paths are never cleaned for identity checks:
+	// resolving symlink/.. in the kernel can reach a different file.
 	identities map[sshdConfigIdentity]bool
 	// accountExists controls whether Match Group is evaluable by `sshd -T -C
 	// user=...`. OpenSSH cannot resolve group membership for a not-yet-created
@@ -166,13 +169,12 @@ func HasConnectionScopedMatch() bool {
 // future account receives only the global result from `sshd -T -C user=name`.
 func HasUnverifiableMatch(accountExists bool) bool {
 	files := []string{sshdConfigPath}
-	if entries, err := strictGlob(filepath.Join(sshdConfigDropInDir, "*.conf")); err == nil {
+	if entries, err := strictGlob(sshdConfigDropInDir + "/*.conf"); err == nil {
 		files = append(files, entries...)
 	} else {
 		return true
 	}
 	scan := &sshdIncludeScan{
-		paths:         map[string]bool{},
 		identities:    map[sshdConfigIdentity]bool{},
 		accountExists: accountExists,
 	}
@@ -190,11 +192,6 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 	if depth >= maxSSHDIncludeDepth {
 		return false, false
 	}
-	path = filepath.Clean(path)
-	if scan.paths[path] {
-		return false, true
-	}
-	scan.paths[path] = true
 	// sshd follows symlinked configuration files, so this scanner does too. Open
 	// nonblocking, then require the resolved descriptor to be regular and bounded:
 	// a damaged Include that names a FIFO or device must downgrade the verdict
@@ -213,13 +210,13 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 		return false, false
 	}
 	identity := sshdConfigIdentity{dev: uint64(st.Dev), ino: st.Ino}
-	if scan.identities[identity] {
-		return false, true
+	if complete, seen := scan.identities[identity]; seen {
+		return false, complete
 	}
 	if scan.files >= maxSSHDIncludeFiles || fi.Size() > maxSSHDIncludeBytes-scan.bytes {
 		return false, false
 	}
-	scan.identities[identity] = true
+	scan.identities[identity] = false
 	scan.files++
 	scan.bytes += fi.Size()
 	limited := &io.LimitedReader{R: f, N: maxSSHDConfigBytes + 1}
@@ -252,7 +249,9 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 				}
 				scan.globs++
 				if !filepath.IsAbs(pattern) {
-					pattern = filepath.Join(baseDir, pattern)
+					// filepath.Join would clean symlink/.. before the kernel
+					// resolves it, potentially scanning an unrelated file.
+					pattern = baseDir + "/" + pattern
 				}
 				matches, err := strictGlob(pattern)
 				if err != nil {
@@ -312,7 +311,9 @@ func fileHasConnectionScopedMatch(path, baseDir string, scan *sshdIncludeScan, d
 			}
 		}
 	}
-	return false, sc.Err() == nil && limited.N > 0
+	complete = sc.Err() == nil && limited.N > 0
+	scan.identities[identity] = complete
+	return false, complete
 }
 
 // parseSSHDDirective accepts both forms supported by OpenSSH's configuration
@@ -404,10 +405,9 @@ func readSSHDGlobDir(path string) ([]os.DirEntry, error) {
 	return entries, nil
 }
 
-// strictGlob is filepath.Glob with one security-relevant difference: directory
-// I/O errors are returned instead of silently treated as no matches. An
-// incomplete sshd Include scan must downgrade the login verdict, not hide a
-// connection-scoped Match rule.
+// strictGlob expands supported Include patterns without cleaning their paths.
+// Directory I/O errors are returned instead of silently treated as no matches.
+// An incomplete scan must downgrade the verdict, not hide a Match rule.
 func strictGlob(pattern string) ([]string, error) {
 	if _, err := matchSSHDIncludeGlob(pattern, ""); err != nil {
 		return nil, err
@@ -469,6 +469,15 @@ func strictGlobDir(dir, pattern string, matches []string) ([]string, error) {
 	if !fi.IsDir() {
 		return matches, nil
 	}
+	// ReadDir omits these entries, but glob(3) can traverse them after a globbed
+	// component (for example release-*/../policy.conf). Keep the spelling so
+	// symlinked directories retain the kernel's parent-directory semantics.
+	if pattern == "." || pattern == ".." {
+		if len(matches) >= maxSSHDIncludeFiles {
+			return nil, errSSHDGlobLimit
+		}
+		return append(matches, dir+"/"+pattern), nil
+	}
 	entries, err := strictGlobReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -482,7 +491,7 @@ func strictGlobDir(dir, pattern string, matches []string) ([]string, error) {
 			if len(matches) >= maxSSHDIncludeFiles {
 				return nil, errSSHDGlobLimit
 			}
-			matches = append(matches, filepath.Join(dir, entry.Name()))
+			matches = append(matches, dir+"/"+entry.Name())
 		}
 	}
 	return matches, nil

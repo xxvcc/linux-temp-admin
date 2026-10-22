@@ -235,20 +235,65 @@ printf '%s\n' '#!/bin/sh' 'exec /usr/bin/gpg --batch --no-auto-key-retrieve "$@"
 chmod 0700 "$gpg_wrapper"
 LATEST_PROMOTION_ATTEMPTED=0
 PUBLISH_COMPLETE=0
+recovery_dir=""
+arm_latest_restoration() {
+  # Commit a small, private recovery record before any possibly-applied Latest
+  # mutation. Never retain gh configuration, API diagnostics, or the environment:
+  # those may contain credentials. These identifiers and the independently pinned
+  # bundle hash are enough to bind the manual recovery procedure to this run.
+  if [[ -z "$recovery_dir" ]]; then
+    recovery_dir="$(mktemp -d /tmp/lta-publish-recovery.XXXXXX)" || return 1
+    chmod 0700 "$recovery_dir" || return 1
+    {
+      printf '%s\n' 'linux-temp-admin publication recovery v1'
+      printf 'repo\t%s\ntag\t%s\nrelease-id\t%s\ncommit\t%s\n' \
+        "$REPO" "$TAG" "$EXPECTED_RELEASE_ID" "$COMMIT"
+      printf 'signed-bundle-manifest-sha256\t%s\n' "$LTA_EXPECTED_SIGNED_BUNDLE_MANIFEST_SHA256"
+      printf 'baseline-highest-tag\t%s\nbaseline-highest-release-id\t%s\n' \
+        "$BASELINE_HIGHEST_TAG" "$BASELINE_HIGHEST_ID"
+    } > "$recovery_dir/context.tsv" || return 1
+    chmod 0600 "$recovery_dir/context.tsv" || return 1
+  fi
+  LATEST_PROMOTION_ATTEMPTED=1
+}
 cleanup() {
-  local status=$?
+  local status=$? preserve_recovery=0
+  # Cleanup runs once. Repeated terminal/parent signals cannot interrupt its
+  # bookkeeping or start a second restoration. Helpers retain their timeouts;
+  # a process-group signal may still fail a helper, which preserves the record.
+  trap '' HUP INT TERM
   trap - EXIT
-  if (( status != 0 && LATEST_PROMOTION_ATTEMPTED == 1 && PUBLISH_COMPLETE == 0 )); then
+  set +e
+  if (( LATEST_PROMOTION_ATTEMPTED == 1 && PUBLISH_COMPLETE == 0 )); then
+    (( status != 0 )) || status=1
     echo "stable publication failed after a mutation that could affect Latest; restoring the exact highest stable release other than $TAG" >&2
     if ! restore_latest_after_failed_promotion; then
+      preserve_recovery=1
       echo "CRITICAL: automatic Latest restoration failed; keep the release unannounced and follow docs/releasing.md recovery" >&2
+      if [[ -n "${recovery_dir:-}" ]]; then
+        printf 'exit-status\t%s\n' "$status" >> "$recovery_dir/context.tsv" \
+          || echo "warning: could not append the exit status to the recovery record" >&2
+        echo "private recovery identifiers retained at: $recovery_dir/context.tsv" >&2
+      else
+        echo "CRITICAL: no recovery record is available; retain the independently recorded release identity and signed bundle" >&2
+      fi
     fi
   fi
   timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" rm -rf -- "$work" \
     || echo "warning: could not remove private publication workspace within timeout: $work" >&2
+  if (( preserve_recovery == 0 )) && [[ -n "${recovery_dir:-}" ]]; then
+    timeout -k 5 "$LOCAL_COMMAND_TIMEOUT_SECONDS" rm -rf -- "$recovery_dir" \
+      || echo "warning: could not remove private recovery record within timeout: $recovery_dir" >&2
+  fi
   exit "$status"
 }
 trap cleanup EXIT
+# Bash's EXIT trap can see a preceding command's zero status when the shell is
+# terminated directly. Convert each supported terminating signal explicitly;
+# never infer signal failure from the EXIT trap's incoming status alone.
+trap 'trap "" HUP INT TERM; exit 129' HUP
+trap 'trap "" HUP INT TERM; exit 130' INT
+trap 'trap "" HUP INT TERM; exit 143' TERM
 
 # Pin the verifier by descriptor so the inode hashed here is the one every
 # subsequent verify command executes.
@@ -906,7 +951,7 @@ if (( RELEASE_WAS_DRAFT == 1 )); then
     # has passed byte-for-byte and signature verification. Set the restoration
     # guard before the call because a failed response can still follow an
     # applied server-side mutation.
-    LATEST_PROMOTION_ATTEMPTED=1
+    arm_latest_restoration
   fi
   if ! publish_bound_release; then
     echo "publishing bound Release $EXPECTED_RELEASE_ID failed or returned an invalid response" >&2
@@ -985,7 +1030,7 @@ if [[ "$TAG" != *-* ]]; then
       || { echo "a higher stable release appeared; refusing to promote $TAG" >&2; exit 1; }
     # Set this before the mutating call: gh can fail after the server applied
     # the update. The EXIT trap must restore even in that ambiguous outcome.
-    LATEST_PROMOTION_ATTEMPTED=1
+    arm_latest_restoration
     require_immutable_release
     set_latest_by_release_id "$EXPECTED_RELEASE_ID" "$TAG" true
   else
@@ -994,7 +1039,7 @@ if [[ "$TAG" != *-* ]]; then
 
   final_highest="$(highest_stable_release_excluding "")"
   if [[ "$final_highest" != "$TAG" ]]; then
-    LATEST_PROMOTION_ATTEMPTED=1
+    arm_latest_restoration
     if restore_latest_after_failed_promotion; then
       LATEST_PROMOTION_ATTEMPTED=0
       echo "a higher stable release appeared during Latest promotion; restored the exact highest alternative" >&2
@@ -1011,7 +1056,7 @@ if [[ "$TAG" != *-* ]]; then
   require_remote_asset_digests
   final_highest="$(highest_stable_release_excluding "")"
   if [[ "$final_highest" != "$TAG" ]]; then
-    LATEST_PROMOTION_ATTEMPTED=1
+    arm_latest_restoration
     if restore_latest_after_failed_promotion; then
       LATEST_PROMOTION_ATTEMPTED=0
       echo "a higher stable release appeared during final verification; restored the exact highest alternative" >&2

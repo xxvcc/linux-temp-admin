@@ -36,8 +36,6 @@ type System interface {
 	// RemoveAtJobsFor removes queued jobs matching a known standalone revoke
 	// command selected by command's legacy-compatible prefix.
 	RemoveAtJobsFor(command string) error
-	// AtrmJob removes a specific at job by id. An already-absent job is success.
-	AtrmJob(id string) error
 	// AtJobs returns queued job bodies and their generated owner UID so uninstall
 	// can inventory root-created jobs whose registry row has been lost. Missing
 	// inventory commands or an unparseable owner header are errors.
@@ -261,7 +259,6 @@ func (s systemdOnlySystem) ScheduleAt(string, time.Time) (string, error) {
 	return "", fmt.Errorf("at is disabled for identity quarantine")
 }
 func (s systemdOnlySystem) RemoveAtJobsFor(string) error { return nil }
-func (s systemdOnlySystem) AtrmJob(string) error         { return nil }
 func (s systemdOnlySystem) AtJobs() ([]AtJob, error)     { return nil, nil }
 
 func (s *Scheduler) scheduleSystemd(user string, uid int, generation string, deadline time.Time) (string, error) {

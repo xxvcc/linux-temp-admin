@@ -293,6 +293,19 @@ func TestUpgradeRefusedWithoutKey(t *testing.T) {
 }
 
 func TestReleaseVersionWitnessIsCanonicalAndUnique(t *testing.T) {
+	installer, err := os.ReadFile("../../scripts/install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(installer), "read_release_version() {")
+	if start < 0 {
+		t.Fatal("installer witness reader missing")
+	}
+	end := strings.Index(string(installer)[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("installer witness reader boundary missing")
+	}
+	shellReader := string(installer)[start : start+end+2]
 	maxVersion := "2.3.4-" + strings.Repeat("a", validate.MaxReleaseVersionBytes-len("2.3.4-"))
 	for _, tc := range []struct {
 		name    string
@@ -302,6 +315,8 @@ func TestReleaseVersionWitnessIsCanonicalAndUnique(t *testing.T) {
 	}{
 		{name: "historical binary has no witness", bin: "historical"},
 		{name: "canonical", bin: "prefix LTA_RELEASE_VERSION_V1{2.9.5} suffix", want: "2.9.5"},
+		{name: "binary nul framing", bin: "\x00LTA_RELEASE_VERSION_V1{2.9.5}\x00", want: "2.9.5"},
+		{name: "nested invalid marker", bin: "LTA_RELEASE_VERSION_V1{badLTA_RELEASE_VERSION_V1{2.9.5}", want: "2.9.5"},
 		{name: "prerelease", bin: "LTA_RELEASE_VERSION_V1{2.10.0-rc.1}", want: "2.10.0-rc.1"},
 		{name: "maximum length", bin: "LTA_RELEASE_VERSION_V1{" + maxVersion + "}", want: maxVersion},
 		{name: "over maximum length", bin: "LTA_RELEASE_VERSION_V1{" + maxVersion + "a}"},
@@ -314,6 +329,28 @@ func TestReleaseVersionWitnessIsCanonicalAndUnique(t *testing.T) {
 			got, err := releaseVersionWitness([]byte(tc.bin))
 			if (err != nil) != tc.wantErr || got != tc.want {
 				t.Fatalf("releaseVersionWitness = %q,%v, want %q, error=%v", got, err, tc.want, tc.wantErr)
+			}
+			dir := t.TempDir()
+			binary := filepath.Join(dir, "binary")
+			if err := os.WriteFile(binary, []byte(tc.bin), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, shell := range []string{"sh", "bash", "dash", "busybox"} {
+				path, lookErr := exec.LookPath(shell)
+				if lookErr != nil {
+					continue
+				}
+				args := []string{}
+				if shell == "busybox" {
+					args = append(args, "ash")
+				}
+				body := "set -eu\nMAX_RELEASE_VERSION_BYTES=128\n" + shellReader + "\nread_release_version \"$TEST_BINARY\""
+				cmd := exec.Command(path, append(args, "-c", body)...)
+				cmd.Env = append(os.Environ(), "tmp="+dir, "TEST_BINARY="+binary)
+				out, shellErr := cmd.CombinedOutput()
+				if (shellErr != nil) != (err != nil) || (err == nil && string(out) != got) {
+					t.Fatalf("%s witness disagrees with Go: %q,%v; Go %q,%v", shell, out, shellErr, got, err)
+				}
 			}
 		})
 	}

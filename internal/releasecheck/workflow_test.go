@@ -543,7 +543,10 @@ func TestReleaseScriptsBindSignerIdentityAndClientSizeLimit(t *testing.T) {
 	for _, required := range []string{
 		"MANAGED_DEST=/usr/local/sbin/linux-temp-admin",
 		`[ "$DEST" = "$MANAGED_DEST" ]`,
-		`"$stage" --lang en install --force`,
+		"LIFECYCLE_LOCK=/run/linux-temp-admin.lock",
+		"acquire_bootstrap_lock\ncheck_bootstrap_state",
+		"signed candidate has no static release-version witness",
+		"refusing downgrade from $current_version to $signed_version",
 		"installed destination differs from the verified candidate",
 		`stat -c %g -- "$DEST"`,
 		"installed destination group is not root",
@@ -553,7 +556,7 @@ func TestReleaseScriptsBindSignerIdentityAndClientSizeLimit(t *testing.T) {
 		`sync_destination_directory_chain "$dest_dir"`,
 	} {
 		if !strings.Contains(installer, required) {
-			t.Fatalf("installer does not delegate managed-path lifecycle activation: missing %q", required)
+			t.Fatalf("installer does not preserve locked, verified installation: missing %q", required)
 		}
 	}
 	if !strings.Contains(installer, "OPENSSL_CONF=/dev/null") || !strings.Contains(installer, "unset OPENSSL_CONF_INCLUDE OPENSSL_MODULES OPENSSL_ENGINES") {

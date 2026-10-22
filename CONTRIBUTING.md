@@ -14,7 +14,7 @@ The tool lives in `cmd/` and `internal/`, and ships as a signed static Go binary
 
 ## Local Checks
 
-**Go** — requires Go 1.26.6+:
+**Go** — requires Go 1.26.10+:
 
 ```bash
 go build ./...
@@ -61,6 +61,33 @@ For changes that touch account creation, revoke, sudoers, systemd timers, or `at
 - Keep non-interactive automation explicit: dangerous actions need `--yes` plus a specific confirmation value when relevant.
 - Update both languages of every affected user document when user-facing behavior changes.
 - Add or update tests for validation, parsing, quoting, and safety boundary changes.
+
+Keep compatibility and recovery decisions in their existing owners: registry
+cross-field validation belongs in `Record.lifecycleState`, live-account
+classification in `classifyRegisteredAccount`, and at cancellation in the
+owner/body-checked scheduler path. Do not add another ID-only cancellation API or
+another independent interpretation of the same lifecycle flags.
+
+The supported compatibility matrix includes v2–v5 registry input, v1 task
+namespaces, systemd and at scheduling, and native atd enablement on systemd,
+OpenRC and SysV hosts. Removing a legacy branch requires an explicit supported
+upgrade floor and a tested migration that leaves no old account, grant or task
+without recovery. Consolidate equal contracts and shared test vectors first;
+do not remove backend or identity checks merely to shorten the code.
+
+Explicit-name creation and legacy identity migration can hold the global
+lifecycle lock during the cron/at drain. Other revocations queue behind that
+operation; the 65-second drain is not an upper bound on total lock time. A future
+concurrency change must persist a disabled intermediate identity, retain the
+same-name barrier, and revalidate generation, uninstall state and scheduler
+ownership after reacquiring the lock. The existing generated-name fast path and
+asynchronous quarantine are the preferred ways to avoid that wait.
+
+Release and offline reconstruction use the exact patched Go version declared in
+`go.mod`. Update both pins and their operator instructions together; ordinary CI
+uses the latest patch within the supported Go series and cannot substitute for
+checking the release pin. Test semantic boundaries with real signals and sshd
+where available, in addition to checking the release scripts' structure.
 
 ## Pull Request Checklist
 
