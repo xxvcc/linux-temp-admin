@@ -25,7 +25,9 @@ func bootstrapCommitFunctions(t *testing.T) string {
 	if start < 0 || end <= start {
 		t.Fatal("missing bootstrap commit functions")
 	}
-	return source[start:end]
+	return `MAX_BINARY_BYTES=67108864
+FSIZE_BLOCK_BYTES=$(ulimit -f 1; awk '$1 == "Max" && $2 == "file" && $3 == "size" { print $4 }' /proc/self/limits)
+` + source[start:end]
 }
 
 func bootstrapShells(t *testing.T) [][]string {
@@ -46,30 +48,75 @@ func bootstrapShells(t *testing.T) [][]string {
 }
 
 func TestBootstrapVersionWitnessAcrossShells(t *testing.T) {
+	utilities := []struct{ name, setup string }{{name: "default"}}
+	if busybox, err := exec.LookPath("busybox"); err == nil {
+		utilities = append(utilities, struct{ name, setup string }{
+			name:  "busybox-applets",
+			setup: fmt.Sprintf("grep() { %q grep \"$@\"; }; awk() { %q awk \"$@\"; }; tr() { %q tr \"$@\"; }\n", busybox, busybox, busybox),
+		})
+	}
 	for _, shell := range bootstrapShells(t) {
-		for _, tc := range []struct {
-			name, binary, want string
-			invalid            bool
-		}{
-			{"canonical", "\x00LTA_RELEASE_VERSION_V1{2.10.8}\x00", "2.10.8", false},
-			{"prerelease", "LTA_RELEASE_VERSION_V1{2.10.8-rc.12}", "2.10.8-rc.12", false},
-			{"absent", "old binary", "", false},
-			{"noncanonical", "LTA_RELEASE_VERSION_V1{02.10.8}", "", false},
-			{"overlong", "LTA_RELEASE_VERSION_V1{2.10.8-" + strings.Repeat("x", 128) + "}", "", false},
-			{"duplicate", "LTA_RELEASE_VERSION_V1{2.10.8}\x00LTA_RELEASE_VERSION_V1{2.10.8}", "", true},
+		for _, utility := range utilities {
+			for _, tc := range []struct {
+				name, binary, want string
+				invalid            bool
+			}{
+				{"canonical", "\x00LTA_RELEASE_VERSION_V1{2.10.8}\x00", "2.10.8", false},
+				{"prerelease", "LTA_RELEASE_VERSION_V1{2.10.8-rc.12}", "2.10.8-rc.12", false},
+				{"absent", "old binary", "", false},
+				{"noncanonical", "LTA_RELEASE_VERSION_V1{02.10.8}", "", false},
+				{"overlong", "LTA_RELEASE_VERSION_V1{2.10.8-" + strings.Repeat("x", 128) + "}", "", false},
+				{"duplicate", "LTA_RELEASE_VERSION_V1{2.10.8}\x00LTA_RELEASE_VERSION_V1{2.10.8}", "", true},
+				{"different after nul", "LTA_RELEASE_VERSION_V1{2.10.8}\x00LTA_RELEASE_VERSION_V1{2.10.7}", "", true},
+				{"duplicate same line", "LTA_RELEASE_VERSION_V1{2.10.8} LTA_RELEASE_VERSION_V1{2.10.8}", "", true},
+				{"different same line", "LTA_RELEASE_VERSION_V1{2.10.8} LTA_RELEASE_VERSION_V1{2.10.7}", "", true},
+				{"duplicate newline", "LTA_RELEASE_VERSION_V1{2.10.8}\nLTA_RELEASE_VERSION_V1{2.10.8}", "", true},
+				{"nul cannot join marker", "LTA_RELEASE_VERSION_V1{2.10.\x008}", "", false},
+				{"nul cannot join prefix", "LTA_RELEASE_VER\x00SION_V1{2.10.8}", "", false},
+			} {
+				t.Run(filepath.Base(shell[0])+"/"+utility.name+"/"+tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					binary := filepath.Join(dir, "binary")
+					if err := os.WriteFile(binary, []byte(tc.binary), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					body := "set -eu\nMAX_RELEASE_VERSION_BYTES=128\n" + bootstrapCommitFunctions(t) + utility.setup + "\nread_release_version \"$TEST_BINARY\"\n"
+					cmd := exec.Command(shell[0], append(append([]string{}, shell[1:]...), "-c", body)...)
+					cmd.Env = append(os.Environ(), "tmp="+dir, "TEST_BINARY="+binary)
+					out, err := cmd.CombinedOutput()
+					if (err != nil) != tc.invalid || (!tc.invalid && string(out) != tc.want) {
+						t.Fatalf("version=%q error=%v want %q invalid=%v", out, err, tc.want, tc.invalid)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestBootstrapVersionWitnessToolFailures(t *testing.T) {
+	for _, shell := range bootstrapShells(t) {
+		for _, tc := range []struct{ name, setup string }{
+			{"tr fails", `tr() { return 1; }`},
+			{"tr partial failure", `tr() { printf 'LTA_RELEASE_VERSION_V1{2.10.8}\n'; return 1; }`},
+			{"tr output exceeds exact cap", `MAX_BINARY_BYTES=64; tr() { printf 'LTA_RELEASE_VERSION_V1{2.10.8}\n%200s' x; }`},
+			{"tr output exceeds kernel cap", `MAX_BINARY_BYTES=1024; tr() { printf 'LTA_RELEASE_VERSION_V1{2.10.8}\n%9000s' x; }`},
+			{"grep fails", `grep() { return 2; }`},
+			{"grep partial failure", `grep() { printf 'LTA_RELEASE_VERSION_V1{2.10.8}\n'; return 2; }`},
+			{"grep no-match with output", `grep() { printf 'LTA_RELEASE_VERSION_V1{2.10.8}\n'; return 1; }`},
+			{"awk fails", `awk() { return 2; }`},
+			{"wc fails", `wc() { return 1; }`},
 		} {
 			t.Run(filepath.Base(shell[0])+"/"+tc.name, func(t *testing.T) {
 				dir := t.TempDir()
 				binary := filepath.Join(dir, "binary")
-				if err := os.WriteFile(binary, []byte(tc.binary), 0o600); err != nil {
+				if err := os.WriteFile(binary, []byte("LTA_RELEASE_VERSION_V1{2.10.8}"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				body := "set -eu\nMAX_RELEASE_VERSION_BYTES=128\n" + bootstrapCommitFunctions(t) + "\nread_release_version \"$TEST_BINARY\"\n"
+				body := "set -eu\nulimit -c 0\nMAX_RELEASE_VERSION_BYTES=128\n" + bootstrapCommitFunctions(t) + tc.setup + "\nread_release_version \"$TEST_BINARY\"\n"
 				cmd := exec.Command(shell[0], append(append([]string{}, shell[1:]...), "-c", body)...)
 				cmd.Env = append(os.Environ(), "tmp="+dir, "TEST_BINARY="+binary)
-				out, err := cmd.CombinedOutput()
-				if (err != nil) != tc.invalid || (!tc.invalid && string(out) != tc.want) {
-					t.Fatalf("version=%q error=%v want %q invalid=%v", out, err, tc.want, tc.invalid)
+				if out, err := cmd.CombinedOutput(); err == nil {
+					t.Fatalf("accepted a failed or oversized witness scan: %s", out)
 				}
 			})
 		}

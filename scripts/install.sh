@@ -12,7 +12,7 @@ esac
 set -eu
 # Some systems link /bin/sh to Bash, which imports exported functions before
 # executing this file. Clear every command name we call before trusting PATH.
-for imported_name in id uname mktemp stat sha256sum openssl timeout awk grep od wc cp chmod chown mv \
+for imported_name in id uname mktemp stat sha256sum openssl timeout awk grep tr od wc cp chmod chown mv \
   dirname mkdir rm sleep sync flock curl getent nslookup command printf ulimit echo umask export unset set trap exit return break ':' '['; do
   unset -f "$imported_name" 2>/dev/null || :
 done
@@ -58,7 +58,7 @@ case "$DEST" in
   *) fail "DEST must be an absolute path" ;;
 esac
 
-for command_name in id uname mktemp stat sha256sum openssl timeout awk grep od wc cp chmod chown mv \
+for command_name in id uname mktemp stat sha256sum openssl timeout awk grep tr od wc cp chmod chown mv \
   dirname mkdir rm sleep sync flock curl; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
 done
@@ -905,10 +905,28 @@ sync_destination_directory_chain() {
 # This witness is part of the Ed25519-authenticated candidate bytes. Read it
 # without running either binary; the unsigned mirror index is only a selector.
 read_release_version() {
+  # BusyBox grep can stop matching a binary line at its first NUL even with -a.
+  # Convert NUL to a separator without joining bytes into a new valid witness.
+  # Keep each stage separate: a pipeline would hide tr failures in POSIX sh.
+  witness_blocks=$(( (MAX_BINARY_BYTES + FSIZE_BLOCK_BYTES - 1) / FSIZE_BLOCK_BYTES ))
+  if ! (
+    ulimit -f "$witness_blocks" || exit 1
+    tr '\000' '\n' < "$1" > "$tmp/witness-input"
+  ); then
+    return 1
+  fi
+  witness_bytes=$(wc -c < "$tmp/witness-input") || return 1
+  [ "$witness_bytes" -le "$MAX_BINARY_BYTES" ] || return 1
   witness_status=0
-  grep -aoE 'LTA_RELEASE_VERSION_V1[{](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?[}]' "$1" \
-    > "$tmp/witnesses" || witness_status=$?
-  [ "$witness_status" -le 1 ] || return 1
+  (
+    ulimit -f "$witness_blocks" || exit 2
+    grep -aoE 'LTA_RELEASE_VERSION_V1[{](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?[}]' "$tmp/witness-input"
+  ) > "$tmp/witnesses" || witness_status=$?
+  case "$witness_status" in
+    0) ;;
+    1) [ ! -s "$tmp/witnesses" ] || return 1 ;;
+    *) return 1 ;;
+  esac
   awk -v max="$MAX_RELEASE_VERSION_BYTES" '
     { value=substr($0, 24, length($0)-24); if (length(value) <= max) { count++; version=value } }
     END { if (count > 1) exit 1; if (count == 1) printf "%s", version }

@@ -344,7 +344,11 @@ func TestReleaseVersionWitnessIsCanonicalAndUnique(t *testing.T) {
 				if shell == "busybox" {
 					args = append(args, "ash")
 				}
-				body := "set -eu\nMAX_RELEASE_VERSION_BYTES=128\n" + shellReader + "\nread_release_version \"$TEST_BINARY\""
+				body := `set -eu
+MAX_RELEASE_VERSION_BYTES=128
+MAX_BINARY_BYTES=67108864
+FSIZE_BLOCK_BYTES=$(ulimit -f 1; awk '$1 == "Max" && $2 == "file" && $3 == "size" { print $4 }' /proc/self/limits)
+` + shellReader + "\nread_release_version \"$TEST_BINARY\""
 				cmd := exec.Command(path, append(args, "-c", body)...)
 				cmd.Env = append(os.Environ(), "tmp="+dir, "TEST_BINARY="+binary)
 				out, shellErr := cmd.CombinedOutput()
