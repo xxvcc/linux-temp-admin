@@ -41,7 +41,6 @@ func (s revokeTestScheduleSystem) RemoveAtJobsFor(string) error {
 	}
 	return s.removeAtErr
 }
-func (revokeTestScheduleSystem) AtrmJob(string) error              { return nil }
 func (revokeTestScheduleSystem) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
 func (revokeTestScheduleSystem) AtDaemonRunning() (bool, error)    { return true, nil }
 

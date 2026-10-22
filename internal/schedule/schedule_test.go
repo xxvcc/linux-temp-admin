@@ -20,11 +20,9 @@ type fakeSystem struct {
 	atDeadline   time.Time
 	atID         string
 	removedFor   []string
-	atrmd        []string
 	atJobs       []AtJob
 	loadedUnits  []string
 	removeAtErr  error
-	atrmErr      error
 	atJobsErr    error
 	loadedErr    error
 	systemctlErr func(args ...string) error
@@ -53,7 +51,6 @@ func (f *fakeSystem) RemoveAtJobsFor(command string) error {
 	f.removedFor = append(f.removedFor, command)
 	return f.removeAtErr
 }
-func (f *fakeSystem) AtrmJob(id string) error  { f.atrmd = append(f.atrmd, id); return f.atrmErr }
 func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
 
 // atdStopped/atdProbeErr default to a running daemon so existing cases keep their
@@ -175,8 +172,8 @@ func TestCancelQuarantineNeverSweepsExpiryAtJobs(t *testing.T) {
 	if err := s.CancelQuarantine("xxvcc-a1", unit); err != nil {
 		t.Fatal(err)
 	}
-	if len(sys.removedFor) != 0 || len(sys.atrmd) != 0 {
-		t.Fatalf("quarantine cleanup touched at jobs: sweep=%v atrm=%v", sys.removedFor, sys.atrmd)
+	if len(sys.removedFor) != 0 {
+		t.Fatalf("quarantine cleanup touched at jobs: sweep=%v", sys.removedFor)
 	}
 }
 
@@ -824,9 +821,6 @@ func TestCancelNeverRemovesARecordedAtIDWithoutBodyVerification(t *testing.T) {
 	if err := s.Cancel("xxvcc-a1", "at:42"); err != nil {
 		t.Fatal(err)
 	}
-	if len(sys.atrmd) != 0 {
-		t.Fatalf("Cancel passed a reusable recorded id directly to atrm: %v", sys.atrmd)
-	}
 	if len(sys.removedFor) != 1 {
 		t.Fatalf("Cancel did not use the verified command-body sweep: %v", sys.removedFor)
 	}
@@ -839,9 +833,6 @@ func TestCancelKeepsRecordedAtEvidenceWithoutInventoryBackend(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "at backend is unavailable") {
 		t.Fatalf("Cancel error = %v, want missing-inventory refusal", err)
 	}
-	if len(sys.atrmd) != 0 {
-		t.Fatalf("Cancel passed an unverified recorded id directly to atrm: %v", sys.atrmd)
-	}
 }
 
 func TestCancelPreservesUnknownRecordedScheduleEvidence(t *testing.T) {
@@ -852,9 +843,6 @@ func TestCancelPreservesUnknownRecordedScheduleEvidence(t *testing.T) {
 			err := s.Cancel("xxvcc-a1", recorded)
 			if err == nil || !strings.Contains(err.Error(), "unsupported recorded auto-revoke identifier") {
 				t.Fatalf("Cancel(%q) error = %v, want unsupported evidence refusal", recorded, err)
-			}
-			if len(sys.atrmd) != 0 {
-				t.Fatalf("Cancel passed an invalid recorded id to atrm: %v", sys.atrmd)
 			}
 			if len(sys.removedFor) != 1 {
 				t.Fatalf("Cancel did not still sweep exact known at commands: %v", sys.removedFor)

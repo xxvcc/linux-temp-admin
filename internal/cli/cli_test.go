@@ -46,7 +46,6 @@ func (failingScheduleSystem) Systemctl(...string) error                    { ret
 func (failingScheduleSystem) HasAt() bool                                  { return true }
 func (failingScheduleSystem) ScheduleAt(string, time.Time) (string, error) { return "", nil }
 func (failingScheduleSystem) RemoveAtJobsFor(string) error                 { return nil }
-func (failingScheduleSystem) AtrmJob(string) error                         { return nil }
 func (failingScheduleSystem) AtDaemonRunning() (bool, error)               { return true, nil }
 
 func (failingScheduleSystem) AtJobs() ([]schedule.AtJob, error) {

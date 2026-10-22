@@ -12,8 +12,8 @@ esac
 set -eu
 # Some systems link /bin/sh to Bash, which imports exported functions before
 # executing this file. Clear every command name we call before trusting PATH.
-for imported_name in id uname mktemp stat sha256sum openssl timeout awk grep od wc cp chmod chown mv \
-  dirname mkdir rm sleep sync curl getent nslookup command printf ulimit echo umask export unset set trap exit return break ':' '['; do
+for imported_name in id uname mktemp stat sha256sum openssl timeout awk grep tr od wc cp chmod chown mv \
+  dirname mkdir rm sleep sync flock curl getent nslookup command printf ulimit echo umask export unset set trap exit return break ':' '['; do
   unset -f "$imported_name" 2>/dev/null || :
 done
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -28,11 +28,13 @@ if ! ulimit -c 0 2>/dev/null; then
 fi
 
 release="${LTA_RELEASE-latest}"
+allow_downgrade="${LTA_ALLOW_DOWNGRADE-0}"
 expected_version=""
 release_tag=""
 MIRROR_ROOT=https://dl.ll.cd/linux-temp-admin
 GITHUB_RELEASE_ROOT=https://github.com/xxvcc/linux-temp-admin/releases
 MANAGED_DEST=/usr/local/sbin/linux-temp-admin
+LIFECYCLE_LOCK=/run/linux-temp-admin.lock
 DEST="${DEST:-$MANAGED_DEST}"
 TMP_ROOT=/tmp
 MAX_BINARY_BYTES=67108864
@@ -56,13 +58,10 @@ case "$DEST" in
   *) fail "DEST must be an absolute path" ;;
 esac
 
-for command_name in id uname mktemp stat sha256sum openssl timeout awk grep od wc cp chmod chown mv \
-  dirname mkdir rm sleep curl; do
+for command_name in id uname mktemp stat sha256sum openssl timeout awk grep tr od wc cp chmod chown mv \
+  dirname mkdir rm sleep sync flock curl; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
 done
-if [ "$DEST" != "$MANAGED_DEST" ]; then
-  command -v sync >/dev/null 2>&1 || fail "required command not found: sync"
-fi
 
 case "$release" in
   latest) ;;
@@ -78,6 +77,11 @@ case "$release" in
     release_tag=$release
     expected_version=${release#v}
     ;;
+esac
+case "$allow_downgrade" in
+  0) ;;
+  1) [ "$release" != latest ] || fail "LTA_ALLOW_DOWNGRADE=1 requires an exact LTA_RELEASE=vX.Y.Z" ;;
+  *) fail "LTA_ALLOW_DOWNGRADE must be 0 or 1" ;;
 esac
 
 # Bash uses 1024-byte `ulimit -f` blocks normally but 512-byte blocks in POSIX
@@ -897,23 +901,158 @@ sync_destination_directory_chain() {
   done
 }
 
+# BEGIN BOOTSTRAP_COMMIT_FUNCTIONS
+# This witness is part of the Ed25519-authenticated candidate bytes. Read it
+# without running either binary; the unsigned mirror index is only a selector.
+read_release_version() {
+  # BusyBox grep can stop matching a binary line at its first NUL even with -a.
+  # Convert NUL to a separator without joining bytes into a new valid witness.
+  # Keep each stage separate: a pipeline would hide tr failures in POSIX sh.
+  witness_blocks=$(( (MAX_BINARY_BYTES + FSIZE_BLOCK_BYTES - 1) / FSIZE_BLOCK_BYTES ))
+  if ! (
+    ulimit -f "$witness_blocks" || exit 1
+    tr '\000' '\n' < "$1" > "$tmp/witness-input"
+  ); then
+    return 1
+  fi
+  witness_bytes=$(wc -c < "$tmp/witness-input") || return 1
+  [ "$witness_bytes" -le "$MAX_BINARY_BYTES" ] || return 1
+  witness_status=0
+  (
+    ulimit -f "$witness_blocks" || exit 2
+    grep -aoE 'LTA_RELEASE_VERSION_V1[{](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?[}]' "$tmp/witness-input"
+  ) > "$tmp/witnesses" || witness_status=$?
+  case "$witness_status" in
+    0) ;;
+    1) [ ! -s "$tmp/witnesses" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  awk -v max="$MAX_RELEASE_VERSION_BYTES" '
+    { value=substr($0, 24, length($0)-24); if (length(value) <= max) { count++; version=value } }
+    END { if (count > 1) exit 1; if (count == 1) printf "%s", version }
+  ' "$tmp/witnesses"
+}
+
+# Match internal/version.Greater, including arbitrary-size decimal components,
+# final > prerelease, numeric suffix runs, and their leading-zero tie breaker.
+compare_release_versions() {
+  awk -v a="$1" -v b="$2" '
+    function lexical(x,y) { return ("x" x < "x" y) ? -1 : (("x" x > "x" y) ? 1 : 0) }
+    function decimal(x,y) {
+      sub(/^0+/, "", x); sub(/^0+/, "", y)
+      if (length(x) != length(y)) return length(x) < length(y) ? -1 : 1
+      return lexical(x,y)
+    }
+    function natural(x,y, xc,yc,xn,yn,c) {
+      while (length(x) && length(y)) {
+        xc=substr(x,1,1); yc=substr(y,1,1)
+        if (xc ~ /[0-9]/ && yc ~ /[0-9]/) {
+          match(x,/^[0-9]+/); xn=substr(x,1,RLENGTH)
+          match(y,/^[0-9]+/); yn=substr(y,1,RLENGTH)
+          c=decimal(xn,yn); if (c) return c
+          c=lexical(xn,yn); if (c) return c
+          x=substr(x,length(xn)+1); y=substr(y,length(yn)+1)
+        } else {
+          c=lexical(xc,yc); if (c) return c
+          x=substr(x,2); y=substr(y,2)
+        }
+      }
+      return length(x) ? 1 : (length(y) ? -1 : 0)
+    }
+    BEGIN {
+      ac=a; bc=b; sub(/-.*/, "", ac); sub(/-.*/, "", bc)
+      split(ac,aa,"."); split(bc,bb,".")
+      for (i=1;i<=3;i++) { c=decimal(aa[i],bb[i]); if (c) { print c < 0 ? "older" : "not-older"; exit } }
+      as=substr(a,length(ac)+1); bs=substr(b,length(bc)+1)
+      if (as == "" && bs != "") { print "not-older"; exit }
+      if (as != "" && bs == "") { print "older"; exit }
+      print natural(as,bs) < 0 ? "older" : "not-older"
+    }
+  '
+}
+
+acquire_bootstrap_lock() {
+  check_safe_dir_chain "$(dirname -- "$LIFECYCLE_LOCK")"
+  # Shell has no O_NOFOLLOW redirection. The parent chain is root-only, reject
+  # links/non-regular files before a non-truncating open, then bind the descriptor
+  # to the same inode and metadata. No unprivileged writer can race this path.
+  [ ! -L "$LIFECYCLE_LOCK" ] || fail "lifecycle lock is a symlink"
+  if [ ! -e "$LIFECYCLE_LOCK" ]; then
+    ( set -C; : > "$LIFECYCLE_LOCK" ) 2>/dev/null \
+      || [ -f "$LIFECYCLE_LOCK" ] || fail "cannot create lifecycle lock"
+  fi
+  if [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ]; then
+    fail "lifecycle lock is not a regular non-symlink file"
+  fi
+  [ "$(stat -c '%u:%a' -- "$LIFECYCLE_LOCK")" = 0:600 ] \
+    || fail "lifecycle lock has unsafe metadata"
+  exec 9<> "$LIFECYCLE_LOCK"
+  lock_identity=$(stat -Lc '%d:%i:%u:%a' -- /proc/self/fd/9) \
+    || fail "cannot inspect lifecycle lock descriptor"
+  [ "$lock_identity" = "$(stat -c '%d:%i:%u:%a' -- "$LIFECYCLE_LOCK")" ] \
+    || fail "lifecycle lock changed while opening"
+  timeout -k 1 30 flock -x 9 || fail "cannot acquire lifecycle lock within 30 seconds"
+  if [ -L "$LIFECYCLE_LOCK" ] || \
+    [ "$lock_identity" != "$(stat -c '%d:%i:%u:%a' -- "$LIFECYCLE_LOCK")" ]; then
+    fail "lifecycle lock changed while waiting"
+  fi
+}
+
+check_bootstrap_state() {
+  was_uninstalled=0
+  uninstall_marker="${LIFECYCLE_LOCK}.uninstalled"
+  if [ "$DEST" = "$MANAGED_DEST" ] && { [ -e "$uninstall_marker" ] || [ -L "$uninstall_marker" ]; }; then
+    if [ ! -f "$uninstall_marker" ] || [ -L "$uninstall_marker" ]; then
+      fail "uninstall marker is not a regular non-symlink file"
+    fi
+    [ "$(stat -c '%u:%g:%a:%s' -- "$uninstall_marker")" = 0:0:600:15 ] \
+      || fail "uninstall marker has unsafe metadata or size"
+    [ "$(od -An -v -tx1 "$uninstall_marker" | awk '{$1=$1; printf "%s", $0}')" = '75 6e 69 6e 73 74 61 6c 6c 65 64 2d 76 31 0a' ] \
+      || fail "uninstall marker has invalid content"
+    was_uninstalled=1
+  fi
+  [ ! -L "$DEST" ] || fail "destination is a symlink: $DEST"
+  if [ -e "$DEST" ]; then
+    [ -f "$DEST" ] || fail "destination is not a regular file: $DEST"
+    if [ "$allow_downgrade" = 0 ]; then
+      [ "$(stat -c '%u:%g:%a' -- "$DEST")" = 0:0:755 ] \
+        || fail "installed command has unsafe metadata; explicit pinned recovery is required"
+      [ "$(wc -c < "$DEST")" -le "$MAX_BINARY_BYTES" ] \
+        || fail "installed command exceeds the size limit"
+      current_version=$(read_release_version "$DEST") \
+        || fail "installed command has ambiguous version witnesses"
+      [ -n "$current_version" ] \
+        || fail "installed version is unknown; explicit pinned recovery is required"
+      comparison=$(compare_release_versions "$signed_version" "$current_version") \
+        || fail "could not compare installed and candidate versions"
+      case "$comparison" in
+        older) fail "refusing downgrade from $current_version to $signed_version; set LTA_ALLOW_DOWNGRADE=1 with an exact LTA_RELEASE only if intended" ;;
+        not-older) ;;
+        *) fail "could not compare installed and candidate versions" ;;
+      esac
+    fi
+  fi
+}
+# END BOOTSTRAP_COMMIT_FUNCTIONS
+
+signed_version=$(read_release_version "$tmp/bin") \
+  || fail "signed candidate has ambiguous release-version witnesses"
+if [ "$allow_downgrade" = 0 ] && [ -z "$signed_version" ]; then
+  fail "signed candidate has no static release-version witness; explicit pinned recovery is required"
+fi
+[ -z "$expected_version" ] || [ -z "$signed_version" ] || [ "$signed_version" = "$expected_version" ] \
+  || fail "downloaded binary version does not match LTA_RELEASE"
+
 check_safe_dir_chain "$existing_ancestor"
 mkdir -p -- "$dest_dir"
 check_safe_dir_chain "$dest_dir"
-if [ "$DEST" != "$MANAGED_DEST" ]; then
-  # Sync every directory inode from the leaf through root, in leaf-to-parent
-  # order. This makes each newly created component's entry durable in its parent
-  # before a custom installation can report success, including on a retry after
-  # an earlier visible mkdir whose parent sync failed.
-  sync_destination_directory_chain "$dest_dir"
-fi
+sync_destination_directory_chain "$dest_dir"
 
-if [ -L "$DEST" ]; then
-  fail "destination is a symlink: $DEST"
-fi
-if [ -e "$DEST" ] && [ ! -f "$DEST" ]; then
-  fail "destination is not a regular file: $DEST"
-fi
+# Keep the existing lifecycle lock from the first installed-state read through
+# the candidate probe, commit and reactivation. Custom destinations use the same
+# lock, so two installers cannot both approve against an obsolete version.
+acquire_bootstrap_lock
+check_bootstrap_state
 
 stage=$(mktemp "${dest_dir}/.linux-temp-admin.XXXXXX")
 if [ ! -f "$stage" ] || [ -L "$stage" ]; then
@@ -934,7 +1073,7 @@ if ! (
   # stdin is still the pipe carrying the rest of this script when the documented
   # `curl ... | sh` path is used, and the candidate is an untrusted binary at this
   # point. Hand it /dev/null so it cannot consume or observe the installer text.
-  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err" < /dev/null
+  exec timeout -k 1 10 "$stage" version > "$tmp/version" 2> "$tmp/version.err" < /dev/null 9>&-
 ); then
   fail "downloaded binary failed its pre-install version probe"
 fi
@@ -948,6 +1087,8 @@ if ! candidate_version=$(awk '
 fi
 [ -z "$expected_version" ] || [ "$candidate_version" = "$expected_version" ] \
   || fail "downloaded binary version does not match LTA_RELEASE"
+[ -z "$signed_version" ] || [ "$candidate_version" = "$signed_version" ] \
+  || fail "downloaded binary version does not match its signed static witness"
 
 [ "$(sha256sum "$stage" | awk '{print $1}')" = "$got" ] \
   || fail "staging copy changed during the version probe"
@@ -955,29 +1096,15 @@ check_safe_dir_chain "$dest_dir"
 if [ -L "$DEST" ] || { [ -e "$DEST" ] && [ ! -f "$DEST" ]; }; then
   fail "destination changed before commit: $DEST"
 fi
-if [ "$DEST" = "$MANAGED_DEST" ]; then
-  # The signed candidate owns the lifecycle lock and uninstall marker protocol.
-  # Delegating the managed-path commit to it serializes reinstall with every
-  # other mutation and reactivates a deliberately uninstalled host. An unsafe
-  # marker is rejected before the candidate changes the stable command.
-  if ! timeout -k 1 30 "$stage" --lang en install --force >/dev/null 2>&1 < /dev/null; then
-    fail "signed candidate could not complete the managed install/reactivation"
-  fi
-  rm -f -- "$stage" || fail "could not remove the verified staging file"
-  stage=""
+# The shell already owns the lifecycle lock. Commit the verified inode directly;
+# invoking a historical candidate install would try to acquire that lock again.
+timeout -k 5 30 sync "$stage" || fail "destination staging file could not be made durable"
+if mv --help 2>&1 | grep -q -- '--no-target-directory'; then
+  mv -fT -- "$stage" "$DEST"
 else
-  # Flush the fully verified inode before its name is committed. Operand-based
-  # sync is supported by both GNU coreutils and BusyBox without relying on their
-  # differing -d/-f option details.
-  timeout -k 5 30 sync "$stage" \
-    || fail "custom destination staging file could not be made durable"
-  if mv --help 2>&1 | grep -q -- '--no-target-directory'; then
-    mv -fT -- "$stage" "$DEST"
-  else
-    mv -f -- "$stage" "$DEST"
-  fi
-  stage=""
+  mv -f -- "$stage" "$DEST"
 fi
+stage=""
 
 if [ -L "$DEST" ] || [ ! -f "$DEST" ]; then
   fail "installed destination is not a regular non-symlink file"
@@ -1002,10 +1129,14 @@ if ! final_mode=$(stat -c %a -- "$DEST"); then
   fail "cannot inspect installed destination mode"
 fi
 [ "$final_mode" = 755 ] || fail "installed destination mode is not 0755"
-if [ "$DEST" != "$MANAGED_DEST" ]; then
-  timeout -k 5 30 sync "$DEST" \
-    || fail "custom destination is visible but its file durability is unknown"
-  timeout -k 5 30 sync "$dest_dir" \
-    || fail "custom destination is visible but its directory durability is unknown"
+timeout -k 5 30 sync "$DEST" \
+  || fail "installed command is visible but its file durability is unknown"
+timeout -k 5 30 sync "$dest_dir" \
+  || fail "installed command is visible but its directory durability is unknown"
+if [ "$was_uninstalled" = 1 ]; then
+  rm -- "$uninstall_marker" || fail "command is installed but uninstall marker could not be cleared"
+  timeout -k 5 30 sync "$(dirname -- "$uninstall_marker")" \
+    || echo "warning: command is installed and reactivated but marker-removal durability is unknown" >&2
 fi
+exec 9>&-
 echo "installed ${DEST} (version ${candidate_version})"

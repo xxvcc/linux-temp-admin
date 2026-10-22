@@ -10,7 +10,7 @@ This guide is for administrators who install and maintain `linux-temp-admin`. Se
 - amd64 or arm64;
 - primary support for Debian, Ubuntu, RHEL, Rocky, AlmaLinux, Fedora, and common aaPanel environments;
 - best-effort support for Alpine and Arch Linux;
-- root access plus curl, OpenSSL 3, sha256sum, and timeout for installation;
+- root access plus curl, OpenSSL 3, sha256sum, timeout, sync, and flock for installation;
 - `getent` or `nslookup` for GitHub CDN fallback, so every redirect target can be validated and pinned to a public address.
 
 The binary has no dynamic-library or language-runtime dependency. Account lifecycle operations still use the system's `id`, `useradd`, `userdel`, `groupdel`, `usermod`, and `chage`; password login additionally requires `chpasswd`, while granting sudo requires `sudo` and `visudo` for pre-commit policy validation. `groupdel` removes a managed same-name private group only when `userdel` leaves it behind and the registry's `SequentialID` proves its GID; it is therefore a base dependency even on distributions where `userdel` normally removes that group itself. The tool does not fall back to a distro `adduser`/`deluser` or an arbitrary BusyBox account applet: command names alone cannot prove equivalent arguments, configuration, or compile-time shadow/group semantics. Missing tools can be installed through apt, dnf, yum, or apk after interactive confirmation; the account helpers come from Debian's `passwd`, the RPM families' `shadow-utils`, or Alpine/Arch's `shadow` package. With apt, the tool attempts both the index refresh and package installation; a failed refresh remains an error with its diagnostic even if the old cache lets installation complete.
@@ -50,6 +50,16 @@ After installation, run:
 The convenience command obtains the script from the official mirror over HTTPS and streams it directly to a root shell. `pipefail` propagates curl DNS, TLS, HTTP, and transfer failures to the whole pipeline; it **does not authenticate the script or stop an already received partial script from beginning execution**. Before the first curl has obtained the installer, the installer is not running and cannot provide its own GitHub fallback.
 
 Once started, the installer applies a separate strict verification chain to the binary. SHA-256, the detached ed25519 signature, architecture, and candidate version must all pass before an atomic installation to `/usr/local/sbin/linux-temp-admin`. There is no unsigned or checksum-only fallback.
+
+Reinstallation allows the same or a newer version by default and refuses downgrades. Before executing the candidate, the installer reads its static version witness from the signed bytes and compares it with the installed file under the lifecycle lock. Custom `DEST` paths follow the same rule. An unknown installed version, unsafe installed metadata, or a historical candidate without a witness stops the default installation. The uninstall marker is validated before commit and cleared only after a successful, durable installation at the standard path; custom destinations do not reactivate that installation.
+
+For an intentional downgrade or recovery of an unknown installation, independently verify the target version and installer, then set both an exact release and the recovery switch when running the verified local script:
+
+```bash
+/usr/bin/sudo env LTA_RELEASE=v2.10.7 LTA_ALLOW_DOWNGRADE=1 /bin/sh /root/verified-install.sh
+```
+
+`LTA_ALLOW_DOWNGRADE=1` cannot be combined with `latest` and does not bypass candidate signatures, architecture checks, or exact version matching. A first installation still has no trusted historical version floor; pin an exact release when replay resistance is required. The installer commits the verified file itself and does not invoke the candidate's local `install` command. Its exit status and output report the result; it does not emit that command's application audit event, so retain the output in deployment records.
 
 ## Official mirror and GitHub fallback
 

@@ -44,7 +44,6 @@ func (fakeSched) Systemctl(...string) error                    { return nil }
 func (fakeSched) HasAt() bool                                  { return true }
 func (fakeSched) ScheduleAt(string, time.Time) (string, error) { return "1", nil }
 func (fakeSched) RemoveAtJobsFor(string) error                 { return nil }
-func (fakeSched) AtrmJob(string) error                         { return nil }
 func (fakeSched) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
 func (fakeSched) AtDaemonRunning() (bool, error)               { return true, nil }
 
@@ -57,7 +56,6 @@ func (unavailableSched) ScheduleAt(string, time.Time) (string, error) {
 	return "", errors.New("unavailable")
 }
 func (unavailableSched) RemoveAtJobsFor(string) error      { return nil }
-func (unavailableSched) AtrmJob(string) error              { return nil }
 func (unavailableSched) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
 func (unavailableSched) AtDaemonRunning() (bool, error)    { return false, nil }
 
@@ -93,10 +91,6 @@ func (s *trackingSched) RemoveAtJobsFor(command string) error {
 			delete(s.jobs, id)
 		}
 	}
-	return nil
-}
-func (s *trackingSched) AtrmJob(id string) error {
-	delete(s.jobs, id)
 	return nil
 }
 func (s *trackingSched) AtDaemonRunning() (bool, error) { return true, nil }

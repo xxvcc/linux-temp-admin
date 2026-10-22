@@ -33,7 +33,7 @@ func TestInstallerSyncsDestinationDirectoryChainAcrossShells(t *testing.T) {
 	if start < 0 {
 		t.Fatal("could not locate installer directory-chain sync function")
 	}
-	endRel := strings.Index(installer[start:], "\n}\n\ncheck_safe_dir_chain")
+	endRel := strings.Index(installer[start:], "\n}\n\n# BEGIN BOOTSTRAP_COMMIT_FUNCTIONS")
 	if endRel < 0 {
 		t.Fatal("could not isolate installer directory-chain sync function")
 	}
@@ -225,7 +225,7 @@ func TestInstallerInspectionFailuresAreFailClosedAcrossShells(t *testing.T) {
 		t.Fatal("could not locate installer inspection functions")
 	}
 	fetchEndRel := strings.Index(installer[fetchStart:], "\n}\n\nfetch()")
-	checkEndRel := strings.Index(installer[checkStart:], "\n}\n\ncheck_safe_dir_chain")
+	checkEndRel := strings.Index(installer[checkStart:], "\n}\n\nsync_destination_directory_chain")
 	if fetchEndRel < 0 || checkEndRel < 0 {
 		t.Fatal("could not isolate installer inspection functions")
 	}
@@ -482,29 +482,24 @@ func InstallerPinnedReleaseEndToEnd(t *testing.T) {
 	dest := filepath.Join(destDir, "linux-temp-admin")
 	coreEvidence := filepath.Join(destDir, "core-limits")
 	activationEvidence := filepath.Join(destDir, "activation-evidence")
-	activationBlock := filepath.Join(destDir, "activation-block")
-	tombstone := filepath.Join(destDir, "uninstalled-marker")
+	tombstone := dest + ".lock.uninstalled"
 	if err := os.WriteFile(tombstone, []byte("uninstalled-v1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	candidate := elfWrappedScript(t, fmt.Sprintf(`
+# LTA_RELEASE_VERSION_V1{2.8.0}
 case "$1" in
   version)
     awk '$1 == "Max" && $2 == "core" && $3 == "file" && $4 == "size" { print $5, $6 }' /proc/self/limits > "$LTA_CORE_EVIDENCE"
     printf '2.8.0\n'
     ;;
   --lang)
-    [ "$#" -eq 4 ] && [ "$2" = en ] && [ "$3" = install ] && [ "$4" = --force ] || exit 76
-    [ ! -e '%s' ] || exit 77
-    /bin/cp -- "$0" '%s'
-    /bin/chown 0:0 '%s'
-    /bin/chmod 0755 '%s'
-    /bin/rm -f -- '%s'
-    printf 'delegated\n' > '%s'
+    printf 'unexpected install invocation\n' > '%s'
+    exit 77
     ;;
   *) exit 78 ;;
 esac
-`, activationBlock, dest, dest, dest, tombstone, activationEvidence))
+`, activationEvidence))
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -550,6 +545,7 @@ esac
 	installer = strings.ReplaceAll(installer,
 		"MANAGED_DEST=/usr/local/sbin/linux-temp-admin",
 		"MANAGED_DEST="+dest)
+	installer = strings.ReplaceAll(installer, "LIFECYCLE_LOCK=/run/linux-temp-admin.lock", "LIFECYCLE_LOCK="+dest+".lock")
 	keyStart := strings.Index(installer, "RELEASE_PUBKEY_PEMS='")
 	if keyStart < 0 {
 		t.Fatal("installer keyring start not found")
@@ -630,12 +626,12 @@ esac
 		t.Fatalf("version mismatch changed target: %v", statErr)
 	}
 
-	if err := os.WriteFile(activationBlock, []byte("block\n"), 0o600); err != nil {
+	if err := os.WriteFile(tombstone, []byte("invalid-marker\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	out, err = run("v2.8.0")
-	if err == nil || !strings.Contains(string(out), "could not complete the managed install/reactivation") {
-		t.Fatalf("candidate install refusal was not fail-closed: err=%v\n%s", err, out)
+	if err == nil || !strings.Contains(string(out), "uninstall marker") {
+		t.Fatalf("unsafe uninstall marker was not fail-closed: err=%v\n%s", err, out)
 	}
 	if _, statErr := os.Lstat(dest); !os.IsNotExist(statErr) {
 		t.Fatalf("candidate install refusal changed target: %v", statErr)
@@ -643,7 +639,7 @@ esac
 	if _, statErr := os.Stat(tombstone); statErr != nil {
 		t.Fatalf("candidate install refusal removed the uninstall marker: %v", statErr)
 	}
-	if err := os.Remove(activationBlock); err != nil {
+	if err := os.WriteFile(tombstone, []byte("uninstalled-v1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -658,11 +654,11 @@ esac
 	if !bytes.Equal(installed, candidate) {
 		t.Fatal("installed bytes differ from the signed candidate")
 	}
-	if evidence, err := os.ReadFile(activationEvidence); err != nil || string(evidence) != "delegated\n" {
-		t.Fatalf("managed install was not delegated to the signed candidate: evidence=%q err=%v", evidence, err)
+	if _, err := os.Stat(activationEvidence); !os.IsNotExist(err) {
+		t.Fatalf("bootstrap invoked candidate install while holding the lifecycle lock: %v", err)
 	}
 	if _, err := os.Lstat(tombstone); !os.IsNotExist(err) {
-		t.Fatalf("successful delegated install did not clear the uninstall marker: %v", err)
+		t.Fatalf("successful install did not clear the uninstall marker: %v", err)
 	}
 	fi, err := os.Stat(dest)
 	if err != nil {
@@ -699,7 +695,7 @@ func InstallerOfficialMirrorFallbackBoundary(t *testing.T) {
 	}
 
 	asset := "linux-temp-admin-linux-" + runtime.GOARCH
-	candidate := elfWrappedScript(t, "[ \"$1\" = version ] && printf '2.8.0\\n'\n")
+	candidate := elfWrappedScript(t, "# LTA_RELEASE_VERSION_V1{2.8.0}\n[ \"$1\" = version ] && printf '2.8.0\\n'\n")
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -809,6 +805,7 @@ func InstallerOfficialMirrorFallbackBoundary(t *testing.T) {
 	installer := readReleaseFile(t, "../../scripts/install.sh")
 	installer = strings.ReplaceAll(installer, "MIRROR_ROOT=https://dl.ll.cd/linux-temp-admin", "MIRROR_ROOT="+server.URL+"/mirror")
 	installer = strings.ReplaceAll(installer, "GITHUB_RELEASE_ROOT=https://github.com/xxvcc/linux-temp-admin/releases", "GITHUB_RELEASE_ROOT="+server.URL+"/github")
+	installer = strings.ReplaceAll(installer, "LIFECYCLE_LOCK=/run/linux-temp-admin.lock", "LIFECYCLE_LOCK=$DEST.lock")
 	installer = strings.ReplaceAll(installer, "MIRROR_FETCH_ATTEMPTS=2", "MIRROR_FETCH_ATTEMPTS=1")
 	installer = strings.ReplaceAll(installer, "GITHUB_FETCH_ATTEMPTS=4", "GITHUB_FETCH_ATTEMPTS=1")
 	keyStart := strings.Index(installer, "RELEASE_PUBKEY_PEMS='")

@@ -132,8 +132,8 @@ unset TAR_OPTIONS GZIP BZIP2 BZIP XZ_OPT
        GOTELEMETRY=off GOAUTH=off timeout -k 5 30 go version); then
     fail "cannot execute the trusted Go toolchain"
   fi
-  [[ "$(awk '{print $3}' <<<"$trusted_go_version")" == go1.26.6 ]] \
-    || fail "trusted Go toolchain is not exactly go1.26.6"
+  [[ "$(awk '{print $3}' <<<"$trusted_go_version")" == go1.26.10 ]] \
+    || fail "trusted Go toolchain is not exactly go1.26.10"
   signer_arch=$(env -i PATH="$PATH" LC_ALL=C HOME=/root GOROOT= GOENV=off \
     GOTOOLCHAIN=local GOFLAGS= GOWORK=off GOEXPERIMENT= GOFIPS140=off \
     GOTELEMETRY=off GOAUTH=off timeout -k 5 30 go env GOARCH) \
@@ -254,7 +254,7 @@ unset TAR_OPTIONS GZIP BZIP2 BZIP XZ_OPT
 LTA_TRUSTED_SIGNER
 ```
 
-The preparation workstation must likewise have Go 1.26.6 installed as its
+The preparation workstation must likewise have Go 1.26.10 installed as its
 local toolchain. An automatically downloaded toolchain is not sufficient: the
 version gate and every reproducible build use `GOENV=off GOTOOLCHAIN=local
 GOFLAGS= GOWORK=off` so they cannot inspect one compiler and build with another
@@ -371,6 +371,31 @@ supply a durable exclusive lock that records its owner and tag and has an
 explicit stale-lock recovery policy. Workflow concurrency and a workstation-local
 `flock` do not satisfy this requirement.
 
+For this repository, coordinators use the shared GitHub reference
+`refs/tags/lta-publication-lock`. Before online preparation, create a unique
+annotated tag object whose message records the release tag, exact commit,
+authenticated maintainer login, UTC acquisition time and a random operation ID.
+Atomically create the fixed reference with GitHub's `POST /repos/xxvcc/linux-temp-admin/git/refs`.
+An existing reference means the release is busy; never update or replace it.
+If the create request has an ambiguous result, read the reference and proceed
+only if it points to this operation's exact tag-object SHA. Record that SHA in
+the release evidence and recheck ownership before signing and publication.
+The lock tag does not match the `v*` release trigger and is not a version tag.
+Every workstation must use this same protocol; it coordinates participating
+publishers and does not protect against an authorized maintainer deliberately
+deleting the lock. A local lock may additionally coordinate older local tools.
+
+Retain the reference through publication, mirror synchronization and independent
+public verification. Release only the owned reference with an atomic expected-SHA
+check, using `git push --force-with-lease=refs/tags/lta-publication-lock:<recorded-tag-object-sha>
+origin :refs/tags/lta-publication-lock`. Do not use a separate GET followed by an
+unconditional REST DELETE, which could remove a successor's lock. Locks do not
+expire automatically. After an interrupted operation, first establish that its
+recorded coordinator and workflows have stopped, inspect the bound draft/public
+release and Latest state, and record the recovery decision. Resume the same
+operation or remove only its recorded tag-object SHA with the same lease check;
+elapsed time alone is never sufficient to reclaim a lock.
+
 The OpenPGP tag-signing key is separate from the offline ed25519 release key.
 Before the first release under this process, generate or import a dedicated
 maintainer OpenPGP key whose UID contains an email verified on the `xxvcc`
@@ -449,7 +474,7 @@ API and require `verification.verified=true`, `verification.reason=valid`, and
 an armored OpenPGP signature before continuing. Use that same fingerprint as
 `LTA_EXPECTED_TAG_SIGNER_FINGERPRINT` during preparation and publication.
 
-The `Release` workflow uses exactly Go 1.26.6. Its read-only `gate-build` job
+The `Release` workflow uses exactly Go 1.26.10. Its read-only `gate-build` job
 runs vet, uncached race tests, package-serialized root integration tests,
 formatting, shell checks,
 the mirror receiver policy tests, a clean-worktree check, and
@@ -478,7 +503,7 @@ objects, checks the commit's ancestry against GitHub's `main` rather than a
 caller-configured `origin`, rejects symlinks and submodules, and exports the
 self-contained tree with `git archive`. Ignored/untracked files and candidate
 scripts therefore cannot affect the build. It checks the successful Release
-workflow and draft, rebuilds with exactly Go 1.26.6, `GOWORK=off`, and the CI
+workflow and draft, rebuilds with exactly Go 1.26.10, `GOWORK=off`, and the CI
 flags, then `cmp`s every CI binary byte-for-byte. Draft assets are fetched one
 at a time through the authenticated Release Asset API after an advertised-size
 preflight and under a kernel file-size limit. The source archive has its own size
@@ -640,9 +665,12 @@ stable release, it clears Latest and confirms the REST Latest route is exactly a
 404; authentication or transport errors never count as that empty state. The
 Latest route is then independently compared, checksummed, and
 signature-verified for both architectures, followed by another highest-version
-check and a final immutable-Release check. An EXIT trap performs the same exact
-restoration after any error or catchable terminating signal following a possibly
-applied promotion.
+check and a final immutable-Release check. Explicit HUP, INT, and TERM handlers
+exit with a nonzero status and invoke the same EXIT cleanup after a possibly
+applied promotion. Cleanup attempts exact restoration once and ignores repeated
+HUP, INT, and TERM signals while it runs. Its external helpers remain bounded by
+timeouts; if restoration fails, a private recovery record is retained as described
+below. SIGKILL and machine loss cannot execute cleanup.
 If a publish request fails or returns an ambiguous response while the same bound
 Release is public but still mutable, the publisher returns that exact numeric ID
 to draft and verifies the rollback. It never follows a replaced tag to another
@@ -684,6 +712,15 @@ published release to make a retry pass.
 If the script reports that automatic Latest restoration itself failed, keep the
 release unannounced and retain the organization-wide publication lock. Restore
 network/API access, rerun the same publisher first, and inspect its exact result.
+The script prints the path to a private `/tmp/lta-publish-recovery.*/context.tsv`
+record (directory mode 0700, file mode 0600). It records the repository, candidate
+tag and numeric Release ID, commit, independently pinned signed-bundle manifest
+hash, baseline highest stable tag and ID, and failure status. Cleanup removes the
+credential-bearing publication workspace with a bounded command and reports any
+removal failure. The retained record contains no GitHub token, GitHub
+configuration, environment dump, or raw API response. Keep this record and the
+original signed bundle until recovery is independently verified, then remove the
+record. Read the TSV as data; do not source or execute it.
 For manual incident recovery only, use the following fail-closed procedure. It
 uses decimal-string comparison rather than machine-sized arithmetic, rejects a
 noncanonical stable tag or mutable recovery target, excludes the failed `TAG`,

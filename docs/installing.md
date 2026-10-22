@@ -10,7 +10,7 @@
 - amd64 或 arm64；
 - 主要支持 Debian、Ubuntu、RHEL、Rocky、AlmaLinux、Fedora 和常见宝塔环境；
 - Alpine 和 Arch Linux 为尽力支持；
-- 安装需要 root 权限、curl、OpenSSL 3、sha256sum 和 timeout；
+- 安装需要 root 权限、curl、OpenSSL 3、sha256sum、timeout、sync 和 flock；
 - GitHub CDN 回退还需要 `getent` 或 `nslookup`，用于验证并固定每个重定向目标的公网地址。
 
 二进制本身不依赖动态库或语言运行时。账号生命周期仍会使用系统的 `id`、`useradd`、`userdel`、`groupdel`、`usermod` 和 `chage`；密码登录还需要 `chpasswd`，授予 sudo 时还需要 `sudo` 和用于写入前策略校验的 `visudo`。`groupdel` 用于清理 `userdel` 可能留下、且已由登记中的 `SequentialID` 证明 GID 的受管同名私有组；它因此属于基础依赖，即使目标发行版上的 `userdel` 通常会自行删除该组。程序不回退到发行版 `adduser`/`deluser` 或任意 BusyBox 账号 applet：这些实现的参数、配置及编译期 shadow/group 语义不能仅凭命令名证明与 shadow 工具链等价。缺失依赖可在交互确认后通过 apt、dnf、yum 或 apk 安装；账号 helper 分别由 Debian 系的 `passwd`、RPM 系的 `shadow-utils` 或 Alpine/Arch 的 `shadow` 包提供。使用 apt 时，程序会依次尝试更新索引和安装软件包；即使旧缓存让安装完成，索引更新失败仍会作为错误返回并保留诊断。
@@ -50,6 +50,16 @@ curl -fsSL https://dl.ll.cd/linux-temp-admin/install.sh | /usr/bin/sudo /bin/sh
 便利入口通过 HTTPS 从官方镜像取得脚本并立即交给 root shell。`pipefail` 会让 curl 的 DNS、TLS、HTTP 或传输失败成为整个管道的失败；它**不认证脚本本身，也不能阻止已经收到的部分脚本开始执行**。第一次 curl 尚未取得安装器时，安装器还没有运行，因此无法自行回退 GitHub。
 
 安装器启动后，二进制下载进入另一条严格验证链：SHA-256、detached ed25519 签名、架构和候选版本全部通过后，才会原子安装到 `/usr/local/sbin/linux-temp-admin`。不存在未验签或只有校验和的降级路径。
+
+重复安装默认允许同版和新版，拒绝降级。安装器在执行候选程序之前读取已签名字节中的静态版本见证，并在生命周期锁内与当前安装文件的静态版本比较；自定义 `DEST` 使用相同规则。当前版本无法确认、当前文件元数据不安全或历史候选缺少版本见证时，默认停止。卸载标记也会在提交前验证；只有标准路径安装成功并确认文件持久化后才清除标记，自定义路径不会重新激活标准安装。
+
+有意降级或修复未知安装时，先独立确认目标版本和安装脚本，再对已验证的本地脚本同时设置精确版本与恢复开关，例如：
+
+```bash
+/usr/bin/sudo env LTA_RELEASE=v2.10.7 LTA_ALLOW_DOWNGRADE=1 /bin/sh /root/verified-install.sh
+```
+
+`LTA_ALLOW_DOWNGRADE=1` 不能与 `latest` 一起使用，也不会绕过候选签名、架构和精确版本检查。首次安装仍没有可信的历史版本下限，需要防止历史版本回放时应固定精确发行标签。安装器自行提交已验证文件，不调用候选的本地 `install` 命令；安装结果以其退出状态和输出为准，不生成该命令的应用审计事件，请在部署记录中保留安装输出。
 
 ## 官方镜像与 GitHub 回退
 

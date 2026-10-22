@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## v2.10.9 - 2026-10-23
+
+- Refuse bootstrap reinstalls that would lower the installed version before
+  executing the signed candidate. Hold the lifecycle lock through the version
+  decision, atomic installation and uninstall-marker reactivation; require an
+  exact release and explicit consent for historical or unknown-version recovery.
+- Preserve OpenSSH Include path semantics through symlink parents and globbed
+  `.` / `..` components. Distinguish recursive includes from completely scanned
+  inodes, and verify the scanner against real sshd configurations.
+- Restore Latest after HUP, INT or TERM interrupts an unfinished publication,
+  including repeated signals. Preserve a private record of release identities
+  when restoration fails while removing credential-bearing temporary files.
+- Raise the Go security floor and reproducible release/rebuild pins to 1.26.10;
+  check that these pins remain aligned.
+- Remove the unused direct-at-ID cancellation API and adapters; keep cancellation
+  bound to verified job ownership and command contents. Document the compatibility
+  matrix and requirements for future lifecycle-concurrency changes.
+
 ## v2.10.8 - 2026-09-26
 
 - Keep automatic cleanup scheduled until absent-account database, sudoers and

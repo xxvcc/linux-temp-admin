@@ -421,39 +421,6 @@ func sysVAtdLinksEnabled(initDir string) bool {
 	return true
 }
 
-func (realSystem) AtrmJob(id string) error {
-	if id == "" {
-		return fmt.Errorf("empty at job id")
-	}
-	for _, r := range id {
-		if r < '0' || r > '9' {
-			return fmt.Errorf("invalid at job id %q", id)
-		}
-	}
-	if !has("atrm") {
-		return fmt.Errorf("atrm is unavailable")
-	}
-	// at removes a one-shot job from the queue before running its command. The
-	// firing auto-revoke therefore sees its recorded job id as already absent;
-	// that is the desired state, not a cleanup failure.
-	if queued, err := atJobQueued(id); err == nil && !queued {
-		return nil
-	}
-	if out, err := executil.CombinedOutput("atrm", []string{id}, schedulerCommandOptions(schedulerOutputLimit)); err != nil {
-		// The job may have fired between the queue check and atrm. Confirm absence
-		// once more before reporting the command failure.
-		if queued, qerr := atJobQueued(id); qerr == nil && !queued {
-			return nil
-		}
-		return fmt.Errorf("atrm %s: %w: %s", id, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func atJobQueued(id string) (bool, error) {
-	return atJobQueuedContext(context.Background(), id)
-}
-
 func atJobQueuedContext(ctx context.Context, id string) (bool, error) {
 	if !has("atq") {
 		return false, fmt.Errorf("atq is unavailable")
