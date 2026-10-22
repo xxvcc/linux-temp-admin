@@ -646,6 +646,7 @@ require_draft() {
 publish_bound_release() {
   local state actual_tag actual_draft actual_prerelease actual_immutable actual_id extra
   state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+    -f "tag_name=${TAG}" \
     -F draft=false -F "prerelease=${expected_prerelease}" -f make_latest=false \
     --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
     || return 1
@@ -685,6 +686,7 @@ secure_failed_publication_state() {
   fi
 
   rollback_state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${EXPECTED_RELEASE_ID}" \
+    -f "tag_name=${TAG}" \
     -F draft=true -F "prerelease=${expected_prerelease}" -f make_latest=false \
     --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
     || { echo "could not return mutable Release $EXPECTED_RELEASE_ID to draft" >&2; return 1; }
@@ -719,6 +721,7 @@ set_latest_by_release_id() {
     && ( "$make_latest" == true || "$make_latest" == false ) ]] \
     || { echo "invalid bound Release identity for Latest update" >&2; return 1; }
   state="$(gh_with_timeout api --method PATCH "repos/${REPO}/releases/${release_id}" \
+    -f "tag_name=${tag}" \
     -f "make_latest=${make_latest}" \
     --jq '. | (.tag_name|tostring) + " " + (.draft|tostring) + " " + (.prerelease|tostring) + " " + (.immutable|tostring) + " " + (.id|tostring)')" \
     || return 1
