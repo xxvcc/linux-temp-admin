@@ -695,6 +695,10 @@ func (tx *inviteTransaction) scheduleActivateAndReport() int {
 	// expiry or an explicit never-expire value only after every rollback witness is
 	// in place. Skipping it for a permanent invite would leave the credential
 	// unusable forever.
+	if err := a.Users.CheckNoSubordinateIDsExpected(tx.username, tx.pw); err != nil {
+		tx.failf("%s: %v", a.P.M("激活前验证账号本地从属身份失败", "validating local subordinate identities before account activation failed"), err)
+		return 1
+	}
 	tx.loginActivationStarted = true
 	if tx.permanent {
 		if err := a.Users.ClearExpiry(tx.username); err != nil {

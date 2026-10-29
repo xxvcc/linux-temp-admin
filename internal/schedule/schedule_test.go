@@ -53,9 +53,9 @@ func (f *fakeSystem) RemoveAtJobsFor(command string) error {
 }
 func (f *fakeSystem) AtJobs() ([]AtJob, error) { return f.atJobs, f.atJobsErr }
 
-// atdStopped/atdProbeErr default to a running daemon so existing cases keep their
-// meaning; the at-validity tests set them explicitly.
-func (f *fakeSystem) AtDaemonRunning() (bool, error) {
+// The default fixture represents a running and persistently enabled backend;
+// at-validity tests explicitly inject stopped/unverified states.
+func (f *fakeSystem) AtDaemonReady() (bool, error) {
 	if f.atdProbeErr != nil {
 		return false, f.atdProbeErr
 	}

@@ -105,7 +105,7 @@ ssh -i ./USER.key -p PORT USER@HOST
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin status --user xxvcc-a1b2c3d4e5
 ```
 
-状态会显示账号身份、UID、有效期、自动删除任务、身份隔离截止时间和异常登记。v2.9.3 及更早版本创建、仍只有 GECOS 首字段世代见证的账号会显示 `generation-bound-first-field-compat`；`doctor` 会提示尽快撤销并用当前版本重新邀请。`doctor` 还会报告孤儿 sudoers、sshd 例外，以及孤儿、缺失或无效的到期撤销/隔离终删任务；它不会在没有待调度账号时单独证明 systemd 或 `at` 后端可用。
+状态会显示账号身份、UID、有效期、自动删除任务、身份隔离截止时间和异常登记。v2.9.3 及更早版本创建、仍只有 GECOS 首字段世代见证的账号会显示 `generation-bound-first-field-compat`；`doctor` 会提示尽快撤销并用当前版本重新邀请。`doctor` 还会报告孤儿 sudoers、sshd 例外，以及孤儿、缺失或无效的到期撤销/隔离终删任务；已有 `at` 任务要求 atd 当前运行且持久启用开机启动，`doctor` 只观察、不修复服务状态。它不会在没有待调度账号时单独证明 systemd 或 `at` 后端可用。
 
 ## 撤销账号
 

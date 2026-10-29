@@ -414,7 +414,7 @@ func ensureSubordinateIDsAbsent(name string, numericOwner int) error {
 				break
 			}
 			if parts[0] == name || (numericOwner > 0 && parts[0] == strconv.Itoa(numericOwner)) {
-				errs = append(errs, fmt.Errorf("%s assignment remains for deleted account %s", database.label, name))
+				errs = append(errs, fmt.Errorf("%s assignment remains for account %s", database.label, name))
 				break
 			}
 		}

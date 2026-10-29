@@ -45,7 +45,7 @@ func (fakeSched) HasAt() bool                                  { return true }
 func (fakeSched) ScheduleAt(string, time.Time) (string, error) { return "1", nil }
 func (fakeSched) RemoveAtJobsFor(string) error                 { return nil }
 func (fakeSched) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
-func (fakeSched) AtDaemonRunning() (bool, error)               { return true, nil }
+func (fakeSched) AtDaemonReady() (bool, error)                 { return true, nil }
 
 type unavailableSched struct{}
 
@@ -57,7 +57,7 @@ func (unavailableSched) ScheduleAt(string, time.Time) (string, error) {
 }
 func (unavailableSched) RemoveAtJobsFor(string) error      { return nil }
 func (unavailableSched) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
-func (unavailableSched) AtDaemonRunning() (bool, error)    { return false, nil }
+func (unavailableSched) AtDaemonReady() (bool, error)      { return false, nil }
 
 type trackingSched struct {
 	jobs           map[string]string
@@ -93,7 +93,7 @@ func (s *trackingSched) RemoveAtJobsFor(command string) error {
 	}
 	return nil
 }
-func (s *trackingSched) AtDaemonRunning() (bool, error) { return true, nil }
+func (s *trackingSched) AtDaemonReady() (bool, error) { return true, nil }
 
 func (s *trackingSched) AtJobs() ([]schedule.AtJob, error) {
 	jobs := make([]schedule.AtJob, 0, len(s.jobs))

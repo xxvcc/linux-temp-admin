@@ -79,11 +79,11 @@ func (s *Scheduler) ValidSchedule(user string, uid int, generation, recordedUnit
 		}
 		// A queue nobody drains is not a schedule. This probe never starts atd:
 		// reporting on a host must not change it.
-		running, err := s.Sys.AtDaemonRunning()
+		ready, err := s.Sys.AtDaemonReady()
 		if err != nil {
-			return false, fmt.Errorf("confirm atd is running: %w", err)
+			return false, fmt.Errorf("confirm atd is running and persistently enabled: %w", err)
 		}
-		return running, nil
+		return ready, nil
 	}
 
 	unit := s.UnitName(user)

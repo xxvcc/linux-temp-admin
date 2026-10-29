@@ -29,7 +29,7 @@ const (
 )
 
 func main() {
-	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
+	if err := disableCoreDumps(); err != nil {
 		fmt.Fprintln(os.Stderr, "error: disable core dumps:", err)
 		os.Exit(1)
 	}
@@ -58,6 +58,15 @@ func main() {
 	default:
 		usage()
 	}
+}
+
+func disableCoreDumps() error {
+	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
+		return err
+	}
+	// Pipe-based core collectors ignore RLIMIT_CORE. Close that path before any
+	// signing key is read, while keeping the signer independent of application code.
+	return unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
 }
 
 func printPublicKey(privFile string) {
