@@ -719,13 +719,6 @@ func (r realSystem) AtDaemonReady() (bool, error) {
 	return atdReadyWithSystemd(r.HasSystemctl(), "/etc")
 }
 
-// isExitCode reports whether err is a plain non-zero exit with the given status,
-// which distinguishes "the probe ran and said no" from "the probe never ran".
-func isExitCode(err error, code int) bool {
-	var exit *exec.ExitError
-	return errors.As(err, &exit) && exit.ExitCode() == code
-}
-
 func rootAtBodyMatches(body string, match func(string) (bool, error)) (bool, error) {
 	owner, err := atqueue.ParseOwner([]byte(body), int(atJobBodyLimit))
 	if err != nil {
