@@ -26,5 +26,10 @@ func main() {
 }
 
 func disableCoreDumps() error {
-	return unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{})
+	if err := unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{}); err != nil {
+		return err
+	}
+	// A pipe-based kernel core_pattern ignores RLIMIT_CORE. Disable dumpability
+	// as well before invitation credentials can enter this process's memory.
+	return unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
 }

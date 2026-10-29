@@ -317,53 +317,100 @@ func ensureAtdWithSystemd(systemd bool, initDir string) bool {
 		return executil.Run(name, args, schedulerCommandOptions(schedulerOutputLimit)) == nil
 	}
 	if systemd {
-		// enable must succeed even when atd was already started manually. Then
-		// query both properties; active alone permits a reboot to strand jobs.
 		if !run("systemctl", "enable", "--now", "atd") {
 			return false
 		}
-		out, err := executil.Output("systemctl", []string{"is-enabled", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
-		// A zero exit also covers static, indirect and enabled-runtime. Only
-		// persistent enabled proves that this service is armed for later boots.
-		return err == nil && strings.TrimSpace(string(out)) == "enabled" &&
-			run("systemctl", "is-active", "--quiet", "atd")
-	}
-	if has("rc-service") {
+	} else if has("rc-service") {
 		if !has("rc-update") || !run("rc-update", "add", "atd", "default") {
 			return false
 		}
-		out, err := executil.Output("rc-update", []string{"show", "default"}, schedulerCommandOptions(schedulerOutputLimit))
-		if err != nil || !openRCAtdEnabled(string(out)) {
+		if enabled, err := atdBootEnabledWithSystemd(false, initDir); err != nil || !enabled {
 			return false
 		}
 		if !run("rc-service", "atd", "status") && !run("rc-service", "atd", "start") {
 			return false
 		}
-		return run("rc-service", "atd", "status")
-	}
-	if has("service") {
+	} else if has("service") {
 		switch {
 		case has("chkconfig"):
 			if !run("chkconfig", "atd", "on") {
 				return false
 			}
-			out, err := executil.Output("chkconfig", []string{"--list", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
-			if err != nil || !sysVAtdEnabled(string(out)) {
-				return false
-			}
 		case has("update-rc.d"):
-			if !run("update-rc.d", "atd", "enable") || !sysVAtdLinksEnabled(initDir) {
+			if !run("update-rc.d", "atd", "enable") {
 				return false
 			}
 		default:
 			return false
 		}
+		if enabled, err := atdBootEnabledWithSystemd(false, initDir); err != nil || !enabled {
+			return false
+		}
 		if !run("service", "atd", "status") && !run("service", "atd", "start") {
 			return false
 		}
-		return run("service", "atd", "status")
+	} else {
+		return false
 	}
-	return false
+	ready, err := atdReadyWithSystemd(systemd, initDir)
+	return ready && err == nil
+}
+
+// atdBootEnabledWithSystemd is shared by submission and the read-only health
+// check. Only the native init backend can prove persistence; a running process
+// or an installed systemctl on a non-systemd host cannot establish it.
+func atdBootEnabledWithSystemd(systemd bool, initDir string) (bool, error) {
+	if systemd {
+		err := (realSystem{}).Systemctl("is-enabled", "atd")
+		if errors.Is(err, errSystemdUnitNotPersistent) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	if has("rc-service") {
+		if !has("rc-update") {
+			return false, fmt.Errorf("rc-update is unavailable; cannot verify atd boot enablement")
+		}
+		out, err := executil.Output("rc-update", []string{"show", "default"}, schedulerCommandOptions(schedulerOutputLimit))
+		if err != nil {
+			return false, fmt.Errorf("inspect OpenRC atd boot enablement: %w", err)
+		}
+		return openRCAtdEnabled(string(out)), nil
+	}
+	if has("service") {
+		switch {
+		case has("chkconfig"):
+			out, err := executil.Output("chkconfig", []string{"--list", "atd"}, schedulerCommandOptions(schedulerOutputLimit))
+			if err != nil {
+				return false, fmt.Errorf("inspect SysV atd boot enablement: %w", err)
+			}
+			return sysVAtdEnabled(string(out)), nil
+		case has("update-rc.d"):
+			return sysVAtdLinksEnabled(initDir), nil
+		}
+	}
+	return false, fmt.Errorf("no native init backend can verify persistent atd enablement")
+}
+
+func atdReadyWithSystemd(systemd bool, initDir string) (bool, error) {
+	enabled, err := atdBootEnabledWithSystemd(systemd, initDir)
+	if err != nil || !enabled {
+		return false, err
+	}
+	var command string
+	var args []string
+	switch {
+	case systemd:
+		command, args = "systemctl", []string{"is-active", "--quiet", "atd"}
+	case has("rc-service"):
+		command, args = "rc-service", []string{"atd", "status"}
+	default:
+		command, args = "service", []string{"atd", "status"}
+	}
+	if err := executil.Run(command, args, schedulerCommandOptions(schedulerOutputLimit)); err != nil {
+		return false, fmt.Errorf("confirm atd running state: %w", err)
+	}
+	return true, nil
 }
 
 func openRCAtdEnabled(out string) bool {
@@ -665,57 +712,11 @@ func (realSystem) AtJobs() ([]AtJob, error) {
 	return jobs, nil
 }
 
-// AtDaemonRunning probes atd without starting or enabling it. Each branch only
-// reports a definite answer; when no probe on this host can answer, the caller
-// gets an error rather than a healthy-looking false negative.
-func (realSystem) AtDaemonRunning() (bool, error) {
-	probe := func(name string, args ...string) error {
-		return executil.Run(name, args, schedulerCommandOptions(schedulerOutputLimit))
-	}
-	if has("systemctl") {
-		if probe("systemctl", "is-active", "--quiet", "atd") == nil {
-			return true, nil
-		}
-		// `is-active` exits non-zero for a known-but-inactive unit and for an
-		// unknown one alike, so only a unit systemd actually knows is evidence.
-		if probe("systemctl", "cat", "--no-pager", "atd.service") == nil {
-			return false, nil
-		}
-	}
-	if has("rc-service") {
-		if probe("rc-service", "atd", "status") == nil {
-			return true, nil
-		}
-		if probe("rc-service", "--exists", "atd") == nil {
-			return false, nil
-		}
-	}
-	if has("service") {
-		if probe("service", "atd", "status") == nil {
-			return true, nil
-		}
-	}
-	if has("pgrep") {
-		// Bind to real root: atd keeps real UID 0 even after dropping its effective
-		// credentials, so an unprivileged process that merely names itself "atd"
-		// must not satisfy this probe. Without -U 0 any local user — including the
-		// temporary account this tool creates — could make a dead at backend report
-		// healthy, defeating the check this probe exists for.
-		switch err := probe("pgrep", "-x", "-U", "0", "atd"); {
-		case err == nil:
-			return true, nil
-		case isExitCode(err, 1):
-			return false, nil
-		}
-	}
-	return false, fmt.Errorf("no available probe could confirm whether atd is running")
-}
-
-// isExitCode reports whether err is a plain non-zero exit with the given status,
-// which distinguishes "the probe ran and said no" from "the probe never ran".
-func isExitCode(err error, code int) bool {
-	var exit *exec.ExitError
-	return errors.As(err, &exit) && exit.ExitCode() == code
+// AtDaemonReady verifies the native init backend without changing its state.
+// HasSystemctl keeps uncertain or broken systemd managers on the error path;
+// only positive evidence of a non-systemd host allows a native fallback.
+func (r realSystem) AtDaemonReady() (bool, error) {
+	return atdReadyWithSystemd(r.HasSystemctl(), "/etc")
 }
 
 func rootAtBodyMatches(body string, match func(string) (bool, error)) (bool, error) {

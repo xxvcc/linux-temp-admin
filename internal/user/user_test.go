@@ -873,7 +873,7 @@ func TestCreatePendingAndMarkManagedArgv(t *testing.T) {
 	}
 	want := [][]string{
 		{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/bash", "-c", pendingMarker,
-			"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"},
+			"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "-K", "SUB_UID_COUNT=0", "-K", "SUB_GID_COUNT=0", "xxvcc-a1"},
 		{"usermod", "-c", managedMarker, "xxvcc-a1"},
 	}
 	if !reflect.DeepEqual(f.calls, want) {
@@ -894,7 +894,7 @@ func TestCreatePendingIdentityPinsReservedUIDAndGID(t *testing.T) {
 	}
 	want := []string{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/bash", "-c", pendingMarker,
 		"-e", expiredDate, "-p", initialLockedPasswordHash,
-		"-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"}
+		"-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "-K", "SUB_UID_COUNT=0", "-K", "SUB_GID_COUNT=0", "xxvcc-a1"}
 	if len(f.calls) != 1 || !reflect.DeepEqual(f.calls[0], want) {
 		t.Fatalf("reserved useradd argv = %v, want %v", f.calls, want)
 	}
@@ -1833,6 +1833,7 @@ func setProcRoot(t *testing.T, statuses map[int]string) {
 	old := procRoot
 	procRoot = dir
 	t.Cleanup(func() { procRoot = old })
+	writeProcUserNamespace(t, filepath.Join(dir, "self"))
 	for pid, status := range statuses {
 		writeProcProcess(t, pid, status)
 	}
@@ -1853,10 +1854,21 @@ func writeProcTask(t *testing.T, tgid, tid int, status string) {
 	if err := os.WriteFile(filepath.Join(taskDir, "status"), []byte(status), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeProcUserNamespace(t, taskDir)
 	if tid == tgid {
 		if err := os.WriteFile(filepath.Join(pidDir, "status"), []byte(status), 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func writeProcUserNamespace(t *testing.T, taskDir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(taskDir, "ns"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/proc/self/ns/user", filepath.Join(taskDir, "ns", "user")); err != nil && !errors.Is(err, os.ErrExist) {
+		t.Fatal(err)
 	}
 }
 
@@ -1872,7 +1884,7 @@ func TestCreateRejectsUIDWithResidualProcess(t *testing.T) {
 		t.Fatalf("Create error = %v, want residual-UID process refusal", err)
 	}
 	want := [][]string{{"useradd", "-M", "-d", "/home/xxvcc-a1", "-s", "/bin/sh", "-c", marker,
-		"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "xxvcc-a1"}}
+		"-e", expiredDate, "-p", initialLockedPasswordHash, "-U", "-u", "2345", "-K", "GID_MIN=2345", "-K", "GID_MAX=2345", "-K", "SUB_UID_COUNT=0", "-K", "SUB_GID_COUNT=0", "xxvcc-a1"}}
 	if !reflect.DeepEqual(f.calls, want) {
 		t.Fatalf("Create calls = %v, want the pending account retained to occupy the reused UID: %v", f.calls, want)
 	}

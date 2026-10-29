@@ -40,13 +40,11 @@ type System interface {
 	// can inventory root-created jobs whose registry row has been lost. Missing
 	// inventory commands or an unparseable owner header are errors.
 	AtJobs() ([]AtJob, error)
-	// AtDaemonRunning reports whether atd is currently able to dispatch queued
-	// jobs. Unlike the submission path it never starts or enables anything: a
-	// validity check must observe the host, not change it. It returns false with
-	// no error only when a probe positively answered "not running"; when no probe
-	// could answer at all it returns an error so callers fail closed instead of
-	// reporting a queue nobody will drain as healthy.
-	AtDaemonRunning() (bool, error)
+	// AtDaemonReady requires atd to be running and persistently enabled through
+	// the native init backend. It never starts or enables anything. A definite
+	// disabled state returns false; an unavailable or failed check returns an
+	// error so an unverified backend cannot make queued jobs look healthy.
+	AtDaemonReady() (bool, error)
 }
 
 type AtJob struct {

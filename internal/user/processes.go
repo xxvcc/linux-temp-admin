@@ -279,7 +279,24 @@ func processGroupHasUID(tgid, uid int) (matched, stable bool, err error) {
 		}
 		// Zombie/dead threads cannot execute or fork. A zombie leader does not make
 		// the group inactive: another task entry may still describe a live worker.
-		if !status.inactive && containsUID(status.uids, uid) {
+		if status.inactive {
+			continue
+		}
+		if containsUID(status.uids, uid) {
+			return true, stable, nil
+		}
+		// A legacy account may have received subordinate UIDs from useradd.
+		// Namespace ownership survives credential changes within that namespace;
+		// inspect it even when none of the task's current UIDs match the account.
+		owned, namespaceErr := taskUserNamespaceOwnedBy(tgid, tid, uid)
+		if errors.Is(namespaceErr, os.ErrNotExist) || errors.Is(namespaceErr, unix.ESRCH) {
+			stable = false
+			continue
+		}
+		if namespaceErr != nil {
+			return false, false, fmt.Errorf("inspect user namespace for task %d/%d: %w", tgid, tid, namespaceErr)
+		}
+		if owned {
 			return true, stable, nil
 		}
 	}

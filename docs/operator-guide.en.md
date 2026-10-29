@@ -105,7 +105,7 @@ Unattended mode never installs dependencies or changes sshd implicitly; pass `--
 /usr/bin/sudo /usr/local/sbin/linux-temp-admin status --user xxvcc-a1b2c3d4e5
 ```
 
-Status reports account identity, UID, expiry, auto-delete task, identity-quarantine deadline, and registry anomalies. An account created by v2.9.3 or earlier that still has only a first-field GECOS generation witness is shown as `generation-bound-first-field-compat`; `doctor` recommends revoking it promptly and issuing a new invite with the current version. `doctor` also reports orphaned sudoers files and sshd exceptions, plus orphaned, missing, or invalid expiry-revoke and quarantine-finalizer tasks; with no account awaiting a schedule, it does not independently prove that the systemd or `at` backend is available.
+Status reports account identity, UID, expiry, auto-delete task, identity-quarantine deadline, and registry anomalies. An account created by v2.9.3 or earlier that still has only a first-field GECOS generation witness is shown as `generation-bound-first-field-compat`; `doctor` recommends revoking it promptly and issuing a new invite with the current version. `doctor` also reports orphaned sudoers files and sshd exceptions, plus orphaned, missing, or invalid expiry-revoke and quarantine-finalizer tasks; existing `at` jobs require atd to be running and persistently enabled at boot, and `doctor` observes service state without repairing it. With no account awaiting a schedule, it does not independently prove that the systemd or `at` backend is available.
 
 ## Revoke an account
 

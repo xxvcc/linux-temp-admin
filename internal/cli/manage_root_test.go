@@ -33,7 +33,7 @@ func (fakeSys) HasAt() bool                                  { return false }
 func (fakeSys) ScheduleAt(string, time.Time) (string, error) { return "", nil }
 func (fakeSys) RemoveAtJobsFor(string) error                 { return nil }
 func (fakeSys) AtJobs() ([]schedule.AtJob, error)            { return nil, nil }
-func (fakeSys) AtDaemonRunning() (bool, error)               { return true, nil }
+func (fakeSys) AtDaemonReady() (bool, error)                 { return true, nil }
 
 type failedCreateRunner struct{}
 

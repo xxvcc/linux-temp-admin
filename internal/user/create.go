@@ -56,10 +56,14 @@ func (m *Manager) CreatePendingIdentityWithID(name, shell, generation string, re
 	// Pin the private-group allocator to the same already-reserved number:
 	// login.defs gaps or concurrent administration can otherwise make -U's
 	// usual UID==GID choice unreliable. The post-create check remains authoritative.
+	// Temporary accounts do not need subordinate identities. Besides widening the
+	// authority granted by an invite, distro defaults can otherwise let a user
+	// namespace carry credentials outside the account's primary UID.
 	id := strconv.Itoa(reservedID)
 	args := []string{"-M", "-d", home, "-s", shell, "-c", gecos,
 		"-e", expiredDate, "-p", initialLockedPasswordHash,
-		"-U", "-u", id, "-K", "GID_MIN=" + id, "-K", "GID_MAX=" + id, name}
+		"-U", "-u", id, "-K", "GID_MIN=" + id, "-K", "GID_MAX=" + id,
+		"-K", "SUB_UID_COUNT=0", "-K", "SUB_GID_COUNT=0", name}
 	err = m.Runner.Run("useradd", args...)
 	if err != nil {
 		pw, exists, lookupErr := m.lookup(name)
@@ -109,6 +113,9 @@ func (m *Manager) CreatePendingIdentityWithID(name, shell, generation string, re
 		// generation marker and every name-scoped grant before it may delete anything.
 		return pw, fmt.Errorf("newly created account identity does not match the requested name, home, shell, and marker; account retained for rollback or manual recovery")
 	}
+	if err := m.CheckNoSubordinateIDsExpected(name, pw); err != nil {
+		return pw, fmt.Errorf("verify newly created account has no local subordinate-ID assignments: %w", err)
+	}
 	pids, scanErr := processesForUID(pw.UID)
 	if scanErr != nil {
 		return Passwd{}, fmt.Errorf("scan processes before using UID %d: %w; account retained to keep the UID occupied", pw.UID, scanErr)
@@ -125,6 +132,29 @@ func (m *Manager) CreatePendingIdentityWithID(name, shell, generation string, re
 		return pw, fmt.Errorf("clear mail spool before using account identity: %w; account retained for rollback or manual recovery", err)
 	}
 	return pw, nil
+}
+
+// CheckNoSubordinateIDsExpected verifies that a pending invite has no local
+// subordinate UID/GID allocation before activation. External NSS subid providers
+// remain a host-administration trust boundary. The full identity is checked on
+// both sides of the database read so the result cannot authorize a replacement.
+// Revoke attributes user namespaces independently of the allocation source, so
+// existing accounts and external providers do not bypass process cleanup.
+func (m *Manager) CheckNoSubordinateIDsExpected(name string, expected Passwd) error {
+	if err := validateMutationName(name); err != nil {
+		return err
+	}
+	if expected.Name != name || !validate.AccountID(expected.UID) || !validate.AccountID(expected.GID) ||
+		expected.Home != managedHome(name) || expected.Shell == "" ||
+		(!hasManagedGenerationMarker(expected) && !hasPendingGenerationMarker(expected)) {
+		return fmt.Errorf("invalid expected account identity for subordinate-ID validation")
+	}
+	if err := m.verifyExpectedIdentity(name, expected, "before subordinate-ID validation"); err != nil {
+		return err
+	}
+	subIDErr := m.ensureSubordinateIDsAbsent(name, expected.UID)
+	identityErr := m.verifyExpectedIdentity(name, expected, "during subordinate-ID validation")
+	return errors.Join(subIDErr, identityErr)
 }
 
 // CreateManagedHomeExpected creates and validates an empty Home only while the

@@ -304,8 +304,13 @@ signing output paths must be new canonical paths whose existing parents are
 protected by ownership and mode or by root-owned sticky-directory semantics;
 the path is checked again immediately before creation. Network clients, local Git/GPG operations, removable-media
 copies, compiler runs, and signer/verifier invocations all have hard timeouts.
-Each trusted phase also disables core dumps before reading any release input;
-the online phases also disable Git credential prompts and lazy object fetching,
+Each trusted shell phase sets `RLIMIT_CORE=0` before reading any release input.
+Linux ignores that size limit when `core_pattern` pipes dumps to a collector, so
+the release host must separately prevent that collector from recording sensitive
+shell or helper processes. The Go signer and installed command additionally set
+`PR_SET_DUMPABLE=0` before handling inputs; that protection is process-local and
+does not establish a host-wide core-dump policy. The online phases also disable
+Git credential prompts and lazy object fetching,
 GitHub CLI prompts/pagers, and GnuPG automatic key retrieval.
 
 All three trusted phases create private snapshots below `/tmp`. They refuse to
@@ -1310,7 +1315,7 @@ and redirected protocols to HTTPS, and runs curl only after setting a kernel
 unit. It completes successfully and passes the independent hash check before any
 downloaded text is interpreted as shell code. The installer itself has no
 unsigned/checksum-only fallback. It drops imported shell
-functions before fixing a trusted root `PATH`, disables core dumps, neutralizes
+functions before fixing a trusted root `PATH`, sets `RLIMIT_CORE=0`, neutralizes
 caller-controlled OpenSSL configuration/provider paths, and gives each download
 explicit connect/total timeouts plus a kernel `RLIMIT_FSIZE`, so chunked
 responses and old curl versions cannot bypass the hard cap.

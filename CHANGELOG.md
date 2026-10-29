@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+## v2.10.10 - 2026-10-29
+
+- Prevent default local subordinate UID/GID allocation for new invitations and verify its
+  absence before login activation. Include kernel user-namespace ownership in
+  per-thread process cleanup so older accounts remain safely revocable after a
+  namespace changes its effective credentials. Unverifiable scans retain the
+  disabled account and recovery state instead of releasing its identities.
+- Make `doctor` require persistent atd boot enablement as well as a running
+  daemon, using the same native systemd/OpenRC/SysV checks as scheduling without
+  changing service state.
+- Reuse the bounded process runner for installed/candidate version probes,
+  cleaning up same-group descendants before reaping an exited leader. Bound both
+  output streams and isolate the helper environment.
+- Disable Linux process dumpability in both Go entrypoints before handling
+  credentials or signing keys, supplementing the core-size limit. Clarify that
+  shell release phases still require a host policy for piped core collectors.
+
 ## v2.10.9 - 2026-10-23
 
 - Refuse bootstrap reinstalls that would lower the installed version before

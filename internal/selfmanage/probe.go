@@ -10,9 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
-	"time"
 
+	"github.com/xxvcc/linux-temp-admin/internal/executil"
 	"github.com/xxvcc/linux-temp-admin/internal/fsutil"
 	"github.com/xxvcc/linux-temp-admin/internal/validate"
 	"golang.org/x/sys/unix"
@@ -80,60 +79,43 @@ func (m *Manager) runVersionProbe(path string) (string, error) {
 	if maxOutput <= 0 {
 		maxOutput = defaultProbeMaxBytes
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "version")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-		return err
-	}
-	cmd.WaitDelay = time.Second
-	out := &boundedBuffer{max: maxOutput}
-	cmd.Stdout = out
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
+	// Keep the leader waitable until exceptional completion has terminated its
+	// process group. CommandContext alone can reap an exited leader and return
+	// WaitDelay while a descendant still holds the output pipe and keeps running.
+	// The shared runner also bounds stderr and supplies a minimal environment.
+	out, err := executil.Output(path, []string{"version"}, executil.Options{
+		Timeout: timeout, MaxOutput: maxOutput,
+	})
+	if errors.Is(err, context.DeadlineExceeded) {
 		return "", fmt.Errorf("version probe timed out after %s", timeout)
 	}
-	if errors.Is(err, errProbeOutputLimit) || errors.Is(out.err, errProbeOutputLimit) {
+	if errors.Is(err, executil.ErrOutputLimit) {
 		return "", fmt.Errorf("version probe output exceeds %d bytes", maxOutput)
 	}
 	if err != nil {
-		return "", err
+		// Output adds captured stderr to helper failures. Version probes historically
+		// discarded stderr; preserve that boundary instead of exposing arbitrary
+		// diagnostic contents through upgrade errors and audit logs.
+		if errors.Is(err, exec.ErrWaitDelay) {
+			return "", exec.ErrWaitDelay
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", exitErr
+		}
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			return "", pathErr
+		}
+		var execErr *exec.Error
+		if errors.As(err, &execErr) {
+			return "", execErr
+		}
+		return "", errors.New("version probe failed")
 	}
-	v := strings.TrimSpace(out.String())
+	v := strings.TrimSpace(string(out))
 	if !validate.InstalledVersion(v) {
 		return "", fmt.Errorf("binary reported an invalid version: %q", v)
 	}
 	return v, nil
 }
-
-var errProbeOutputLimit = errors.New("version probe output limit exceeded")
-
-type boundedBuffer struct {
-	buf bytes.Buffer
-	max int64
-	err error
-}
-
-func (b *boundedBuffer) Write(p []byte) (int, error) {
-	remaining := b.max - int64(b.buf.Len())
-	if remaining <= 0 {
-		b.err = errProbeOutputLimit
-		return 0, b.err
-	}
-	if int64(len(p)) > remaining {
-		n, _ := b.buf.Write(p[:remaining])
-		b.err = errProbeOutputLimit
-		return n, b.err
-	}
-	return b.buf.Write(p)
-}
-
-func (b *boundedBuffer) String() string { return b.buf.String() }

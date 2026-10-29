@@ -469,7 +469,7 @@ func TestValidScheduleRejectsAtJobWhoseDeadlinePassedOrWhoseDaemonIsGone(t *test
 		return s, sys
 	}
 
-	t.Run("future deadline with a running atd is valid", func(t *testing.T) {
+	t.Run("future deadline with a ready atd is valid", func(t *testing.T) {
 		s, _ := setup(t)
 		valid, err := s.ValidSchedule("xxvcc-a1", 1001, testGeneration, "at:57", now.Add(24*time.Hour))
 		if err != nil || !valid {

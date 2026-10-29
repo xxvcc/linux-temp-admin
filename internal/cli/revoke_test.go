@@ -42,7 +42,7 @@ func (s revokeTestScheduleSystem) RemoveAtJobsFor(string) error {
 	return s.removeAtErr
 }
 func (revokeTestScheduleSystem) AtJobs() ([]schedule.AtJob, error) { return nil, nil }
-func (revokeTestScheduleSystem) AtDaemonRunning() (bool, error)    { return true, nil }
+func (revokeTestScheduleSystem) AtDaemonReady() (bool, error)      { return true, nil }
 
 func (r *orderedTeardownRunner) Run(name string, _ ...string) error {
 	*r.events = append(*r.events, name)
